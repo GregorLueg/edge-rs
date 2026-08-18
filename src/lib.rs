@@ -36,6 +36,7 @@
 pub mod core;
 pub mod errors;
 pub mod glm;
+pub mod limma;
 pub mod numeric;
 pub mod prelude;
 pub mod utils;
