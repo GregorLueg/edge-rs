@@ -23,15 +23,6 @@
 //! looping samples on the outside and genes on the inside, so both the read and
 //! the accumulator stay sequential.
 //!
-//! ### Parallelism
-//!
-//! Samples are the parallel axis here, which is the one deliberate exception to
-//! the crate-wide "genes are the parallel axis" rule stated in `lib.rs`. TMM has
-//! no gene axis to fan out over: the unit of work *is* a sample, and it is a
-//! pair of `O(n_genes log n_genes)` sorts. RLE and upper-quartile stay
-//! sequential because a column reduction is memory bound and there is nothing
-//! to hide.
-//!
 //! ### Numerics
 //!
 //! Counts carry the generic `T` and are converted to `f64` on read. Library
@@ -44,9 +35,9 @@ use crate::errors::EdgeErrors;
 use crate::numeric::stats::{quantile_type7, rank_average};
 use crate::utils::traits::EdgeFloat;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Below this the observed and reference libraries are proportional.
 ///
@@ -84,6 +75,9 @@ const F75_DEGENERATE: f64 = 1e-20;
 /// way.
 const REF_COLUMN_QUANTILE: f64 = 0.75;
 
+/// The strings edgeR accepts, for the error message.
+const NORM_METHOD_NAMES: &str = "TMM, TMMwsp, RLE, upperquartile, none";
+
 /////////////
 // Methods //
 /////////////
@@ -103,9 +97,6 @@ pub enum NormMethod {
     None,
 }
 
-/// The strings edgeR accepts, for the error message.
-const NORM_METHOD_NAMES: &str = "TMM, TMMwsp, RLE, upperquartile, none";
-
 /// Parses edgeR's `method` string.
 ///
 /// Matching is case-insensitive, and `TMMwzp` is accepted as the pre-3.36 spelling
@@ -122,7 +113,6 @@ const NORM_METHOD_NAMES: &str = "TMM, TMMwsp, RLE, upperquartile, none";
 pub fn parse_norm_method(s: &str) -> Option<NormMethod> {
     match s.to_ascii_lowercase().as_str() {
         "tmm" => Some(NormMethod::Tmm),
-        // edgeR renamed TMMwzp to TMMwsp and kept the old spelling working.
         "tmmwsp" | "tmmwzp" => Some(NormMethod::TmmwSp),
         "rle" => Some(NormMethod::Rle),
         "upperquartile" => Some(NormMethod::UpperQuartile),
@@ -153,7 +143,7 @@ impl TryFrom<&str> for NormMethod {
 }
 
 ////////////////
-// Parameters //
+// NormParams //
 ////////////////
 
 /// Tuning knobs for [`calc_norm_factors`].
@@ -226,123 +216,6 @@ impl Default for NormParams {
     }
 }
 
-///////////////
-// Front end //
-///////////////
-
-/// Normalisation factors for a count matrix, as edgeR's `calcNormFactors`.
-///
-/// Genes that are zero in every sample are dropped first, exactly as edgeR does,
-/// and the library sizes are *not* recomputed afterwards: they stay anchored to
-/// whatever was supplied or to the column sums of the unfiltered matrix. If no
-/// gene survives, or there is only one sample, the method degrades to
-/// [`NormMethod::None`] rather than failing, again matching edgeR.
-///
-/// The returned factors are rescaled to have a geometric mean of one, so they
-/// multiply to one across samples. Skipping that step is a common porting bug;
-/// the factors are only identified up to a constant without it.
-///
-/// ### Params
-///
-/// * `counts` - Row-major counts, `n_genes * n_samples`. Must be non-negative
-///   and finite.
-/// * `n_genes` - Number of genes, that is, rows
-/// * `n_samples` - Number of samples, that is, columns
-/// * `lib_size` - Library size per sample. Defaults to the column sums. Every
-///   method divides by it, so each entry must be finite and strictly positive.
-/// * `method` - Which scaling rule to apply
-/// * `ref_column` - Zero-based reference sample for TMM and TMMwsp. `None`
-///   picks one by the rule described at [`resolve_ref_column`]. Ignored by the
-///   other methods.
-/// * `params` - Tuning knobs, or `None` for [`NormParams::default`]
-///
-/// ### Returns
-///
-/// One factor per sample, with geometric mean one, or an [`EdgeErrors`] if the
-/// shape is inconsistent, a library size is not positive, the reference column
-/// is out of range, a parameter is outside its domain, or the chosen method
-/// cannot be computed on this matrix.
-///
-/// ### References
-///
-/// Robinson and Oshlack, Genome Biology, 2010 (TMM); Anders and Huber, Genome
-/// Biology, 2010 (RLE); Bullard et al., BMC Bioinformatics, 2010 (upper quartile)
-pub fn calc_norm_factors<T: EdgeFloat>(
-    counts: &[T],
-    n_genes: usize,
-    n_samples: usize,
-    lib_size: Option<&[f64]>,
-    method: NormMethod,
-    ref_column: Option<usize>,
-    params: Option<NormParams>,
-) -> Result<Vec<f64>, EdgeErrors> {
-    let params = params.unwrap_or_default();
-    validate_params(&params)?;
-
-    if n_genes == 0 || n_samples == 0 {
-        return Err(EdgeErrors::EmptyCounts { n_genes, n_samples });
-    }
-    if counts.len() != n_genes * n_samples {
-        return Err(EdgeErrors::LengthMismatch {
-            name: "counts",
-            expected: n_genes * n_samples,
-            got: counts.len(),
-        });
-    }
-    if let Some(r) = ref_column
-        && r >= n_samples
-    {
-        return Err(EdgeErrors::InvalidReferenceColumn(format!(
-            "column {r} requested but there are only {n_samples} samples"
-        )));
-    }
-
-    let lib = resolve_lib_size(counts, n_genes, n_samples, lib_size)?;
-    let (x, n_kept) = to_column_major_nonzero(counts, n_genes, n_samples)?;
-
-    // edgeR degrades rather than failing: nothing to normalise against.
-    let method = if n_kept == 0 || n_samples == 1 {
-        NormMethod::None
-    } else {
-        method
-    };
-
-    let mut f = match method {
-        NormMethod::Tmm | NormMethod::TmmwSp => {
-            let reference = match ref_column {
-                Some(r) => r,
-                None => resolve_ref_column(&x, n_kept, n_samples, &lib, method)?,
-            };
-            let kernel = if method == NormMethod::Tmm {
-                calc_factor_tmm
-            } else {
-                calc_factor_tmmwsp
-            };
-            let ref_col = &x[reference * n_kept..(reference + 1) * n_kept];
-            (0..n_samples)
-                .into_par_iter()
-                .map(|j| {
-                    kernel(
-                        &x[j * n_kept..(j + 1) * n_kept],
-                        ref_col,
-                        lib[j],
-                        lib[reference],
-                        &params,
-                    )
-                })
-                .collect()
-        }
-        NormMethod::Rle => calc_factor_rle(&x, n_kept, n_samples, &lib)?,
-        NormMethod::UpperQuartile => {
-            calc_factor_quantile(&x, n_kept, n_samples, &lib, params.quantile)?
-        }
-        NormMethod::None => vec![1.0; n_samples],
-    };
-
-    normalise_to_unit_product(&mut f)?;
-    Ok(f)
-}
-
 /// Rejects parameter values whose downstream behaviour is undefined.
 ///
 /// ### Params
@@ -376,6 +249,10 @@ fn validate_params(params: &NormParams) -> Result<(), EdgeErrors> {
     }
     Ok(())
 }
+
+/////////////
+// Helpers //
+/////////////
 
 /// Resolves the library sizes, defaulting to the column sums.
 ///
@@ -692,8 +569,6 @@ fn calc_factor_rle(
             *acc += v.ln();
         }
     }
-    // A single zero count sends the row mean to -inf and the geometric mean to
-    // zero, which is exactly the `gm > 0` filter below.
     let positive: Vec<usize> = log_gm
         .iter()
         .enumerate()
@@ -734,9 +609,9 @@ fn calc_factor_rle(
 /// Trimming is by rank, on both axes at once. With `n` usable genes the kept
 /// set is the rank window `[floor(n * logratio_trim) + 1, n + 1 - that]` on the
 /// log-ratios intersected with the same window at `sum_trim` on the abundances.
-/// The `floor(...) + 1` is the part that has to be exact: computing the bound as
-/// `ceil` or dropping the `+ 1` shifts the window by one gene and moves every
-/// factor in the last few digits, sometimes further on small matrices.
+/// The `floor(...) + 1` is the part that has to be exact: computing the bound
+/// as `ceil` or dropping the `+ 1` shifts the window by one gene and moves
+/// every factor in the last few digits, sometimes further on small matrices.
 ///
 /// Ranks are averaged over ties, matching R's `rank()` default, so a run of
 /// equal log-ratios straddling the trim boundary is either wholly kept or
@@ -778,9 +653,6 @@ fn calc_factor_tmm(
         if lr.is_finite() && ae.is_finite() && ae > params.a_cutoff {
             log_r.push(lr);
             abs_e.push(ae);
-            // Approximate asymptotic variance of the log-ratio, delta method on
-            // the binomial. Both counts are strictly positive here, so this is
-            // finite by construction.
             var.push((lib_obs - o) / lib_obs / o + (lib_ref - r) / lib_ref / r);
         }
     }
@@ -822,22 +694,27 @@ fn calc_factor_tmm(
     } else {
         num / kept as f64
     };
-    // edgeR maps a missing weighted mean to a factor of one rather than failing.
+
+    // edgeR maps a missing weighted mean to a factor of one rather than
+    // failing.
     let f = if f.is_nan() { 0.0 } else { f };
+
     f.exp2()
 }
 
 /// TMMwsp factor for one sample against the reference.
 ///
 /// `.calcFactorTMMwsp`, TMM with singleton pairing. Where TMM throws away every
-/// gene that is zero in one library, TMMwsp keeps that information: it pairs the
-/// largest counts among the observed-only positives with the largest among the
-/// reference-only positives, so `k` genes seen only in the observed sample and
-/// `k` seen only in the reference offset each other instead of both vanishing.
-/// Genes zero in both are still dropped. On data where most genes are zero
-/// somewhere, that is most of the matrix.
+/// gene that is zero in one library, TMMwsp keeps that information: it pairs
+/// the largest counts among the observed-only positives with the largest among
+/// the reference-only positives, so `k` genes seen only in the observed sample
+/// and `k` seen only in the reference offset each other instead of both
+/// vanishing. Genes zero in both are still dropped. On data where most genes
+/// are zero somewhere, that is most of the matrix.
 ///
-/// ### Tie-breaking
+/// ### Notes
+///
+/// **On tie-breaking:**
 ///
 /// The M-values are ordered by `order(M, M.shrunk)`, R's stable sort keyed on
 /// `M` with the add-0.5 shrunk log-ratio as the tiebreak. This is not cosmetic.
@@ -848,13 +725,11 @@ fn calc_factor_tmm(
 /// and the answer stops being reproducible; with it, the run is ordered by the
 /// shrunk ratio, which is monotone in the raw counts, so the pairs carrying the
 /// least evidence are trimmed first. Ties in *both* keys fall back to input
-/// order, which is why the sort must be stable and why the paired singletons are
-/// appended in edgeR's order rather than interleaved.
+/// order, which is why the sort must be stable and why the paired singletons
+/// are appended in edgeR's order rather than interleaved.
 ///
-/// Note the trim window here is `[floor(n * trim) + 1, n + 1 - that]` in 1-based
-/// positions, the same as [`calc_factor_tmm`]. The intermediate Python port
-/// slices `[loM, n - loM)` in 0-based positions, which drops one extra element
-/// at each end; this follows the R.
+/// Note the trim window here is `[floor(n * trim) + 1, n + 1 - that]` in
+/// 1-based positions, the same as [`calc_factor_tmm`].
 ///
 /// ### Params
 ///
@@ -976,7 +851,8 @@ fn calc_factor_tmmwsp(
     if tmm.is_nan() { 1.0 } else { tmm.exp2() }
 }
 
-/// Marks the central `n + 2 - 2 * (floor(n * trim) + 1)` entries of an ordering.
+/// Marks the central `n + 2 - 2 * (floor(n * trim) + 1)` entries of an
+/// ordering.
 ///
 /// The window is stated in R's 1-based positions, `[lo, n + 1 - lo]` with
 /// `lo = floor(n * trim) + 1`, and translated to a half-open 0-based slice of
@@ -1006,6 +882,123 @@ fn trim_window(order: &[usize], n: usize, trim: f64) -> Vec<bool> {
     keep
 }
 
+///////////////
+// Front end //
+///////////////
+
+/// Normalisation factors for a count matrix, as edgeR's `calcNormFactors`.
+///
+/// Genes that are zero in every sample are dropped first, exactly as edgeR
+/// does, and the library sizes are *not* recomputed afterwards: they stay
+/// anchored to whatever was supplied or to the column sums of the unfiltered
+/// matrix. If no gene survives, or there is only one sample, the method
+/// degrades to [`NormMethod::None`] rather than failing, again matching edgeR.
+///
+/// The returned factors are rescaled to have a geometric mean of one, so they
+/// multiply to one across samples.
+///
+/// ### Params
+///
+/// * `counts` - Row-major counts, `n_genes * n_samples`. Must be non-negative
+///   and finite.
+/// * `n_genes` - Number of genes, that is, rows
+/// * `n_samples` - Number of samples, that is, columns
+/// * `lib_size` - Library size per sample. Defaults to the column sums. Every
+///   method divides by it, so each entry must be finite and strictly positive.
+/// * `method` - Which scaling rule to apply
+/// * `ref_column` - Zero-based reference sample for TMM and TMMwsp. `None`
+///   picks one by the rule described at [`resolve_ref_column`]. Ignored by the
+///   other methods.
+/// * `params` - Tuning knobs, or `None` for [`NormParams::default`]
+///
+/// ### Returns
+///
+/// One factor per sample, with geometric mean one, or an [`EdgeErrors`] if the
+/// shape is inconsistent, a library size is not positive, the reference column
+/// is out of range, a parameter is outside its domain, or the chosen method
+/// cannot be computed on this matrix.
+///
+/// ### References
+///
+/// Robinson and Oshlack, Genome Biology, 2010 (TMM); Anders and Huber, Genome
+/// Biology, 2010 (RLE); Bullard et al., BMC Bioinformatics, 2010 (upper
+/// quartile)
+pub fn calc_norm_factors<T: EdgeFloat>(
+    counts: &[T],
+    n_genes: usize,
+    n_samples: usize,
+    lib_size: Option<&[f64]>,
+    method: NormMethod,
+    ref_column: Option<usize>,
+    params: Option<NormParams>,
+) -> Result<Vec<f64>, EdgeErrors> {
+    let params = params.unwrap_or_default();
+    validate_params(&params)?;
+
+    if n_genes == 0 || n_samples == 0 {
+        return Err(EdgeErrors::EmptyCounts { n_genes, n_samples });
+    }
+    if counts.len() != n_genes * n_samples {
+        return Err(EdgeErrors::LengthMismatch {
+            name: "counts",
+            expected: n_genes * n_samples,
+            got: counts.len(),
+        });
+    }
+    if let Some(r) = ref_column
+        && r >= n_samples
+    {
+        return Err(EdgeErrors::InvalidReferenceColumn(format!(
+            "column {r} requested but there are only {n_samples} samples"
+        )));
+    }
+
+    let lib = resolve_lib_size(counts, n_genes, n_samples, lib_size)?;
+    let (x, n_kept) = to_column_major_nonzero(counts, n_genes, n_samples)?;
+
+    // edgeR degrades rather than failing: nothing to normalise against.
+    let method = if n_kept == 0 || n_samples == 1 {
+        NormMethod::None
+    } else {
+        method
+    };
+
+    let mut f = match method {
+        NormMethod::Tmm | NormMethod::TmmwSp => {
+            let reference = match ref_column {
+                Some(r) => r,
+                None => resolve_ref_column(&x, n_kept, n_samples, &lib, method)?,
+            };
+            let kernel = if method == NormMethod::Tmm {
+                calc_factor_tmm
+            } else {
+                calc_factor_tmmwsp
+            };
+            let ref_col = &x[reference * n_kept..(reference + 1) * n_kept];
+            (0..n_samples)
+                .into_par_iter()
+                .map(|j| {
+                    kernel(
+                        &x[j * n_kept..(j + 1) * n_kept],
+                        ref_col,
+                        lib[j],
+                        lib[reference],
+                        &params,
+                    )
+                })
+                .collect()
+        }
+        NormMethod::Rle => calc_factor_rle(&x, n_kept, n_samples, &lib)?,
+        NormMethod::UpperQuartile => {
+            calc_factor_quantile(&x, n_kept, n_samples, &lib, params.quantile)?
+        }
+        NormMethod::None => vec![1.0; n_samples],
+    };
+
+    normalise_to_unit_product(&mut f)?;
+    Ok(f)
+}
+
 ///////////
 // Tests //
 ///////////
@@ -1017,11 +1010,6 @@ mod tests {
     use std::path::PathBuf;
 
     /// Relative tolerance against the R reference values.
-    ///
-    /// The brief asked for 1e-6. Every method actually agrees with edgeR to
-    /// within 1e-15, which is the resolution of the 15-significant-figure
-    /// reference values pasted in below, so this is pinned two orders above the
-    /// printing floor rather than at the target.
     const TOL: f64 = 1e-14;
 
     /// Reads a headed, all-numeric CSV from `tests/data` into a row-major matrix.

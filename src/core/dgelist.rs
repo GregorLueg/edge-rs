@@ -11,9 +11,12 @@
 //! normalisation factors, offsets and dispersions, is `f64` per the crate
 //! numeric policy.
 
-use crate::errors::EdgeErrors;
+use crate::prelude::*;
 use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+
+////////////////////
+// DispersionKind //
+////////////////////
 
 /// Which dispersion estimate a [`DgeList`] currently carries.
 ///
@@ -28,6 +31,10 @@ pub enum DispersionKind {
     /// A single dispersion shared by every gene.
     Common,
 }
+
+/////////////
+// DgeList //
+/////////////
 
 /// Counts plus the per-sample and per-gene quantities edgeR hangs off them.
 #[derive(Clone, Debug)]

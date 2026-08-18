@@ -4,27 +4,18 @@
 //! `min_count` counts in the median-sized library, in at least as many samples
 //! as the smallest group has, and its total across all samples reaches
 //! `min_total_count`.
-//!
-//! The interesting part is "as many samples as the smallest group has". edgeR
-//! derives that number from `group` when it is given, from the leverages of
-//! `design` when it is not, and otherwise treats every sample as one group. See
-//! [`resolve_min_sample_size`] for the precedence and for the one place R's
-//! `hat` does something a plain QR does not.
-//!
-//! Genes are the parallel axis, as everywhere else in the crate.
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::core::expression::{PER_MILLION, check_counts, column_sums, cpm};
-use crate::errors::EdgeErrors;
 use crate::numeric::stats::quantile_type7;
+use crate::prelude::*;
 use crate::utils::design::{hat_diagonal, matrix_rank};
-use crate::utils::traits::EdgeFloat;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Slack allowed on both cutoffs.
 ///
@@ -33,15 +24,11 @@ use crate::utils::traits::EdgeFloat;
 /// integers, is not dropped by a rounding error in the CPM.
 const CUTOFF_TOLERANCE: f64 = 1e-14;
 
-////////////////
-// Parameters //
-////////////////
+//////////////////
+// FilterParams //
+//////////////////
 
 /// Tuning knobs for [`filter_by_expr`].
-///
-/// The names mirror edgeR's arguments: `min_count` is `min.count`,
-/// `min_total_count` is `min.total.count`, `large_n` is `large.n` and `min_prop`
-/// is `min.prop`.
 #[derive(Clone, Copy, Debug)]
 pub struct FilterParams {
     /// Counts a gene must reach in the median-sized library, expressed on the
@@ -98,6 +85,40 @@ impl Default for FilterParams {
     }
 }
 
+/// Rejects parameters outside their domain.
+///
+/// edgeR does no checking here, but a negative `min_prop` or a non-finite
+/// `min_count` silently turns the filter into something other than a filter, so
+/// it is worth catching.
+///
+/// ### Params
+///
+/// * `params` - The resolved parameter set
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the offending knob.
+fn check_params(params: &FilterParams) -> Result<(), EdgeErrors> {
+    for (name, value) in [
+        ("min_count", params.min_count),
+        ("min_total_count", params.min_total_count),
+        ("large_n", params.large_n),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(EdgeErrors::InvalidArgument(format!(
+                "{name} must be non-negative and finite, got {value}"
+            )));
+        }
+    }
+    if !(0.0..=1.0).contains(&params.min_prop) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "min_prop must lie in [0, 1], got {}",
+            params.min_prop
+        )));
+    }
+    Ok(())
+}
+
 ////////////////////////
 // Minimum group size //
 ////////////////////////
@@ -109,16 +130,10 @@ impl Default for FilterParams {
 /// 1. `group`, when supplied: the size of the smallest non-empty group. A
 ///    supplied `group` wins even if a `design` is also given, because edgeR
 ///    tests `is.null(group)` first.
-/// 2. `design`, otherwise: `1 / max(hat(design))`, the reciprocal of the largest
-///    leverage. For a one-way layout that is exactly the smallest group size,
-///    and for anything else it is the natural continuous generalisation.
+/// 2. `design`, otherwise: `1 / max(hat(design))`, the reciprocal of the
+///    largest leverage. For a one-way layout that is exactly the smallest group
+///    size, and for anything else it is the natural continuous generalisation.
 /// 3. Neither: every sample is treated as one group, so `n_samples`.
-///
-/// Note that R's `stats::hat` prepends an intercept column unless told not to,
-/// and `filterByExpr` does not tell it not to. That is invisible for any design
-/// whose column space already contains an intercept, which is nearly all of
-/// them, and it changes the answer for a design without one. edgePython uses a
-/// plain QR and so disagrees there; this follows edgeR.
 ///
 /// ### Params
 ///
@@ -213,9 +228,6 @@ fn design_leverage(
         return hat_diagonal(&augmented, n_samples, n_coef + 1);
     }
 
-    // The augmented matrix lost a column to the intercept, so the intercept is
-    // in the span of the design and the two have the same leverages. Unless the
-    // design was already deficient on its own.
     let rank = matrix_rank(design, n_samples, n_coef)?;
     if rank != n_coef {
         return Err(EdgeErrors::DesignNotFullRank {
@@ -248,8 +260,8 @@ fn design_leverage(
 /// ### Returns
 ///
 /// One keep flag per gene, or [`EdgeErrors`] if a shape disagrees, a library
-/// size is not positive, the design is rank deficient, or a parameter is outside
-/// its domain.
+/// size is not positive, the design is rank deficient, or a parameter is
+/// outside its domain.
 pub fn filter_by_expr<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,
@@ -312,40 +324,6 @@ pub fn filter_by_expr<T: EdgeFloat>(
                 && total >= params.min_total_count - CUTOFF_TOLERANCE
         })
         .collect())
-}
-
-/// Rejects parameters outside their domain.
-///
-/// edgeR does no checking here, but a negative `min_prop` or a non-finite
-/// `min_count` silently turns the filter into something other than a filter, so
-/// it is worth catching.
-///
-/// ### Params
-///
-/// * `params` - The resolved parameter set
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the offending knob.
-fn check_params(params: &FilterParams) -> Result<(), EdgeErrors> {
-    for (name, value) in [
-        ("min_count", params.min_count),
-        ("min_total_count", params.min_total_count),
-        ("large_n", params.large_n),
-    ] {
-        if !value.is_finite() || value < 0.0 {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "{name} must be non-negative and finite, got {value}"
-            )));
-        }
-    }
-    if !(0.0..=1.0).contains(&params.min_prop) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "min_prop must lie in [0, 1], got {}",
-            params.min_prop
-        )));
-    }
-    Ok(())
 }
 
 ///////////
@@ -541,8 +519,6 @@ mod tests {
         let want = filter_by_expr(&COUNTS, 8, 6, None, Some(&GROUP), None, None).unwrap();
         assert_eq!(keep, want);
     }
-
-    // -- errors --
 
     #[test]
     fn test_rejects_empty_counts() {

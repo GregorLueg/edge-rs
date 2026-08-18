@@ -16,23 +16,19 @@
 //! then fits an intercept-only negative binomial GLM with
 //! [`mglm_one_group`], rather than averaging log-CPMs, which is what keeps it
 //! stable for genes that are zero in most samples.
-//!
-//! Genes are the parallel axis throughout, per the crate rule: one gene is a
-//! contiguous row of the input and a contiguous row of the output.
 
 use std::f64::consts::LN_2;
 
 use rayon::prelude::*;
 
-use crate::errors::EdgeErrors;
 use crate::glm::fit::add_prior_count;
 use crate::glm::one_group::mglm_one_group;
+use crate::prelude::*;
 use crate::utils::recycled::{Recycled, RecycledRow};
-use crate::utils::traits::EdgeFloat;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Counts per million: the scale every summary in this module reports on.
 pub(crate) const PER_MILLION: f64 = 1e6;
@@ -47,9 +43,9 @@ const BASES_PER_KB: f64 = 1000.0;
 /// abundance, so a fixed guess is good enough to start from.
 const DEFAULT_DISPERSION: f64 = 0.05;
 
-////////////////
-// Validation //
-////////////////
+/////////////////
+// Validations //
+/////////////////
 
 /// Checks a count matrix against its stated shape.
 ///
@@ -85,26 +81,6 @@ pub(crate) fn check_counts<T: EdgeFloat>(
         )));
     }
     Ok(())
-}
-
-/// Column sums of a row-major matrix.
-///
-/// ### Params
-///
-/// * `values` - Row-major values, a whole number of rows of `n_samples`
-/// * `n_samples` - Number of columns
-///
-/// ### Returns
-///
-/// One sum per column, in `f64` regardless of `T`.
-pub(crate) fn column_sums<T: EdgeFloat>(values: &[T], n_samples: usize) -> Vec<f64> {
-    let mut sums = vec![0.0_f64; n_samples];
-    for row in values.chunks_exact(n_samples) {
-        for (acc, v) in sums.iter_mut().zip(row.iter()) {
-            *acc += v.to_f64().unwrap_or(f64::NAN);
-        }
-    }
-    sums
 }
 
 /// Rejects a prior count that cannot be scaled.
@@ -150,6 +126,84 @@ fn check_lib_sizes(lib_sizes: &Recycled<f64>) -> Result<(), EdgeErrors> {
         )));
     }
     Ok(())
+}
+
+/// Rejects gene lengths that cannot be divided by.
+///
+/// ### Params
+///
+/// * `lengths` - One length per gene
+/// * `n_genes` - Number of genes
+/// * `name` - Argument name, for the error message
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::LengthMismatch`] on the wrong length and
+/// [`EdgeErrors::InvalidArgument`] on a non-positive entry.
+fn check_gene_length(
+    lengths: &[f64],
+    n_genes: usize,
+    name: &'static str,
+) -> Result<(), EdgeErrors> {
+    if lengths.len() != n_genes {
+        return Err(EdgeErrors::LengthMismatch {
+            name,
+            expected: n_genes,
+            got: lengths.len(),
+        });
+    }
+    if let Some(bad) = lengths.iter().find(|v| !v.is_finite() || **v <= 0.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "{name} must be positive and finite, found {bad}"
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a dispersion outside `[0, inf)`.
+///
+/// Only the stored values are examined, as in [`check_lib_sizes`].
+///
+/// ### Params
+///
+/// * `dispersion` - Dispersion, recycled over genes and samples
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidDispersion`] naming the offending value.
+fn check_dispersion(dispersion: &Recycled<f64>) -> Result<(), EdgeErrors> {
+    let stored: &[f64] = match dispersion {
+        Recycled::Scalar(v) => std::slice::from_ref(v),
+        Recycled::ByGene(v) | Recycled::BySample(v) | Recycled::Full(v) => v,
+    };
+    match stored.iter().find(|v| !v.is_finite() || **v < 0.0) {
+        Some(bad) => Err(EdgeErrors::InvalidDispersion(*bad)),
+        None => Ok(()),
+    }
+}
+
+/////////////
+// Helpers //
+/////////////
+
+/// Column sums of a row-major matrix.
+///
+/// ### Params
+///
+/// * `values` - Row-major values, a whole number of rows of `n_samples`
+/// * `n_samples` - Number of columns
+///
+/// ### Returns
+///
+/// One sum per column, in `f64` regardless of `T`.
+pub(crate) fn column_sums<T: EdgeFloat>(values: &[T], n_samples: usize) -> Vec<f64> {
+    let mut sums = vec![0.0_f64; n_samples];
+    for row in values.chunks_exact(n_samples) {
+        for (acc, v) in sums.iter_mut().zip(row.iter()) {
+            *acc += v.to_f64().unwrap_or(f64::NAN);
+        }
+    }
+    sums
 }
 
 /// Resolves the library sizes every summary here divides by.
@@ -213,11 +267,12 @@ fn resolve_lib_sizes<T: EdgeFloat>(
 
 /// Adds library-size-scaled prior counts to one gene.
 ///
-/// edgeR's `addPriorCount` rule, per gene: the prior is scaled by each library's
-/// size relative to the mean *of that gene's row*, so every sample is perturbed
-/// by the same relative amount. With per-sample library sizes the row mean is
-/// the same for every gene and this collapses to the usual formula; with a
-/// gene-varying offset it does not, and edgeR really does use the row mean.
+/// edgeR's `addPriorCount` rule, per gene: the prior is scaled by each
+/// library's size relative to the mean *of that gene's row*, so every sample is
+/// perturbed by the same relative amount. With per-sample library sizes the row
+/// mean is the same for every gene and this collapses to the usual formula;
+/// with a gene-varying offset it does not, and edgeR really does use the row
+/// mean.
 ///
 /// ### Params
 ///
@@ -253,7 +308,8 @@ fn add_prior_count_row<T: EdgeFloat>(
 ///
 /// The per-sample case is handed to [`add_prior_count`], which already
 /// implements exactly this rule; only a gene-varying library size needs the
-/// per-gene loop, and only that case pays `n_genes * n_samples` for the offsets.
+/// per-gene loop, and only that case pays `n_genes * n_samples` for the
+/// offsets.
 ///
 /// ### Params
 ///
@@ -378,8 +434,8 @@ pub fn cpm<T: EdgeFloat>(
 
 /// Reads per kilobase of gene length per million reads, as edgeR's `rpkm`.
 ///
-/// [`cpm`] divided by the gene length in kilobases, or minus its log2 when `log`
-/// is set.
+/// [`cpm`] divided by the gene length in kilobases, or minus its log2 when
+/// `log` is set.
 ///
 /// ### Params
 ///
@@ -419,6 +475,7 @@ pub fn rpkm<T: EdgeFloat>(
         log,
         prior_count,
     )?;
+
     out.par_chunks_mut(n_samples)
         .zip(gene_length.par_iter())
         .for_each(|(row, length)| {
@@ -487,6 +544,7 @@ pub fn tpm<T: EdgeFloat>(
 
     out.par_iter_mut()
         .for_each(|v| *v = *v / geometric_mean * PER_MILLION);
+
     Ok(out)
 }
 
@@ -494,10 +552,10 @@ pub fn tpm<T: EdgeFloat>(
 ///
 /// Not a mean of [`cpm`] values. edgeR adds a library-size-scaled prior count
 /// and fits an intercept-only negative binomial GLM per gene with
-/// [`mglm_one_group`], then reports the coefficient as log2-CPM. The GLM weights
-/// samples by their information rather than equally, which is what makes the
-/// answer usable for genes that are zero in most samples, and it is the
-/// abundance covariate the whole dispersion trend is built on.
+/// [`mglm_one_group`], then reports the coefficient as log2-CPM. The GLM
+/// weights samples by their information rather than equally, which is what
+/// makes the answer usable for genes that are zero in most samples, and it is
+/// the abundance covariate the whole dispersion trend is built on.
 ///
 /// ### Params
 ///
@@ -554,60 +612,6 @@ pub fn ave_log_cpm<T: EdgeFloat>(
 
     let shift = PER_MILLION.ln();
     Ok(coefficients.iter().map(|a| (a + shift) / LN_2).collect())
-}
-
-/// Rejects gene lengths that cannot be divided by.
-///
-/// ### Params
-///
-/// * `lengths` - One length per gene
-/// * `n_genes` - Number of genes
-/// * `name` - Argument name, for the error message
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::LengthMismatch`] on the wrong length and
-/// [`EdgeErrors::InvalidArgument`] on a non-positive entry.
-fn check_gene_length(
-    lengths: &[f64],
-    n_genes: usize,
-    name: &'static str,
-) -> Result<(), EdgeErrors> {
-    if lengths.len() != n_genes {
-        return Err(EdgeErrors::LengthMismatch {
-            name,
-            expected: n_genes,
-            got: lengths.len(),
-        });
-    }
-    if let Some(bad) = lengths.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "{name} must be positive and finite, found {bad}"
-        )));
-    }
-    Ok(())
-}
-
-/// Rejects a dispersion outside `[0, inf)`.
-///
-/// Only the stored values are examined, as in [`check_lib_sizes`].
-///
-/// ### Params
-///
-/// * `dispersion` - Dispersion, recycled over genes and samples
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidDispersion`] naming the offending value.
-fn check_dispersion(dispersion: &Recycled<f64>) -> Result<(), EdgeErrors> {
-    let stored: &[f64] = match dispersion {
-        Recycled::Scalar(v) => std::slice::from_ref(v),
-        Recycled::ByGene(v) | Recycled::BySample(v) | Recycled::Full(v) => v,
-    };
-    match stored.iter().find(|v| !v.is_finite() || **v < 0.0) {
-        Some(bad) => Err(EdgeErrors::InvalidDispersion(*bad)),
-        None => Ok(()),
-    }
 }
 
 ///////////
