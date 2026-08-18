@@ -399,7 +399,8 @@ Two smaller corrections to the plan while here:
   matrices are not in the repo and cannot be regenerated locally. Every module
   has instead been validated against references generated fresh from the
   installed edgeR 4.8.2 and limma 3.66. That has been strictly better, since it
-  also pins the package version.
+  also pins the package version. They have since been deleted; `tests/data` holds
+  only the six files the suite reads.
 - Section B of `UPSTREAM_DEVIATIONS.md` did not exist in the plan. It was added
   once upstream R itself turned out to be wrong in places, which the plan did not
   anticipate. Three entries so far.
