@@ -1,0 +1,19 @@
+name: Test the package
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: GregorLueg/personal-actions/.github/workflows/rust-test.yml@v1
+    with:
+      cpu-args: '--release'
+      # No GPU lane: edge-rs is CPU only. An empty gpu-args skips that job.
+    secrets: inherit
