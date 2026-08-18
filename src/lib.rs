@@ -40,4 +40,5 @@ pub mod glm;
 pub mod limma;
 pub mod numeric;
 pub mod prelude;
+pub mod ql;
 pub mod utils;
