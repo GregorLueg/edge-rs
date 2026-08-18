@@ -13,60 +13,16 @@
 //! the complement directly: the upper regularised incomplete gamma for the
 //! normal and chi-squared, and the regularised incomplete beta with its
 //! arguments swapped for t, F and beta. None of them subtracts from one.
-//!
-//! ### Numeric policy
-//!
-//! `f64` throughout, per the crate policy in `lib.rs`. These sit inside
-//! likelihood evaluation where the arithmetic is a difference of large logs.
-//!
-//! ### What comes from `statrs` and what does not
-//!
-//! The incomplete beta `beta_reg` and `ln_gamma` come from `statrs`, and so
-//! does `norm_ppf`, through `statrs::function::erf::erfc_inv`. How well they
-//! hold depends on which end of the distribution is being read. Measured
-//! against R 4.5:
-//!
-//! * The small tails, which is where every p-value and every quantile edgeR
-//!   reports comes from, are good to 1e-14 or better: `chisq_sf(200, 1)`
-//!   1.1e-14 relative, `norm_sf(8)` 6.3e-16, `beta_cdf(1e-12, 0.3, 0.7)`
-//!   8.8e-16, `beta_ppf(1e-12, 0.3, 0.7)` 8.6e-16, `gamma_ppf(1e-12, 2.5, 1)`
-//!   2.9e-15, `t_ppf(1e-12, 5)` 8.7e-16, and `norm_ppf` 2e-16 from `p = 1e-300`
-//!   upwards.
-//! * The near-one tails are three to five orders worse, because they come out
-//!   of `beta_reg`'s internal symmetry swap `1 - I(1-x)` and lose the
-//!   cancellation: `f_sf(2, 1, 1e5)` is 4.2e-10 relative and
-//!   `beta_sf(1e-12, 0.3, 0.7)` 1.4e-9. Nothing in edgeR is read from that end,
-//!   but do not quote these functions as full precision either way.
-//!
-//! Three things are not taken from `statrs`:
-//!
-//! * `statrs::function::erf` carries Boost's *single* precision coefficient
-//!   tables (`b = 0.3440242112` and friends, ten digits) on the `f64` path, so
-//!   `erfc` is only good to about 4e-11 for arguments above 0.5. Since
-//!   `erfc(z) = Q(1/2, z^2)`, the normal tails are built from the incomplete
-//!   gamma below instead, which costs a handful of iterations and buys three
-//!   digits. `erfc_inv` is a different routine and does not inherit that, which
-//!   is why `norm_ppf` is left on it.
-//! * `statrs::function::gamma::gamma_lr` returns a flat `0.0` for any
-//!   `x < 1.1e-15`, which puts a floor under `gamma_cdf` and strands the gamma
-//!   quantile solver on a plateau for small shapes.
-//! * `statrs::function::beta::inv_beta_reg` is Algorithm AS 109, whose
-//!   published floor is `FPU = 1e-30`. It gives up around there and returns
-//!   answers wrong by orders of magnitude for a quantile deeper in the tail
-//!   (`beta_ppf(1e-12, 0.3, 0.7)` comes back as 1.4e-16 against a true
-//!   1.66e-40). It is used only as a starting point here, polished by Newton on
-//!   `ln I` against `ln p`.
-//!
-//! `statrs`'s distribution types are not used at all: their `inverse_cdf`
-//! panics on out-of-range input, `Gamma::inverse_cdf` is a truncated bisection
-//! nowhere near `f64` precision, and `FisherSnedecor::sf` forms
-//! `1 - d1 x / (d1 x + d2)`, which cancels in exactly the tail edgeR reads.
 
 use statrs::function::beta::{beta_reg, inv_beta_reg, ln_beta};
 use statrs::function::erf::erfc_inv;
 use statrs::function::gamma::ln_gamma;
 
 use crate::errors::EdgeErrors;
+
+////////////
+// Consts //
+////////////
 
 /// `sqrt(2)`, the scale between the standard normal and the error function.
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
@@ -126,9 +82,51 @@ const T_INNER_OUTER_SWITCH: f64 = 0.7;
 /// incomplete gamma, which is itself only good to a few ulp.
 const GAMMA_PPF_REL_TOL: f64 = 1e-15;
 
-/////////////////////////////////
+////////////////
+// Validation //
+////////////////
+
+/// Checks that a degrees-of-freedom-like parameter is finite and positive.
+///
+/// ### Params
+///
+/// * `name` - Parameter name, used verbatim in the error message
+/// * `value` - Value supplied by the caller
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the parameter and value.
+fn check_positive(name: &str, value: f64) -> Result<(), EdgeErrors> {
+    if !(value.is_finite() && value > 0.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "'{name}' must be finite and strictly positive; got {value}."
+        )));
+    }
+    Ok(())
+}
+
+/// Checks that a probability lies in the closed unit interval.
+///
+/// ### Params
+///
+/// * `name` - Parameter name, used verbatim in the error message
+/// * `value` - Value supplied by the caller
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the parameter and value.
+fn check_probability(name: &str, value: f64) -> Result<(), EdgeErrors> {
+    if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "'{name}' must be a probability in [0, 1]; got {value}."
+        )));
+    }
+    Ok(())
+}
+
+//////////////////////////////////
 // Regularised incomplete gamma //
-/////////////////////////////////
+//////////////////////////////////
 
 /// The shared prefactor `exp(a ln x - x - ln Gamma(a))` of both branches.
 ///
@@ -275,51 +273,9 @@ fn gamma_cont_frac(a: f64, x: f64) -> f64 {
     h * inc_gamma_prefactor(a, x)
 }
 
-//////////////////
-// Validation   //
-//////////////////
-
-/// Checks that a degrees-of-freedom-like parameter is finite and positive.
-///
-/// ### Params
-///
-/// * `name` - Parameter name, used verbatim in the error message
-/// * `value` - Value supplied by the caller
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the parameter and value.
-fn check_positive(name: &str, value: f64) -> Result<(), EdgeErrors> {
-    if !(value.is_finite() && value > 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "'{name}' must be finite and strictly positive; got {value}."
-        )));
-    }
-    Ok(())
-}
-
-/// Checks that a probability lies in the closed unit interval.
-///
-/// ### Params
-///
-/// * `name` - Parameter name, used verbatim in the error message
-/// * `value` - Value supplied by the caller
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the parameter and value.
-fn check_probability(name: &str, value: f64) -> Result<(), EdgeErrors> {
-    if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "'{name}' must be a probability in [0, 1]; got {value}."
-        )));
-    }
-    Ok(())
-}
-
-////////////////////////////////
-// Incomplete beta inverse    //
-////////////////////////////////
+/////////////////////////////
+// Incomplete beta inverse //
+/////////////////////////////
 
 /// Inverts the regularised incomplete beta on its lower half.
 ///
@@ -570,9 +526,9 @@ pub fn chisq_sf(x: f64, df: f64) -> Result<f64, EdgeErrors> {
     Ok(reg_gamma_upper(0.5 * df, 0.5 * x))
 }
 
-////////////////////
-// Student's t    //
-////////////////////
+/////////////////
+// Student's t //
+/////////////////
 
 /// The two halves of the t distribution's mass either side of `|x|`.
 ///

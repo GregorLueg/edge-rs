@@ -1,18 +1,14 @@
 //! Adaptive numerical integration.
 //!
-//! edgePython reaches for `scipy.integrate.quad` in exactly one place, the Huber
-//! weighting inside `estimate_glm_robust_disp` (`dispersion.py` line 999), with
-//! `limit = 50`. `quad` is QUADPACK's `QAGS`, which is adaptive Gauss-Kronrod
-//! with epsilon extrapolation. The extrapolation only earns its keep on
-//! endpoint singularities, and the integrand there is a smooth deviance
-//! function on a finite interval, so this implements plain adaptive
-//! Gauss-Kronrod 15/7 without it.
-//!
 //! ### References
 //!
 //! Piessens, de Doncker-Kapenga, Uberhuber and Kahaner, QUADPACK, 1983
 
-use crate::errors::EdgeErrors;
+use crate::prelude::*;
+
+////////////
+// Consts //
+////////////
 
 /// Abscissae of the 15-point Kronrod rule on `[-1, 1]`, symmetric about zero.
 ///
@@ -59,6 +55,10 @@ const GAUSS_WEIGHTS: [f64; 4] = [
 /// Default subdivision budget, matching the `limit = 50` edgePython passes.
 const DEFAULT_LIMIT: usize = 50;
 
+/////////////
+// Segment //
+/////////////
+
 /// A subinterval and what the rule made of it.
 #[derive(Clone, Copy, Debug)]
 struct Segment {
@@ -72,6 +72,10 @@ struct Segment {
     error: f64,
 }
 
+////////////////
+// QuadResult //
+////////////////
+
 /// Result of an adaptive integration.
 #[derive(Clone, Copy, Debug)]
 pub struct QuadResult {
@@ -84,6 +88,10 @@ pub struct QuadResult {
     /// Whether both tolerances were met before the subdivision budget ran out.
     pub converged: bool,
 }
+
+///////////////
+// Functions //
+///////////////
 
 /// Applies the 15-point Kronrod rule with its embedded 7-point Gauss rule.
 ///

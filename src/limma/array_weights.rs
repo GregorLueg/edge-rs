@@ -72,29 +72,21 @@
 
 use rayon::prelude::*;
 
-use crate::errors::EdgeErrors;
 use crate::numeric::stats::trimmed_mean;
-use crate::utils::recycled::Recycled;
+use crate::prelude::*;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Relative tolerance below which a column counts as linearly dependent.
-///
-/// R's `lm.fit` and `qr` both default to `tol = 1e-7`, and both pass it to
-/// LINPACK's `dqrdc2`, which drops a column once the norm of its part orthogonal
-/// to the columns already accepted falls below `tol` times its original norm.
-/// The rank this produces is what `arrayWeights` reduces the design to, so it
-/// has to be R's rule rather than the SVD rule [`crate::utils::design::matrix_rank`]
-/// uses.
 const LM_RANK_TOL: f64 = 1e-7;
 
 /// Residual variances below this are treated as structurally zero.
 ///
 /// limma skips such genes rather than dividing by them. A gene whose weighted
-/// residual sum of squares is this small is either constant or perfectly fitted,
-/// and carries no information about the sample variances either way.
+/// residual sum of squares is this small is either constant or perfectly
+/// fitted, and carries no information about the sample variances either way.
 const MIN_RESIDUAL_VAR: f64 = 1e-15;
 
 /// Residual degrees of freedom a gene needs before it can contribute.
@@ -161,9 +153,131 @@ const GLMGAM_DEVIANCE_TOL: f64 = 1e-15;
 /// different quantity, so it gets its own name.
 const GLMGAM_ZERO_TOL: f64 = 1e-15;
 
-///////////////////
+////////////////////////
+// Small dense helper //
+////////////////////////
+
+/// Euclidean norm of a slice.
+///
+/// ### Params
+///
+/// * `x` - Values
+///
+/// ### Returns
+///
+/// `sqrt(sum(x^2))`.
+fn euclidean_norm(x: &[f64]) -> f64 {
+    x.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+/// Solves a small dense system by Gaussian elimination with partial pivoting.
+///
+/// This is LAPACK's `dgesv` and therefore R's `solve`. The systems here are
+/// `ngam` by `ngam` with `ngam` one less than the sample count, so tens of rows
+/// at most; a factorisation library would cost more in ceremony than it saves.
+///
+/// ### Params
+///
+/// * `a` - Column-major `n * n` coefficient matrix, copied before use
+/// * `b` - Right hand side of length `n`
+/// * `n` - Order of the system
+///
+/// ### Returns
+///
+/// The solution, or [`EdgeErrors::SolveFailed`] if a pivot vanishes or the
+/// result is not finite.
+fn solve_linear(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, EdgeErrors> {
+    let mut m = a.to_vec();
+    let mut x = b.to_vec();
+
+    for k in 0..n {
+        let (pivot_row, pivot) = (k..n).fold((k, 0.0), |(best, mag), i| {
+            let v = m[k * n + i].abs();
+            if v > mag { (i, v) } else { (best, mag) }
+        });
+        if pivot == 0.0 || !pivot.is_finite() {
+            return Err(EdgeErrors::SolveFailed(format!(
+                "the array weight information matrix is singular at pivot {k}"
+            )));
+        }
+        if pivot_row != k {
+            for c in 0..n {
+                m.swap(c * n + k, c * n + pivot_row);
+            }
+            x.swap(k, pivot_row);
+        }
+        for i in (k + 1)..n {
+            let factor = m[k * n + i] / m[k * n + k];
+            if factor == 0.0 {
+                continue;
+            }
+            for c in (k + 1)..n {
+                m[c * n + i] -= factor * m[c * n + k];
+            }
+            x[i] -= factor * x[k];
+        }
+    }
+
+    for k in (0..n).rev() {
+        let mut acc = x[k];
+        for c in (k + 1)..n {
+            acc -= m[c * n + k] * x[c];
+        }
+        x[k] = acc / m[k * n + k];
+    }
+
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(EdgeErrors::SolveFailed(
+            "the array weight update was not finite".to_string(),
+        ));
+    }
+    Ok(x)
+}
+
+/// Transposes a row-major matrix into column-major order.
+///
+/// ### Params
+///
+/// * `x` - Row-major `n_rows * n_cols` values
+/// * `n_rows` - Number of rows
+/// * `n_cols` - Number of columns
+///
+/// ### Returns
+///
+/// The same matrix, column-major.
+fn to_column_major(x: &[f64], n_rows: usize, n_cols: usize) -> Vec<f64> {
+    let mut out = vec![0.0; n_rows * n_cols];
+    for i in 0..n_rows {
+        for j in 0..n_cols {
+            out[j * n_rows + i] = x[i * n_cols + j];
+        }
+    }
+    out
+}
+
+/// R's `contr.sum(n)`.
+///
+/// ### Params
+///
+/// * `n` - Number of levels
+///
+/// ### Returns
+///
+/// Column-major `n * (n - 1)`: an identity block over the first `n - 1` rows
+/// and a row of `-1` underneath. Constraining the log weights against this
+/// basis is what makes them sum to zero.
+fn contr_sum(n: usize) -> Vec<f64> {
+    let mut out = vec![0.0; n * (n - 1)];
+    for k in 0..(n - 1) {
+        out[k * n + k] = 1.0;
+        out[k * n + (n - 1)] = -1.0;
+    }
+    out
+}
+
+////////////////////
 // Householder QR //
-///////////////////
+////////////////////
 
 /// A LINPACK `dqrdc2` Householder QR: the factorisation R's `lm.fit` uses.
 ///
@@ -372,131 +486,9 @@ impl LinpackQr {
     }
 }
 
-/////////////////////
-// Small dense help //
-/////////////////////
-
-/// Euclidean norm of a slice.
-///
-/// ### Params
-///
-/// * `x` - Values
-///
-/// ### Returns
-///
-/// `sqrt(sum(x^2))`.
-fn euclidean_norm(x: &[f64]) -> f64 {
-    x.iter().map(|v| v * v).sum::<f64>().sqrt()
-}
-
-/// Solves a small dense system by Gaussian elimination with partial pivoting.
-///
-/// This is LAPACK's `dgesv` and therefore R's `solve`. The systems here are
-/// `ngam` by `ngam` with `ngam` one less than the sample count, so tens of rows
-/// at most; a factorisation library would cost more in ceremony than it saves.
-///
-/// ### Params
-///
-/// * `a` - Column-major `n * n` coefficient matrix, copied before use
-/// * `b` - Right hand side of length `n`
-/// * `n` - Order of the system
-///
-/// ### Returns
-///
-/// The solution, or [`EdgeErrors::SolveFailed`] if a pivot vanishes or the
-/// result is not finite.
-fn solve_linear(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, EdgeErrors> {
-    let mut m = a.to_vec();
-    let mut x = b.to_vec();
-
-    for k in 0..n {
-        let (pivot_row, pivot) = (k..n).fold((k, 0.0), |(best, mag), i| {
-            let v = m[k * n + i].abs();
-            if v > mag { (i, v) } else { (best, mag) }
-        });
-        if pivot == 0.0 || !pivot.is_finite() {
-            return Err(EdgeErrors::SolveFailed(format!(
-                "the array weight information matrix is singular at pivot {k}"
-            )));
-        }
-        if pivot_row != k {
-            for c in 0..n {
-                m.swap(c * n + k, c * n + pivot_row);
-            }
-            x.swap(k, pivot_row);
-        }
-        for i in (k + 1)..n {
-            let factor = m[k * n + i] / m[k * n + k];
-            if factor == 0.0 {
-                continue;
-            }
-            for c in (k + 1)..n {
-                m[c * n + i] -= factor * m[c * n + k];
-            }
-            x[i] -= factor * x[k];
-        }
-    }
-
-    for k in (0..n).rev() {
-        let mut acc = x[k];
-        for c in (k + 1)..n {
-            acc -= m[c * n + k] * x[c];
-        }
-        x[k] = acc / m[k * n + k];
-    }
-
-    if x.iter().any(|v| !v.is_finite()) {
-        return Err(EdgeErrors::SolveFailed(
-            "the array weight update was not finite".to_string(),
-        ));
-    }
-    Ok(x)
-}
-
-/// Transposes a row-major matrix into column-major order.
-///
-/// ### Params
-///
-/// * `x` - Row-major `n_rows * n_cols` values
-/// * `n_rows` - Number of rows
-/// * `n_cols` - Number of columns
-///
-/// ### Returns
-///
-/// The same matrix, column-major.
-fn to_column_major(x: &[f64], n_rows: usize, n_cols: usize) -> Vec<f64> {
-    let mut out = vec![0.0; n_rows * n_cols];
-    for i in 0..n_rows {
-        for j in 0..n_cols {
-            out[j * n_rows + i] = x[i * n_cols + j];
-        }
-    }
-    out
-}
-
-/// R's `contr.sum(n)`.
-///
-/// ### Params
-///
-/// * `n` - Number of levels
-///
-/// ### Returns
-///
-/// Column-major `n * (n - 1)`: an identity block over the first `n - 1` rows and
-/// a row of `-1` underneath. Constraining the log weights against this basis is
-/// what makes them sum to zero.
-fn contr_sum(n: usize) -> Vec<f64> {
-    let mut out = vec![0.0; n * (n - 1)];
-    for k in 0..(n - 1) {
-        out[k * n + k] = 1.0;
-        out[k * n + (n - 1)] = -1.0;
-    }
-    out
-}
-
-//////////////////
-// Public types //
-//////////////////
+///////////////////////
+// ArrayWeightMethod //
+///////////////////////
 
 /// How [`array_weights`] sweeps the genes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,6 +506,10 @@ pub enum ArrayWeightMethod {
     /// unweighted matrix, which is the common case.
     Reml,
 }
+
+///////////////////////
+// ArrayWeightParams //
+///////////////////////
 
 /// Knobs for [`array_weights`].
 #[derive(Clone, Debug)]
@@ -598,9 +594,9 @@ impl ArrayWeightParams {
     }
 }
 
-////////////////////
+/////////////////////
 // Shared plumbing //
-////////////////////
+/////////////////////
 
 /// Checks the shape of an expression matrix and its design.
 ///

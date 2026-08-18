@@ -1,11 +1,6 @@
 //! Small statistical utilities: multiple testing, ranks, quantiles, trimmed
 //! means and the column-wise moving average.
 //!
-//! These are the pieces edgePython reaches into `scipy.stats`, `numpy` and R's
-//! base library for. Every one of them is defined to match a specific reference
-//! implementation bit for bit, because the port's parity tests compare against
-//! edgeR output rather than against a mathematical ideal:
-//!
 //! * [`p_adjust_bh`] is R's `p.adjust(method = "BH")`
 //! * [`rank_average`] is `scipy.stats.rankdata(method = "average")`
 //! * [`quantile_type7`] is R's `quantile(type = 7)`, the default
@@ -16,18 +11,8 @@
 //! under the likelihood machinery, not next to the count data, so there is no
 //! memory argument for a generic float and plenty of accuracy argument against
 //! one.
-//!
-//! ### Ordering of `f64`
-//!
-//! Ranking and quantiles need a total order, so everything here sorts with
-//! [`f64::total_cmp`]. That places a quiet positive NaN above `+inf`, a
-//! negative NaN below `-inf`, and orders `-0.0` strictly below `+0.0`. In
-//! practice: a NaN in the input sorts to the end and poisons any quantile or
-//! trimmed mean that touches it, rather than being silently dropped. The one
-//! deliberate exception is tie detection in [`rank_average`], which uses `==`
-//! so that it agrees with `scipy` on `-0.0` and on NaN.
 
-use crate::errors::EdgeErrors;
+use crate::prelude::*;
 
 //////////////////////
 // Multiple testing //
@@ -190,9 +175,9 @@ pub fn quantile_type7(x: &[f64], prob: f64) -> Result<f64, EdgeErrors> {
     Ok((1.0 - frac) * sorted[lo] + frac * sorted[hi])
 }
 
-////////////////////
-// Trimmed means  //
-////////////////////
+///////////////////
+// Trimmed means //
+///////////////////
 
 /// Mean after dropping a fraction from each tail, as R's `mean(x, trim = ...)`.
 ///

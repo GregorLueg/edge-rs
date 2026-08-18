@@ -20,6 +20,10 @@
 
 use crate::errors::EdgeErrors;
 
+////////////
+// Consts //
+////////////
+
 /// Armijo parameter for the sufficient decrease condition.
 ///
 /// The value both Nocedal and Wright and the Fortran use. It is deliberately
@@ -45,6 +49,10 @@ const CURVATURE_EPS: f64 = 2.2e-16;
 /// The subspace minimisation already truncates to the feasible box, so a unit
 /// step is the natural scale and anything far beyond it signals trouble.
 const MAX_STEP: f64 = 1e3;
+
+//////////////////
+// LbfgsbParams //
+//////////////////
 
 /// Tuning knobs for [`minimise`].
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +85,10 @@ impl Default for LbfgsbParams {
     }
 }
 
+//////////////////
+// LbfgsbStatus //
+//////////////////
+
 /// Why the optimiser stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LbfgsbStatus {
@@ -107,6 +119,10 @@ impl LbfgsbStatus {
     }
 }
 
+//////////////////
+// LbfgsbResult //
+//////////////////
+
 /// Outcome of a bounded minimisation.
 #[derive(Clone, Debug)]
 pub struct LbfgsbResult {
@@ -124,9 +140,9 @@ pub struct LbfgsbResult {
     pub status: LbfgsbStatus,
 }
 
-/////////////////////////
+//////////////////////////
 // Limited-memory pairs //
-/////////////////////////
+//////////////////////////
 
 /// The correction pairs and the compact representation built from them.
 ///
@@ -390,9 +406,9 @@ fn solve_dense(a: &[f64], b: &[f64], dim: usize) -> Option<Vec<f64>> {
     Some(x)
 }
 
-////////////////////////////
+//////////////////////////////
 // Generalised Cauchy point //
-////////////////////////////
+//////////////////////////////
 
 /// Result of the Cauchy point search.
 struct CauchyPoint {
@@ -404,7 +420,8 @@ struct CauchyPoint {
     c: Vec<f64>,
 }
 
-/// Locates the generalised Cauchy point along the projected steepest descent path.
+/// Locates the generalised Cauchy point along the projected steepest descent
+/// path.
 ///
 /// Walks the piecewise-linear projected gradient path, tracking the first and
 /// second derivatives of the quadratic model segment by segment, and stops at
@@ -536,17 +553,17 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-////////////////////////////
-// Subspace minimisation  //
-////////////////////////////
+///////////////////////////
+// Subspace minimisation //
+///////////////////////////
 
 /// Minimises the quadratic model over the free variables, starting at the
 /// Cauchy point.
 ///
 /// Uses the direct primal method of the paper: form the reduced gradient at the
-/// Cauchy point, apply the inverse of the compact Hessian restricted to the free
-/// set through a Sherman-Morrison-Woodbury identity, then truncate the resulting
-/// step so the point stays inside the box.
+/// Cauchy point, apply the inverse of the compact Hessian restricted to the
+/// free set through a Sherman-Morrison-Woodbury identity, then truncate the
+/// resulting step so the point stays inside the box.
 ///
 /// ### Params
 ///
@@ -730,11 +747,6 @@ where
         return None;
     }
 
-    // Beyond the last feasible step every trial point clamps to the same corner
-    // of the box, so the objective flattens while `dot(grad, direction)` keeps
-    // reporting the unclamped slope. The curvature condition can then never be
-    // met and the search burns its whole budget. Cap the step instead, as the
-    // Fortran's `stpmx` does.
     let step_max = max_feasible_step(x, direction, lower, upper).min(MAX_STEP);
     if step_max <= 0.0 {
         return None;
@@ -897,7 +909,7 @@ where
 }
 
 ///////////////
-// Front door //
+// Front end //
 ///////////////
 
 /// Minimises a differentiable objective subject to box constraints.

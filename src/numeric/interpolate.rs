@@ -1,12 +1,12 @@
 //! Interpolation: the layer edgeR gets from R's C sources.
 //!
-//! Three things live here. The Forsythe-Malcolm-Moler cubic spline, which is
-//! what R's `spline(method = "fmm")` fits and what edgeR's `maximizeInterpolant`
-//! is built on. The natural spline basis behind `dispCoxReidSplineTrend`. And
-//! plain piecewise-linear interpolation, which voom leans on for its
-//! mean-variance trend.
+//! Three things live here: the Forsythe-Malcolm-Moler cubic spline, which is
+//! what R's `spline(method = "fmm")` fits and what edgeR's
+//! `maximizeInterpolant` is built on. The natural spline basis behind
+//! `dispCoxReidSplineTrend`. And plain piecewise-linear interpolation, which
+//! voom leans on for its mean-variance trend.
 //!
-//! [`maximize_interpolant`] is the load-bearing one: every tagwise dispersion in
+//! [`maximize_interpolant`] is the key one: every tagwise dispersion in
 //! the package is the abscissa it returns. It reproduces edgeR's C `find_max`
 //! step for step rather than handing the curve to a general optimiser, because
 //! the grid is coarse and the answer has to be the same one edgeR would give,
@@ -16,7 +16,11 @@
 
 use rayon::prelude::*;
 
-use crate::errors::EdgeErrors;
+use crate::prelude::*;
+
+////////////
+// Consts //
+////////////
 
 /// Fewest knots the FMM spline accepts.
 ///
@@ -36,9 +40,88 @@ const MIN_BASIS_DF: usize = 2;
 /// One point defines no segment and therefore no slope.
 const MIN_INTERP_POINTS: usize = 2;
 
-//////////////////
-// FMM spline   //
-//////////////////
+////////////////
+// Validation //
+////////////////
+
+/// Checks that a knot vector can carry a spline.
+///
+/// ### Params
+///
+/// * `x` - Knot abscissae
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] if there are fewer than
+/// [`MIN_SPLINE_KNOTS`] knots or they are not strictly increasing.
+fn validate_knots(x: &[f64]) -> Result<(), EdgeErrors> {
+    if x.len() < MIN_SPLINE_KNOTS {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "a spline needs at least {MIN_SPLINE_KNOTS} knots; got {}",
+            x.len()
+        )));
+    }
+    strictly_increasing(x, "knots")
+}
+
+/// Checks the knot vectors handed to the linear interpolators.
+///
+/// ### Params
+///
+/// * `xp` - Knot abscissae
+/// * `fp` - Knot ordinates
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] / [`EdgeErrors::LengthMismatch`].
+fn validate_interp_knots(xp: &[f64], fp: &[f64]) -> Result<(), EdgeErrors> {
+    if xp.len() < MIN_INTERP_POINTS {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "linear interpolation needs at least {MIN_INTERP_POINTS} points; got {}",
+            xp.len()
+        )));
+    }
+    if fp.len() != xp.len() {
+        return Err(EdgeErrors::LengthMismatch {
+            name: "fp",
+            expected: xp.len(),
+            got: fp.len(),
+        });
+    }
+    strictly_increasing(xp, "xp")
+}
+
+/// Checks that a vector is strictly increasing.
+///
+/// Ties matter as much as inversions: a repeated abscissa makes a segment of
+/// zero width, and every routine here divides by that width.
+///
+/// ### Params
+///
+/// * `x` - Values to check
+/// * `name` - Argument name, for the error message
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the first bad position.
+fn strictly_increasing(x: &[f64], name: &str) -> Result<(), EdgeErrors> {
+    for (i, pair) in x.windows(2).enumerate() {
+        // NaN fails the comparison silently, so it is rejected explicitly.
+        if pair[1] <= pair[0] || pair[0].is_nan() || pair[1].is_nan() {
+            return Err(EdgeErrors::InvalidArgument(format!(
+                "{name} must be strictly increasing; {} at index {} is not above {} at index {i}",
+                pair[1],
+                i + 1,
+                pair[0],
+            )));
+        }
+    }
+    Ok(())
+}
+
+////////////////
+// FMM spline //
+////////////////
 
 /// Cubic spline coefficients in the Forsythe, Malcolm and Moler form.
 ///
@@ -140,11 +223,12 @@ impl FmmSpline {
 
 /// Writes FMM spline coefficients into caller-supplied buffers.
 ///
-/// A direct transcription of R's `fmm_spline` in `src/library/stats/src/splines.c`.
-/// The tridiagonal system is assembled in place: `d` holds the knot spacings and
-/// then the off-diagonal, `b` the diagonal, `c` the right-hand side and then the
-/// solution. Every buffer entry is written before it is read, so the buffers can
-/// be reused across genes without clearing.
+/// A direct transcription of R's `fmm_spline` in
+/// `src/library/stats/src/splines.c`. The tridiagonal system is assembled in
+/// place: `d` holds the knot spacings and then the off-diagonal, `b` the
+/// diagonal, `c` the right-hand side and then the solution. Every buffer entry
+/// is written before it is read, so the buffers can be reused across genes
+/// without clearing.
 ///
 /// ### Params
 ///
@@ -231,11 +315,12 @@ fn fmm_coefficients(x: &[f64], y: &[f64], b: &mut [f64], c: &mut [f64], d: &mut 
 /// 1. Take the grid point with the largest ordinate.
 /// 2. Fit the FMM cubic spline through the whole grid.
 /// 3. On each of the (at most two) segments touching that grid point, solve
-///    `b + 2ct + 3dt^2 = 0` analytically and keep the root that is a maximum. If
-///    it falls strictly inside the segment and beats the grid value, it wins.
+///    `b + 2ct + 3dt^2 = 0` analytically and keep the root that is a maximum.
+///    If it falls strictly inside the segment and beats the grid value, it
+///    wins.
 ///
-/// A general-purpose optimiser would land somewhere else on a coarse grid, so it
-/// is not a substitute.
+/// A general-purpose optimiser would land somewhere else on a coarse grid, so
+/// it is not a substitute.
 ///
 /// ### Params
 ///
@@ -269,8 +354,8 @@ pub fn maximize_interpolant(x: &[f64], y: &[f64]) -> Result<f64, EdgeErrors> {
 /// tens of thousands of genes and a grid of a couple of dozen points, each gene
 /// is an independent spline fit, and each gene's row is contiguous in `y`. The
 /// grid itself is far too short to parallelise over and shared by everyone.
-/// Scratch buffers for the tridiagonal solve are allocated once per chunk rather
-/// than once per gene.
+/// Scratch buffers for the tridiagonal solve are allocated once per chunk
+/// rather than once per gene.
 ///
 /// ### Params
 ///
@@ -344,9 +429,6 @@ fn find_max(x: &[f64], y: &[f64], b: &mut [f64], c: &mut [f64], d: &mut [f64]) -
 
     fmm_coefficients(x, y, b, c, d);
 
-    // At an interior grid point both neighbouring segments are searched; at the
-    // first or last grid point only the one that exists, which is why edgeR can
-    // return a boundary abscissa unchanged.
     if maxed_at > 0 {
         refine_on_segment(maxed_at - 1, x, y, b, c, d, &mut maxed, &mut x_max);
     }
@@ -359,11 +441,11 @@ fn find_max(x: &[f64], y: &[f64], b: &mut [f64], c: &mut [f64], d: &mut [f64]) -
 
 /// Solves for the spline maximum inside one segment and keeps it if it wins.
 ///
-/// The derivative on segment `seg` is `b + 2ct + 3dt^2`, so the stationary points
-/// are `t = (-c +/- sqrt(c^2 - 3db)) / (3d)`. The negative branch is the maximum
-/// for the sign convention edgeR uses; a zero cubic coefficient is treated as
-/// "no interior root", matching the reference implementation, since the linear
-/// case has no interior stationary point to find anyway.
+/// The derivative on segment `seg` is `b + 2ct + 3dt^2`, so the stationary
+/// points are `t = (-c +/- sqrt(c^2 - 3db)) / (3d)`. The negative branch is the
+/// maximum for the sign convention edgeR uses; a zero cubic coefficient is
+/// treated as "no interior root", matching the reference implementation, since
+/// the linear case has no interior stationary point to find anyway.
 ///
 /// ### Params
 ///
@@ -409,9 +491,9 @@ fn refine_on_segment(
     }
 }
 
-///////////////////////////
-// Natural spline basis  //
-///////////////////////////
+//////////////////////////
+// Natural spline basis //
+//////////////////////////
 
 /// Builds a natural cubic spline basis over `x`.
 ///
@@ -430,8 +512,9 @@ fn refine_on_segment(
 /// coefficients do not.
 ///
 /// `x` need not be sorted. If every value of `x` is identical there is no range
-/// to place knots in, and the basis degenerates to `[1, x]`; the returned column
-/// count is then 2 rather than `df`, which is why the count is returned at all.
+/// to place knots in, and the basis degenerates to `[1, x]`; the returned
+/// column count is then 2 rather than `df`, which is why the count is returned
+/// at all.
 ///
 /// ### Params
 ///
@@ -441,7 +524,8 @@ fn refine_on_segment(
 /// ### Returns
 ///
 /// The flattened row-major basis and its column count, or
-/// [`EdgeErrors::InvalidArgument`] if `x` is empty or `df` is below the minimum.
+/// [`EdgeErrors::InvalidArgument`] if `x` is empty or `df` is below the
+/// minimum.
 ///
 /// ### References
 ///
@@ -520,9 +604,10 @@ fn truncated_cube(x: f64, knot: f64) -> f64 {
 
 /// One `d_j` term of the truncated power basis.
 ///
-/// Coincident knots would divide by zero. R's knot placement cannot produce that
-/// unless `x` is so tied that a quantile lands on the upper boundary, in which
-/// case the term carries no information and is set to zero rather than to NaN.
+/// Coincident knots would divide by zero. R's knot placement cannot produce
+/// that unless `x` is so tied that a quantile lands on the upper boundary, in
+/// which case the term carries no information and is set to zero rather than to
+/// NaN.
 ///
 /// ### Params
 ///
@@ -564,9 +649,9 @@ fn quantile_type7(sorted: &[f64], p: f64) -> f64 {
     sorted[idx] + (h - lo) * (sorted[idx + 1] - sorted[idx])
 }
 
-////////////////////////////
-// Linear interpolation   //
-////////////////////////////
+//////////////////////////
+// Linear interpolation //
+//////////////////////////
 
 /// Piecewise-linear interpolation inside the knot range.
 ///
@@ -646,85 +731,6 @@ fn interp_one(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
     let lo = hi - 1;
     let t = (x - xp[lo]) / (xp[hi] - xp[lo]);
     fp[lo] + t * (fp[hi] - fp[lo])
-}
-
-/////////////////
-// Validation  //
-/////////////////
-
-/// Checks that a knot vector can carry a spline.
-///
-/// ### Params
-///
-/// * `x` - Knot abscissae
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] if there are fewer than
-/// [`MIN_SPLINE_KNOTS`] knots or they are not strictly increasing.
-fn validate_knots(x: &[f64]) -> Result<(), EdgeErrors> {
-    if x.len() < MIN_SPLINE_KNOTS {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "a spline needs at least {MIN_SPLINE_KNOTS} knots; got {}",
-            x.len()
-        )));
-    }
-    strictly_increasing(x, "knots")
-}
-
-/// Checks the knot vectors handed to the linear interpolators.
-///
-/// ### Params
-///
-/// * `xp` - Knot abscissae
-/// * `fp` - Knot ordinates
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] / [`EdgeErrors::LengthMismatch`].
-fn validate_interp_knots(xp: &[f64], fp: &[f64]) -> Result<(), EdgeErrors> {
-    if xp.len() < MIN_INTERP_POINTS {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "linear interpolation needs at least {MIN_INTERP_POINTS} points; got {}",
-            xp.len()
-        )));
-    }
-    if fp.len() != xp.len() {
-        return Err(EdgeErrors::LengthMismatch {
-            name: "fp",
-            expected: xp.len(),
-            got: fp.len(),
-        });
-    }
-    strictly_increasing(xp, "xp")
-}
-
-/// Checks that a vector is strictly increasing.
-///
-/// Ties matter as much as inversions: a repeated abscissa makes a segment of
-/// zero width, and every routine here divides by that width.
-///
-/// ### Params
-///
-/// * `x` - Values to check
-/// * `name` - Argument name, for the error message
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the first bad position.
-fn strictly_increasing(x: &[f64], name: &str) -> Result<(), EdgeErrors> {
-    for (i, pair) in x.windows(2).enumerate() {
-        // NaN fails the comparison silently, so it is rejected explicitly.
-        if pair[1] <= pair[0] || pair[0].is_nan() || pair[1].is_nan() {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "{name} must be strictly increasing; {} at index {} is not above {} at index {i}",
-                pair[1],
-                i + 1,
-                pair[0],
-            )));
-        }
-    }
-    Ok(())
 }
 
 ///////////

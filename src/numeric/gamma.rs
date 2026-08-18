@@ -1,4 +1,5 @@
-//! The polygamma family in `f64`: the `scipy.special` calls edgeR and limma make.
+//! The polygamma family in `f64`: the `scipy.special` calls edgeR and limma
+//! make.
 //!
 //! `ln_gamma` is delegated to `statrs`. Everything else is implemented here as
 //! upward recurrence to a fixed threshold followed by the asymptotic Bernoulli
@@ -18,13 +19,12 @@
 
 use statrs::function::gamma;
 
+////////////
+// Consts //
+////////////
+
 /// Argument at (or above) which the asymptotic Bernoulli series is used
 /// directly; below it the recurrence walks `x` up in unit steps first.
-///
-/// Twenty is comfortably past the point where the series is asymptotic-but-good:
-/// at `z = 20` the first neglected `digamma` term is `O(z^-14) ~ 5e-20`, some
-/// four orders below the `f64` epsilon of the leading `ln(z)`. Raising it buys
-/// nothing and costs a recurrence step per unit.
 const RECURRENCE_THRESHOLD: f64 = 20.0;
 
 /// Highest polygamma order [`polygamma`] will evaluate.
@@ -82,9 +82,138 @@ const TRIGAMMA_INVERSE_LARGE: f64 = 1e7;
 /// `trigamma(y) ~ 1/y` as `y -> inf`.
 const TRIGAMMA_INVERSE_SMALL: f64 = 1e-6;
 
-////////////////////
-// Public surface //
-////////////////////
+/////////////
+// Helpers //
+/////////////
+
+/// Whether an argument falls outside the `x > 0` domain this module supports.
+///
+/// Written out rather than as `!(x > 0.0)` so the `NaN` case is explicit: a
+/// `NaN` argument propagates, it does not silently take the positive branch.
+///
+/// ### Params
+///
+/// * `x` - Argument to check
+///
+/// ### Returns
+///
+/// `true` when `x` is `NaN` or non-positive.
+#[inline]
+fn is_outside_domain(x: f64) -> bool {
+    x.is_nan() || x <= 0.0
+}
+
+/// Walks `x` up in unit steps until it reaches `target`, accumulating the
+/// recurrence correction on the way.
+///
+/// Every function here shares the same shape: shift the argument into the range
+/// where the asymptotic series is good, and carry a sum of `(x + j)^-power` for
+/// the steps taken. The sum is accumulated from the largest `j` downwards so the
+/// small terms are not rounded away against the first one.
+///
+/// ### Params
+///
+/// * `x` - Starting argument, strictly positive
+/// * `target` - Argument to reach
+/// * `power` - Exponent of the correction terms: one for the digamma family,
+///   `n + 1` for polygamma order `n`
+///
+/// ### Returns
+///
+/// The shifted argument `z >= target` and `sum_{j=0}^{m-1} (x + j)^-power`,
+/// where `m` is the number of steps taken.
+fn shift_to_threshold(x: f64, target: f64, power: i32) -> (f64, f64) {
+    let mut z = x;
+    let mut steps = 0_u32;
+    while z < target {
+        z += 1.0;
+        steps += 1;
+    }
+    let mut correction = 0.0;
+    for j in (0..steps).rev() {
+        correction += (x + f64::from(j)).powi(-power);
+    }
+    (z, correction)
+}
+
+/// Asymptotic expansion of `ln(z) - psi(z)` for `z >= RECURRENCE_THRESHOLD`.
+///
+/// `1/(2z) + sum_k B_2k / (2k z^2k)`, evaluated by Horner in `z^-2`. Both terms
+/// are positive-definite small quantities, so there is no cancellation to lose.
+///
+/// ### Params
+///
+/// * `z` - Argument, expected at or above [`RECURRENCE_THRESHOLD`]
+///
+/// ### Returns
+///
+/// `ln(z) - psi(z)`.
+#[inline]
+fn log_minus_digamma_asymptotic(z: f64) -> f64 {
+    let inv_z = 1.0 / z;
+    let inv_z2 = inv_z * inv_z;
+    let mut tail = 0.0;
+    for &c in LOG_MINUS_DIGAMMA_COEFFS.iter().rev() {
+        tail = tail * inv_z2 + c;
+    }
+    0.5 * inv_z + tail * inv_z2
+}
+
+/// Asymptotic Bernoulli series for `psi^(n)(z)`, order `n >= 1`.
+///
+/// The factorial ratio `(2k + n - 1)! / (2k)!` is formed as the product of the
+/// `n - 1` integers above `2k`, which keeps it out of overflow range for every
+/// order this module accepts.
+///
+/// ### Params
+///
+/// * `n` - Order, at least one and at most [`POLYGAMMA_MAX_ORDER`]
+/// * `z` - Argument, expected at or above `RECURRENCE_THRESHOLD + n`
+///
+/// ### Returns
+///
+/// `psi^(n)(z)`.
+fn polygamma_asymptotic(n: usize, z: f64) -> f64 {
+    let inv_z = 1.0 / z;
+    let inv_z2 = inv_z * inv_z;
+    let inv_z_n = inv_z.powi(n as i32);
+
+    let mut sum = factorial(n - 1) * inv_z_n + 0.5 * factorial(n) * inv_z_n * inv_z;
+    let mut inv_z_pow = inv_z_n * inv_z2;
+    for (i, &b) in BERNOULLI_EVEN.iter().enumerate() {
+        let two_k = 2 * (i + 1);
+        let mut ratio = 1.0;
+        for j in 1..n {
+            ratio *= (two_k + j) as f64;
+        }
+        sum += b * ratio * inv_z_pow;
+        inv_z_pow *= inv_z2;
+    }
+
+    // (-1)^(n-1)
+    if n.is_multiple_of(2) { -sum } else { sum }
+}
+
+/// Factorial of a small integer as `f64`.
+///
+/// Only ever called with arguments up to [`POLYGAMMA_MAX_ORDER`], well inside
+/// the exactly representable range.
+///
+/// ### Params
+///
+/// * `n` - Argument
+///
+/// ### Returns
+///
+/// `n!`.
+#[inline]
+fn factorial(n: usize) -> f64 {
+    (1..=n).map(|i| i as f64).product()
+}
+
+///////////////
+// Front end //
+///////////////
 
 /// Natural logarithm of the gamma function.
 ///
@@ -260,135 +389,6 @@ pub fn logmdigamma(x: f64) -> f64 {
     }
     let (z, shifted) = shift_to_threshold(x, RECURRENCE_THRESHOLD, 1);
     (x / z).ln() + log_minus_digamma_asymptotic(z) + shifted
-}
-
-///////////////
-// Internals //
-///////////////
-
-/// Whether an argument falls outside the `x > 0` domain this module supports.
-///
-/// Written out rather than as `!(x > 0.0)` so the `NaN` case is explicit: a
-/// `NaN` argument propagates, it does not silently take the positive branch.
-///
-/// ### Params
-///
-/// * `x` - Argument to check
-///
-/// ### Returns
-///
-/// `true` when `x` is `NaN` or non-positive.
-#[inline]
-fn is_outside_domain(x: f64) -> bool {
-    x.is_nan() || x <= 0.0
-}
-
-/// Walks `x` up in unit steps until it reaches `target`, accumulating the
-/// recurrence correction on the way.
-///
-/// Every function here shares the same shape: shift the argument into the range
-/// where the asymptotic series is good, and carry a sum of `(x + j)^-power` for
-/// the steps taken. The sum is accumulated from the largest `j` downwards so the
-/// small terms are not rounded away against the first one.
-///
-/// ### Params
-///
-/// * `x` - Starting argument, strictly positive
-/// * `target` - Argument to reach
-/// * `power` - Exponent of the correction terms: one for the digamma family,
-///   `n + 1` for polygamma order `n`
-///
-/// ### Returns
-///
-/// The shifted argument `z >= target` and `sum_{j=0}^{m-1} (x + j)^-power`,
-/// where `m` is the number of steps taken.
-fn shift_to_threshold(x: f64, target: f64, power: i32) -> (f64, f64) {
-    let mut z = x;
-    let mut steps = 0_u32;
-    while z < target {
-        z += 1.0;
-        steps += 1;
-    }
-    let mut correction = 0.0;
-    for j in (0..steps).rev() {
-        correction += (x + f64::from(j)).powi(-power);
-    }
-    (z, correction)
-}
-
-/// Asymptotic expansion of `ln(z) - psi(z)` for `z >= RECURRENCE_THRESHOLD`.
-///
-/// `1/(2z) + sum_k B_2k / (2k z^2k)`, evaluated by Horner in `z^-2`. Both terms
-/// are positive-definite small quantities, so there is no cancellation to lose.
-///
-/// ### Params
-///
-/// * `z` - Argument, expected at or above [`RECURRENCE_THRESHOLD`]
-///
-/// ### Returns
-///
-/// `ln(z) - psi(z)`.
-#[inline]
-fn log_minus_digamma_asymptotic(z: f64) -> f64 {
-    let inv_z = 1.0 / z;
-    let inv_z2 = inv_z * inv_z;
-    let mut tail = 0.0;
-    for &c in LOG_MINUS_DIGAMMA_COEFFS.iter().rev() {
-        tail = tail * inv_z2 + c;
-    }
-    0.5 * inv_z + tail * inv_z2
-}
-
-/// Asymptotic Bernoulli series for `psi^(n)(z)`, order `n >= 1`.
-///
-/// The factorial ratio `(2k + n - 1)! / (2k)!` is formed as the product of the
-/// `n - 1` integers above `2k`, which keeps it out of overflow range for every
-/// order this module accepts.
-///
-/// ### Params
-///
-/// * `n` - Order, at least one and at most [`POLYGAMMA_MAX_ORDER`]
-/// * `z` - Argument, expected at or above `RECURRENCE_THRESHOLD + n`
-///
-/// ### Returns
-///
-/// `psi^(n)(z)`.
-fn polygamma_asymptotic(n: usize, z: f64) -> f64 {
-    let inv_z = 1.0 / z;
-    let inv_z2 = inv_z * inv_z;
-    let inv_z_n = inv_z.powi(n as i32);
-
-    let mut sum = factorial(n - 1) * inv_z_n + 0.5 * factorial(n) * inv_z_n * inv_z;
-    let mut inv_z_pow = inv_z_n * inv_z2;
-    for (i, &b) in BERNOULLI_EVEN.iter().enumerate() {
-        let two_k = 2 * (i + 1);
-        let mut ratio = 1.0;
-        for j in 1..n {
-            ratio *= (two_k + j) as f64;
-        }
-        sum += b * ratio * inv_z_pow;
-        inv_z_pow *= inv_z2;
-    }
-
-    // (-1)^(n-1)
-    if n.is_multiple_of(2) { -sum } else { sum }
-}
-
-/// Factorial of a small integer as `f64`.
-///
-/// Only ever called with arguments up to [`POLYGAMMA_MAX_ORDER`], well inside
-/// the exactly representable range.
-///
-/// ### Params
-///
-/// * `n` - Argument
-///
-/// ### Returns
-///
-/// `n!`.
-#[inline]
-fn factorial(n: usize) -> f64 {
-    (1..=n).map(|i| i as f64).product()
 }
 
 ///////////

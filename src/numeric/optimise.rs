@@ -1,7 +1,7 @@
 //! Scalar minimisation, root finding and derivative-free simplex search.
 //!
-//! Between them these cover every `scipy.optimize` call in edgePython except the
-//! bounded quasi-Newton, which lives in [`crate::numeric::lbfgsb`]:
+//! Between them these cover every `scipy.optimize` call in edgePython except
+//! the bounded quasi-Newton, which lives in [`crate::numeric::lbfgsb`]:
 //!
 //! * `minimize_scalar(method = 'bounded')` becomes [`brent_minimise_bounded`],
 //!   used by `disp_cox_reid` and the TMM-to-ChIP normalisation
@@ -16,7 +16,11 @@
 
 use std::cmp::Ordering;
 
-use crate::errors::EdgeErrors;
+use crate::prelude::*;
+
+////////////
+// Consts //
+////////////
 
 /// Squared inverse of the golden ratio, the golden section step.
 const GOLDEN: f64 = 0.381_966_011_250_105_2;
@@ -44,16 +48,17 @@ const NELDER_MEAD_STEP: f64 = 0.05;
 /// A relative step cannot move a zero, so scipy substitutes this constant.
 const NELDER_MEAD_ZERO_STEP: f64 = 0.000_25;
 
-/////////////////////////////
-// Bounded scalar minimum  //
-/////////////////////////////
+////////////////////////////
+// Bounded scalar minimum //
+////////////////////////////
 
 /// Minimises a scalar function on a closed interval.
 ///
 /// Brent's method: golden section search with parabolic interpolation accepted
 /// whenever it stays inside the bracket and improves on the previous step. This
-/// is the algorithm behind `scipy.optimize.minimize_scalar(method = 'bounded')`,
-/// down to the convergence test.
+/// is the algorithm behind
+/// `scipy.optimize.minimize_scalar(method = 'bounded')`, down to the
+/// convergence test.
 ///
 /// ### Params
 ///
@@ -102,7 +107,6 @@ where
 
     for _ in 0..max_iter {
         let midpoint = 0.5 * (a + b);
-        // scipy's test: the bracket is small relative to |x| plus the absolute floor.
         let tol1 = xatol * x.abs() + xatol / 3.0;
         let tol2 = 2.0 * tol1;
         if (x - midpoint).abs() <= tol2 - 0.5 * (b - a) {
@@ -111,7 +115,6 @@ where
 
         let mut golden_step = true;
         if step_before_last.abs() > tol1 {
-            // Fit a parabola through (x, fx), (w, fw), (v, fv).
             let r = (x - w) * (fx - fv);
             let mut q = (x - v) * (fx - fw);
             let mut p = (x - v) * q - (x - w) * r;
@@ -313,7 +316,7 @@ where
     })
 }
 
-/////// Minimises a scalar function on a closed interval, as R's `optimize` does.
+/// Minimises a scalar function on a closed interval, as R's `optimize` does.
 ///
 /// A line-by-line port of R's `Brent_fmin`. This is deliberately not
 /// [`brent_minimise_bounded`]: that one is scipy's
@@ -427,9 +430,9 @@ where
     }
 }
 
-//////////////
-// Nelder-Mead  //
-//////////////////
+/////////////////
+// Nelder-Mead //
+/////////////////
 
 /// Tuning knobs for [`nelder_mead`].
 #[derive(Clone, Copy, Debug)]
