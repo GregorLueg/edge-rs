@@ -10,3 +10,5 @@ pub mod fit;
 pub mod levenberg;
 pub mod one_group;
 pub mod one_way;
+pub mod ql_fit;
+pub mod test;
