@@ -4,15 +4,6 @@
 //! This is edgeR's `mglmLevenberg` and the hottest path in the crate: one fit
 //! per gene, tens of thousands of genes, a design of a handful of columns.
 //!
-//! edgePython batches every gene into one BLAS-3 matmul against a precomputed
-//! `design_outer` of shape `(n_samples, n_coef^2)`, then a batched solve. That
-//! is the only way to go fast in NumPy, and it costs an `n_genes * n_coef^2`
-//! intermediate every iteration. Here the shape is inverted: rayon over genes,
-//! a per-thread scratch buffer, and a hand-rolled Cholesky on the `n_coef` by
-//! `n_coef` normal equations. One gene's working set is `n_samples * n_coef`
-//! doubles, which sits in L1, and nothing proportional to `n_genes` is ever
-//! materialised beyond the outputs themselves.
-//!
 //! ### References
 //!
 //! McCarthy, Chen and Smyth, Nucleic Acids Research 40(10), 2012
@@ -25,6 +16,10 @@ use crate::glm::deviance::unit_nb_deviance;
 use crate::utils::recycled::{Recycled, RecycledRow};
 use crate::utils::simd::EdgeSimd;
 use crate::utils::traits::EdgeFloat;
+
+////////////
+// Consts //
+////////////
 
 /// Bound on the linear predictor before exponentiating.
 ///
@@ -56,6 +51,10 @@ const MAX_DAMPING: f64 = 1e10;
 /// system singular.
 const DIAGONAL_FLOOR: f64 = 1e-10;
 
+/////////////////
+// StartMethod //
+/////////////////
+
 /// How the coefficients are initialised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartMethod {
@@ -69,6 +68,10 @@ pub enum StartMethod {
     /// zero counts, which have to be floored first.
     LogCounts,
 }
+
+/////////////////////
+// LevenbergParams //
+/////////////////////
 
 /// Tuning knobs for [`mglm_levenberg`].
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +100,10 @@ impl Default for LevenbergParams {
     }
 }
 
+//////////////////
+// LevenbergFit //
+//////////////////
+
 /// Result of fitting every gene.
 #[derive(Clone, Debug)]
 pub struct LevenbergFit {
@@ -113,14 +120,18 @@ pub struct LevenbergFit {
     pub failed: Vec<bool>,
 }
 
+/////////////
+// Scratch //
+/////////////
+
 /// Per-thread scratch, allocated once per rayon worker rather than per gene.
-pub(crate) struct Scratch {
+pub struct Scratch {
     /// Counts for the current gene, widened to `f64`.
-    pub(crate) y: Vec<f64>,
+    pub y: Vec<f64>,
     /// Linear predictor.
     eta: Vec<f64>,
     /// Fitted mean.
-    pub(crate) mu: Vec<f64>,
+    pub mu: Vec<f64>,
     /// Trial fitted mean for the proposed step.
     mu_trial: Vec<f64>,
     /// IRLS working weights.
@@ -148,7 +159,7 @@ impl Scratch {
     /// ### Returns
     ///
     /// Buffers sized for a single gene's fit.
-    pub(crate) fn new(n_samples: usize, n_coef: usize) -> Self {
+    pub fn new(n_samples: usize, n_coef: usize) -> Self {
         Self {
             y: vec![0.0; n_samples],
             eta: vec![0.0; n_samples],
@@ -163,6 +174,10 @@ impl Scratch {
         }
     }
 }
+
+/////////////
+// Helpers //
+/////////////
 
 /// Solves a small symmetric positive definite system in place by Cholesky.
 ///
@@ -280,6 +295,194 @@ fn deviance_of(
         })
         .sum()
 }
+
+/// Chooses starting coefficients for one gene.
+///
+/// ### Params
+///
+/// * `y` - Counts for this gene
+/// * `design` - Row-major design
+/// * `offset` - Offset row
+/// * `n_samples` - Number of samples
+/// * `n_coef` - Number of coefficients
+/// * `method` - Which initialisation to use
+/// * `beta` - Output, length `n_coef`
+fn initial_coefficients(
+    y: &[f64],
+    design: &[f64],
+    offset: RecycledRow<'_, f64>,
+    n_samples: usize,
+    n_coef: usize,
+    method: StartMethod,
+    beta: &mut [f64],
+) {
+    beta.fill(0.0);
+
+    match method {
+        StartMethod::Null => {
+            let total_counts: f64 = y.iter().sum();
+            let total_library: f64 = (0..n_samples).map(|j| offset.get(j).exp()).sum();
+            beta[0] = if total_counts > 0.0 && total_library > 0.0 {
+                (total_counts / total_library).max(MIN_POSITIVE).ln()
+            } else {
+                // No signal to fit. edgeR starts these at a very small mean
+                // rather than negative infinity so the first step is finite.
+                -20.0
+            };
+        }
+        StartMethod::LogCounts => {
+            // Intercept-only least squares on the log scale. A full solve buys
+            // nothing here: the damped iteration converges from either start,
+            // and this avoids a per-gene factorisation.
+            let total: f64 = y
+                .iter()
+                .enumerate()
+                .map(|(j, &y_j)| {
+                    let library = offset.get(j).exp().max(MIN_POSITIVE);
+                    (y_j / library).max(MIN_POSITIVE).ln()
+                })
+                .sum();
+            beta[0] = total / n_samples as f64;
+            let _ = (design, n_coef);
+        }
+    }
+}
+
+/// Runs the damped iteration for a single gene.
+///
+/// ### Params
+///
+/// * `scratch` - Per-thread buffers
+/// * `beta` - Coefficients, updated in place
+/// * `design` - Row-major design
+/// * `n_samples` - Number of samples
+/// * `n_coef` - Number of coefficients
+/// * `dispersion` - Dispersion row
+/// * `offset` - Offset row
+/// * `weights` - Optional weight row
+/// * `params` - Tuning knobs
+///
+/// ### Returns
+///
+/// The number of iterations used and whether the normal equations ever went
+/// singular.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_one_gene(
+    scratch: &mut Scratch,
+    beta: &mut [f64],
+    design: &[f64],
+    n_samples: usize,
+    n_coef: usize,
+    dispersion: RecycledRow<'_, f64>,
+    offset: RecycledRow<'_, f64>,
+    weights: Option<RecycledRow<'_, f64>>,
+    params: &LevenbergParams,
+) -> (usize, bool) {
+    let mut damping = INITIAL_DAMPING;
+    let mut singular = false;
+
+    linear_predictor(
+        design,
+        beta,
+        offset,
+        n_samples,
+        n_coef,
+        &mut scratch.eta,
+        &mut scratch.mu,
+    );
+    let mut dev_current = deviance_of(&scratch.y, &scratch.mu, dispersion, weights);
+
+    for iteration in 0..params.max_iter {
+        // Working weights and residuals.
+        for j in 0..n_samples {
+            let mu_j = scratch.mu[j];
+            let w_j = weights.map_or(1.0, |w| w.get(j));
+            let denom = 1.0 + dispersion.get(j) * mu_j;
+            scratch.working[j] = (w_j * mu_j / denom).max(MIN_POSITIVE);
+        }
+
+        // Normal equations. The design row is reused for both accumulations, so
+        // this is one pass over the samples rather than two.
+        scratch.xtwx.fill(0.0);
+        scratch.xtwz.fill(0.0);
+        for j in 0..n_samples {
+            let row = &design[j * n_coef..(j + 1) * n_coef];
+            let w_j = scratch.working[j];
+            let z_j = (scratch.y[j] - scratch.mu[j]) / scratch.mu[j];
+            for (a, &x_a) in row.iter().enumerate() {
+                let wx = w_j * x_a;
+                scratch.xtwz[a] += wx * z_j;
+                // Lower triangle only; the upper is mirrored afterwards.
+                for (b, &x_b) in row[..=a].iter().enumerate() {
+                    scratch.xtwx[a * n_coef + b] += wx * x_b;
+                }
+            }
+        }
+        // Mirror the lower triangle into the upper.
+        for a in 0..n_coef {
+            for b in 0..a {
+                scratch.xtwx[b * n_coef + a] = scratch.xtwx[a * n_coef + b];
+            }
+        }
+
+        scratch.damped.copy_from_slice(&scratch.xtwx);
+        for a in 0..n_coef {
+            scratch.damped[a * n_coef + a] +=
+                damping * (scratch.xtwx[a * n_coef + a] + DIAGONAL_FLOOR);
+        }
+        scratch.delta.copy_from_slice(&scratch.xtwz);
+
+        if !solve_spd_in_place(&mut scratch.damped, &mut scratch.delta, n_coef) {
+            // Not positive definite: damp harder and try again.
+            singular = true;
+            damping = (damping * 10.0).min(MAX_DAMPING);
+            if damping >= MAX_DAMPING {
+                return (iteration + 1, singular);
+            }
+            continue;
+        }
+
+        for ((trial, &current), &step) in scratch
+            .beta_trial
+            .iter_mut()
+            .zip(beta.iter())
+            .zip(scratch.delta.iter())
+        {
+            *trial = current + step;
+        }
+        linear_predictor(
+            design,
+            &scratch.beta_trial,
+            offset,
+            n_samples,
+            n_coef,
+            &mut scratch.eta,
+            &mut scratch.mu_trial,
+        );
+        let dev_trial = deviance_of(&scratch.y, &scratch.mu_trial, dispersion, weights);
+
+        if dev_trial <= dev_current {
+            beta.copy_from_slice(&scratch.beta_trial);
+            scratch.mu.copy_from_slice(&scratch.mu_trial);
+            damping = (damping / 10.0).max(MIN_DAMPING);
+
+            let change = (dev_current - dev_trial).abs();
+            let threshold = params.tol * (dev_current.abs() + 0.1);
+            dev_current = dev_trial;
+            if change < threshold {
+                return (iteration + 1, singular);
+            }
+        } else {
+            damping = (damping * 10.0).min(MAX_DAMPING);
+        }
+    }
+
+    (params.max_iter, singular)
+}
+
+///////////////
+// Front end //
+///////////////
 
 /// Fits genewise negative binomial GLMs with Levenberg damping.
 ///
@@ -424,190 +627,6 @@ pub fn mglm_levenberg<T: EdgeFloat>(
         iterations,
         failed,
     })
-}
-
-/// Runs the damped iteration for a single gene.
-///
-/// ### Params
-///
-/// * `scratch` - Per-thread buffers
-/// * `beta` - Coefficients, updated in place
-/// * `design` - Row-major design
-/// * `n_samples` - Number of samples
-/// * `n_coef` - Number of coefficients
-/// * `dispersion` - Dispersion row
-/// * `offset` - Offset row
-/// * `weights` - Optional weight row
-/// * `params` - Tuning knobs
-///
-/// ### Returns
-///
-/// The number of iterations used and whether the normal equations ever went
-/// singular.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fit_one_gene(
-    scratch: &mut Scratch,
-    beta: &mut [f64],
-    design: &[f64],
-    n_samples: usize,
-    n_coef: usize,
-    dispersion: RecycledRow<'_, f64>,
-    offset: RecycledRow<'_, f64>,
-    weights: Option<RecycledRow<'_, f64>>,
-    params: &LevenbergParams,
-) -> (usize, bool) {
-    let mut damping = INITIAL_DAMPING;
-    let mut singular = false;
-
-    linear_predictor(
-        design,
-        beta,
-        offset,
-        n_samples,
-        n_coef,
-        &mut scratch.eta,
-        &mut scratch.mu,
-    );
-    let mut dev_current = deviance_of(&scratch.y, &scratch.mu, dispersion, weights);
-
-    for iteration in 0..params.max_iter {
-        // Working weights and residuals.
-        for j in 0..n_samples {
-            let mu_j = scratch.mu[j];
-            let w_j = weights.map_or(1.0, |w| w.get(j));
-            let denom = 1.0 + dispersion.get(j) * mu_j;
-            scratch.working[j] = (w_j * mu_j / denom).max(MIN_POSITIVE);
-        }
-
-        // Normal equations. The design row is reused for both accumulations, so
-        // this is one pass over the samples rather than two.
-        scratch.xtwx.fill(0.0);
-        scratch.xtwz.fill(0.0);
-        for j in 0..n_samples {
-            let row = &design[j * n_coef..(j + 1) * n_coef];
-            let w_j = scratch.working[j];
-            let z_j = (scratch.y[j] - scratch.mu[j]) / scratch.mu[j];
-            for (a, &x_a) in row.iter().enumerate() {
-                let wx = w_j * x_a;
-                scratch.xtwz[a] += wx * z_j;
-                // Lower triangle only; the upper is mirrored afterwards.
-                for (b, &x_b) in row[..=a].iter().enumerate() {
-                    scratch.xtwx[a * n_coef + b] += wx * x_b;
-                }
-            }
-        }
-        // Mirror the lower triangle into the upper.
-        for a in 0..n_coef {
-            for b in 0..a {
-                scratch.xtwx[b * n_coef + a] = scratch.xtwx[a * n_coef + b];
-            }
-        }
-
-        scratch.damped.copy_from_slice(&scratch.xtwx);
-        for a in 0..n_coef {
-            scratch.damped[a * n_coef + a] +=
-                damping * (scratch.xtwx[a * n_coef + a] + DIAGONAL_FLOOR);
-        }
-        scratch.delta.copy_from_slice(&scratch.xtwz);
-
-        if !solve_spd_in_place(&mut scratch.damped, &mut scratch.delta, n_coef) {
-            // Not positive definite: damp harder and try again.
-            singular = true;
-            damping = (damping * 10.0).min(MAX_DAMPING);
-            if damping >= MAX_DAMPING {
-                return (iteration + 1, singular);
-            }
-            continue;
-        }
-
-        for ((trial, &current), &step) in scratch
-            .beta_trial
-            .iter_mut()
-            .zip(beta.iter())
-            .zip(scratch.delta.iter())
-        {
-            *trial = current + step;
-        }
-        linear_predictor(
-            design,
-            &scratch.beta_trial,
-            offset,
-            n_samples,
-            n_coef,
-            &mut scratch.eta,
-            &mut scratch.mu_trial,
-        );
-        let dev_trial = deviance_of(&scratch.y, &scratch.mu_trial, dispersion, weights);
-
-        if dev_trial <= dev_current {
-            beta.copy_from_slice(&scratch.beta_trial);
-            scratch.mu.copy_from_slice(&scratch.mu_trial);
-            damping = (damping / 10.0).max(MIN_DAMPING);
-
-            let change = (dev_current - dev_trial).abs();
-            let threshold = params.tol * (dev_current.abs() + 0.1);
-            dev_current = dev_trial;
-            if change < threshold {
-                return (iteration + 1, singular);
-            }
-        } else {
-            damping = (damping * 10.0).min(MAX_DAMPING);
-        }
-    }
-
-    (params.max_iter, singular)
-}
-
-/// Chooses starting coefficients for one gene.
-///
-/// ### Params
-///
-/// * `y` - Counts for this gene
-/// * `design` - Row-major design
-/// * `offset` - Offset row
-/// * `n_samples` - Number of samples
-/// * `n_coef` - Number of coefficients
-/// * `method` - Which initialisation to use
-/// * `beta` - Output, length `n_coef`
-fn initial_coefficients(
-    y: &[f64],
-    design: &[f64],
-    offset: RecycledRow<'_, f64>,
-    n_samples: usize,
-    n_coef: usize,
-    method: StartMethod,
-    beta: &mut [f64],
-) {
-    beta.fill(0.0);
-
-    match method {
-        StartMethod::Null => {
-            let total_counts: f64 = y.iter().sum();
-            let total_library: f64 = (0..n_samples).map(|j| offset.get(j).exp()).sum();
-            beta[0] = if total_counts > 0.0 && total_library > 0.0 {
-                (total_counts / total_library).max(MIN_POSITIVE).ln()
-            } else {
-                // No signal to fit. edgeR starts these at a very small mean
-                // rather than negative infinity so the first step is finite.
-                -20.0
-            };
-        }
-        StartMethod::LogCounts => {
-            // Intercept-only least squares on the log scale. A full solve buys
-            // nothing here: the damped iteration converges from either start,
-            // and this avoids a per-gene factorisation.
-            let total: f64 = y
-                .iter()
-                .enumerate()
-                .map(|(j, &y_j)| {
-                    let library = offset.get(j).exp().max(MIN_POSITIVE);
-                    (y_j / library).max(MIN_POSITIVE).ln()
-                })
-                .sum();
-            beta[0] = total / n_samples as f64;
-            let _ = (design, n_coef);
-        }
-    }
 }
 
 ///////////

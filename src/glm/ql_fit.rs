@@ -1,18 +1,18 @@
 //! `glmQLFit`: quasi-likelihood negative binomial fits.
 //!
-//! The quasi-likelihood pipeline is edgeR's default for bulk RNA-seq. It sits on
-//! top of an ordinary negative binomial fit and adds a second layer of
+//! The quasi-likelihood pipeline is edgeR's default for bulk RNA-seq. It sits
+//! on top of an ordinary negative binomial fit and adds a second layer of
 //! dispersion: the negative binomial dispersion describes variation shared
-//! across genes, and the quasi-likelihood dispersion `s2` describes what is left
-//! over for each gene individually. Shrinking `s2` towards a fitted prior is
-//! what buys the method its power on small experiments.
+//! across genes, and the quasi-likelihood dispersion `s2` describes what is
+//! left over for each gene individually. Shrinking `s2` towards a fitted prior
+//! is what buys the method its power on small experiments.
 //!
 //! ### Two pipelines
 //!
-//! edgeR carries an old and a new one, and they differ in more than bookkeeping.
+//! edgeR carries an old and a new one:
 //!
-//! The **legacy** path takes the residual deviance at face value, divides by the
-//! residual degrees of freedom after dropping structural zeros, and shrinks
+//! The **legacy** path takes the residual deviance at face value, divides by
+//! the residual degrees of freedom after dropping structural zeros, and shrinks
 //! that. It is what every edgeR result before 4.0 used.
 //!
 //! The **current** path, the default here as in edgeR, replaces both numerator
@@ -31,13 +31,15 @@
 
 use crate::dispersion::cox_reid::{CoxReidParams, common_dispersion_cox_reid};
 use crate::dispersion::estimate::residual_df;
-use crate::errors::EdgeErrors;
 use crate::glm::fit::{DEFAULT_PRIOR_COUNT, FitMethod, glm_fit};
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
+use crate::prelude::*;
 use crate::ql::weights::{compute_adjust_vec, update_prior};
 use crate::utils::design::choose_lowess_span;
-use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+
+////////////
+// Consts //
+////////////
 
 /// Largest negative binomial dispersion the current pipeline will accept.
 ///
@@ -56,6 +58,10 @@ const TOP_PROPORTION_MIN_SPAN: f64 = 0.02;
 
 /// Exponent for the automatic top-abundance proportion.
 const TOP_PROPORTION_POWER: f64 = 1.0 / 3.0;
+
+/////////////////
+// QlFitParams //
+/////////////////
 
 /// Tuning knobs for [`glm_ql_fit`].
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +96,30 @@ impl Default for QlFitParams {
         }
     }
 }
+
+////////////
+// Extras //
+////////////
+
+/// What the chosen pipeline left behind beyond the residual variance.
+enum Extras {
+    /// Residual degrees of freedom after dropping structural zeros.
+    Legacy(Vec<f64>),
+    /// Adjusted deviance and degrees of freedom, plus the average
+    /// quasi-dispersion the fit was rescaled by.
+    Current {
+        /// Adjusted residual deviance per gene.
+        deviance_adj: Vec<f64>,
+        /// Adjusted residual degrees of freedom per gene.
+        df_residual_adj: Vec<f64>,
+        /// Average quasi-dispersion.
+        average: f64,
+    },
+}
+
+///////////
+// QlFit //
+///////////
 
 /// Output of [`glm_ql_fit`].
 #[derive(Clone, Debug)]
@@ -129,6 +159,10 @@ pub struct QlFit {
     /// Top-abundance proportion used, when a dispersion was estimated.
     pub top_proportion: Option<f64>,
 }
+
+/////////////
+// Helpers //
+/////////////
 
 /// Applies a map to every stored value of a recycled matrix.
 ///
@@ -243,22 +277,6 @@ fn dispersion_from_top_genes<T: EdgeFloat>(
     )
 }
 
-/// What the chosen pipeline left behind beyond the residual variance.
-enum Extras {
-    /// Residual degrees of freedom after dropping structural zeros.
-    Legacy(Vec<f64>),
-    /// Adjusted deviance and degrees of freedom, plus the average
-    /// quasi-dispersion the fit was rescaled by.
-    Current {
-        /// Adjusted residual deviance per gene.
-        deviance_adj: Vec<f64>,
-        /// Adjusted residual degrees of freedom per gene.
-        df_residual_adj: Vec<f64>,
-        /// Average quasi-dispersion.
-        average: f64,
-    },
-}
-
 /// Settles which negative binomial dispersion the fit will use.
 ///
 /// ### Params
@@ -342,6 +360,10 @@ fn resolve_dispersion<T: EdgeFloat>(
     )?;
     Ok((Recycled::scalar(estimated), Some(proportion)))
 }
+
+///////////////
+// Front end //
+///////////////
 
 /// Fits quasi-likelihood negative binomial GLMs.
 ///

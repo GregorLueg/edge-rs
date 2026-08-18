@@ -49,6 +49,10 @@ pub enum FitMethod {
     Levenberg,
 }
 
+////////////
+// GlmFit //
+////////////
+
 /// Output of [`glm_fit`].
 #[derive(Clone, Debug)]
 pub struct GlmFit {
@@ -66,6 +70,118 @@ pub struct GlmFit {
     /// Which fitter ran.
     pub method: FitMethod,
 }
+
+/////////////
+// Helpers //
+/////////////
+
+/// Chooses a fitter and runs it.
+///
+/// ### Params
+///
+/// * `counts` - Counts, row-major
+/// * `n_genes` - Number of genes
+/// * `n_samples` - Number of samples
+/// * `design` - Row-major design
+/// * `n_coef` - Number of coefficients
+/// * `dispersion` - Dispersion
+/// * `offset` - Offsets
+/// * `weights` - Optional weights
+///
+/// ### Returns
+///
+/// Coefficients, fitted means and which fitter ran.
+#[allow(clippy::too_many_arguments)]
+fn fit_dispatch<T: EdgeFloat>(
+    counts: &[T],
+    n_genes: usize,
+    n_samples: usize,
+    design: &[f64],
+    n_coef: usize,
+    dispersion: &Recycled<f64>,
+    offset: &Recycled<f64>,
+    weights: Option<&Recycled<f64>>,
+) -> Result<(Vec<f64>, Vec<f64>, FitMethod), EdgeErrors> {
+    let (labels, n_groups) = design_as_factor(design, n_samples, n_coef)?;
+
+    if n_groups == n_coef {
+        let fit = mglm_one_way(
+            counts,
+            n_genes,
+            n_samples,
+            design,
+            n_coef,
+            Some(&labels),
+            dispersion,
+            offset,
+            weights,
+            None,
+        )?;
+        Ok((fit.coefficients, fit.fitted, FitMethod::OneWay))
+    } else {
+        let params = LevenbergParams {
+            max_iter: GLM_FIT_MAX_ITER,
+            ..Default::default()
+        };
+        let fit = mglm_levenberg(
+            counts,
+            n_genes,
+            n_samples,
+            design,
+            n_coef,
+            dispersion,
+            offset,
+            weights,
+            None,
+            Some(params),
+        )?;
+        Ok((fit.coefficients, fit.fitted, FitMethod::Levenberg))
+    }
+}
+
+/// Residual deviance per gene from a set of fitted means.
+///
+/// ### Params
+///
+/// * `counts` - Counts, row-major
+/// * `n_genes` - Number of genes
+/// * `n_samples` - Number of samples
+/// * `fitted` - Fitted means, row-major
+/// * `dispersion` - Dispersion
+/// * `weights` - Optional weights
+///
+/// ### Returns
+///
+/// One deviance per gene.
+fn residual_deviance<T: EdgeFloat>(
+    counts: &[T],
+    n_genes: usize,
+    n_samples: usize,
+    fitted: &[f64],
+    dispersion: &Recycled<f64>,
+    weights: Option<&Recycled<f64>>,
+) -> Vec<f64> {
+    (0..n_genes)
+        .map(|gene| {
+            let disp = dispersion.row(gene, n_samples);
+            let weight = weights.map(|w| w.row(gene, n_samples));
+            let y = &counts[gene * n_samples..(gene + 1) * n_samples];
+            let mu = &fitted[gene * n_samples..(gene + 1) * n_samples];
+            y.iter()
+                .zip(mu.iter())
+                .enumerate()
+                .map(|(j, (y_j, &mu_j))| {
+                    let d = unit_nb_deviance(y_j.to_f64().unwrap_or(0.0), mu_j, disp.get(j));
+                    weight.map_or(d, |w| w.get(j) * d)
+                })
+                .sum()
+        })
+        .collect()
+}
+
+///////////////
+// Front end //
+///////////////
 
 /// Adds library-size-scaled prior counts to the data.
 ///
@@ -219,110 +335,6 @@ pub fn glm_fit<T: EdgeFloat>(
         df_residual: n_samples - n_coef,
         method,
     })
-}
-
-/// Chooses a fitter and runs it.
-///
-/// ### Params
-///
-/// * `counts` - Counts, row-major
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples
-/// * `design` - Row-major design
-/// * `n_coef` - Number of coefficients
-/// * `dispersion` - Dispersion
-/// * `offset` - Offsets
-/// * `weights` - Optional weights
-///
-/// ### Returns
-///
-/// Coefficients, fitted means and which fitter ran.
-#[allow(clippy::too_many_arguments)]
-fn fit_dispatch<T: EdgeFloat>(
-    counts: &[T],
-    n_genes: usize,
-    n_samples: usize,
-    design: &[f64],
-    n_coef: usize,
-    dispersion: &Recycled<f64>,
-    offset: &Recycled<f64>,
-    weights: Option<&Recycled<f64>>,
-) -> Result<(Vec<f64>, Vec<f64>, FitMethod), EdgeErrors> {
-    let (labels, n_groups) = design_as_factor(design, n_samples, n_coef)?;
-
-    if n_groups == n_coef {
-        let fit = mglm_one_way(
-            counts,
-            n_genes,
-            n_samples,
-            design,
-            n_coef,
-            Some(&labels),
-            dispersion,
-            offset,
-            weights,
-            None,
-        )?;
-        Ok((fit.coefficients, fit.fitted, FitMethod::OneWay))
-    } else {
-        let params = LevenbergParams {
-            max_iter: GLM_FIT_MAX_ITER,
-            ..Default::default()
-        };
-        let fit = mglm_levenberg(
-            counts,
-            n_genes,
-            n_samples,
-            design,
-            n_coef,
-            dispersion,
-            offset,
-            weights,
-            None,
-            Some(params),
-        )?;
-        Ok((fit.coefficients, fit.fitted, FitMethod::Levenberg))
-    }
-}
-
-/// Residual deviance per gene from a set of fitted means.
-///
-/// ### Params
-///
-/// * `counts` - Counts, row-major
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples
-/// * `fitted` - Fitted means, row-major
-/// * `dispersion` - Dispersion
-/// * `weights` - Optional weights
-///
-/// ### Returns
-///
-/// One deviance per gene.
-fn residual_deviance<T: EdgeFloat>(
-    counts: &[T],
-    n_genes: usize,
-    n_samples: usize,
-    fitted: &[f64],
-    dispersion: &Recycled<f64>,
-    weights: Option<&Recycled<f64>>,
-) -> Vec<f64> {
-    (0..n_genes)
-        .map(|gene| {
-            let disp = dispersion.row(gene, n_samples);
-            let weight = weights.map(|w| w.row(gene, n_samples));
-            let y = &counts[gene * n_samples..(gene + 1) * n_samples];
-            let mu = &fitted[gene * n_samples..(gene + 1) * n_samples];
-            y.iter()
-                .zip(mu.iter())
-                .enumerate()
-                .map(|(j, (y_j, &mu_j))| {
-                    let d = unit_nb_deviance(y_j.to_f64().unwrap_or(0.0), mu_j, disp.get(j));
-                    weight.map_or(d, |w| w.get(j) * d)
-                })
-                .sum()
-        })
-        .collect()
 }
 
 /// Fits a [`DgeList`] using its own offsets and dispersion.

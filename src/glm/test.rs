@@ -18,13 +18,15 @@
 
 use rayon::prelude::*;
 
-use crate::errors::EdgeErrors;
 use crate::glm::fit::{GlmFit, glm_fit};
 use crate::glm::levenberg::{LevenbergParams, mglm_levenberg};
 use crate::numeric::dist::{chisq_sf, f_sf, norm_cdf, norm_ppf, t_sf};
+use crate::prelude::*;
 use crate::utils::design::{contrast_as_coef, design_as_factor, matrix_rank, non_estimable};
-use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+
+////////////
+// Consts //
+////////////
 
 /// Iteration budget for a warm-started null fit.
 ///
@@ -50,486 +52,6 @@ const MAX_TREAT_ZSCORE: f64 = 38.0;
 
 /// `1 / sqrt(2 * pi)`, the standard normal density's normalising constant.
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-
-//////////////////////
-// Public interface //
-//////////////////////
-
-/// What a test is aimed at.
-#[derive(Clone, Debug)]
-pub enum Tested {
-    /// Design columns to drop from the null model, as zero-based indices.
-    ///
-    /// Repeats are collapsed, keeping the first occurrence, as edgeR's
-    /// `unique` does. The first surviving index is the one whose coefficient
-    /// becomes the reported log-fold-change.
-    Coef(Vec<usize>),
-    /// A contrast, or several, over the coefficients.
-    Contrast {
-        /// Column-major `n_coef * n_contrasts` values.
-        values: Vec<f64>,
-        /// Number of contrast columns. Must have full column rank.
-        n_contrasts: usize,
-    },
-}
-
-/// Which null [`glm_treat`] tests against.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TreatNull {
-    /// The whole interval `[-lfc, lfc]` is null. edgeR's default, and the one
-    /// that keeps the test from being anti-conservative near the threshold.
-    #[default]
-    Interval,
-    /// Only the worst point of the interval is null, giving the conservative
-    /// `pnorm(-z_right) + pnorm(z_left)`.
-    WorstCase,
-}
-
-/// Everything a test needs to know about the data behind the fit.
-///
-/// Layouts follow the crate's conventions: counts are row-major
-/// `n_genes * n_samples`, the design is row-major `n_samples * n_coef`, and the
-/// recycled matrices are logically `n_genes * n_samples`.
-#[derive(Clone, Debug)]
-pub struct GlmTestInput<'a, T: EdgeFloat> {
-    /// Counts, row-major `n_genes * n_samples`.
-    pub counts: &'a [T],
-    /// Number of genes.
-    pub n_genes: usize,
-    /// Number of samples.
-    pub n_samples: usize,
-    /// Design matrix, row-major `n_samples * n_coef`. The same one the fit used.
-    pub design: &'a [f64],
-    /// Number of coefficients. At least two, since the null model must keep one.
-    pub n_coef: usize,
-    /// Dispersion the fit used, recycled over genes and samples.
-    pub dispersion: &'a Recycled<f64>,
-    /// Log-scale offsets, recycled over genes and samples.
-    pub offset: &'a Recycled<f64>,
-    /// Optional observation weights.
-    pub weights: Option<&'a Recycled<f64>>,
-    /// Optional average log-CPM per gene, copied straight into the result.
-    pub log_cpm: Option<&'a [f64]>,
-}
-
-/// The quasi-likelihood quantities `glmQLFit` produces.
-///
-/// [`glm_ql_ftest`] and the quasi-likelihood flavour of [`glm_treat`] read these
-/// rather than recomputing them, exactly as edgeR reads them off the `DGEGLM`.
-#[derive(Clone, Debug)]
-pub struct QlSummary<'a> {
-    /// Posterior quasi-likelihood dispersion per gene, `s2.post`.
-    pub s2_post: &'a [f64],
-    /// Prior degrees of freedom, either one value shared by every gene or one
-    /// per gene when the squeezing was robust.
-    pub df_prior: &'a [f64],
-    /// Residual degrees of freedom adjusted for the effective number of
-    /// observations, `df.residual.adj`. One per gene.
-    pub df_residual_adj: &'a [f64],
-    /// Residual degrees of freedom after dropping structural zeros,
-    /// `df.residual.zeros`. One per gene.
-    ///
-    /// `Some` marks the legacy quasi-likelihood pipeline, which is the only one
-    /// where the Poisson bound applies; `None` takes its place *and* switches
-    /// the bound off, as edgeR does.
-    pub df_residual_zeros: Option<&'a [f64]>,
-    /// Fitted means from the quasi-likelihood fit, row-major
-    /// `n_genes * n_samples`. Only read by the Poisson bound.
-    pub fitted: &'a [f64],
-    /// Average quasi-likelihood dispersion the fit was divided by, if the
-    /// non-legacy pipeline produced one. The null refit divides the dispersion
-    /// by it again so that the two models see the same scale.
-    pub average_ql_dispersion: Option<f64>,
-}
-
-/// Result of a genewise test.
-#[derive(Clone, Debug)]
-pub struct GlmTest {
-    /// Log2 fold change per gene.
-    ///
-    /// The shrunk coefficient of the first tested column, or the contrast
-    /// applied to the shrunk coefficients, divided by `ln 2`. When several
-    /// coefficients are tested at once only the first one is reported, matching
-    /// the first `logFC` column of edgeR's table.
-    pub log_fc: Vec<f64>,
-    /// Average log-CPM per gene, passed through from the input.
-    pub log_cpm: Option<Vec<f64>>,
-    /// Test statistic per gene.
-    ///
-    /// The likelihood ratio for [`glm_lrt`], the F statistic for
-    /// [`glm_ql_ftest`], and `z_right` for [`glm_treat`], which is the larger of
-    /// the two threshold z-scores. edgeR reports no statistic for `glmTreat`, so
-    /// that last one is this crate's choice rather than a ported column.
-    pub statistic: Vec<f64>,
-    /// P-value per gene.
-    pub p_value: Vec<f64>,
-    /// Degrees of freedom under test, that is, how many columns the null drops.
-    pub df_test: f64,
-    /// Denominator degrees of freedom per gene. Only the quasi-likelihood tests
-    /// set this.
-    pub df_total: Option<Vec<f64>>,
-}
-
-///////////////////////////
-// Likelihood ratio test //
-///////////////////////////
-
-/// Genewise likelihood ratio test.
-///
-/// Port of edgeR's `glmLRT`. Drops the tested columns from the design, refits
-/// the null model at the fit's own dispersion and offsets, and reads the
-/// deviance difference off a chi-squared with as many degrees of freedom as
-/// columns were dropped. When a contrast is given the design is first rotated
-/// through [`contrast_as_coef`] so that the contrast becomes the leading
-/// coefficients; the likelihood ratio depends only on the column space the null
-/// keeps, so the rotation's sign conventions do not reach the p-value.
-///
-/// ### Params
-///
-/// * `input` - Counts, design and the recycled matrices behind the fit
-/// * `fit` - The full-model fit, from [`glm_fit`]
-/// * `tested` - Coefficients or contrast under test
-/// * `ql` - Quasi-likelihood summary when the fit came from `glmQLFit`, purely
-///   so that `average_ql_dispersion` can be divided out before the null refit.
-///   `None` for a plain `glmFit`.
-///
-/// ### Returns
-///
-/// The likelihood ratios and their p-values, or [`EdgeErrors`] if the shapes
-/// disagree, the design has fewer than two columns, the contrast is rank
-/// deficient, or every column is under test.
-///
-/// ### References
-///
-/// McCarthy, Chen and Smyth, Nucleic Acids Research, 2012
-pub fn glm_lrt<T: EdgeFloat>(
-    input: &GlmTestInput<'_, T>,
-    fit: &GlmFit,
-    tested: &Tested,
-    ql: Option<&QlSummary<'_>>,
-) -> Result<GlmTest, EdgeErrors> {
-    validate(input, fit)?;
-
-    let resolved = resolve_tested(input, fit, tested)?;
-    let n_coef_null = input.n_coef - resolved.coef.len();
-    if n_coef_null == 0 {
-        return Err(EdgeErrors::InvalidArgument(
-            "cannot test every coefficient: the null model would have no columns".to_string(),
-        ));
-    }
-
-    let design_null = drop_columns(
-        &resolved.design,
-        input.n_samples,
-        input.n_coef,
-        &resolved.coef,
-    );
-
-    // edgeR stores the undivided dispersion on a quasi-likelihood fit but fits
-    // with `dispersion / average.ql.dispersion`, so the null must be divided
-    // again or the two models sit on different scales.
-    let scaled = ql
-        .and_then(|q| q.average_ql_dispersion)
-        .map(|a| divide_dispersion(input.dispersion, a));
-    let dispersion = scaled.as_ref().unwrap_or(input.dispersion);
-
-    // Warm start only when the coefficients are still in the original basis. A
-    // contrast has been rotated by `contrast_as_coef`, which does not hand back
-    // the transformation, so there is nothing to project the full fit through.
-    let start = match tested {
-        Tested::Coef(_) => Some(drop_columns(
-            fit.unshrunk_coefficients
-                .as_deref()
-                .unwrap_or(&fit.coefficients),
-            input.n_genes,
-            input.n_coef,
-            &resolved.coef,
-        )),
-        Tested::Contrast { .. } => None,
-    };
-
-    let deviance_null = fit_null(
-        input,
-        &design_null,
-        n_coef_null,
-        dispersion,
-        input.offset,
-        start.as_deref(),
-    )?;
-
-    let df_test = resolved.coef.len() as f64;
-    let statistic: Vec<f64> = deviance_null
-        .iter()
-        .zip(fit.deviance.iter())
-        .map(|(null, full)| null - full)
-        .collect();
-    let p_value = statistic
-        .par_iter()
-        .map(|lr| chisq_sf(lr.max(0.0), df_test))
-        .collect::<Result<Vec<f64>, EdgeErrors>>()?;
-
-    Ok(GlmTest {
-        log_fc: resolved.log_fc,
-        log_cpm: input.log_cpm.map(<[f64]>::to_vec),
-        statistic,
-        p_value,
-        df_test,
-        df_total: None,
-    })
-}
-
-/////////////////////////////
-// Quasi-likelihood F test //
-/////////////////////////////
-
-/// Genewise quasi-likelihood F test.
-///
-/// Port of edgeR's `glmQLFTest`. Runs [`glm_lrt`] for the deviance difference,
-/// then divides by the tested degrees of freedom and the posterior
-/// quasi-likelihood dispersion to get an F statistic on `df_test` and
-/// `df_prior + df_residual` degrees of freedom. The denominator is capped at the
-/// total residual degrees of freedom in the experiment, which is what stops a
-/// large `df_prior` claiming more information than the data hold.
-///
-/// The Poisson bound, when it applies, refits every gene at zero dispersion and
-/// raises the p-value of any gene whose quasi-likelihood variance
-/// `s2_post * (1 + dispersion * mu)` has fallen below the Poisson variance for
-/// some library. Such a gene would otherwise look more significant than its own
-/// counts can justify.
-///
-/// ### Params
-///
-/// * `input` - Counts, design and the recycled matrices behind the fit
-/// * `fit` - The quasi-likelihood fit, from `glmQLFit`
-/// * `ql` - The squeezed quantities that fit produced
-/// * `tested` - Coefficients or contrast under test
-/// * `poisson_bound` - Apply the Poisson bound. Silently ignored, as in edgeR,
-///   when `ql.df_residual_zeros` is `None`, since the non-legacy pipeline has
-///   no zero-adjusted degrees of freedom to bound against.
-///
-/// ### Returns
-///
-/// The F statistics, their p-values and the denominator degrees of freedom, or
-/// [`EdgeErrors`] if a shape disagrees or the null refit fails.
-///
-/// ### References
-///
-/// Lund, Nettleton, McCarthy and Smyth, Statistical Applications in Genetics and
-/// Molecular Biology, 2012
-pub fn glm_ql_ftest<T: EdgeFloat>(
-    input: &GlmTestInput<'_, T>,
-    fit: &GlmFit,
-    ql: &QlSummary<'_>,
-    tested: &Tested,
-    poisson_bound: bool,
-) -> Result<GlmTest, EdgeErrors> {
-    validate_ql(input, ql)?;
-    let out = glm_lrt(input, fit, tested, Some(ql))?;
-
-    // No zero-adjusted degrees of freedom means the non-legacy pipeline, which
-    // edgeR does not bound.
-    let (df_residual, poisson_bound) = match ql.df_residual_zeros {
-        Some(zeros) => (zeros, poisson_bound),
-        None => (ql.df_residual_adj, false),
-    };
-    let cap = (input.n_genes * fit.df_residual) as f64;
-
-    let df_total: Vec<f64> = (0..input.n_genes)
-        .map(|gene| (recycle(ql.df_prior, gene) + df_residual[gene]).min(cap))
-        .collect();
-    let statistic: Vec<f64> = out
-        .statistic
-        .iter()
-        .zip(ql.s2_post.iter())
-        .map(|(lr, s2)| lr / out.df_test / s2)
-        .collect();
-    let mut p_value = statistic
-        .par_iter()
-        .zip(df_total.par_iter())
-        .map(|(f, df2)| f_sf(f.max(0.0), out.df_test, *df2))
-        .collect::<Result<Vec<f64>, EdgeErrors>>()?;
-
-    if poisson_bound {
-        let below = below_poisson_bound(input, ql);
-        if below.iter().any(|b| *b) {
-            let poisson = poisson_refit_lrt(input, tested)?;
-            for (gene, flagged) in below.iter().enumerate() {
-                if *flagged {
-                    p_value[gene] = p_value[gene].max(poisson.p_value[gene]);
-                }
-            }
-        }
-    }
-
-    Ok(GlmTest {
-        log_fc: out.log_fc,
-        log_cpm: out.log_cpm,
-        statistic,
-        p_value,
-        df_test: out.df_test,
-        df_total: Some(df_total),
-    })
-}
-
-///////////
-// Treat //
-///////////
-
-/// Genewise test against a fold-change threshold.
-///
-/// Port of edgeR's `glmTreat`. Rather than asking whether the log-fold-change is
-/// zero, it asks whether it is outside `[-lfc, lfc]`. Both bounds are tested by
-/// shifting the offsets by `lfc * ln 2 * design[, coef]` and refitting, which
-/// gives two deviance-difference z-scores; the smaller is signed negative when
-/// the estimated fold change lies inside the interval, and the pair is fed to
-/// either the interval null or the conservative worst-case null.
-///
-/// A zero `lfc` falls straight through to [`glm_lrt`] or [`glm_ql_ftest`], as
-/// edgeR does.
-///
-/// Only one coefficient can be tested. Extra entries in `tested` are dropped,
-/// which is edgeR's behaviour for a multi-column contrast, there with a warning.
-///
-/// ### Params
-///
-/// * `input` - Counts, design and the recycled matrices behind the fit
-/// * `fit` - The fit, from [`glm_fit`] or `glmQLFit`
-/// * `ql` - The squeezed quantities when the fit is a quasi-likelihood one,
-///   which switches the test from the likelihood ratio flavour to the moderated
-///   t flavour. `None` for a plain `glmFit`.
-/// * `tested` - Coefficient or contrast under test
-/// * `lfc` - Log2 fold-change threshold, non-negative
-/// * `null` - Which null to test against
-///
-/// ### Returns
-///
-/// The threshold z-scores and their p-values, or [`EdgeErrors`] for a negative
-/// `lfc`, a shape mismatch, or a failed refit.
-///
-/// ### References
-///
-/// McCarthy and Smyth, Bioinformatics, 2009
-pub fn glm_treat<T: EdgeFloat>(
-    input: &GlmTestInput<'_, T>,
-    fit: &GlmFit,
-    ql: Option<&QlSummary<'_>>,
-    tested: &Tested,
-    lfc: f64,
-    null: TreatNull,
-) -> Result<GlmTest, EdgeErrors> {
-    if lfc < 0.0 || lfc.is_nan() {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "lfc must be non-negative, got {lfc}"
-        )));
-    }
-    if lfc == 0.0 {
-        return match ql {
-            Some(q) => glm_ql_ftest(input, fit, q, tested, true),
-            None => glm_lrt(input, fit, tested, None),
-        };
-    }
-    validate(input, fit)?;
-    if let Some(q) = ql {
-        validate_ql(input, q)?;
-    }
-
-    let narrowed = narrow(tested, input.n_coef)?;
-    let resolved = resolve_tested(input, fit, &narrowed)?;
-    let coef = resolved.coef[0];
-    let design_null = drop_columns(&resolved.design, input.n_samples, input.n_coef, &[coef]);
-
-    let unshrunk_log_fc = match fit.unshrunk_coefficients.as_deref() {
-        Some(unshrunk) => project(unshrunk, input.n_genes, input.n_coef, &narrowed, coef),
-        None => resolved.log_fc.clone(),
-    };
-
-    let scaled = ql
-        .and_then(|q| q.average_ql_dispersion)
-        .map(|a| divide_dispersion(input.dispersion, a));
-    let dispersion = scaled.as_ref().unwrap_or(input.dispersion);
-
-    // The threshold enters as an offset shift along the tested column, so both
-    // bounds are ordinary fits of the same two models on shifted data.
-    let adjustment: Vec<f64> = (0..input.n_samples)
-        .map(|sample| lfc * std::f64::consts::LN_2 * resolved.design[sample * input.n_coef + coef])
-        .collect();
-
-    let mut z_left = threshold_z(
-        input,
-        &resolved.design,
-        &design_null,
-        dispersion,
-        &adjustment,
-        1.0,
-    )?;
-    let mut z_right = threshold_z(
-        input,
-        &resolved.design,
-        &design_null,
-        dispersion,
-        &adjustment,
-        -1.0,
-    )?;
-    for (left, right) in z_left.iter_mut().zip(z_right.iter_mut()) {
-        if *left > *right {
-            std::mem::swap(left, right);
-        }
-    }
-
-    // Under the quasi-likelihood pipeline the two deviance roots are moderated
-    // t statistics, not z, so they are pushed through the t quantile first.
-    let df_total = ql.map(|q| {
-        let df_residual = q.df_residual_zeros.unwrap_or(q.df_residual_adj);
-        let cap = (input.n_genes * (input.n_samples - input.n_coef)) as f64;
-        (0..input.n_genes)
-            .map(|gene| (recycle(q.df_prior, gene) + df_residual[gene]).min(cap))
-            .collect::<Vec<f64>>()
-    });
-    if let (Some(q), Some(df)) = (ql, df_total.as_ref()) {
-        for gene in 0..input.n_genes {
-            let scale = q.s2_post[gene].sqrt();
-            z_left[gene] = zscore_t(z_left[gene] / scale, df[gene])?;
-            z_right[gene] = zscore_t(z_right[gene] / scale, df[gene])?;
-        }
-    }
-
-    for (gene, left) in z_left.iter_mut().enumerate() {
-        let within = unshrunk_log_fc[gene].abs() <= lfc;
-        *left *= if within { 1.0 } else { -1.0 };
-    }
-
-    let mut p_value: Vec<f64> = z_left
-        .par_iter()
-        .zip(z_right.par_iter())
-        .map(|(left, right)| treat_p_value(*left, *right, null))
-        .collect();
-
-    // edgeR's recursive Poisson bound. Note that it re-enters `glmTreat` without
-    // passing `null` through, so the bound is always computed against the
-    // interval null even when the caller asked for the worst case.
-    if let Some(q) = ql
-        && q.df_residual_zeros.is_some()
-    {
-        let below = below_poisson_bound(input, q);
-        if below.iter().any(|b| *b) {
-            let poisson = poisson_refit_treat(input, &narrowed, lfc)?;
-            for (gene, flagged) in below.iter().enumerate() {
-                if *flagged {
-                    p_value[gene] = p_value[gene].max(poisson.p_value[gene]);
-                }
-            }
-        }
-    }
-
-    Ok(GlmTest {
-        log_fc: resolved.log_fc,
-        log_cpm: input.log_cpm.map(<[f64]>::to_vec),
-        statistic: z_right,
-        p_value,
-        df_test: 1.0,
-        df_total,
-    })
-}
 
 /////////////
 // Helpers //
@@ -1307,6 +829,484 @@ fn validate_ql<T: EdgeFloat>(
         });
     }
     Ok(())
+}
+
+//////////////////////
+// Public interface //
+//////////////////////
+
+/// What a test is aimed at.
+#[derive(Clone, Debug)]
+pub enum Tested {
+    /// Design columns to drop from the null model, as zero-based indices.
+    ///
+    /// Repeats are collapsed, keeping the first occurrence, as edgeR's
+    /// `unique` does. The first surviving index is the one whose coefficient
+    /// becomes the reported log-fold-change.
+    Coef(Vec<usize>),
+    /// A contrast, or several, over the coefficients.
+    Contrast {
+        /// Column-major `n_coef * n_contrasts` values.
+        values: Vec<f64>,
+        /// Number of contrast columns. Must have full column rank.
+        n_contrasts: usize,
+    },
+}
+
+/// Which null [`glm_treat`] tests against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TreatNull {
+    /// The whole interval `[-lfc, lfc]` is null. edgeR's default, and the one
+    /// that keeps the test from being anti-conservative near the threshold.
+    #[default]
+    Interval,
+    /// Only the worst point of the interval is null, giving the conservative
+    /// `pnorm(-z_right) + pnorm(z_left)`.
+    WorstCase,
+}
+
+/// Everything a test needs to know about the data behind the fit.
+///
+/// Layouts follow the crate's conventions: counts are row-major
+/// `n_genes * n_samples`, the design is row-major `n_samples * n_coef`, and the
+/// recycled matrices are logically `n_genes * n_samples`.
+#[derive(Clone, Debug)]
+pub struct GlmTestInput<'a, T: EdgeFloat> {
+    /// Counts, row-major `n_genes * n_samples`.
+    pub counts: &'a [T],
+    /// Number of genes.
+    pub n_genes: usize,
+    /// Number of samples.
+    pub n_samples: usize,
+    /// Design matrix, row-major `n_samples * n_coef`. The same one the fit used.
+    pub design: &'a [f64],
+    /// Number of coefficients. At least two, since the null model must keep one.
+    pub n_coef: usize,
+    /// Dispersion the fit used, recycled over genes and samples.
+    pub dispersion: &'a Recycled<f64>,
+    /// Log-scale offsets, recycled over genes and samples.
+    pub offset: &'a Recycled<f64>,
+    /// Optional observation weights.
+    pub weights: Option<&'a Recycled<f64>>,
+    /// Optional average log-CPM per gene, copied straight into the result.
+    pub log_cpm: Option<&'a [f64]>,
+}
+
+/// The quasi-likelihood quantities `glmQLFit` produces.
+///
+/// [`glm_ql_ftest`] and the quasi-likelihood flavour of [`glm_treat`] read these
+/// rather than recomputing them, exactly as edgeR reads them off the `DGEGLM`.
+#[derive(Clone, Debug)]
+pub struct QlSummary<'a> {
+    /// Posterior quasi-likelihood dispersion per gene, `s2.post`.
+    pub s2_post: &'a [f64],
+    /// Prior degrees of freedom, either one value shared by every gene or one
+    /// per gene when the squeezing was robust.
+    pub df_prior: &'a [f64],
+    /// Residual degrees of freedom adjusted for the effective number of
+    /// observations, `df.residual.adj`. One per gene.
+    pub df_residual_adj: &'a [f64],
+    /// Residual degrees of freedom after dropping structural zeros,
+    /// `df.residual.zeros`. One per gene.
+    ///
+    /// `Some` marks the legacy quasi-likelihood pipeline, which is the only one
+    /// where the Poisson bound applies; `None` takes its place *and* switches
+    /// the bound off, as edgeR does.
+    pub df_residual_zeros: Option<&'a [f64]>,
+    /// Fitted means from the quasi-likelihood fit, row-major
+    /// `n_genes * n_samples`. Only read by the Poisson bound.
+    pub fitted: &'a [f64],
+    /// Average quasi-likelihood dispersion the fit was divided by, if the
+    /// non-legacy pipeline produced one. The null refit divides the dispersion
+    /// by it again so that the two models see the same scale.
+    pub average_ql_dispersion: Option<f64>,
+}
+
+/// Result of a genewise test.
+#[derive(Clone, Debug)]
+pub struct GlmTest {
+    /// Log2 fold change per gene.
+    ///
+    /// The shrunk coefficient of the first tested column, or the contrast
+    /// applied to the shrunk coefficients, divided by `ln 2`. When several
+    /// coefficients are tested at once only the first one is reported, matching
+    /// the first `logFC` column of edgeR's table.
+    pub log_fc: Vec<f64>,
+    /// Average log-CPM per gene, passed through from the input.
+    pub log_cpm: Option<Vec<f64>>,
+    /// Test statistic per gene.
+    ///
+    /// The likelihood ratio for [`glm_lrt`], the F statistic for
+    /// [`glm_ql_ftest`], and `z_right` for [`glm_treat`], which is the larger of
+    /// the two threshold z-scores. edgeR reports no statistic for `glmTreat`, so
+    /// that last one is this crate's choice rather than a ported column.
+    pub statistic: Vec<f64>,
+    /// P-value per gene.
+    pub p_value: Vec<f64>,
+    /// Degrees of freedom under test, that is, how many columns the null drops.
+    pub df_test: f64,
+    /// Denominator degrees of freedom per gene. Only the quasi-likelihood tests
+    /// set this.
+    pub df_total: Option<Vec<f64>>,
+}
+
+///////////////////////////
+// Likelihood ratio test //
+///////////////////////////
+
+/// Genewise likelihood ratio test.
+///
+/// Port of edgeR's `glmLRT`. Drops the tested columns from the design, refits
+/// the null model at the fit's own dispersion and offsets, and reads the
+/// deviance difference off a chi-squared with as many degrees of freedom as
+/// columns were dropped. When a contrast is given the design is first rotated
+/// through [`contrast_as_coef`] so that the contrast becomes the leading
+/// coefficients; the likelihood ratio depends only on the column space the null
+/// keeps, so the rotation's sign conventions do not reach the p-value.
+///
+/// ### Params
+///
+/// * `input` - Counts, design and the recycled matrices behind the fit
+/// * `fit` - The full-model fit, from [`glm_fit`]
+/// * `tested` - Coefficients or contrast under test
+/// * `ql` - Quasi-likelihood summary when the fit came from `glmQLFit`, purely
+///   so that `average_ql_dispersion` can be divided out before the null refit.
+///   `None` for a plain `glmFit`.
+///
+/// ### Returns
+///
+/// The likelihood ratios and their p-values, or [`EdgeErrors`] if the shapes
+/// disagree, the design has fewer than two columns, the contrast is rank
+/// deficient, or every column is under test.
+///
+/// ### References
+///
+/// McCarthy, Chen and Smyth, Nucleic Acids Research, 2012
+pub fn glm_lrt<T: EdgeFloat>(
+    input: &GlmTestInput<'_, T>,
+    fit: &GlmFit,
+    tested: &Tested,
+    ql: Option<&QlSummary<'_>>,
+) -> Result<GlmTest, EdgeErrors> {
+    validate(input, fit)?;
+
+    let resolved = resolve_tested(input, fit, tested)?;
+    let n_coef_null = input.n_coef - resolved.coef.len();
+    if n_coef_null == 0 {
+        return Err(EdgeErrors::InvalidArgument(
+            "cannot test every coefficient: the null model would have no columns".to_string(),
+        ));
+    }
+
+    let design_null = drop_columns(
+        &resolved.design,
+        input.n_samples,
+        input.n_coef,
+        &resolved.coef,
+    );
+
+    // edgeR stores the undivided dispersion on a quasi-likelihood fit but fits
+    // with `dispersion / average.ql.dispersion`, so the null must be divided
+    // again or the two models sit on different scales.
+    let scaled = ql
+        .and_then(|q| q.average_ql_dispersion)
+        .map(|a| divide_dispersion(input.dispersion, a));
+    let dispersion = scaled.as_ref().unwrap_or(input.dispersion);
+
+    // Warm start only when the coefficients are still in the original basis. A
+    // contrast has been rotated by `contrast_as_coef`, which does not hand back
+    // the transformation, so there is nothing to project the full fit through.
+    let start = match tested {
+        Tested::Coef(_) => Some(drop_columns(
+            fit.unshrunk_coefficients
+                .as_deref()
+                .unwrap_or(&fit.coefficients),
+            input.n_genes,
+            input.n_coef,
+            &resolved.coef,
+        )),
+        Tested::Contrast { .. } => None,
+    };
+
+    let deviance_null = fit_null(
+        input,
+        &design_null,
+        n_coef_null,
+        dispersion,
+        input.offset,
+        start.as_deref(),
+    )?;
+
+    let df_test = resolved.coef.len() as f64;
+    let statistic: Vec<f64> = deviance_null
+        .iter()
+        .zip(fit.deviance.iter())
+        .map(|(null, full)| null - full)
+        .collect();
+    let p_value = statistic
+        .par_iter()
+        .map(|lr| chisq_sf(lr.max(0.0), df_test))
+        .collect::<Result<Vec<f64>, EdgeErrors>>()?;
+
+    Ok(GlmTest {
+        log_fc: resolved.log_fc,
+        log_cpm: input.log_cpm.map(<[f64]>::to_vec),
+        statistic,
+        p_value,
+        df_test,
+        df_total: None,
+    })
+}
+
+/////////////////////////////
+// Quasi-likelihood F test //
+/////////////////////////////
+
+/// Genewise quasi-likelihood F test.
+///
+/// Port of edgeR's `glmQLFTest`. Runs [`glm_lrt`] for the deviance difference,
+/// then divides by the tested degrees of freedom and the posterior
+/// quasi-likelihood dispersion to get an F statistic on `df_test` and
+/// `df_prior + df_residual` degrees of freedom. The denominator is capped at
+/// the total residual degrees of freedom in the experiment, which is what stops
+/// a large `df_prior` claiming more information than the data hold.
+///
+/// The Poisson bound, when it applies, refits every gene at zero dispersion and
+/// raises the p-value of any gene whose quasi-likelihood variance
+/// `s2_post * (1 + dispersion * mu)` has fallen below the Poisson variance for
+/// some library. Such a gene would otherwise look more significant than its own
+/// counts can justify.
+///
+/// ### Params
+///
+/// * `input` - Counts, design and the recycled matrices behind the fit
+/// * `fit` - The quasi-likelihood fit, from `glmQLFit`
+/// * `ql` - The squeezed quantities that fit produced
+/// * `tested` - Coefficients or contrast under test
+/// * `poisson_bound` - Apply the Poisson bound. Silently ignored, as in edgeR,
+///   when `ql.df_residual_zeros` is `None`, since the non-legacy pipeline has
+///   no zero-adjusted degrees of freedom to bound against.
+///
+/// ### Returns
+///
+/// The F statistics, their p-values and the denominator degrees of freedom, or
+/// [`EdgeErrors`] if a shape disagrees or the null refit fails.
+///
+/// ### References
+///
+/// Lund, Nettleton, McCarthy and Smyth, Statistical Applications in Genetics and
+/// Molecular Biology, 2012
+pub fn glm_ql_ftest<T: EdgeFloat>(
+    input: &GlmTestInput<'_, T>,
+    fit: &GlmFit,
+    ql: &QlSummary<'_>,
+    tested: &Tested,
+    poisson_bound: bool,
+) -> Result<GlmTest, EdgeErrors> {
+    validate_ql(input, ql)?;
+    let out = glm_lrt(input, fit, tested, Some(ql))?;
+
+    let (df_residual, poisson_bound) = match ql.df_residual_zeros {
+        Some(zeros) => (zeros, poisson_bound),
+        None => (ql.df_residual_adj, false),
+    };
+    let cap = (input.n_genes * fit.df_residual) as f64;
+
+    let df_total: Vec<f64> = (0..input.n_genes)
+        .map(|gene| (recycle(ql.df_prior, gene) + df_residual[gene]).min(cap))
+        .collect();
+    let statistic: Vec<f64> = out
+        .statistic
+        .iter()
+        .zip(ql.s2_post.iter())
+        .map(|(lr, s2)| lr / out.df_test / s2)
+        .collect();
+    let mut p_value = statistic
+        .par_iter()
+        .zip(df_total.par_iter())
+        .map(|(f, df2)| f_sf(f.max(0.0), out.df_test, *df2))
+        .collect::<Result<Vec<f64>, EdgeErrors>>()?;
+
+    if poisson_bound {
+        let below = below_poisson_bound(input, ql);
+        if below.iter().any(|b| *b) {
+            let poisson = poisson_refit_lrt(input, tested)?;
+            for (gene, flagged) in below.iter().enumerate() {
+                if *flagged {
+                    p_value[gene] = p_value[gene].max(poisson.p_value[gene]);
+                }
+            }
+        }
+    }
+
+    Ok(GlmTest {
+        log_fc: out.log_fc,
+        log_cpm: out.log_cpm,
+        statistic,
+        p_value,
+        df_test: out.df_test,
+        df_total: Some(df_total),
+    })
+}
+
+///////////
+// Treat //
+///////////
+
+/// Genewise test against a fold-change threshold.
+///
+/// Port of edgeR's `glmTreat`. Rather than asking whether the log-fold-change
+/// is zero, it asks whether it is outside `[-lfc, lfc]`. Both bounds are tested
+/// by shifting the offsets by `lfc * ln 2 * design[, coef]` and refitting,
+/// which gives two deviance-difference z-scores; the smaller is signed negative
+/// when the estimated fold change lies inside the interval, and the pair is fed
+/// to either the interval null or the conservative worst-case null.
+///
+/// A zero `lfc` falls straight through to [`glm_lrt`] or [`glm_ql_ftest`], as
+/// edgeR does.
+///
+/// Only one coefficient can be tested. Extra entries in `tested` are dropped,
+/// which is edgeR's behaviour for a multi-column contrast, there with a warning.
+///
+/// ### Params
+///
+/// * `input` - Counts, design and the recycled matrices behind the fit
+/// * `fit` - The fit, from [`glm_fit`] or `glmQLFit`
+/// * `ql` - The squeezed quantities when the fit is a quasi-likelihood one,
+///   which switches the test from the likelihood ratio flavour to the moderated
+///   t flavour. `None` for a plain `glmFit`.
+/// * `tested` - Coefficient or contrast under test
+/// * `lfc` - Log2 fold-change threshold, non-negative
+/// * `null` - Which null to test against
+///
+/// ### Returns
+///
+/// The threshold z-scores and their p-values, or [`EdgeErrors`] for a negative
+/// `lfc`, a shape mismatch, or a failed refit.
+///
+/// ### References
+///
+/// McCarthy and Smyth, Bioinformatics, 2009
+pub fn glm_treat<T: EdgeFloat>(
+    input: &GlmTestInput<'_, T>,
+    fit: &GlmFit,
+    ql: Option<&QlSummary<'_>>,
+    tested: &Tested,
+    lfc: f64,
+    null: TreatNull,
+) -> Result<GlmTest, EdgeErrors> {
+    if lfc < 0.0 || lfc.is_nan() {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "lfc must be non-negative, got {lfc}"
+        )));
+    }
+    if lfc == 0.0 {
+        return match ql {
+            Some(q) => glm_ql_ftest(input, fit, q, tested, true),
+            None => glm_lrt(input, fit, tested, None),
+        };
+    }
+    validate(input, fit)?;
+    if let Some(q) = ql {
+        validate_ql(input, q)?;
+    }
+
+    let narrowed = narrow(tested, input.n_coef)?;
+    let resolved = resolve_tested(input, fit, &narrowed)?;
+    let coef = resolved.coef[0];
+    let design_null = drop_columns(&resolved.design, input.n_samples, input.n_coef, &[coef]);
+
+    let unshrunk_log_fc = match fit.unshrunk_coefficients.as_deref() {
+        Some(unshrunk) => project(unshrunk, input.n_genes, input.n_coef, &narrowed, coef),
+        None => resolved.log_fc.clone(),
+    };
+
+    let scaled = ql
+        .and_then(|q| q.average_ql_dispersion)
+        .map(|a| divide_dispersion(input.dispersion, a));
+    let dispersion = scaled.as_ref().unwrap_or(input.dispersion);
+
+    // The threshold enters as an offset shift along the tested column, so both
+    // bounds are ordinary fits of the same two models on shifted data.
+    let adjustment: Vec<f64> = (0..input.n_samples)
+        .map(|sample| lfc * std::f64::consts::LN_2 * resolved.design[sample * input.n_coef + coef])
+        .collect();
+
+    let mut z_left = threshold_z(
+        input,
+        &resolved.design,
+        &design_null,
+        dispersion,
+        &adjustment,
+        1.0,
+    )?;
+    let mut z_right = threshold_z(
+        input,
+        &resolved.design,
+        &design_null,
+        dispersion,
+        &adjustment,
+        -1.0,
+    )?;
+    for (left, right) in z_left.iter_mut().zip(z_right.iter_mut()) {
+        if *left > *right {
+            std::mem::swap(left, right);
+        }
+    }
+
+    // Under the quasi-likelihood pipeline the two deviance roots are moderated
+    // t statistics, not z, so they are pushed through the t quantile first.
+    let df_total = ql.map(|q| {
+        let df_residual = q.df_residual_zeros.unwrap_or(q.df_residual_adj);
+        let cap = (input.n_genes * (input.n_samples - input.n_coef)) as f64;
+        (0..input.n_genes)
+            .map(|gene| (recycle(q.df_prior, gene) + df_residual[gene]).min(cap))
+            .collect::<Vec<f64>>()
+    });
+    if let (Some(q), Some(df)) = (ql, df_total.as_ref()) {
+        for gene in 0..input.n_genes {
+            let scale = q.s2_post[gene].sqrt();
+            z_left[gene] = zscore_t(z_left[gene] / scale, df[gene])?;
+            z_right[gene] = zscore_t(z_right[gene] / scale, df[gene])?;
+        }
+    }
+
+    for (gene, left) in z_left.iter_mut().enumerate() {
+        let within = unshrunk_log_fc[gene].abs() <= lfc;
+        *left *= if within { 1.0 } else { -1.0 };
+    }
+
+    let mut p_value: Vec<f64> = z_left
+        .par_iter()
+        .zip(z_right.par_iter())
+        .map(|(left, right)| treat_p_value(*left, *right, null))
+        .collect();
+
+    // edgeR's recursive Poisson bound. Note that it re-enters `glmTreat` without
+    // passing `null` through, so the bound is always computed against the
+    // interval null even when the caller asked for the worst case.
+    if let Some(q) = ql
+        && q.df_residual_zeros.is_some()
+    {
+        let below = below_poisson_bound(input, q);
+        if below.iter().any(|b| *b) {
+            let poisson = poisson_refit_treat(input, &narrowed, lfc)?;
+            for (gene, flagged) in below.iter().enumerate() {
+                if *flagged {
+                    p_value[gene] = p_value[gene].max(poisson.p_value[gene]);
+                }
+            }
+        }
+    }
+
+    Ok(GlmTest {
+        log_fc: resolved.log_fc,
+        log_cpm: input.log_cpm.map(<[f64]>::to_vec),
+        statistic: z_right,
+        p_value,
+        df_test: 1.0,
+        df_total,
+    })
 }
 
 ///////////

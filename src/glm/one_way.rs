@@ -15,11 +15,13 @@ use faer::linalg::solvers::Solve;
 use rayon::prelude::*;
 
 use crate::core::expression::check_dispersion;
-use crate::errors::EdgeErrors;
 use crate::glm::one_group::{OneGroupParams, fit_one_gene, initial_coefficient};
+use crate::prelude::*;
 use crate::utils::design::design_as_factor;
-use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+
+////////////
+// Consts //
+////////////
 
 /// Bound on the linear predictor before exponentiating.
 const ETA_CLAMP: f64 = 500.0;
@@ -31,17 +33,22 @@ const ETA_CLAMP: f64 = 500.0;
 /// an infinite coefficient from a finite design.
 const MIN_COEF: f64 = -1e8;
 
+///////////////
+// OneWayFit //
+///////////////
+
 /// Result of a one-way fit.
 #[derive(Clone, Debug)]
 pub struct OneWayFit {
     /// Coefficients, row-major `n_genes * n_coef`.
-    ///
-    /// Expressed in the supplied design's parametrisation, not as group means,
-    /// unless the design was already a group indicator.
     pub coefficients: Vec<f64>,
     /// Fitted means, row-major `n_genes * n_samples`.
     pub fitted: Vec<f64>,
 }
+
+/////////////
+// Helpers //
+/////////////
 
 /// Whether a design is a plain group indicator.
 ///
@@ -62,6 +69,10 @@ fn is_group_indicator(unique_rows: &[f64], n_groups: usize) -> bool {
     let zeros = unique_rows.iter().filter(|v| **v == 0.0).count();
     ones == n_groups && zeros == (n_groups - 1) * n_groups
 }
+
+///////////////
+// Front-end //
+///////////////
 
 /// Fits genewise negative binomial GLMs for a one-way layout.
 ///

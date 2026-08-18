@@ -12,9 +12,11 @@
 use rayon::prelude::*;
 
 use crate::core::expression::check_dispersion;
-use crate::errors::EdgeErrors;
-use crate::utils::recycled::{Recycled, RecycledRow};
-use crate::utils::traits::EdgeFloat;
+use crate::prelude::*;
+
+////////////
+// Consts //
+////////////
 
 /// Bound on the linear predictor before exponentiating, as in the Levenberg fit.
 const ETA_CLAMP: f64 = 500.0;
@@ -32,6 +34,10 @@ const EMPTY_GENE_COEF: f64 = -20.0;
 
 /// Information below which a step is treated as undefined.
 const MIN_INFORMATION: f64 = 1e-300;
+
+////////////////////
+// OneGroupParams //
+////////////////////
 
 /// Tuning knobs for [`mglm_one_group`].
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +61,10 @@ impl Default for OneGroupParams {
         }
     }
 }
+
+///////////////
+// Front end //
+///////////////
 
 /// Fits an intercept-only negative binomial GLM to every gene.
 ///
