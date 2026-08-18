@@ -19,6 +19,7 @@
 
 use rayon::prelude::*;
 
+use crate::core::expression::check_dispersion;
 use crate::errors::EdgeErrors;
 use crate::glm::deviance::unit_nb_deviance;
 use crate::utils::recycled::{Recycled, RecycledRow};
@@ -342,6 +343,7 @@ pub fn mglm_levenberg<T: EdgeFloat>(
         return Err(EdgeErrors::MustBePositive("n_coef".to_string()));
     }
     dispersion.validate(n_genes, n_samples)?;
+    check_dispersion(dispersion)?;
     offset.validate(n_genes, n_samples)?;
     if let Some(w) = weights {
         w.validate(n_genes, n_samples)?;
@@ -649,14 +651,21 @@ mod tests {
     /// ```
     ///
     /// Agreement is asserted to 1e-7 absolute rather than tighter, because
-    /// edgeR's own default `tol = 1e-6` is the binding constraint, not this
-    /// implementation. On the flat gene edgeR reports a slope of
-    /// -0.021851123519974 while the true maximum likelihood estimate is
-    /// -0.021851159884, confirmed independently with
+    /// neither side is at its own maximum at the shared nominal `tol = 1e-6`.
+    /// On the flat gene edgeR reports a slope of -0.021851123519974 while the
+    /// true maximum likelihood estimate is -0.021851159884, confirmed
+    /// independently with
     /// `glm(y ~ x, family = negative.binomial(theta = 10), epsilon = 1e-14)`.
-    /// Tightening `tol` here moves this fit onto that value and away from
-    /// edgeR's, so a tighter assertion would be pinning edgeR's residual
-    /// convergence error rather than anything about correctness.
+    ///
+    /// The algorithm is edgeR's, but the damping schedule and the break
+    /// condition are not identical, and this one stops the earlier of the two:
+    /// on a 40 by 6 fixture at `dispersion = 0.5` it sits 5.7e-4 from its own
+    /// `tol = 1e-14` answer where `mglmLevenberg` at its own `tol = 1e-6` sits
+    /// 2.6e-4 from the same point. Tightened, the two land on each other to
+    /// 1.2e-7, so it is the stopping rule that differs and not the fit. The
+    /// practical consequence is that coefficients agree with edgeR to a few
+    /// parts in 1e3 on overdispersed data, and the tolerance here reflects that
+    /// as much as edgeR's own residual convergence error.
     #[test]
     fn test_matches_edger_glmfit_on_a_continuous_design() {
         let counts = vec![
@@ -1045,5 +1054,24 @@ mod tests {
                 max_relative = 1e-10
             );
         }
+    }
+
+    #[test]
+    fn test_rejects_a_negative_dispersion() {
+        let (counts, design, n_genes, n_samples, n_coef) = fixture();
+        let err = mglm_levenberg(
+            &counts,
+            n_genes,
+            n_samples,
+            &design,
+            n_coef,
+            &Recycled::scalar(-0.1),
+            &Recycled::scalar(0.0),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, EdgeErrors::InvalidDispersion(_)));
     }
 }

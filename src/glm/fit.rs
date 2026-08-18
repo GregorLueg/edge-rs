@@ -12,6 +12,7 @@
 //! failed fit.
 
 use crate::core::dgelist::DgeList;
+use crate::core::expression::{augment_counts, resolve_lib_sizes};
 use crate::glm::deviance::unit_nb_deviance;
 use crate::glm::levenberg::{LevenbergParams, mglm_levenberg};
 use crate::glm::one_way::mglm_one_way;
@@ -189,11 +190,12 @@ pub fn glm_fit<T: EdgeFloat>(
     // Shrinkage refits the augmented data and replaces the coefficients, but
     // keeps the fitted values and deviance from the unshrunk fit, as edgeR does.
     let (coefficients, unshrunk) = if prior_count > 0.0 {
-        let library_sizes: Vec<f64> = (0..n_samples)
-            .map(|j| offset.get(0, j, n_samples).exp())
-            .collect();
+        // Per gene, off the compressed offsets: a gene-varying offset gives a
+        // gene-varying library size, and collapsing it to one row would scale
+        // every gene's prior by the wrong libraries.
+        let library_sizes = resolve_lib_sizes(counts, n_genes, n_samples, None, Some(offset))?;
         let (augmented, augmented_offsets) =
-            add_prior_count(counts, n_genes, n_samples, &library_sizes, prior_count)?;
+            augment_counts(counts, n_genes, n_samples, &library_sizes, prior_count)?;
         let (shrunk, _, _) = fit_dispatch(
             &augmented,
             n_genes,
@@ -201,7 +203,7 @@ pub fn glm_fit<T: EdgeFloat>(
             design,
             n_coef,
             dispersion,
-            &Recycled::by_sample(augmented_offsets),
+            &augmented_offsets,
             weights,
         )?;
         (shrunk, Some(coefficients))
@@ -427,6 +429,75 @@ mod tests {
         assert_eq!(fit.method, FitMethod::OneWay);
         assert_eq!(fit.df_residual, 4);
         assert!(fit.unshrunk_coefficients.is_some());
+    }
+
+    /// Prior-count shrinkage under a gene-varying offset, against edgeR 4.8.2:
+    /// ```r
+    /// y <- matrix(c(10,12,11,40,44,38, 50,48,52,49,51,50, 2,0,5,1,3,0,
+    ///               100,90,110,300,280,320, 1,1,0,8,9,7,
+    ///               500,520,480,505,495,510), nrow = 6, byrow = TRUE)
+    /// X <- cbind(1, c(0,0,0,1,1,1))
+    /// off <- outer(0:5, 0:5, function(g, j) log(1e3 * (1 + 0.25*j*(1 + 0.6*g))))
+    /// glmFit(y, X, dispersion = 0.1, offset = off, prior.count = 0.125)
+    /// ```
+    ///
+    /// The library sizes the prior is scaled by vary by gene here, so a fit that
+    /// took them from one offset row would still get the unshrunk coefficients
+    /// right and the shrunk ones wrong by up to 0.6 on the natural log scale.
+    #[test]
+    fn test_matches_edger_glmfit_with_shrinkage_and_a_gene_varying_offset() {
+        let counts = vec![
+            10.0, 12.0, 11.0, 40.0, 44.0, 38.0, //
+            50.0, 48.0, 52.0, 49.0, 51.0, 50.0, //
+            2.0, 0.0, 5.0, 1.0, 3.0, 0.0, //
+            100.0, 90.0, 110.0, 300.0, 280.0, 320.0, //
+            1.0, 1.0, 0.0, 8.0, 9.0, 7.0, //
+            500.0, 520.0, 480.0, 505.0, 495.0, 510.0, //
+        ];
+        let design = vec![
+            1.0, 0.0, //
+            1.0, 0.0, //
+            1.0, 0.0, //
+            1.0, 1.0, //
+            1.0, 1.0, //
+            1.0, 1.0, //
+        ];
+        let offsets: Vec<f64> = (0..6)
+            .flat_map(|g| {
+                (0..6).map(move |j| (1e3 * (1.0 + 0.25 * j as f64 * (1.0 + 0.6 * g as f64))).ln())
+            })
+            .collect();
+
+        let fit = glm_fit(
+            &counts,
+            6,
+            6,
+            &design,
+            2,
+            &Recycled::scalar(0.1),
+            &Recycled::full(offsets, 6, 6).unwrap(),
+            None,
+            DEFAULT_PRIOR_COUNT,
+        )
+        .unwrap();
+
+        let expected = [
+            -4.71385797554227,
+            0.8317728696432809,
+            -3.2854254113008703,
+            -0.6503664257070851,
+            -6.475901113939795,
+            -1.1813613300490617,
+            -2.7255694787676576,
+            0.206162145980485,
+            -7.799915823609166,
+            1.5260709158222285,
+            -1.186163762454638,
+            -1.0830875826258086,
+        ];
+        for (got, want) in fit.coefficients.iter().zip(expected.iter()) {
+            assert_relative_eq!(got, want, epsilon = 1e-11, max_relative = 1e-11);
+        }
     }
 
     /// Shrinkage must pull a fold change towards zero, and must leave the

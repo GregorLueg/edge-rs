@@ -14,6 +14,7 @@ use faer::MatRef;
 use faer::linalg::solvers::Solve;
 use rayon::prelude::*;
 
+use crate::core::expression::check_dispersion;
 use crate::errors::EdgeErrors;
 use crate::glm::one_group::{OneGroupParams, fit_one_gene, initial_coefficient};
 use crate::utils::design::design_as_factor;
@@ -115,6 +116,7 @@ pub fn mglm_one_way<T: EdgeFloat>(
         });
     }
     dispersion.validate(n_genes, n_samples)?;
+    check_dispersion(dispersion)?;
     offset.validate(n_genes, n_samples)?;
     if let Some(w) = weights {
         w.validate(n_genes, n_samples)?;
@@ -452,6 +454,25 @@ mod tests {
     fn test_is_group_indicator_recognises_both_forms() {
         assert!(is_group_indicator(&[1.0, 0.0, 0.0, 1.0], 2));
         assert!(!is_group_indicator(&[1.0, 0.0, 1.0, 1.0], 2));
+    }
+
+    #[test]
+    fn test_rejects_a_negative_dispersion() {
+        let (counts, n_genes, n_samples) = fixture();
+        let err = mglm_one_way(
+            &counts,
+            n_genes,
+            n_samples,
+            &treatment_design(),
+            2,
+            None,
+            &Recycled::scalar(-0.1),
+            &Recycled::scalar(0.0),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, EdgeErrors::InvalidDispersion(_)));
     }
 
     #[test]

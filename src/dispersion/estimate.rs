@@ -55,6 +55,12 @@ const MAX_PRIOR_N: f64 = 1e6;
 /// adjusting the residual degrees of freedom.
 const ZERO_TOLERANCE: f64 = 1e-4;
 
+/// Prior count used when the trend covariate is recomputed internally.
+///
+/// `aveLogCPM`'s own default, which is what `estimateDisp.default` calls it
+/// with.
+const AVE_LOG_CPM_PRIOR_COUNT: f64 = 2.0;
+
 /////////////////
 // TrendMethod //
 /////////////////
@@ -684,15 +690,18 @@ pub fn residual_df<T: EdgeFloat>(
 /// * `offset` - Log-scale offsets
 /// * `weights` - Optional observation weights
 /// * `ave_log_cpm` - Average log2 counts per million per gene, the trend
-///   covariate. Required unless the trend method is [`TrendMethod::None`].
+///   covariate. `None` recomputes it internally once the common dispersion is
+///   known, which is what `estimateDisp.default` does; anything supplied here
+///   overrides that. The recomputed covariate ignores `weights`, which
+///   [`crate::core::expression::ave_log_cpm`] does not take.
 /// * `prior_df` - Prior degrees of freedom for the tagwise shrinkage. Supply
 ///   `None` in `params` to let the caller pass it here instead.
 /// * `params` - Tuning knobs, or [`EstimateDispParams::default`]
 ///
 /// ### Returns
 ///
-/// The estimates, or [`EdgeErrors`] if the shapes disagree, there are no
-/// residual degrees of freedom, or a trend was requested without a covariate.
+/// The estimates, or [`EdgeErrors`] if the shapes disagree or there are no
+/// residual degrees of freedom.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_disp<T: EdgeFloat>(
     counts: &[T],
@@ -724,11 +733,6 @@ pub fn estimate_disp<T: EdgeFloat>(
     }
     if params.grid_length < 2 {
         return Err(EdgeErrors::MustBePositive("grid_length".to_string()));
-    }
-    if params.trend_method != TrendMethod::None && ave_log_cpm.is_none() {
-        return Err(EdgeErrors::InvalidArgument(
-            "a trended dispersion needs ave_log_cpm as the covariate".to_string(),
-        ));
     }
     if let Some(a) = ave_log_cpm
         && a.len() != n_genes
@@ -789,7 +793,24 @@ pub fn estimate_disp<T: EdgeFloat>(
     }
     let common = GRID_CENTRE * 2.0_f64.powf(maximize_interpolant(&spline_pts, &summed)?);
 
-    let covariate: Option<Vec<f64>> = ave_log_cpm.map(|a| kept.iter().map(|&g| a[g]).collect());
+    // edgeR recomputes the covariate here, at the dispersion it has just
+    // estimated, and over the full matrix before subsetting to the kept genes.
+    let recomputed: Option<Vec<f64>> = match (ave_log_cpm, params.trend_method) {
+        (None, TrendMethod::None) => None,
+        (None, _) => Some(crate::core::expression::ave_log_cpm(
+            counts,
+            n_genes,
+            n_samples,
+            None,
+            Some(offset),
+            AVE_LOG_CPM_PRIOR_COUNT,
+            Some(&Recycled::scalar(common)),
+        )?),
+        (Some(_), _) => None,
+    };
+    let covariate: Option<Vec<f64>> = ave_log_cpm
+        .or(recomputed.as_deref())
+        .map(|a| kept.iter().map(|&g| a[g]).collect());
 
     // Trended dispersion.
     let trend_fit = wleb(
@@ -1073,6 +1094,124 @@ mod tests {
         let tagwise = out.tagwise.as_ref().unwrap();
         for (got, want) in tagwise.iter().zip(expected_trended.iter()) {
             assert_relative_eq!(got, want, max_relative = 1e-4);
+        }
+    }
+
+    /// A 40 gene by 6 sample run from raw counts, with no covariate supplied.
+    ///
+    /// ```r
+    /// set.seed(23); n <- 40
+    /// y <- matrix(rnbinom(n*6, mu = rep(c(20,200,2000,50), length.out = n),
+    ///                     size = 1/0.2), nrow = n)
+    /// X <- cbind(1, c(0,0,0,1,1,1))
+    /// d <- estimateDisp(DGEList(counts = y), design = X, robust = FALSE)
+    /// ```
+    ///
+    /// This is the one test that does *not* hand in edgeR's own `AveLogCPM`, so
+    /// it is what pins the two-pass structure: edgeR recomputes the covariate at
+    /// the common dispersion before smoothing, and a covariate taken at any
+    /// other dispersion moves the trend by around 2e-3 relative and the prior
+    /// degrees of freedom by 7e-3.
+    #[test]
+    fn test_matches_edger_estimate_disp_from_raw_counts() {
+        #[rustfmt::skip]
+        let counts: Vec<f64> = vec![
+            17.0, 25.0, 2.0, 26.0, 27.0, 13.0,
+            176.0, 236.0, 33.0, 206.0, 318.0, 103.0,
+            2847.0, 2053.0, 917.0, 1262.0, 917.0, 2824.0,
+            32.0, 68.0, 34.0, 74.0, 55.0, 46.0,
+            15.0, 31.0, 7.0, 20.0, 17.0, 26.0,
+            285.0, 244.0, 142.0, 102.0, 195.0, 176.0,
+            2480.0, 1518.0, 4296.0, 1742.0, 1211.0, 1925.0,
+            45.0, 48.0, 65.0, 27.0, 24.0, 37.0,
+            9.0, 9.0, 17.0, 40.0, 15.0, 11.0,
+            234.0, 178.0, 133.0, 317.0, 171.0, 265.0,
+            2470.0, 964.0, 1813.0, 3782.0, 3897.0, 2419.0,
+            50.0, 54.0, 71.0, 30.0, 96.0, 66.0,
+            17.0, 19.0, 20.0, 16.0, 24.0, 15.0,
+            136.0, 255.0, 133.0, 290.0, 212.0, 73.0,
+            4500.0, 1122.0, 3483.0, 1744.0, 3759.0, 311.0,
+            40.0, 39.0, 77.0, 54.0, 75.0, 76.0,
+            24.0, 67.0, 22.0, 31.0, 13.0, 25.0,
+            327.0, 101.0, 209.0, 325.0, 99.0, 196.0,
+            1040.0, 1448.0, 5378.0, 2157.0, 1217.0, 2719.0,
+            46.0, 55.0, 78.0, 41.0, 32.0, 41.0,
+            21.0, 11.0, 25.0, 23.0, 20.0, 35.0,
+            298.0, 244.0, 87.0, 255.0, 127.0, 81.0,
+            2509.0, 1644.0, 1600.0, 2614.0, 956.0, 1586.0,
+            32.0, 27.0, 38.0, 92.0, 40.0, 46.0,
+            20.0, 22.0, 11.0, 19.0, 31.0, 10.0,
+            141.0, 175.0, 266.0, 221.0, 160.0, 260.0,
+            1912.0, 1477.0, 1289.0, 3091.0, 2318.0, 1848.0,
+            26.0, 48.0, 97.0, 21.0, 25.0, 35.0,
+            5.0, 17.0, 9.0, 22.0, 20.0, 31.0,
+            126.0, 92.0, 90.0, 80.0, 191.0, 139.0,
+            3536.0, 2158.0, 2899.0, 2438.0, 1857.0, 685.0,
+            88.0, 41.0, 71.0, 26.0, 26.0, 22.0,
+            26.0, 10.0, 13.0, 28.0, 16.0, 9.0,
+            154.0, 180.0, 103.0, 132.0, 160.0, 256.0,
+            2176.0, 1381.0, 2288.0, 1559.0, 2375.0, 1604.0,
+            44.0, 64.0, 41.0, 58.0, 106.0, 80.0,
+            22.0, 6.0, 18.0, 7.0, 24.0, 29.0,
+            362.0, 131.0, 172.0, 87.0, 199.0, 122.0,
+            1037.0, 1399.0, 1746.0, 2543.0, 1242.0, 1027.0,
+            32.0, 70.0, 31.0, 62.0, 17.0, 56.0,
+        ];
+        #[rustfmt::skip]
+        let expected_trended: [f64; 40] = [
+            0.21837504923102202, 0.22114546362792034, 0.2207356614118576,
+            0.21954588311037646, 0.21846250557172514, 0.22120500474232507,
+            0.2207104807147686, 0.21924797561694073, 0.2182110764964012,
+            0.22129296391927716, 0.22067465471360104, 0.2197338099466015,
+            0.21835579687872922, 0.2211499594361139, 0.22069147729507904,
+            0.21969264304075797, 0.21897599759625927, 0.2212356026936647,
+            0.22069610935881623, 0.2194446572454325, 0.21856729661997779,
+            0.22112342066785085, 0.2207444962081235, 0.21936070003926927,
+            0.21838331118383023, 0.22126462166732655, 0.22072318510741426,
+            0.21926611932667234, 0.21833074164156294, 0.22063812831499874,
+            0.22070442150405675, 0.21932213440294568, 0.21821457465100513,
+            0.2210574343681132, 0.22073532634315018, 0.2198600681493942,
+            0.21829957882093082, 0.22106976140409162, 0.22078396671589307,
+            0.21939963897624193,
+        ];
+        #[rustfmt::skip]
+        let expected_tagwise: [f64; 40] = [
+            0.26264323176063703, 0.28243591028679577, 0.24977981840001498,
+            0.21885006624029352, 0.2426969638226232, 0.2184480506608656,
+            0.20336812379373626, 0.19749111797121818, 0.21122405343224196,
+            0.2048097847793373, 0.19578217804982176, 0.21847120120941918,
+            0.19613526417311763, 0.2374059564656287, 0.27989535766298096,
+            0.19936502301217643, 0.2501474523439529, 0.21709189939212875,
+            0.24636531239932158, 0.19513279743284845, 0.19958497564795658,
+            0.23741175183867438, 0.20676320027566777, 0.19542968523532167,
+            0.21792494189834125, 0.20473215339372977, 0.1961486645415931,
+            0.22381094320449546, 0.22567430214578674, 0.20952784298268654,
+            0.20736503372276133, 0.18844561958013636, 0.2051890784540556,
+            0.22208529362992852, 0.19468134790483918, 0.21335200722389336,
+            0.23142983650712093, 0.2153323241218121, 0.20699543541717647,
+            0.2504739292780125,
+        ];
+        let design = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let libraries: [f64; 6] = [27357.0, 17731.0, 27824.0, 25664.0, 22284.0, 19328.0];
+        let offset = Recycled::by_sample(libraries.iter().map(|v| v.ln()).collect());
+
+        let out = estimate_disp(&counts, 40, 6, &design, 2, &offset, None, None, None).unwrap();
+
+        assert_relative_eq!(out.common, 0.21796291038648624, max_relative = 1e-12);
+        assert_relative_eq!(out.span, 1.0, max_relative = 1e-12);
+        assert_relative_eq!(
+            out.prior_df.as_ref().unwrap()[0],
+            24.50373429920392,
+            max_relative = 1e-11
+        );
+
+        let trended = out.trended.as_ref().unwrap();
+        for (got, want) in trended.iter().zip(expected_trended.iter()) {
+            assert_relative_eq!(got, want, max_relative = 1e-12);
+        }
+        let tagwise = out.tagwise.as_ref().unwrap();
+        for (got, want) in tagwise.iter().zip(expected_tagwise.iter()) {
+            assert_relative_eq!(got, want, max_relative = 1e-11);
         }
     }
 

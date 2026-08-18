@@ -21,16 +21,32 @@
 //!
 //! ### What comes from `statrs` and what does not
 //!
-//! The incomplete beta `beta_reg` and `ln_gamma` come from `statrs` and hold to
-//! about 1e-13, dropping to 1e-12 past `beta_reg`'s internal symmetry swap
-//! where it returns `1 - I(1-x)`. Three things do not:
+//! The incomplete beta `beta_reg` and `ln_gamma` come from `statrs`, and so
+//! does `norm_ppf`, through `statrs::function::erf::erfc_inv`. How well they
+//! hold depends on which end of the distribution is being read. Measured
+//! against R 4.5:
+//!
+//! * The small tails, which is where every p-value and every quantile edgeR
+//!   reports comes from, are good to 1e-14 or better: `chisq_sf(200, 1)`
+//!   1.1e-14 relative, `norm_sf(8)` 6.3e-16, `beta_cdf(1e-12, 0.3, 0.7)`
+//!   8.8e-16, `beta_ppf(1e-12, 0.3, 0.7)` 8.6e-16, `gamma_ppf(1e-12, 2.5, 1)`
+//!   2.9e-15, `t_ppf(1e-12, 5)` 8.7e-16, and `norm_ppf` 2e-16 from `p = 1e-300`
+//!   upwards.
+//! * The near-one tails are three to five orders worse, because they come out
+//!   of `beta_reg`'s internal symmetry swap `1 - I(1-x)` and lose the
+//!   cancellation: `f_sf(2, 1, 1e5)` is 4.2e-10 relative and
+//!   `beta_sf(1e-12, 0.3, 0.7)` 1.4e-9. Nothing in edgeR is read from that end,
+//!   but do not quote these functions as full precision either way.
+//!
+//! Three things are not taken from `statrs`:
 //!
 //! * `statrs::function::erf` carries Boost's *single* precision coefficient
 //!   tables (`b = 0.3440242112` and friends, ten digits) on the `f64` path, so
 //!   `erfc` is only good to about 4e-11 for arguments above 0.5. Since
 //!   `erfc(z) = Q(1/2, z^2)`, the normal tails are built from the incomplete
 //!   gamma below instead, which costs a handful of iterations and buys three
-//!   digits.
+//!   digits. `erfc_inv` is a different routine and does not inherit that, which
+//!   is why `norm_ppf` is left on it.
 //! * `statrs::function::gamma::gamma_lr` returns a flat `0.0` for any
 //!   `x < 1.1e-15`, which puts a floor under `gamma_cdf` and strands the gamma
 //!   quantile solver on a plateau for small shapes.

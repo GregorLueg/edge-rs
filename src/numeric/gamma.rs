@@ -218,8 +218,9 @@ pub fn trigamma_inverse(x: f64) -> f64 {
         let tri = trigamma(y);
         let dif = tri * (1.0 - tri / x) / polygamma(2, y);
         y += dif;
-        // A Newton step can overshoot past the pole at zero on a bad start;
-        // limma resets rather than returning a negative root.
+        // A Newton step can overshoot past the pole at zero on a bad start.
+        // limma has no such reset; this guard is ours, and restarting from `x`
+        // is cheaper than returning a root the function has no business having.
         if y <= 0.0 {
             y = x;
         }

@@ -170,7 +170,7 @@ fn check_gene_length(
 /// ### Returns
 ///
 /// `Ok(())`, or [`EdgeErrors::InvalidDispersion`] naming the offending value.
-fn check_dispersion(dispersion: &Recycled<f64>) -> Result<(), EdgeErrors> {
+pub(crate) fn check_dispersion(dispersion: &Recycled<f64>) -> Result<(), EdgeErrors> {
     let stored: &[f64] = match dispersion {
         Recycled::Scalar(v) => std::slice::from_ref(v),
         Recycled::ByGene(v) | Recycled::BySample(v) | Recycled::Full(v) => v,
@@ -224,7 +224,7 @@ pub(crate) fn column_sums<T: EdgeFloat>(values: &[T], n_samples: usize) -> Vec<f
 /// The library sizes on the natural scale, in the same recycled form the offset
 /// arrived in, or [`EdgeErrors`] if a length disagrees or a size is not
 /// positive.
-fn resolve_lib_sizes<T: EdgeFloat>(
+pub(crate) fn resolve_lib_sizes<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,
     n_samples: usize,
@@ -321,7 +321,7 @@ fn add_prior_count_row<T: EdgeFloat>(
 /// ### Returns
 ///
 /// The augmented counts, row-major, and the log of the adjusted library sizes.
-fn augment_counts<T: EdgeFloat>(
+pub(crate) fn augment_counts<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,
     n_samples: usize,

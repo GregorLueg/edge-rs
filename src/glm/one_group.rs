@@ -11,6 +11,7 @@
 
 use rayon::prelude::*;
 
+use crate::core::expression::check_dispersion;
 use crate::errors::EdgeErrors;
 use crate::utils::recycled::{Recycled, RecycledRow};
 use crate::utils::traits::EdgeFloat;
@@ -98,6 +99,7 @@ pub fn mglm_one_group<T: EdgeFloat>(
         });
     }
     dispersion.validate(n_genes, n_samples)?;
+    check_dispersion(dispersion)?;
     offset.validate(n_genes, n_samples)?;
     if let Some(w) = weights {
         w.validate(n_genes, n_samples)?;

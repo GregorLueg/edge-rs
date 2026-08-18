@@ -134,6 +134,18 @@ pub trait EdgeSimd: Sized + Copy {
     /// ### Params
     ///
     /// * `x` - Values to exponentiate, modified in place
+    ///
+    /// Note that each tier vectorises what it can and hands the remainder down,
+    /// and the last tier calls libm. `wide`'s polynomial and libm disagree in
+    /// the last ulp, so the same input value can come back with two different
+    /// bit patterns depending on where in the slice it sits, on the slice
+    /// length, and on which tier the machine dispatched to: `vec![0.37; n]`
+    /// gives two distinct patterns for every odd `n`. This is elementwise rather
+    /// than a reassociation, so it is a stronger caveat than the one on
+    /// [`EdgeSimd::sum_simd`], but the magnitude is still one ulp and nothing in
+    /// the crate depends on it. The vector lanes also flush a deep underflow to
+    /// zero where libm returns a subnormal: `exp(-745.0)` is exactly 0 in a
+    /// lane, 5e-324 in the tail.
     fn exp_in_place_simd(x: &mut [Self]);
 }
 
