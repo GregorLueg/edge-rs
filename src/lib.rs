@@ -36,9 +36,11 @@
 pub mod core;
 pub mod dispersion;
 pub mod errors;
+pub mod exact;
 pub mod glm;
 pub mod limma;
 pub mod numeric;
 pub mod prelude;
 pub mod ql;
+pub mod results;
 pub mod utils;
