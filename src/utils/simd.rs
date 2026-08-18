@@ -11,24 +11,6 @@
 //! ladder matters here because the hot caller is `linear_predictor`, which dots
 //! design rows of two to ten elements: a single-width kernel would drop those
 //! straight to scalar.
-//!
-//! The primitives come from `wide`, whose `f64x8` and `f32x16` compile to real
-//! `__m512d`/`__m512` under `target_feature = "avx512f"` and to two 256-bit
-//! halves otherwise. The 512-bit bodies are `cfg`-gated on that feature and fall
-//! back to the 256-bit kernel when it is off, so the runtime check guards
-//! correctness while the `cfg` decides whether the wide bodies exist at all.
-//! Nothing in this crate sets `target-cpu`, so a stock build compiles every tier
-//! to the SSE2/NEON baseline; consumers who want the 512-bit path build with
-//! `-C target-cpu=x86-64-v4` (or `native`). Use the `target-cpu` form, not a
-//! bare `-C target-feature=+avx512f`: `wide` 1.6.1 picks `i32x16`'s layout on
-//! `avx512f` but its `abs` on `avx512bw`, so the narrower flag fails to compile
-//! inside `wide` itself. None of this is benchmarked yet, there being no
-//! AVX-512 hardware to hand.
-//!
-//! Only general primitives live here. Fused kernels (negative binomial unit
-//! deviance, the working-weight outer product) arrive with the modules that
-//! consume them, so they can be measured against the scalar form rather than
-//! assumed faster.
 
 use std::sync::OnceLock;
 

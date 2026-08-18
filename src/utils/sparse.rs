@@ -18,14 +18,20 @@
 //! `(n_genes, n_cells)`, the gene-major layout every algorithm here wants.
 //! `transpose` is the whole adapter.
 
-use crate::errors::EdgeErrors;
+use crate::prelude::*;
+
+//////////////////
+// SparseFormat //
+//////////////////
 
 /// Which axis a compressed sparse matrix is compressed along.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SparseFormat {
-    /// Compressed sparse row: `indptr` walks rows, `indices` holds column indices.
+    /// Compressed sparse row: `indptr` walks rows, `indices` holds column
+    /// indices.
     Csr,
-    /// Compressed sparse column: `indptr` walks columns, `indices` holds row indices.
+    /// Compressed sparse column: `indptr` walks columns, `indices` holds row
+    /// indices.
     Csc,
 }
 
@@ -43,6 +49,10 @@ impl SparseFormat {
         }
     }
 }
+
+//////////////////////
+// CompressedSparse //
+//////////////////////
 
 /// A sparse matrix in compressed row or column form.
 ///
@@ -97,8 +107,8 @@ impl<T: Copy> CompressedSparse<T> {
 
     /// Checks the structural invariants.
     ///
-    /// Verifies that `data` and `indices` agree in length, that `indptr` has the
-    /// right length and is non-decreasing, that it ends at the number of
+    /// Verifies that `data` and `indices` agree in length, that `indptr` has
+    /// the right length and is non-decreasing, that it ends at the number of
     /// non-zeros, and that every index is inside the non-compressed axis.
     ///
     /// ### Returns

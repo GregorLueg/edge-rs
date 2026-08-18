@@ -14,15 +14,26 @@
 use faer::MatRef;
 use rustc_hash::FxHashMap;
 
-use crate::errors::EdgeErrors;
+use crate::prelude::*;
+
+////////////
+// Consts //
+////////////
 
 /// Multiplier edgeR uses to hash a design row down to one number.
 ///
-/// `designAsFactor` forms `sum_j design[i, j] * z^j` with `z = (e + pi) / 5` and
-/// treats rows sharing a value as the same group. The constant is arbitrary but
-/// must match edgeR exactly: it decides whether `glm_fit` takes the one-way
+/// `designAsFactor` forms `sum_j design[i, j] * z^j` with `z = (e + pi) / 5`
+/// and treats rows sharing a value as the same group. The constant is arbitrary
+/// but must match edgeR exactly: it decides whether `glm_fit` takes the one-way
 /// path or the Levenberg path, and the two do not agree to the last digit.
 const FACTOR_HASH_BASE: f64 = (std::f64::consts::E + std::f64::consts::PI) / 5.0;
+
+/// limma's defaults for [`choose_lowess_span`]: `small_n`, `min_span`, `power`.
+pub const LIMMA_LOWESS_DEFAULTS: (usize, f64, f64) = (50, 0.3, 1.0 / 3.0);
+
+/////////////
+// Helpers //
+/////////////
 
 /// Wraps a row-major slice as a faer matrix, checking the shape first.
 ///
@@ -49,6 +60,10 @@ fn as_matrix(design: &[f64], n_rows: usize, n_cols: usize) -> Result<MatRef<'_, 
     }
     Ok(MatRef::from_row_major_slice(design, n_rows, n_cols))
 }
+
+///////////////
+// Front end //
+///////////////
 
 /// Numerical rank of a design matrix.
 ///
@@ -166,10 +181,10 @@ pub fn hat_diagonal(design: &[f64], n_rows: usize, n_cols: usize) -> Result<Vec<
 /// Groups samples by their design row.
 ///
 /// Reproduces edgeR's `designAsFactor`: hash each row to a single number with
-/// [`FACTOR_HASH_BASE`], then label the distinct values in ascending order. When
-/// the number of groups equals the number of coefficients, `glm_fit` can use the
-/// closed-form one-way fit instead of the iterative Levenberg one, so this is on
-/// the hot path for every bulk analysis.
+/// [`FACTOR_HASH_BASE`], then label the distinct values in ascending order.
+/// When the number of groups equals the number of coefficients, `glm_fit` can
+/// use the closed-form one-way fit instead of the iterative Levenberg one, so
+/// this is on the hot path for every bulk analysis.
 ///
 /// Rows are matched on the exact `f64` hash, as in edgeR. Two rows that differ
 /// only by rounding therefore land in different groups, which is the intended
@@ -228,9 +243,9 @@ pub fn design_as_factor(
     Ok((groups, sorted.len()))
 }
 
-///////////////////////////
+////////////////////////////
 // Contrast reformulation //
-///////////////////////////
+////////////////////////////
 
 /// A design rewritten so that a contrast becomes a coefficient.
 #[derive(Clone, Debug)]
@@ -245,8 +260,8 @@ pub struct ContrastDesign {
 /// Rewrites a design matrix so that a contrast becomes one of its coefficients.
 ///
 /// A likelihood ratio test drops the tested columns and refits, so testing an
-/// arbitrary contrast means first rotating the design until that contrast *is* a
-/// column. Port of limma's `contrastAsCoef`, which edgeR's `glmLRT` and
+/// arbitrary contrast means first rotating the design until that contrast *is*
+/// a column. Port of limma's `contrastAsCoef`, which edgeR's `glmLRT` and
 /// `glmQLFTest` both go through whenever a contrast rather than a coefficient
 /// index is supplied.
 ///
@@ -254,8 +269,8 @@ pub struct ContrastDesign {
 /// triangular solve against `R` so the new coefficient reads as the contrast
 /// itself rather than a scaled version of it. Note that the sign of `Q` is not
 /// pinned down by the factorisation, but the contrast columns come out
-/// sign-invariant because the `R` solve carries the same sign; only the nuisance
-/// columns can flip, and their span, hence the fit, is unchanged.
+/// sign-invariant because the `R` solve carries the same sign; only the
+/// nuisance columns can flip, and their span, hence the fit, is unchanged.
 ///
 /// ### Params
 ///
@@ -361,9 +376,6 @@ pub fn contrast_as_coef(
 
     Ok(ContrastDesign { design: out, coef })
 }
-
-/// limma's defaults for [`choose_lowess_span`]: `small_n`, `min_span`, `power`.
-pub const LIMMA_LOWESS_DEFAULTS: (usize, f64, f64) = (50, 0.3, 1.0 / 3.0);
 
 /// Lowess span for a given number of observations.
 ///

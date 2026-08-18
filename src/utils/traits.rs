@@ -1,8 +1,6 @@
 //! Shared trait boundaries for the crate.
 //!
-//! `EdgeFloat` is the bound every algorithm in `edge-rs` is generic over. It
-//! deliberately mirrors `AnnSearchFloat` and `BixverseFloat` in the sister
-//! crates so that wiring `edge-rs` into `bixverse-rs` later is mechanical.
+//! `EdgeFloat` is the bound every algorithm in `edge-rs` is generic over.
 //!
 //! Note the split documented in the crate root: `EdgeFloat` covers the data
 //! layer (counts, offsets, fitted values), while likelihood evaluation,
@@ -27,10 +25,10 @@ use crate::utils::simd::EdgeSimd;
 /// both satisfy it.
 ///
 /// The bounds break down as: `Float`/`FromPrimitive`/`ToPrimitive` for the
-/// numerics, `ComplexField`/`RealField` for faer interoperability, `Send`/`Sync`
-/// for the rayon fan-out over genes, `EdgeSimd` for the vectorised kernels, and
-/// `TotalOrder` for the sorts in normalisation, which must be deterministic in
-/// the presence of NaN rather than merely fast.
+/// numerics, `ComplexField`/`RealField` for faer interoperability,
+/// `Send`/`Sync` for the rayon fan-out over genes, `EdgeSimd` for the
+/// vectorised kernels, and `TotalOrder` for the sorts in normalisation, which
+/// must be deterministic in the presence of NaN rather than merely fast.
 pub trait EdgeFloat:
     Float
     + FromPrimitive

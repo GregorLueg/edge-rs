@@ -4,17 +4,12 @@
 //! `n_genes` by `n_samples`, and are almost never actually that big. A library
 //! size offset varies by sample only. A tagwise dispersion varies by gene only.
 //! A common dispersion is one number.
-//!
-//! edgeR carries a `compressedMatrix` for exactly this reason, but edgePython
-//! expands it to a dense array at nearly every call site, which throws the
-//! saving away. Here the compressed form survives all the way into the inner
-//! loops: consumers ask for a gene's row and get back either a constant or a
-//! slice, never a freshly allocated vector.
-//!
-//! The saving is not marginal on the single-cell path. At 30k genes by 200k
-//! cells, a `BySample` offset is 1.6 MB and the expanded form is 48 GB.
 
-use crate::errors::EdgeErrors;
+use crate::prelude::*;
+
+//////////////
+// Recycled //
+//////////////
 
 /// A logically `n_genes` by `n_samples` matrix stored in whatever form it
 /// actually varies in.
@@ -29,6 +24,10 @@ pub enum Recycled<T> {
     /// A full matrix, row-major, `n_genes * n_samples` values.
     Full(Vec<T>),
 }
+
+/////////////////
+// RecycledRow //
+/////////////////
 
 /// One gene's row of a [`Recycled`], borrowed rather than materialised.
 ///
