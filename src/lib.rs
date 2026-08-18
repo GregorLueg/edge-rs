@@ -34,5 +34,6 @@
 #![warn(missing_docs)]
 
 pub mod errors;
+pub mod numeric;
 pub mod prelude;
 pub mod utils;
