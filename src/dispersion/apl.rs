@@ -3,18 +3,9 @@
 //! The dispersion cannot be estimated from the profile likelihood directly:
 //! profiling out the coefficients biases it downwards, badly so when the design
 //! has many columns relative to the samples. Cox and Reid's adjustment corrects
-//! for that by subtracting half the log determinant of the observed information,
-//! `-0.5 log|X'WX|`, which is what makes edgeR's dispersion estimates usable on
-//! small experiments.
-//!
-//! ### Layout
-//!
-//! [`apl_grid`] is the workhorse, evaluated at every point of a dispersion grid
-//! for every gene. edgePython loops the grid outside and vectorises genes
-//! inside, which materialises an `(n_genes, n_samples, n_grid)` `gammaln`
-//! broadcast. Here the loops are inverted: genes outside, grid inside. Each
-//! gene's counts are read once and stay in cache across all grid points, and
-//! nothing larger than the output is ever allocated.
+//! for that by subtracting half the log determinant of the observed
+//! information, `-0.5 log|X'WX|`, which is what makes edgeR's dispersion
+//! estimates usable on small experiments.
 //!
 //! ### References
 //!
@@ -23,13 +14,15 @@
 
 use rayon::prelude::*;
 
-use crate::errors::EdgeErrors;
 use crate::glm::levenberg::{LevenbergParams, Scratch};
 use crate::glm::one_group::{OneGroupParams, fit_one_gene as fit_one_group_gene};
 use crate::numeric::gamma::ln_gamma;
+use crate::prelude::*;
 use crate::utils::design::design_as_factor;
-use crate::utils::recycled::{Recycled, RecycledRow};
-use crate::utils::traits::EdgeFloat;
+
+////////////
+// Consts //
+////////////
 
 /// Floor applied to fitted means and working weights.
 const MIN_POSITIVE: f64 = 1e-300;
@@ -44,6 +37,50 @@ const ETA_CLAMP: f64 = 500.0;
 /// infinite adjustment and take the whole grid with it. Clamping matches
 /// edgeR's LDL path, which floors the same quantity.
 const PIVOT_FLOOR: f64 = 1e-10;
+
+/////////////////
+// GeneScratch //
+/////////////////
+
+/// Per-thread buffers for the grid sweep.
+struct GeneScratch {
+    /// Counts for the current gene, widened to `f64`.
+    y: Vec<f64>,
+    /// Fitted means at the current grid point.
+    mu: Vec<f64>,
+    /// Information matrix, row-major.
+    information: Vec<f64>,
+    /// Coefficients, reused as a warm start across grid points.
+    beta: Vec<f64>,
+    /// Scratch for the general Levenberg path.
+    levenberg: Scratch,
+}
+
+impl GeneScratch {
+    /// Allocates scratch for one worker.
+    ///
+    /// ### Params
+    ///
+    /// * `n_samples` - Number of samples
+    /// * `n_coef` - Number of coefficients
+    ///
+    /// ### Returns
+    ///
+    /// Buffers sized for a single gene across the whole grid.
+    fn new(n_samples: usize, n_coef: usize) -> Self {
+        Self {
+            y: vec![0.0; n_samples],
+            mu: vec![0.0; n_samples],
+            information: vec![0.0; n_coef * n_coef],
+            beta: vec![0.0; n_coef],
+            levenberg: Scratch::new(n_samples, n_coef),
+        }
+    }
+}
+
+/////////////
+// Helpers //
+/////////////
 
 /// Cox-Reid adjustment `-0.5 log|X'WX|` from the assembled information matrix.
 ///
@@ -86,8 +123,8 @@ fn cox_reid_adjustment(xtwx: &mut [f64], n_coef: usize) -> f64 {
 
 /// Negative binomial log-likelihood of one gene at a given dispersion.
 ///
-/// Falls back to the Poisson likelihood at zero dispersion, where `1/phi` is not
-/// defined.
+/// Falls back to the Poisson likelihood at zero dispersion, where `1/phi` is
+/// not defined.
 ///
 /// ### Params
 ///
@@ -169,12 +206,97 @@ fn assemble_information(
     // The Cholesky reads the lower triangle only, so the upper is left alone.
 }
 
+/// Fits one gene on the one-way path and writes its fitted means.
+///
+/// ### Params
+///
+/// * `scratch` - Per-thread buffers
+/// * `members` - Sample indices per group
+/// * `dispersion` - Dispersion row
+/// * `offset` - Offset row
+/// * `weights` - Optional weight row
+/// * `n_samples` - Number of samples
+fn fit_one_way_gene(
+    scratch: &mut GeneScratch,
+    members: &[Vec<usize>],
+    dispersion: RecycledRow<'_, f64>,
+    offset: RecycledRow<'_, f64>,
+    weights: Option<RecycledRow<'_, f64>>,
+    n_samples: usize,
+) {
+    let params = OneGroupParams::default();
+
+    for group_members in members.iter() {
+        let start =
+            crate::glm::one_group::initial_coefficient(&scratch.y, group_members, offset, weights);
+        let coef = fit_one_group_gene(
+            &scratch.y,
+            group_members,
+            dispersion,
+            offset,
+            weights,
+            start,
+            &params,
+        );
+        for &sample in group_members {
+            let eta = (coef + offset.get(sample)).clamp(-ETA_CLAMP, ETA_CLAMP);
+            scratch.mu[sample] = eta.exp().max(MIN_POSITIVE);
+        }
+    }
+    let _ = n_samples;
+}
+
+/// Fits one gene on the general path and writes its fitted means.
+///
+/// ### Params
+///
+/// * `scratch` - Per-thread buffers
+/// * `design` - Row-major design
+/// * `n_samples` - Number of samples
+/// * `n_coef` - Number of coefficients
+/// * `dispersion` - Dispersion row
+/// * `offset` - Offset row
+/// * `weights` - Optional weight row
+fn fit_general_gene(
+    scratch: &mut GeneScratch,
+    design: &[f64],
+    n_samples: usize,
+    n_coef: usize,
+    dispersion: RecycledRow<'_, f64>,
+    offset: RecycledRow<'_, f64>,
+    weights: Option<RecycledRow<'_, f64>>,
+) {
+    scratch.levenberg.y.copy_from_slice(&scratch.y);
+
+    // Start from the previous grid point's answer. Neighbouring dispersions give
+    // very similar coefficients, so this saves most of the iterations after the
+    // first grid point.
+    let params = LevenbergParams::default();
+    crate::glm::levenberg::fit_one_gene(
+        &mut scratch.levenberg,
+        &mut scratch.beta,
+        design,
+        n_samples,
+        n_coef,
+        dispersion,
+        offset,
+        weights,
+        &params,
+    );
+    scratch.mu.copy_from_slice(&scratch.levenberg.mu);
+}
+
+///////////////
+// Front-end //
+///////////////
+
 /// Adjusted profile likelihood across a grid of dispersions.
 ///
 /// For each gene the coefficients are refitted at every grid point, since the
 /// profile likelihood is defined at the maximum over coefficients for that
-/// dispersion. The result feeds [`crate::numeric::interpolate::maximize_interpolant`],
-/// which finds the maximising dispersion by fitting a spline through the grid.
+/// dispersion. The result feeds
+/// [`crate::numeric::interpolate::maximize_interpolant`], which finds the
+/// maximising dispersion by fitting a spline through the grid.
 ///
 /// ### Params
 ///
@@ -328,122 +450,6 @@ pub fn apl_at<T: EdgeFloat>(
         offset,
         weights,
     )
-}
-
-/// Per-thread buffers for the grid sweep.
-struct GeneScratch {
-    /// Counts for the current gene, widened to `f64`.
-    y: Vec<f64>,
-    /// Fitted means at the current grid point.
-    mu: Vec<f64>,
-    /// Information matrix, row-major.
-    information: Vec<f64>,
-    /// Coefficients, reused as a warm start across grid points.
-    beta: Vec<f64>,
-    /// Scratch for the general Levenberg path.
-    levenberg: Scratch,
-}
-
-impl GeneScratch {
-    /// Allocates scratch for one worker.
-    ///
-    /// ### Params
-    ///
-    /// * `n_samples` - Number of samples
-    /// * `n_coef` - Number of coefficients
-    ///
-    /// ### Returns
-    ///
-    /// Buffers sized for a single gene across the whole grid.
-    fn new(n_samples: usize, n_coef: usize) -> Self {
-        Self {
-            y: vec![0.0; n_samples],
-            mu: vec![0.0; n_samples],
-            information: vec![0.0; n_coef * n_coef],
-            beta: vec![0.0; n_coef],
-            levenberg: Scratch::new(n_samples, n_coef),
-        }
-    }
-}
-
-/// Fits one gene on the one-way path and writes its fitted means.
-///
-/// ### Params
-///
-/// * `scratch` - Per-thread buffers
-/// * `members` - Sample indices per group
-/// * `dispersion` - Dispersion row
-/// * `offset` - Offset row
-/// * `weights` - Optional weight row
-/// * `n_samples` - Number of samples
-fn fit_one_way_gene(
-    scratch: &mut GeneScratch,
-    members: &[Vec<usize>],
-    dispersion: RecycledRow<'_, f64>,
-    offset: RecycledRow<'_, f64>,
-    weights: Option<RecycledRow<'_, f64>>,
-    n_samples: usize,
-) {
-    let params = OneGroupParams::default();
-
-    for group_members in members.iter() {
-        let start =
-            crate::glm::one_group::initial_coefficient(&scratch.y, group_members, offset, weights);
-        let coef = fit_one_group_gene(
-            &scratch.y,
-            group_members,
-            dispersion,
-            offset,
-            weights,
-            start,
-            &params,
-        );
-        for &sample in group_members {
-            let eta = (coef + offset.get(sample)).clamp(-ETA_CLAMP, ETA_CLAMP);
-            scratch.mu[sample] = eta.exp().max(MIN_POSITIVE);
-        }
-    }
-    let _ = n_samples;
-}
-
-/// Fits one gene on the general path and writes its fitted means.
-///
-/// ### Params
-///
-/// * `scratch` - Per-thread buffers
-/// * `design` - Row-major design
-/// * `n_samples` - Number of samples
-/// * `n_coef` - Number of coefficients
-/// * `dispersion` - Dispersion row
-/// * `offset` - Offset row
-/// * `weights` - Optional weight row
-fn fit_general_gene(
-    scratch: &mut GeneScratch,
-    design: &[f64],
-    n_samples: usize,
-    n_coef: usize,
-    dispersion: RecycledRow<'_, f64>,
-    offset: RecycledRow<'_, f64>,
-    weights: Option<RecycledRow<'_, f64>>,
-) {
-    scratch.levenberg.y.copy_from_slice(&scratch.y);
-
-    // Start from the previous grid point's answer. Neighbouring dispersions give
-    // very similar coefficients, so this saves most of the iterations after the
-    // first grid point.
-    let params = LevenbergParams::default();
-    crate::glm::levenberg::fit_one_gene(
-        &mut scratch.levenberg,
-        &mut scratch.beta,
-        design,
-        n_samples,
-        n_coef,
-        dispersion,
-        offset,
-        weights,
-        &params,
-    );
-    scratch.mu.copy_from_slice(&scratch.levenberg.mu);
 }
 
 ///////////

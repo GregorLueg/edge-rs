@@ -22,16 +22,18 @@
 //! McCarthy, Chen and Smyth, Nucleic Acids Research 40(10), 2012
 
 use crate::dispersion::apl::apl_grid;
-use crate::errors::EdgeErrors;
 use crate::glm::fit::glm_fit;
 use crate::limma::smoothing::{locfit_by_col, loess_by_col};
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 use crate::numeric::dist::beta_cdf;
 use crate::numeric::interpolate::{maximize_interpolant, maximize_interpolant_many};
 use crate::numeric::stats::moving_average_by_col;
+use crate::prelude::*;
 use crate::utils::design::matrix_rank;
-use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+
+////////////
+// Consts //
+////////////
 
 /// Reference dispersion the grid is centred on.
 ///
@@ -52,6 +54,10 @@ const MAX_PRIOR_N: f64 = 1e6;
 /// Count below which an observation is treated as a structural zero when
 /// adjusting the residual degrees of freedom.
 const ZERO_TOLERANCE: f64 = 1e-4;
+
+/////////////////
+// TrendMethod //
+/////////////////
 
 /// How the abundance trend is smoothed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +95,10 @@ pub fn parse_trend_method(s: &str) -> Option<TrendMethod> {
     }
 }
 
+////////////////
+// WlebParams //
+////////////////
+
 /// Which parts of the weighted likelihood fit are wanted.
 #[derive(Clone, Debug)]
 pub struct WlebParams {
@@ -120,6 +130,10 @@ impl Default for WlebParams {
     }
 }
 
+////////////////
+// WlebResult //
+////////////////
+
 /// Output of [`wleb`].
 #[derive(Clone, Debug)]
 pub struct WlebResult {
@@ -134,6 +148,10 @@ pub struct WlebResult {
     /// The smoothed likelihood surface, row-major `n_genes * n_grid`.
     pub shared_loglik: Vec<f64>,
 }
+
+/////////////
+// Helpers //
+/////////////
 
 /// Default smoothing span for a given number of genes.
 ///
@@ -154,6 +172,106 @@ fn default_span(n_genes: usize) -> f64 {
         0.25 + 0.75 * (SMALL_GENE_COUNT / n).sqrt()
     }
 }
+
+/// Smooths the likelihood surface down the gene axis.
+///
+/// Each grid column is smoothed independently against the abundance covariate.
+///
+/// ### Params
+///
+/// * `loglik` - Row-major `n_genes * n_grid` surface
+/// * `n_genes` - Number of genes
+/// * `n_grid` - Number of grid points
+/// * `covariate` - Abundance per gene
+/// * `method` - How to smooth
+/// * `span` - Smoothing span
+///
+/// ### Returns
+///
+/// The smoothed surface, same shape as the input.
+fn smooth_surface(
+    loglik: &[f64],
+    n_genes: usize,
+    n_grid: usize,
+    covariate: Option<&[f64]>,
+    method: TrendMethod,
+    span: f64,
+) -> Result<Vec<f64>, EdgeErrors> {
+    match method {
+        TrendMethod::None => {
+            // Every gene shares the column means.
+            let mut mean = vec![0.0; n_grid];
+            for row in loglik.chunks_exact(n_grid) {
+                for (acc, v) in mean.iter_mut().zip(row.iter()) {
+                    *acc += v;
+                }
+            }
+            for v in mean.iter_mut() {
+                *v /= n_genes as f64;
+            }
+            Ok(mean.repeat(n_genes))
+        }
+        TrendMethod::MovingAverage => {
+            let covariate = covariate.expect("a trend method implies a covariate");
+            // Order genes by abundance, smooth, then put them back.
+            let mut order: Vec<usize> = (0..n_genes).collect();
+            order.sort_by(|&a, &b| covariate[a].total_cmp(&covariate[b]));
+
+            let mut sorted = vec![0.0; n_genes * n_grid];
+            for (position, &gene) in order.iter().enumerate() {
+                sorted[position * n_grid..(position + 1) * n_grid]
+                    .copy_from_slice(&loglik[gene * n_grid..(gene + 1) * n_grid]);
+            }
+
+            let width = ((span * n_genes as f64).floor() as usize).max(1);
+            let smoothed = moving_average_by_col(&sorted, n_genes, n_grid, width, true)?;
+
+            let mut out = vec![0.0; n_genes * n_grid];
+            for (position, &gene) in order.iter().enumerate() {
+                out[gene * n_grid..(gene + 1) * n_grid]
+                    .copy_from_slice(&smoothed[position * n_grid..(position + 1) * n_grid]);
+            }
+            Ok(out)
+        }
+        TrendMethod::Loess => {
+            let covariate = covariate.expect("a trend method implies a covariate");
+            Ok(loess_by_col(loglik, n_genes, n_grid, Some(covariate), span)?.fitted)
+        }
+        TrendMethod::Locfit => {
+            let covariate = covariate.expect("a trend method implies a covariate");
+            locfit_by_col(loglik, n_genes, n_grid, Some(covariate), None, span, 0)
+        }
+        TrendMethod::LocfitMixed => {
+            let covariate = covariate.expect("a trend method implies a covariate");
+            let degree0 = locfit_by_col(loglik, n_genes, n_grid, Some(covariate), None, span, 0)?;
+            let degree1 = locfit_by_col(loglik, n_genes, n_grid, Some(covariate), None, span, 1)?;
+
+            // Blend by a beta(2, 2) weight on the abundance range, so the local
+            // constant fit dominates at the ends where the linear one is least
+            // stable.
+            let lo = covariate.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = covariate.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+            let mut out = vec![0.0; n_genes * n_grid];
+            for (gene, &abundance) in covariate.iter().enumerate().take(n_genes) {
+                let w = if hi > lo {
+                    beta_cdf((abundance - lo) / (hi - lo), 2.0, 2.0)?
+                } else {
+                    0.5
+                };
+                let base = gene * n_grid;
+                for k in 0..n_grid {
+                    out[base + k] = w * degree0[base + k] + (1.0 - w) * degree1[base + k];
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+//////////
+// WLEP //
+//////////
 
 /// Weighted likelihood empirical Bayes over a likelihood grid.
 ///
@@ -276,101 +394,9 @@ pub fn wleb(
     })
 }
 
-/// Smooths the likelihood surface down the gene axis.
-///
-/// Each grid column is smoothed independently against the abundance covariate.
-///
-/// ### Params
-///
-/// * `loglik` - Row-major `n_genes * n_grid` surface
-/// * `n_genes` - Number of genes
-/// * `n_grid` - Number of grid points
-/// * `covariate` - Abundance per gene
-/// * `method` - How to smooth
-/// * `span` - Smoothing span
-///
-/// ### Returns
-///
-/// The smoothed surface, same shape as the input.
-fn smooth_surface(
-    loglik: &[f64],
-    n_genes: usize,
-    n_grid: usize,
-    covariate: Option<&[f64]>,
-    method: TrendMethod,
-    span: f64,
-) -> Result<Vec<f64>, EdgeErrors> {
-    match method {
-        TrendMethod::None => {
-            // Every gene shares the column means.
-            let mut mean = vec![0.0; n_grid];
-            for row in loglik.chunks_exact(n_grid) {
-                for (acc, v) in mean.iter_mut().zip(row.iter()) {
-                    *acc += v;
-                }
-            }
-            for v in mean.iter_mut() {
-                *v /= n_genes as f64;
-            }
-            Ok(mean.repeat(n_genes))
-        }
-        TrendMethod::MovingAverage => {
-            let covariate = covariate.expect("a trend method implies a covariate");
-            // Order genes by abundance, smooth, then put them back.
-            let mut order: Vec<usize> = (0..n_genes).collect();
-            order.sort_by(|&a, &b| covariate[a].total_cmp(&covariate[b]));
-
-            let mut sorted = vec![0.0; n_genes * n_grid];
-            for (position, &gene) in order.iter().enumerate() {
-                sorted[position * n_grid..(position + 1) * n_grid]
-                    .copy_from_slice(&loglik[gene * n_grid..(gene + 1) * n_grid]);
-            }
-
-            let width = ((span * n_genes as f64).floor() as usize).max(1);
-            let smoothed = moving_average_by_col(&sorted, n_genes, n_grid, width, true)?;
-
-            let mut out = vec![0.0; n_genes * n_grid];
-            for (position, &gene) in order.iter().enumerate() {
-                out[gene * n_grid..(gene + 1) * n_grid]
-                    .copy_from_slice(&smoothed[position * n_grid..(position + 1) * n_grid]);
-            }
-            Ok(out)
-        }
-        TrendMethod::Loess => {
-            let covariate = covariate.expect("a trend method implies a covariate");
-            Ok(loess_by_col(loglik, n_genes, n_grid, Some(covariate), span)?.fitted)
-        }
-        TrendMethod::Locfit => {
-            let covariate = covariate.expect("a trend method implies a covariate");
-            locfit_by_col(loglik, n_genes, n_grid, Some(covariate), None, span, 0)
-        }
-        TrendMethod::LocfitMixed => {
-            let covariate = covariate.expect("a trend method implies a covariate");
-            let degree0 = locfit_by_col(loglik, n_genes, n_grid, Some(covariate), None, span, 0)?;
-            let degree1 = locfit_by_col(loglik, n_genes, n_grid, Some(covariate), None, span, 1)?;
-
-            // Blend by a beta(2, 2) weight on the abundance range, so the local
-            // constant fit dominates at the ends where the linear one is least
-            // stable.
-            let lo = covariate.iter().cloned().fold(f64::INFINITY, f64::min);
-            let hi = covariate.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-            let mut out = vec![0.0; n_genes * n_grid];
-            for (gene, &abundance) in covariate.iter().enumerate().take(n_genes) {
-                let w = if hi > lo {
-                    beta_cdf((abundance - lo) / (hi - lo), 2.0, 2.0)?
-                } else {
-                    0.5
-                };
-                let base = gene * n_grid;
-                for k in 0..n_grid {
-                    out[base + k] = w * degree0[base + k] + (1.0 - w) * degree1[base + k];
-                }
-            }
-            Ok(out)
-        }
-    }
-}
+////////////////////////
+// EstimateDispParams //
+////////////////////////
 
 /// Tuning knobs for [`estimate_disp`].
 #[derive(Clone, Debug)]
@@ -414,6 +440,10 @@ impl Default for EstimateDispParams {
     }
 }
 
+/////////////////////////
+// DispersionEstimates //
+/////////////////////////
+
 /// The three dispersion estimates.
 #[derive(Clone, Debug)]
 pub struct DispersionEstimates {
@@ -429,6 +459,218 @@ pub struct DispersionEstimates {
     /// gene when the robust fit was used.
     pub prior_df: Option<Vec<f64>>,
 }
+
+/////////////
+// Helpers //
+/////////////
+
+/// Derives the prior degrees of freedom from the residual variances.
+///
+/// Fits the GLM at the working dispersion, turns each gene's residual deviance
+/// into a variance on its residual degrees of freedom, then hands those to
+/// limma's empirical Bayes fit. This is what edgeR's `estimateDisp` does when
+/// the caller does not supply `prior.df`.
+///
+/// ### Params
+///
+/// * `counts` - Counts of the retained genes, row-major
+/// * `n_genes` - Number of retained genes
+/// * `n_samples` - Number of samples
+/// * `design` - Row-major design
+/// * `n_coef` - Number of coefficients
+/// * `dispersion` - Working dispersion, the trend where there is one
+/// * `offset` - Log-scale offsets
+/// * `weights` - Optional observation weights
+/// * `covariate` - Abundance per retained gene, for the trended prior
+/// * `robust` - Use the robust empirical Bayes fit
+/// * `winsor_tail_p` - Winsorising tails for the robust fit
+///
+/// ### Returns
+///
+/// The prior degrees of freedom, one value or one per gene when robust.
+#[allow(clippy::too_many_arguments)]
+fn derive_prior_df<T: EdgeFloat>(
+    counts: &[T],
+    n_genes: usize,
+    n_samples: usize,
+    design: &[f64],
+    n_coef: usize,
+    dispersion: &Recycled<f64>,
+    offset: &Recycled<f64>,
+    weights: Option<&Recycled<f64>>,
+    covariate: Option<&[f64]>,
+    robust: bool,
+    winsor_tail_p: (f64, f64),
+) -> Result<Vec<f64>, EdgeErrors> {
+    let fit = glm_fit(
+        counts, n_genes, n_samples, design, n_coef, dispersion, offset, weights, 0.0,
+    )?;
+
+    let df = residual_df(counts, &fit.fitted, n_genes, n_samples, design, n_coef)?;
+
+    // A gene with no residual degrees of freedom carries no variance
+    // information, and limma drops it from the fit rather than dividing by zero.
+    let variance: Vec<f64> = fit
+        .deviance
+        .iter()
+        .zip(df.iter())
+        .map(|(dev, d)| if *d > 0.0 { (dev / d).max(0.0) } else { 0.0 })
+        .collect();
+
+    let squeezed = squeeze_var(
+        &variance,
+        &df,
+        covariate,
+        Some(SqueezeVarParams {
+            robust,
+            winsor_tail_p,
+            span: None,
+            legacy: None,
+        }),
+    )?;
+
+    Ok(squeezed.df_prior)
+}
+
+/// Scatters per-gene values from the fitted subset back over all genes.
+///
+/// Genes that were filtered out take the value belonging to the least abundant
+/// retained gene, as edgeR does, rather than the common dispersion: a gene too
+/// sparse to fit is more like the low-abundance end of the trend than like the
+/// average gene.
+///
+/// ### Params
+///
+/// * `values` - One value per retained gene
+/// * `kept` - Indices of the retained genes
+/// * `n_genes` - Total number of genes
+/// * `fallback` - Value used when there is no covariate to order by
+/// * `covariate` - Abundance of the retained genes
+///
+/// ### Returns
+///
+/// One value per gene.
+fn expand_to_all_genes(
+    values: &[f64],
+    kept: &[usize],
+    n_genes: usize,
+    fallback: f64,
+    covariate: Option<&[f64]>,
+) -> Vec<f64> {
+    let filler = match covariate {
+        Some(c) => {
+            let least = c
+                .iter()
+                .enumerate()
+                .fold((0usize, f64::INFINITY), |(bi, bv), (i, &v)| {
+                    if v < bv { (i, v) } else { (bi, bv) }
+                })
+                .0;
+            values[least]
+        }
+        None => fallback,
+    };
+
+    let mut out = vec![filler; n_genes];
+    for (slot, &gene) in kept.iter().enumerate() {
+        out[gene] = values[slot];
+    }
+    out
+}
+
+/// Restricts a recycled matrix to a subset of genes.
+///
+/// ### Params
+///
+/// * `source` - The recycled matrix
+/// * `kept` - Indices of the retained genes
+/// * `n_samples` - Number of samples
+///
+/// ### Returns
+///
+/// A recycled matrix over the retained genes only. The scalar and per-sample
+/// forms are unchanged, which is the common case and costs nothing.
+fn subset_recycled(source: &Recycled<f64>, kept: &[usize], n_samples: usize) -> Recycled<f64> {
+    match source {
+        Recycled::Scalar(v) => Recycled::Scalar(*v),
+        Recycled::BySample(v) => Recycled::BySample(v.clone()),
+        Recycled::ByGene(v) => Recycled::ByGene(kept.iter().map(|&g| v[g]).collect()),
+        Recycled::Full(v) => {
+            let mut out = Vec::with_capacity(kept.len() * n_samples);
+            for &gene in kept {
+                out.extend_from_slice(&v[gene * n_samples..(gene + 1) * n_samples]);
+            }
+            Recycled::Full(out)
+        }
+    }
+}
+
+/// Residual degrees of freedom per gene, reduced where the fit hit exact zeros.
+///
+/// A gene with structural zeros has fewer effective observations than samples,
+/// and using the nominal residual degrees of freedom would inflate the
+/// quasi-likelihood dispersion. edgeR recomputes the rank of the design
+/// restricted to the non-zero samples.
+///
+/// ### Params
+///
+/// * `counts` - Counts, row-major `n_genes * n_samples`
+/// * `fitted` - Fitted means, row-major `n_genes * n_samples`
+/// * `n_genes` - Number of genes
+/// * `n_samples` - Number of samples
+/// * `design` - Row-major design
+/// * `n_coef` - Number of coefficients
+///
+/// ### Returns
+///
+/// One residual degrees of freedom per gene.
+pub fn residual_df<T: EdgeFloat>(
+    counts: &[T],
+    fitted: &[f64],
+    n_genes: usize,
+    n_samples: usize,
+    design: &[f64],
+    n_coef: usize,
+) -> Result<Vec<f64>, EdgeErrors> {
+    let base = (n_samples - n_coef) as f64;
+    let mut out = vec![base; n_genes];
+
+    for gene in 0..n_genes {
+        let y = &counts[gene * n_samples..(gene + 1) * n_samples];
+        let mu = &fitted[gene * n_samples..(gene + 1) * n_samples];
+
+        let zero: Vec<bool> = y
+            .iter()
+            .zip(mu.iter())
+            .map(|(v, m)| v.to_f64().unwrap_or(0.0) < ZERO_TOLERANCE && *m < ZERO_TOLERANCE)
+            .collect();
+        let n_zero = zero.iter().filter(|z| **z).count();
+
+        if n_zero == 0 {
+            continue;
+        }
+        if n_zero >= n_samples - 1 {
+            out[gene] = 0.0;
+            continue;
+        }
+
+        let mut reduced = Vec::with_capacity((n_samples - n_zero) * n_coef);
+        for (sample, is_zero) in zero.iter().enumerate() {
+            if !is_zero {
+                reduced.extend_from_slice(&design[sample * n_coef..(sample + 1) * n_coef]);
+            }
+        }
+        let rows = n_samples - n_zero;
+        let rank = matrix_rank(&reduced, rows, n_coef)?;
+        out[gene] = (rows - rank) as f64;
+    }
+
+    Ok(out)
+}
+
+///////////////
+// Front end //
+///////////////
 
 /// Estimates common, trended and tagwise dispersions.
 ///
@@ -650,210 +892,6 @@ pub fn estimate_disp<T: EdgeFloat>(
         span,
         prior_df: Some(prior_df),
     })
-}
-
-/// Derives the prior degrees of freedom from the residual variances.
-///
-/// Fits the GLM at the working dispersion, turns each gene's residual deviance
-/// into a variance on its residual degrees of freedom, then hands those to
-/// limma's empirical Bayes fit. This is what edgeR's `estimateDisp` does when
-/// the caller does not supply `prior.df`.
-///
-/// ### Params
-///
-/// * `counts` - Counts of the retained genes, row-major
-/// * `n_genes` - Number of retained genes
-/// * `n_samples` - Number of samples
-/// * `design` - Row-major design
-/// * `n_coef` - Number of coefficients
-/// * `dispersion` - Working dispersion, the trend where there is one
-/// * `offset` - Log-scale offsets
-/// * `weights` - Optional observation weights
-/// * `covariate` - Abundance per retained gene, for the trended prior
-/// * `robust` - Use the robust empirical Bayes fit
-/// * `winsor_tail_p` - Winsorising tails for the robust fit
-///
-/// ### Returns
-///
-/// The prior degrees of freedom, one value or one per gene when robust.
-#[allow(clippy::too_many_arguments)]
-fn derive_prior_df<T: EdgeFloat>(
-    counts: &[T],
-    n_genes: usize,
-    n_samples: usize,
-    design: &[f64],
-    n_coef: usize,
-    dispersion: &Recycled<f64>,
-    offset: &Recycled<f64>,
-    weights: Option<&Recycled<f64>>,
-    covariate: Option<&[f64]>,
-    robust: bool,
-    winsor_tail_p: (f64, f64),
-) -> Result<Vec<f64>, EdgeErrors> {
-    let fit = glm_fit(
-        counts, n_genes, n_samples, design, n_coef, dispersion, offset, weights, 0.0,
-    )?;
-
-    let df = residual_df(counts, &fit.fitted, n_genes, n_samples, design, n_coef)?;
-
-    // A gene with no residual degrees of freedom carries no variance
-    // information, and limma drops it from the fit rather than dividing by zero.
-    let variance: Vec<f64> = fit
-        .deviance
-        .iter()
-        .zip(df.iter())
-        .map(|(dev, d)| if *d > 0.0 { (dev / d).max(0.0) } else { 0.0 })
-        .collect();
-
-    let squeezed = squeeze_var(
-        &variance,
-        &df,
-        covariate,
-        Some(SqueezeVarParams {
-            robust,
-            winsor_tail_p,
-            span: None,
-            legacy: None,
-        }),
-    )?;
-
-    Ok(squeezed.df_prior)
-}
-
-/// Scatters per-gene values from the fitted subset back over all genes.
-///
-/// Genes that were filtered out take the value belonging to the least abundant
-/// retained gene, as edgeR does, rather than the common dispersion: a gene too
-/// sparse to fit is more like the low-abundance end of the trend than like the
-/// average gene.
-///
-/// ### Params
-///
-/// * `values` - One value per retained gene
-/// * `kept` - Indices of the retained genes
-/// * `n_genes` - Total number of genes
-/// * `fallback` - Value used when there is no covariate to order by
-/// * `covariate` - Abundance of the retained genes
-///
-/// ### Returns
-///
-/// One value per gene.
-fn expand_to_all_genes(
-    values: &[f64],
-    kept: &[usize],
-    n_genes: usize,
-    fallback: f64,
-    covariate: Option<&[f64]>,
-) -> Vec<f64> {
-    let filler = match covariate {
-        Some(c) => {
-            let least = c
-                .iter()
-                .enumerate()
-                .fold((0usize, f64::INFINITY), |(bi, bv), (i, &v)| {
-                    if v < bv { (i, v) } else { (bi, bv) }
-                })
-                .0;
-            values[least]
-        }
-        None => fallback,
-    };
-
-    let mut out = vec![filler; n_genes];
-    for (slot, &gene) in kept.iter().enumerate() {
-        out[gene] = values[slot];
-    }
-    out
-}
-
-/// Restricts a recycled matrix to a subset of genes.
-///
-/// ### Params
-///
-/// * `source` - The recycled matrix
-/// * `kept` - Indices of the retained genes
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// A recycled matrix over the retained genes only. The scalar and per-sample
-/// forms are unchanged, which is the common case and costs nothing.
-fn subset_recycled(source: &Recycled<f64>, kept: &[usize], n_samples: usize) -> Recycled<f64> {
-    match source {
-        Recycled::Scalar(v) => Recycled::Scalar(*v),
-        Recycled::BySample(v) => Recycled::BySample(v.clone()),
-        Recycled::ByGene(v) => Recycled::ByGene(kept.iter().map(|&g| v[g]).collect()),
-        Recycled::Full(v) => {
-            let mut out = Vec::with_capacity(kept.len() * n_samples);
-            for &gene in kept {
-                out.extend_from_slice(&v[gene * n_samples..(gene + 1) * n_samples]);
-            }
-            Recycled::Full(out)
-        }
-    }
-}
-
-/// Residual degrees of freedom per gene, reduced where the fit hit exact zeros.
-///
-/// A gene with structural zeros has fewer effective observations than samples,
-/// and using the nominal residual degrees of freedom would inflate the
-/// quasi-likelihood dispersion. edgeR recomputes the rank of the design
-/// restricted to the non-zero samples.
-///
-/// ### Params
-///
-/// * `counts` - Counts, row-major `n_genes * n_samples`
-/// * `fitted` - Fitted means, row-major `n_genes * n_samples`
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples
-/// * `design` - Row-major design
-/// * `n_coef` - Number of coefficients
-///
-/// ### Returns
-///
-/// One residual degrees of freedom per gene.
-pub fn residual_df<T: EdgeFloat>(
-    counts: &[T],
-    fitted: &[f64],
-    n_genes: usize,
-    n_samples: usize,
-    design: &[f64],
-    n_coef: usize,
-) -> Result<Vec<f64>, EdgeErrors> {
-    let base = (n_samples - n_coef) as f64;
-    let mut out = vec![base; n_genes];
-
-    for gene in 0..n_genes {
-        let y = &counts[gene * n_samples..(gene + 1) * n_samples];
-        let mu = &fitted[gene * n_samples..(gene + 1) * n_samples];
-
-        let zero: Vec<bool> = y
-            .iter()
-            .zip(mu.iter())
-            .map(|(v, m)| v.to_f64().unwrap_or(0.0) < ZERO_TOLERANCE && *m < ZERO_TOLERANCE)
-            .collect();
-        let n_zero = zero.iter().filter(|z| **z).count();
-
-        if n_zero == 0 {
-            continue;
-        }
-        if n_zero >= n_samples - 1 {
-            out[gene] = 0.0;
-            continue;
-        }
-
-        let mut reduced = Vec::with_capacity((n_samples - n_zero) * n_coef);
-        for (sample, is_zero) in zero.iter().enumerate() {
-            if !is_zero {
-                reduced.extend_from_slice(&design[sample * n_coef..(sample + 1) * n_coef]);
-            }
-        }
-        let rows = n_samples - n_zero;
-        let rank = matrix_rank(&reduced, rows, n_coef)?;
-        out[gene] = (rows - rank) as f64;
-    }
-
-    Ok(out)
 }
 
 ///////////

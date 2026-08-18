@@ -12,7 +12,6 @@
 //! numeric policy.
 
 use crate::prelude::*;
-use crate::utils::recycled::Recycled;
 
 ////////////////////
 // DispersionKind //

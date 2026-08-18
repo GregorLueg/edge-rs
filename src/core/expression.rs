@@ -24,7 +24,6 @@ use rayon::prelude::*;
 use crate::glm::fit::add_prior_count;
 use crate::glm::one_group::mglm_one_group;
 use crate::prelude::*;
-use crate::utils::recycled::{Recycled, RecycledRow};
 
 ////////////
 // Consts //

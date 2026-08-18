@@ -5,24 +5,29 @@
 //! [`crate::dispersion::estimate`], which reads a precomputed grid, this
 //! optimises the dispersion directly with a bounded scalar search.
 //!
-//! Two details are load-bearing for parity. The search runs over the fourth
-//! root of the dispersion, which spreads the interval so a bounded Brent search
-//! resolves small dispersions as well as large ones. And on large experiments a
-//! systematic subset of genes stratified by abundance stands in for the whole
-//! set, which changes the answer, so it has to be reproduced rather than
-//! skipped.
+//! The search runs over the fourth root of the dispersion, which spreads the
+//! interval so a bounded Brent search resolves small dispersions as well as
+//! large ones. And on large experiments a systematic subset of genes stratified
+//! by abundance stands in for the whole set, which changes the answer, so it
+//! has to be reproduced rather than skipped.
 
 use crate::dispersion::apl::apl_at;
-use crate::errors::EdgeErrors;
 use crate::numeric::optimise::brent_fmin;
-use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+use crate::prelude::*;
+
+////////////
+// Consts //
+////////////
 
 /// Lower end of the search interval when the caller asks for zero.
 ///
 /// The objective is optimised over `dispersion^(1/4)`, and a true zero would put
 /// the search on the boundary where the derivative is undefined.
 const MIN_ROOT: f64 = 1e-10;
+
+///////////////////
+// CoxReidParams //
+///////////////////
 
 /// Tuning knobs for [`common_dispersion_cox_reid`].
 #[derive(Clone, Copy, Debug)]
@@ -53,6 +58,40 @@ impl Default for CoxReidParams {
         }
     }
 }
+
+/////////////
+// Helpers //
+/////////////
+
+/// Restricts a recycled matrix to a subset of genes.
+///
+/// ### Params
+///
+/// * `source` - The recycled matrix
+/// * `kept` - Indices of the retained genes
+/// * `n_samples` - Number of samples
+///
+/// ### Returns
+///
+/// A recycled matrix over the retained genes only.
+fn subset_recycled(source: &Recycled<f64>, kept: &[usize], n_samples: usize) -> Recycled<f64> {
+    match source {
+        Recycled::Scalar(v) => Recycled::Scalar(*v),
+        Recycled::BySample(v) => Recycled::BySample(v.clone()),
+        Recycled::ByGene(v) => Recycled::ByGene(kept.iter().map(|&g| v[g]).collect()),
+        Recycled::Full(v) => {
+            let mut out = Vec::with_capacity(kept.len() * n_samples);
+            for &gene in kept {
+                out.extend_from_slice(&v[gene * n_samples..(gene + 1) * n_samples]);
+            }
+            Recycled::Full(out)
+        }
+    }
+}
+
+///////////////
+// Front-end //
+///////////////
 
 /// A systematic subset of indices stratified by a ranking variable.
 ///
@@ -219,32 +258,6 @@ pub fn common_dispersion_cox_reid<T: EdgeFloat>(
     Ok(root.powi(4))
 }
 
-/// Restricts a recycled matrix to a subset of genes.
-///
-/// ### Params
-///
-/// * `source` - The recycled matrix
-/// * `kept` - Indices of the retained genes
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// A recycled matrix over the retained genes only.
-fn subset_recycled(source: &Recycled<f64>, kept: &[usize], n_samples: usize) -> Recycled<f64> {
-    match source {
-        Recycled::Scalar(v) => Recycled::Scalar(*v),
-        Recycled::BySample(v) => Recycled::BySample(v.clone()),
-        Recycled::ByGene(v) => Recycled::ByGene(kept.iter().map(|&g| v[g]).collect()),
-        Recycled::Full(v) => {
-            let mut out = Vec::with_capacity(kept.len() * n_samples);
-            for &gene in kept {
-                out.extend_from_slice(&v[gene * n_samples..(gene + 1) * n_samples]);
-            }
-            Recycled::Full(out)
-        }
-    }
-}
-
 ///////////
 // Tests //
 ///////////
@@ -289,11 +302,7 @@ mod tests {
         let (counts, design, offset) = fixture();
         let got = common_dispersion_cox_reid(&counts, 5, 6, &design, 2, &offset, None, None, None)
             .unwrap();
-        // Agreement is 6.9e-10, limited by the adjusted profile likelihood
-        // itself rather than the search: the objective is flat near its
-        // maximum, so a last-digit difference in the summed likelihood moves
-        // the argument much further than it moves the value. Repointing this
-        // from scipy'''s bounded Brent to R'''s `optimize` took it from 1e-4.
+
         assert_relative_eq!(got, 0.013_404_409_326_629_5, max_relative = 1e-9);
     }
 
