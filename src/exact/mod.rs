@@ -39,18 +39,16 @@ use rayon::prelude::*;
 
 use crate::core::dgelist::DgeList;
 use crate::core::expression::ave_log_cpm;
-use crate::errors::EdgeErrors;
 use crate::glm::deviance::unit_nb_deviance;
 use crate::glm::one_group::mglm_one_group;
 use crate::numeric::dist::nbinom_ln_pmf;
 use crate::numeric::dist::{beta_cdf, beta_ppf, beta_sf, chisq_sf, gamma_cdf, gamma_ppf};
 use crate::numeric::gamma::ln_gamma;
-use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+use crate::prelude::*;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Row sum above which, in both groups, the beta approximation replaces the
 /// convolution.
@@ -122,17 +120,17 @@ const LENTZ_EPS: f64 = 2.220446049250313e-16;
 /// mathematically identical situations differs by a whole term.
 const BINOM_TIE_TOL: f64 = 1.0 + 1e-7;
 
-///////////
-// Types //
-///////////
+/////////////////////
+// RejectionRegion //
+/////////////////////
 
 /// Which set of outcomes counts as "at least as extreme as observed".
 ///
 /// All three condition on the total count and sum negative binomial mass over a
-/// rejection region; they differ only in how that region is chosen. When the two
-/// groups have the same number of samples the regions coincide and edgeR routes
-/// [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`] straight to the
-/// double-tail test, which this does too.
+/// rejection region; they differ only in how that region is chosen. When the
+/// two groups have the same number of samples the regions coincide and edgeR
+/// routes [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`]
+/// straight to the double-tail test, which this does too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectionRegion {
     /// Double the smaller tail. edgeR's default, and the only one with the
@@ -145,6 +143,10 @@ pub enum RejectionRegion {
     SmallP,
 }
 
+/////////////////////
+// ExactTestResult //
+/////////////////////
+
 /// The three columns edgeR's `exactTest` reports.
 #[derive(Clone, Debug)]
 pub struct ExactTestResult {
@@ -155,6 +157,10 @@ pub struct ExactTestResult {
     /// Raw exact-test p-value, one per gene.
     pub p_value: Vec<f64>,
 }
+
+/////////////////////
+// ExactTestParams //
+/////////////////////
 
 /// Tuning knobs for [`exact_test`].
 #[derive(Clone, Copy, Debug)]
@@ -201,9 +207,9 @@ impl ExactTestParams {
     }
 }
 
-////////////////////////////////////
+//////////////////////////////////////
 // Log-space upper incomplete gamma //
-////////////////////////////////////
+//////////////////////////////////////
 
 /// Modified Lentz evaluation of the continued fraction behind `Q(a, x)`.
 ///
@@ -409,9 +415,48 @@ fn ln_reg_gamma_upper_inv(ln_q: f64, a: f64) -> Result<f64, EdgeErrors> {
     })
 }
 
-/////////////////
-// q2qnbinom   //
-/////////////////
+////////////////
+// Validation //
+////////////////
+
+/// Rejects a dispersion outside `[0, inf)`.
+///
+/// ### Params
+///
+/// * `dispersion` - Value supplied by the caller
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidDispersion`].
+fn check_dispersion(dispersion: f64) -> Result<(), EdgeErrors> {
+    if !dispersion.is_finite() || dispersion < 0.0 {
+        return Err(EdgeErrors::InvalidDispersion(dispersion));
+    }
+    Ok(())
+}
+
+/// Rejects a slice holding a negative or non-finite value.
+///
+/// ### Params
+///
+/// * `name` - Argument name, used verbatim in the error message
+/// * `values` - Values to check
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the offending value.
+fn check_non_negative(name: &str, values: &[f64]) -> Result<(), EdgeErrors> {
+    if let Some(bad) = values.iter().find(|v| !v.is_finite() || **v < 0.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "'{name}' must be non-negative and finite, found {bad}"
+        )));
+    }
+    Ok(())
+}
+
+///////////////
+// q2qnbinom //
+///////////////
 
 /// Maps one count from one negative binomial mean to another.
 ///
@@ -442,25 +487,14 @@ fn q2q_one(x: f64, input_mean: f64, output_mean: f64, dispersion: f64) -> Result
     let vi = mi * ri;
     let ro = 1.0 + dispersion * mo;
     let vo = mo * ro;
-
-    // Normal half, in closed form. edgeR round-trips through pnorm and qnorm,
-    // but matching the standardised deviate is what that round trip *is*:
-    // Phi((x - mi) / sd_i) = Phi((q - mo) / sd_o) has the single solution
-    // q = mo + sd_o (x - mi) / sd_i, on either tail. Doing it directly costs
-    // nothing and removes the only step in this function that could round.
     let q1 = mo + (vo / vi).sqrt() * (x - mi);
 
     let shape_i = mi / ri;
     let shape_o = mo / ro;
     let q2 = if x >= mi {
-        // Upper tail, in logs throughout: this is the branch where a count far
-        // above its fitted mean drives Q below what an f64 can hold.
         let ln_q = ln_reg_gamma_upper(shape_i, x / ri)?;
         ro * ln_reg_gamma_upper_inv(ln_q, shape_o)?
     } else {
-        // Lower tail. Here the natural scale is safe: P underflows only for an
-        // x of order 1e-30, and it underflows to zero, which inverts to zero
-        // rather than to infinity.
         let p = gamma_cdf(x, shape_i, ri)?;
         gamma_ppf(p, shape_o, ro)?
     };
@@ -471,24 +505,26 @@ fn q2q_one(x: f64, input_mean: f64, output_mean: f64, dispersion: f64) -> Result
 /// Quantile-to-quantile mapping between two negative binomial means.
 ///
 /// edgeR's `q2qnbinom`. Each count is placed at its quantile under
-/// `NB(input_mean, dispersion)` and read back off `NB(output_mean, dispersion)`.
-/// The negative binomial quantile has no closed form, so edgeR maps through two
-/// continuous approximations and averages them: a normal with the matching mean
-/// and variance, and a gamma with the matching mean and variance. Neither is
-/// good on its own, since the normal is symmetric and the gamma has the wrong
-/// behaviour near zero, and the average of the two is what edgeR's pseudo-counts
-/// are actually built from.
+/// `NB(input_mean, dispersion)` and read back off
+/// `NB(output_mean, dispersion)`. The negative binomial quantile has no closed
+/// form, so edgeR maps through two continuous approximations and averages them:
+/// a normal with the matching mean and variance, and a gamma with the matching
+/// mean and variance. Neither is good on its own, since the normal is symmetric
+/// and the gamma has the wrong behaviour near zero, and the average of the two
+/// is what edgeR's pseudo-counts are actually built from.
 ///
-/// The tail is chosen per element by `x >= input_mean`, so whichever side of the
-/// mean the count sits on is the side that is evaluated, and the small
+/// The tail is chosen per element by `x >= input_mean`, so whichever side of
+/// the mean the count sits on is the side that is evaluated, and the small
 /// probability is never formed as one minus a large one.
 ///
-/// ### Two departures from edgeR's arithmetic
+/// ### Notes
+///
+/// **Two departures from edgeR's arithmetic**
 ///
 /// * The normal half is the linear map `output_mean + sd_out (x - input_mean) /
 ///   sd_in`, which is what `qnorm(pnorm(...))` reduces to exactly. edgeR forms
-///   it as a round trip through log probabilities; the answers agree to the last
-///   bit or two and this one cannot lose any.
+///   it as a round trip through log probabilities; the answers agree to the
+///   last bit or two and this one cannot lose any.
 /// * The upper gamma tail goes through [`ln_reg_gamma_upper`] and its inverse
 ///   rather than through `gamma_cdf` and `gamma_ppf`, because those work on the
 ///   natural scale and R uses `log.p = TRUE` here for a reason.
@@ -546,48 +582,9 @@ pub fn q2q_nbinom(
         .collect()
 }
 
-////////////////
-// Validation //
-////////////////
-
-/// Rejects a dispersion outside `[0, inf)`.
-///
-/// ### Params
-///
-/// * `dispersion` - Value supplied by the caller
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidDispersion`].
-fn check_dispersion(dispersion: f64) -> Result<(), EdgeErrors> {
-    if !dispersion.is_finite() || dispersion < 0.0 {
-        return Err(EdgeErrors::InvalidDispersion(dispersion));
-    }
-    Ok(())
-}
-
-/// Rejects a slice holding a negative or non-finite value.
-///
-/// ### Params
-///
-/// * `name` - Argument name, used verbatim in the error message
-/// * `values` - Values to check
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the offending value.
-fn check_non_negative(name: &str, values: &[f64]) -> Result<(), EdgeErrors> {
-    if let Some(bad) = values.iter().find(|v| !v.is_finite() || **v < 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "'{name}' must be non-negative and finite, found {bad}"
-        )));
-    }
-    Ok(())
-}
-
-////////////////////
-// Pseudo-counts  //
-////////////////////
+///////////////////
+// Pseudo-counts //
+///////////////////
 
 /// Distinct labels in first-appearance order, with a mask per label.
 ///
@@ -647,6 +644,69 @@ fn select_columns<T: EdgeFloat>(
     out
 }
 
+/// Column sums of a row-major matrix, in `f64`.
+///
+/// ### Params
+///
+/// * `values` - Row-major values, a whole number of rows of `n_samples`
+/// * `n_samples` - Number of columns
+///
+/// ### Returns
+///
+/// One sum per column.
+fn column_sums<T: EdgeFloat>(values: &[T], n_samples: usize) -> Vec<f64> {
+    let mut sums = vec![0.0_f64; n_samples];
+    for row in values.chunks_exact(n_samples) {
+        for (acc, v) in sums.iter_mut().zip(row.iter()) {
+            *acc += v.to_f64().unwrap_or(f64::NAN);
+        }
+    }
+    sums
+}
+
+/// Expands a recycled dispersion into one value per gene.
+///
+/// Only the gene axis is meaningful for the exact test, so a
+/// [`Recycled::BySample`] or [`Recycled::Full`] form is an error rather than
+/// something to average over.
+///
+/// ### Params
+///
+/// * `dispersion` - Dispersion, recycled over genes and samples
+/// * `n_genes` - Number of genes
+///
+/// ### Returns
+///
+/// One dispersion per gene, or [`EdgeErrors::LengthMismatch`] on a bad length,
+/// [`EdgeErrors::InvalidDispersion`] on a negative or non-finite value and
+/// [`EdgeErrors::InvalidArgument`] on a sample-varying form.
+fn per_gene_dispersion(dispersion: &Recycled<f64>, n_genes: usize) -> Result<Vec<f64>, EdgeErrors> {
+    let out = match dispersion {
+        Recycled::Scalar(v) => vec![*v; n_genes],
+        Recycled::ByGene(v) => {
+            if v.len() != n_genes {
+                return Err(EdgeErrors::LengthMismatch {
+                    name: "by_gene",
+                    expected: n_genes,
+                    got: v.len(),
+                });
+            }
+            v.clone()
+        }
+        Recycled::BySample(_) | Recycled::Full(_) => {
+            return Err(EdgeErrors::InvalidArgument(
+                "the exact test needs a dispersion that varies by gene only; got a \
+                 sample-varying form"
+                    .to_string(),
+            ));
+        }
+    };
+    for d in &out {
+        check_dispersion(*d)?;
+    }
+    Ok(out)
+}
+
 /// Pseudo-counts on a common library size, edgeR's `equalizeLibSizes`.
 ///
 /// The classic path cannot condition on the total count unless every sample has
@@ -657,9 +717,9 @@ fn select_columns<T: EdgeFloat>(
 /// [`q2q_nbinom`]. The common size is the geometric mean of the library sizes,
 /// which keeps the pseudo-counts on roughly the scale of the originals.
 ///
-/// Negative pseudo-counts are clamped to zero, as edgeR does. The normal half of
-/// the mapping is unbounded below and will go negative for a zero count mapped
-/// onto a much larger library.
+/// Negative pseudo-counts are clamped to zero, as edgeR does. The normal half
+/// of the mapping is unbounded below and will go negative for a zero count
+/// mapped onto a much larger library.
 ///
 /// Genes are the parallel axis for the mapping. The per-group GLM fits are
 /// already parallel over genes inside [`mglm_one_group`].
@@ -683,8 +743,8 @@ fn select_columns<T: EdgeFloat>(
 /// sit on is `exp(mean(ln(lib_size)))` and is not returned, being a one-line
 /// function of the input. Errors are [`EdgeErrors::EmptyCounts`] for a zero
 /// dimension, [`EdgeErrors::LengthMismatch`] for a `group` or `lib_size` of the
-/// wrong length, [`EdgeErrors::InvalidDispersion`] for a negative dispersion and
-/// [`EdgeErrors::InvalidArgument`] for a non-positive library size.
+/// wrong length, [`EdgeErrors::InvalidDispersion`] for a negative dispersion
+/// and [`EdgeErrors::InvalidArgument`] for a non-positive library size.
 pub fn equalize_lib_sizes<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,
@@ -791,69 +851,6 @@ pub fn equalize_lib_sizes<T: EdgeFloat>(
     Ok(pseudo)
 }
 
-/// Column sums of a row-major matrix, in `f64`.
-///
-/// ### Params
-///
-/// * `values` - Row-major values, a whole number of rows of `n_samples`
-/// * `n_samples` - Number of columns
-///
-/// ### Returns
-///
-/// One sum per column.
-fn column_sums<T: EdgeFloat>(values: &[T], n_samples: usize) -> Vec<f64> {
-    let mut sums = vec![0.0_f64; n_samples];
-    for row in values.chunks_exact(n_samples) {
-        for (acc, v) in sums.iter_mut().zip(row.iter()) {
-            *acc += v.to_f64().unwrap_or(f64::NAN);
-        }
-    }
-    sums
-}
-
-/// Expands a recycled dispersion into one value per gene.
-///
-/// Only the gene axis is meaningful for the exact test, so a
-/// [`Recycled::BySample`] or [`Recycled::Full`] form is an error rather than
-/// something to average over.
-///
-/// ### Params
-///
-/// * `dispersion` - Dispersion, recycled over genes and samples
-/// * `n_genes` - Number of genes
-///
-/// ### Returns
-///
-/// One dispersion per gene, or [`EdgeErrors::LengthMismatch`] on a bad length,
-/// [`EdgeErrors::InvalidDispersion`] on a negative or non-finite value and
-/// [`EdgeErrors::InvalidArgument`] on a sample-varying form.
-fn per_gene_dispersion(dispersion: &Recycled<f64>, n_genes: usize) -> Result<Vec<f64>, EdgeErrors> {
-    let out = match dispersion {
-        Recycled::Scalar(v) => vec![*v; n_genes],
-        Recycled::ByGene(v) => {
-            if v.len() != n_genes {
-                return Err(EdgeErrors::LengthMismatch {
-                    name: "by_gene",
-                    expected: n_genes,
-                    got: v.len(),
-                });
-            }
-            v.clone()
-        }
-        Recycled::BySample(_) | Recycled::Full(_) => {
-            return Err(EdgeErrors::InvalidArgument(
-                "the exact test needs a dispersion that varies by gene only; got a \
-                 sample-varying form"
-                    .to_string(),
-            ));
-        }
-    };
-    for d in &out {
-        check_dispersion(*d)?;
-    }
-    Ok(out)
-}
-
 /////////////////////
 // Exact test core //
 /////////////////////
@@ -913,7 +910,9 @@ fn binom_ln_pmf(k: f64, n: f64, ln_p: f64, ln_q: f64) -> f64 {
 /// small-probability rule: sum every outcome no more probable than the observed
 /// one.
 ///
-/// ### Two departures from edgeR
+/// ### Notes
+///
+/// **Departure from edgeR**
 ///
 /// edgeR replaces the enumeration with a Yates-corrected two-by-two chi-square
 /// test once the total exceeds 10000, and the two-by-two it builds uses the
@@ -922,10 +921,10 @@ fn binom_ln_pmf(k: f64, n: f64, ln_p: f64, ln_q: f64) -> f64 {
 /// bug attached. The enumeration is `O(total)` and is used here at every size.
 ///
 /// Ties are admitted within [`BINOM_TIE_TOL`], as R's `binom.test` does, rather
-/// than resolved by `order` on raw masses as edgeR's `binomTest` does. Where the
-/// two disagree it is because two outcomes are exactly equiprobable and edgeR's
-/// `dbinom` put them one ulp apart; the p-value then depends on which of the two
-/// was observed, which it should not.
+/// than resolved by `order` on raw masses as edgeR's `binomTest` does. Where
+/// the two disagree it is because two outcomes are exactly equiprobable and
+/// edgeR's `dbinom` put them one ulp apart; the p-value then depends on which
+/// of the two was observed, which it should not.
 ///
 /// ### Params
 ///
@@ -965,12 +964,12 @@ fn binom_test_one(y1: f64, y2: f64, p: f64) -> Result<f64, EdgeErrors> {
 
 /// Beta approximation to the double-tail test, edgeR's `exactTestBetaApprox`.
 ///
-/// For a gene with thousands of reads in each group the convolution is thousands
-/// of terms and the conditional distribution of the first group's share is
-/// already indistinguishable from a beta with the matching first two moments.
-/// Both tails carry a half-count continuity correction and are compared against
-/// the beta median rather than its mean, so the split matches the discrete
-/// distribution's own centre.
+/// For a gene with thousands of reads in each group the convolution is
+/// thousands of terms and the conditional distribution of the first group's
+/// share is already indistinguishable from a beta with the matching first two
+/// moments. Both tails carry a half-count continuity correction and are
+/// compared against the beta median rather than its mean, so the split matches
+/// the discrete distribution's own centre.
 ///
 /// The sums used here are the raw pseudo-counts, not the rounded ones. edgeR
 /// decides *whether* to take this path from the rounded sums and then hands the
@@ -1196,8 +1195,8 @@ fn deviance_one(
 /// ### One departure from edgeR
 ///
 /// `exactTestBySmallP` ends on `min(pvals, 1)`, and `min` in R reduces a vector
-/// to a scalar. Every gene therefore comes back carrying the smallest p-value in
-/// the whole matrix. It is a typo for `pmin`, and it is not reproduced: this
+/// to a scalar. Every gene therefore comes back carrying the smallest p-value
+/// in the whole matrix. It is a typo for `pmin`, and it is not reproduced: this
 /// caps each gene's own value. Calling edgeR one gene at a time recovers what
 /// the function was meant to return, and that is what the fixtures here compare
 /// against.
@@ -1258,10 +1257,10 @@ fn small_p_one(
 /// The rayon fan-out for the whole test. Each thread keeps one convolution
 /// buffer, which grows to the largest total it sees and is then reused.
 ///
-/// [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`] fall back to the
-/// double-tail test when the groups have the same number of samples, as edgeR
-/// does: the regions are identical there, and the double-tail path is the only
-/// one with the large-count shortcut.
+/// [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`] fall back to
+/// the double-tail test when the groups have the same number of samples, as
+/// edgeR does: the regions are identical there, and the double-tail path is the
+/// only one with the large-count shortcut.
 ///
 /// ### Params
 ///
@@ -1311,6 +1310,88 @@ fn exact_pvalues(
             });
     outcome?;
     Ok(out)
+}
+
+/// Fits the abundance of one group with prior counts added.
+///
+/// edgeR's rule: the prior is scaled by each library's size relative to the
+/// mean over the pair, added to the counts, and the offset is raised to
+/// `log(lib + 2 * prior)` so that adding the prior does not by itself move the
+/// fitted level.
+///
+/// ### Params
+///
+/// * `counts` - This group's counts, row-major `n_genes * n_group`
+/// * `n_genes` - Number of genes
+/// * `lib` - Effective library size per sample of this group
+/// * `mean_lib` - Mean effective library size over *both* groups
+/// * `prior_count` - Prior count before scaling
+/// * `dispersion` - Dispersion, recycled over genes
+///
+/// ### Returns
+///
+/// One log-scale abundance per gene, or whatever [`mglm_one_group`] propagates.
+fn augmented_abundance(
+    counts: &[f64],
+    n_genes: usize,
+    lib: &[f64],
+    mean_lib: f64,
+    prior_count: f64,
+    dispersion: &Recycled<f64>,
+) -> Result<Vec<f64>, EdgeErrors> {
+    let n_group = lib.len();
+    let prior: Vec<f64> = lib.iter().map(|l| prior_count * l / mean_lib).collect();
+    let offset: Vec<f64> = lib
+        .iter()
+        .zip(prior.iter())
+        .map(|(l, p)| (l + 2.0 * p).ln())
+        .collect();
+
+    let mut augmented = vec![0.0_f64; n_genes * n_group];
+    augmented
+        .par_chunks_mut(n_group)
+        .enumerate()
+        .for_each(|(gene, row)| {
+            let src = &counts[gene * n_group..(gene + 1) * n_group];
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = src[j] + prior[j];
+            }
+        });
+
+    mglm_one_group(
+        &augmented,
+        n_genes,
+        n_group,
+        dispersion,
+        &Recycled::by_sample(offset),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Glues two per-group matrices back into one, first group's columns first.
+///
+/// ### Params
+///
+/// * `y1` - First group's counts, row-major `n_genes * n1`
+/// * `y2` - Second group's counts, row-major `n_genes * n2`
+/// * `n_genes` - Number of genes
+/// * `n1` - Number of samples in the first group
+/// * `n2` - Number of samples in the second group
+///
+/// ### Returns
+///
+/// A row-major `n_genes * (n1 + n2)` matrix.
+fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> Vec<f64> {
+    let mut out = vec![0.0_f64; n_genes * (n1 + n2)];
+    out.par_chunks_mut(n1 + n2)
+        .enumerate()
+        .for_each(|(gene, row)| {
+            row[..n1].copy_from_slice(&y1[gene * n1..(gene + 1) * n1]);
+            row[n1..].copy_from_slice(&y2[gene * n2..(gene + 1) * n2]);
+        });
+    out
 }
 
 ///////////////
@@ -1526,88 +1607,6 @@ pub fn exact_test<T: EdgeFloat>(
         log_cpm,
         p_value,
     })
-}
-
-/// Fits the abundance of one group with prior counts added.
-///
-/// edgeR's rule: the prior is scaled by each library's size relative to the mean
-/// over the pair, added to the counts, and the offset is raised to
-/// `log(lib + 2 * prior)` so that adding the prior does not by itself move the
-/// fitted level.
-///
-/// ### Params
-///
-/// * `counts` - This group's counts, row-major `n_genes * n_group`
-/// * `n_genes` - Number of genes
-/// * `lib` - Effective library size per sample of this group
-/// * `mean_lib` - Mean effective library size over *both* groups
-/// * `prior_count` - Prior count before scaling
-/// * `dispersion` - Dispersion, recycled over genes
-///
-/// ### Returns
-///
-/// One log-scale abundance per gene, or whatever [`mglm_one_group`] propagates.
-fn augmented_abundance(
-    counts: &[f64],
-    n_genes: usize,
-    lib: &[f64],
-    mean_lib: f64,
-    prior_count: f64,
-    dispersion: &Recycled<f64>,
-) -> Result<Vec<f64>, EdgeErrors> {
-    let n_group = lib.len();
-    let prior: Vec<f64> = lib.iter().map(|l| prior_count * l / mean_lib).collect();
-    let offset: Vec<f64> = lib
-        .iter()
-        .zip(prior.iter())
-        .map(|(l, p)| (l + 2.0 * p).ln())
-        .collect();
-
-    let mut augmented = vec![0.0_f64; n_genes * n_group];
-    augmented
-        .par_chunks_mut(n_group)
-        .enumerate()
-        .for_each(|(gene, row)| {
-            let src = &counts[gene * n_group..(gene + 1) * n_group];
-            for (j, v) in row.iter_mut().enumerate() {
-                *v = src[j] + prior[j];
-            }
-        });
-
-    mglm_one_group(
-        &augmented,
-        n_genes,
-        n_group,
-        dispersion,
-        &Recycled::by_sample(offset),
-        None,
-        None,
-        None,
-    )
-}
-
-/// Glues two per-group matrices back into one, first group's columns first.
-///
-/// ### Params
-///
-/// * `y1` - First group's counts, row-major `n_genes * n1`
-/// * `y2` - Second group's counts, row-major `n_genes * n2`
-/// * `n_genes` - Number of genes
-/// * `n1` - Number of samples in the first group
-/// * `n2` - Number of samples in the second group
-///
-/// ### Returns
-///
-/// A row-major `n_genes * (n1 + n2)` matrix.
-fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> Vec<f64> {
-    let mut out = vec![0.0_f64; n_genes * (n1 + n2)];
-    out.par_chunks_mut(n1 + n2)
-        .enumerate()
-        .for_each(|(gene, row)| {
-            row[..n1].copy_from_slice(&y1[gene * n1..(gene + 1) * n1]);
-            row[n1..].copy_from_slice(&y2[gene * n2..(gene + 1) * n2]);
-        });
-    out
 }
 
 ///////////
