@@ -12,13 +12,15 @@
 //! failed fit.
 
 use crate::core::dgelist::DgeList;
-use crate::errors::EdgeErrors;
 use crate::glm::deviance::unit_nb_deviance;
 use crate::glm::levenberg::{LevenbergParams, mglm_levenberg};
 use crate::glm::one_way::mglm_one_way;
+use crate::prelude::*;
 use crate::utils::design::{design_as_factor, non_estimable};
-use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+
+////////////
+// Consts //
+////////////
 
 /// Iteration budget for the general path.
 ///
@@ -32,6 +34,10 @@ const GLM_FIT_MAX_ITER: usize = 250;
 /// edgeR's default. Small enough not to move a well-powered gene, large enough
 /// to stop a gene with a zero in one group reporting an infinite fold change.
 pub const DEFAULT_PRIOR_COUNT: f64 = 0.125;
+
+///////////////
+// FitMethod //
+///////////////
 
 /// Which fitter produced a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

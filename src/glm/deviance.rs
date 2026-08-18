@@ -7,14 +7,19 @@
 //! `glm_levenberg._unit_nb_deviance`. edgePython carries two versions and only
 //! the one in `ql_weights.py` matches edgeR; the naive one its GLM path uses
 //! disagrees with edgeR by around 1e-8 relative on ordinary values and
-//! completely near `y == mu`. See `UPSTREAM_DEVIATIONS.md` entry 4.
+//! completely near `y == mu`.
 //!
 //! Two details carry that accuracy. Both `y` and `mu` are nudged by
-//! [`MILDLY_LOW_VALUE`] before anything else, which is what keeps the zero-count
-//! case finite without a special branch. And the formula switches by regime, so
-//! the difference of large logarithms is never evaluated where it would cancel.
+//! [`MILDLY_LOW_VALUE`] before anything else, which is what keeps the
+//! zero-count case finite without a special branch. And the formula switches by
+//! regime, so the difference of large logarithms is never evaluated where it
+//! would cancel.
 
 use crate::numeric::gamma::ln_gamma;
+
+////////////
+// Consts //
+////////////
 
 /// Nudge added to both `y` and `mu` before any logarithm is taken.
 ///
@@ -65,12 +70,12 @@ pub fn unit_nb_deviance(y: f64, mu: f64, phi: f64) -> f64 {
     let out = if phi < POISSON_REGIME {
         // Poisson limit with the leading correction in phi.
         //
-        // The cubic term is `-phi * y`, not `phi * (2/3 * resid - y)`. edgeR's C
-        // writes `2/3` with integer operands, so it truncates to zero and the
-        // `resid` contribution never enters. edgePython treats that as a typo and
-        // writes `2.0/3.0`, which changes the answer by up to 7e-4 relative on
-        // large counts. Reproducing the C is what matches published edgeR
-        // results. See `UPSTREAM_DEVIATIONS.md` entry 5.
+        // The cubic term is `-phi * y`, not `phi * (2/3 * resid - y)`.
+        // edgeR's C writes `2/3` with integer operands, so it truncates to zero
+        // and the `resid` contribution never enters. edgePython treats that as
+        // a typo and writes `2.0/3.0`, which changes the answer by up to 7e-4
+        // relative on large counts. Reproducing the C is what matches published
+        // edgeR results.
         let resid = y - mu;
         2.0 * (y * (y / mu).ln() - resid - 0.5 * resid * resid * phi * (1.0 - phi * y))
     } else {
