@@ -6,6 +6,7 @@
 //! edgePython needs to go fast in NumPy.
 
 pub mod deviance;
+pub mod fit;
 pub mod levenberg;
 pub mod one_group;
 pub mod one_way;

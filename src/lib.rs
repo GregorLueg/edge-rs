@@ -33,6 +33,7 @@
 
 #![warn(missing_docs)]
 
+pub mod core;
 pub mod errors;
 pub mod glm;
 pub mod numeric;
