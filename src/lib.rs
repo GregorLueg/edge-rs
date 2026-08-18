@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 
 pub mod core;
+pub mod dispersion;
 pub mod errors;
 pub mod glm;
 pub mod limma;
