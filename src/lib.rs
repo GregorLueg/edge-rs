@@ -43,4 +43,5 @@ pub mod numeric;
 pub mod prelude;
 pub mod ql;
 pub mod results;
+pub mod splicing;
 pub mod utils;
