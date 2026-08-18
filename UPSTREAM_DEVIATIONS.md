@@ -239,7 +239,6 @@ span-equivalence against R's `ns()` rather than element-wise equality.
 Flagged only so nobody later "fixes" it by swapping in a real `ns()` and then
 wonders why the coefficients moved.
 
-
 ---
 
 ## 8. `locfitByCol` is the real locfit package, not a per-point local fit
@@ -417,7 +416,6 @@ passes. Passing limma's 4 to R's smoother costs 3e-3, worse than the original
 mismatch it was meant to fix.
 
 ---
----
 
 ## 19. `spliceVariants` is a different test entirely
 
@@ -541,7 +539,6 @@ On top of the estimator itself:
 - `nanmean` where limma uses `colMeans`, absorbing NaNs rather than propagating
 
 ---
----
 
 ## 24. NEBULA has no marginal-likelihood Hessian, so its standard errors are wrong
 
@@ -621,7 +618,6 @@ recomputes `vw` at the final iterate *after* `logdet` has already been taken fro
 the previous one. The outer objective is calibrated against that, so both
 edgePython and `edge-rs` keep it.
 
----
 ---
 
 # Section B: edgeR or limma are themselves wrong
