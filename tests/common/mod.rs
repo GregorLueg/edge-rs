@@ -153,22 +153,27 @@ pub fn assert_close(got: &[f64], want: &[f64], tol: Tol, label: &str) {
         want.len()
     );
 
+    // Two running maxima. `worst` is over everything and drives the calibration
+    // report; `worst_failing` is over the failures only and drives the panic
+    // message, because the largest relative difference is often a passing entry
+    // that the absolute leg of the tolerance let through.
     let mut worst: Option<Worst> = None;
+    let mut worst_failing: Option<Worst> = None;
     let mut n_failed = 0_usize;
 
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         let relative = relative_difference(g, w);
         let absolute = if g.is_finite() && w.is_finite() { (g - w).abs() } else { f64::INFINITY };
-        let ok = absolute <= tol.epsilon || relative <= tol.max_relative;
-        if !ok {
-            n_failed += 1;
+        let here = Worst { index: i, relative, absolute, got: g, want: w };
+
+        if worst.is_none_or(|prev| relative > prev.relative) {
+            worst = Some(here);
         }
-        let replace = match worst {
-            None => true,
-            Some(prev) => relative > prev.relative,
-        };
-        if replace {
-            worst = Some(Worst { index: i, relative, absolute, got: g, want: w });
+        if absolute > tol.epsilon && relative > tol.max_relative {
+            n_failed += 1;
+            if worst_failing.is_none_or(|prev| relative > prev.relative) {
+                worst_failing = Some(here);
+            }
         }
     }
 
@@ -188,19 +193,21 @@ pub fn assert_close(got: &[f64], want: &[f64], tol: Tol, label: &str) {
         );
     }
 
-    assert!(
-        n_failed == 0,
+    let Some(bad) = worst_failing else { return };
+
+    panic!(
         "{label}: {n_failed} of {} values outside tolerance \
          (max_relative {:.1e}, epsilon {:.1e}).\n  \
-         worst at index {}: got {:.17e}, want {:.17e}, relative {:.3e}, absolute {:.3e}",
+         worst failure at index {}: got {:.17e}, want {:.17e}, \
+         relative {:.3e}, absolute {:.3e}",
         got.len(),
         tol.max_relative,
         tol.epsilon,
-        worst.index,
-        worst.got,
-        worst.want,
-        worst.relative,
-        worst.absolute
+        bad.index,
+        bad.got,
+        bad.want,
+        bad.relative,
+        bad.absolute
     );
 }
 
