@@ -29,7 +29,7 @@ use crate::numeric::dist::beta_cdf;
 use crate::numeric::interpolate::{maximize_interpolant, maximize_interpolant_many};
 use crate::numeric::stats::moving_average_by_col;
 use crate::prelude::*;
-use crate::utils::design::matrix_rank;
+use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, matrix_rank};
 
 ////////////
 // Consts //
@@ -41,8 +41,6 @@ use crate::utils::design::matrix_rank;
 /// value for a well-behaved bulk RNA-seq experiment. edgeR's choice.
 const GRID_CENTRE: f64 = 0.1;
 
-/// Gene count below which the smoothing span is not reduced.
-const SMALL_GENE_COUNT: f64 = 50.0;
 
 /// Prior sample size above which shrinkage is treated as total.
 ///
@@ -161,7 +159,16 @@ pub struct WlebResult {
 
 /// Default smoothing span for a given number of genes.
 ///
-/// Wider for small experiments, since there is less to average over.
+/// Wider for small experiments, since there is less to average over. This is
+/// `chooseLowessSpan(ntags)` at limma's defaults, which is what edgeR's `WLEB`
+/// reaches for when `span` is `NULL`.
+///
+/// edgeR keeps a second rule behind `legacy.span = TRUE`, namely
+/// `chooseLowessSpan(ntags, small.n = 50, min.span = 0.25, power = 0.5)`. That
+/// was the default before edgeR 4.0 and is not the default now. The two agree
+/// only below fifty genes, where both return 1, so a small fixture cannot tell
+/// them apart: at 890 genes they are 0.568 and 0.428, and the gap lands on every
+/// trended and tagwise dispersion. Pass an explicit `span` to get the old rule.
 ///
 /// ### Params
 ///
@@ -171,12 +178,8 @@ pub struct WlebResult {
 ///
 /// A span in `(0, 1]`.
 fn default_span(n_genes: usize) -> f64 {
-    let n = n_genes as f64;
-    if n <= SMALL_GENE_COUNT {
-        1.0
-    } else {
-        0.25 + 0.75 * (SMALL_GENE_COUNT / n).sqrt()
-    }
+    let (small_n, min_span, power) = LIMMA_LOWESS_DEFAULTS;
+    choose_lowess_span(n_genes, small_n, min_span, power)
 }
 
 /// Smooths the likelihood surface down the gene axis.
@@ -1215,12 +1218,26 @@ mod tests {
         }
     }
 
+    /// The span rule, against edgeR's current default rather than its legacy one.
+    ///
+    /// `WLEB` takes `chooseLowessSpan(ntags)` when `legacy.span` is `FALSE`, which
+    /// it is by default, and only falls back to `min.span = 0.25, power = 0.5`
+    /// when asked. Both rules return 1 below fifty genes, so the sizes below are
+    /// chosen to separate them.
+    ///
+    /// ```r
+    /// # Rscript, limma 3.66
+    /// limma::chooseLowessSpan(200)   # 0.740972367463206
+    /// limma::chooseLowessSpan(890)   # 0.568096640916288
+    /// limma::chooseLowessSpan(10000) # 0.419698316267369
+    /// ```
     #[test]
-    fn test_default_span_widens_for_small_experiments() {
+    fn test_default_span_matches_edger_choose_lowess_span() {
         assert_relative_eq!(default_span(10), 1.0, max_relative = 1e-12);
         assert_relative_eq!(default_span(50), 1.0, max_relative = 1e-12);
-        // R: 0.25 + 0.75 * sqrt(50/200)
-        assert_relative_eq!(default_span(200), 0.625, max_relative = 1e-12);
+        assert_relative_eq!(default_span(200), 0.740972367463206, max_relative = 1e-12);
+        assert_relative_eq!(default_span(890), 0.568096640916288, max_relative = 1e-12);
+        assert_relative_eq!(default_span(10000), 0.419698316267369, max_relative = 1e-12);
     }
 
     #[test]

@@ -14,7 +14,8 @@
 
 use rayon::prelude::*;
 
-use crate::glm::levenberg::{LevenbergParams, Scratch};
+use crate::glm::fit::GLM_FIT_MAX_ITER;
+use crate::glm::levenberg::{LevenbergParams, Scratch, initial_coefficients};
 use crate::glm::one_group::{OneGroupParams, fit_one_gene as fit_one_group_gene};
 use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
@@ -271,7 +272,10 @@ fn fit_general_gene(
     // Start from the previous grid point's answer. Neighbouring dispersions give
     // very similar coefficients, so this saves most of the iterations after the
     // first grid point.
-    let params = LevenbergParams::default();
+    //
+    // The budget is `glmFit`'s rather than `mglmLevenberg`'s, because that is the
+    // route `adjustedProfileLik` takes to the fitter.
+    let params = LevenbergParams { max_iter: GLM_FIT_MAX_ITER, ..Default::default() };
     crate::glm::levenberg::fit_one_gene(
         &mut scratch.levenberg,
         &mut scratch.beta,
@@ -377,6 +381,25 @@ pub fn apl_grid<T: EdgeFloat>(
             let start = gene * n_samples;
             for (slot, value) in scratch.y.iter_mut().zip(&counts[start..start + n_samples]) {
                 *slot = value.to_f64().unwrap_or(0.0);
+            }
+
+            // Cold-start this gene. The scratch is shared by every gene a worker
+            // handles, and `beta` is deliberately carried from one grid point to
+            // the next, so without this the first grid point would start from
+            // whatever the previous *gene* converged to. Neighbouring grid points
+            // are close together; neighbouring genes need not be, and over a wide
+            // abundance range that start is far enough out that the fit lands on
+            // the wrong optimum.
+            if !one_way {
+                initial_coefficients(
+                    &scratch.y,
+                    design,
+                    offset_row,
+                    n_samples,
+                    n_coef,
+                    LevenbergParams::default().start_method,
+                    &mut scratch.beta,
+                );
             }
 
             for (g, &dispersion) in grid.iter().enumerate() {

@@ -28,7 +28,12 @@ use crate::utils::design::{design_as_factor, non_estimable};
 /// `mglmLevenberg` defaults to 200, but `glmFit` raises it: at this point there
 /// is no fallback left, so it is worth spending more iterations on the awkward
 /// genes rather than reporting them unconverged.
-const GLM_FIT_MAX_ITER: usize = 250;
+///
+/// `adjustedProfileLik` reaches the fitter through `glmFit` rather than calling
+/// `mglmLevenberg` itself, so [`crate::dispersion::apl`] shares this budget. A
+/// gene with an empty group never converges and stops on the cap, so the two
+/// paths give different answers if they disagree on it.
+pub(crate) const GLM_FIT_MAX_ITER: usize = 250;
 
 /// Default prior count used to shrink log-fold-changes.
 ///

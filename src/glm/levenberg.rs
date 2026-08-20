@@ -307,7 +307,7 @@ fn deviance_of(
 /// * `n_coef` - Number of coefficients
 /// * `method` - Which initialisation to use
 /// * `beta` - Output, length `n_coef`
-fn initial_coefficients(
+pub(crate) fn initial_coefficients(
     y: &[f64],
     design: &[f64],
     offset: RecycledRow<'_, f64>,
