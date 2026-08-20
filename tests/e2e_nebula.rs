@@ -63,7 +63,7 @@ const TOL_CELL: Tol = Tol::rel(1e-4);
 /// `1.4e-3` on the pure paths, which is that arithmetic exactly.
 const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 
-// -- The LN+HL path, held apart because it does not yet agree --
+// -- The LN+HL path, held apart because the two optimisers pick different basins --
 //
 // nebula picks one of three sub-paths per gene. Measured on the 1005-cell set,
 // worst relative disagreement on the coefficients:
@@ -72,24 +72,47 @@ const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 //   NBGMM (HL)       6 genes    3.8e-7      (118 genes at 7.4e-6 on sc_small)
 //   NBGMM (LN+HL)  281 genes    5.9e-1
 //
-// So the two pure paths are right and the mixed one is not. LN+HL is the branch
-// that keeps stage one's cell-level estimate and refits only the subject-level
-// overdispersion against the profile likelihood, and it is where the crate and
-// the R package part company. The disagreement is not a switch: 224 of the 281
-// genes land inside `1e-6` and the rest tail out, with the subject
-// overdispersion ratio running from 0.92 to 5.47 about a median of exactly 1.
+// The cause is not the LN+HL refit itself. That refit's objective was compared
+// against `nebula:::pql_gamma_ll` at identical `(sigma, phi)` on three affected
+// genes over an eight-point grid: the two agree to `6e-10` absolute, `2e-12`
+// relative, so the profile likelihood, the inner PML solve, `reml`, `ord` and
+// the sign convention are all faithful, and the one-dimensional search finds
+// that objective's minimum.
 //
-// That distribution says the refit finds a different optimum on a minority of
-// genes rather than computing a different quantity. It is not covered by the
-// in-crate golden: at 25 cells per subject that fixture never reaches LN at all,
-// and the nine-gene relabelling test that does reach LN+HL is too small to show
-// the tail.
+// The divergence is in stage one, the marginal likelihood over
+// `[beta, sigma, phi]`. On these genes it is bimodal in `sigma`: one minimum
+// pinned at the lower bound `1e-4` and an interior one between `0.03` and
+// `0.15`, separated by a ridge near `sigma = 0.01`. Both are strict local
+// minima, confirmed by profiling `nebula:::ptmg_ll` over `sigma` with `beta` and
+// `phi` optimised out. R runs nlopt's LD_LBFGS there and this crate runs
+// L-BFGS-B, and on 37 of the 281 genes the two land in different basins. LN+HL
+// then holds stage one's `phi` fixed and refits only `sigma`, so the basin
+// choice propagates straight into both variance components and, through the
+// `-sigma/2` intercept shift, into the coefficients.
 //
-// This matters more than the gene count suggests. LN+HL is the path almost every
-// real single-cell dataset takes, since it needs only thirty cells per subject.
-// The two constants below record where the port currently stands so that the
-// suite fails loudly if it drifts further, and fails just as loudly if someone
-// fixes it and forgets to tighten them. They are not an accepted tolerance.
+// Neither optimiser is the right one. This crate's stage-one optimum has the
+// strictly lower marginal negative log-likelihood on 9 of the 37, by up to
+// `7.2` nats; R's is lower on 27. And R disagrees with itself: nebula's own
+// documented `opt = "trust"` moves the subject overdispersion by more than one
+// per cent on 78 of the 281 genes, twice as many as the 37 where this crate
+// differs from `opt = "lbfgs"`, and on those 37 it lands on this crate's answer
+// rather than on `lbfgs`'s: 22 of them agree to `1e-6` and 32 to `1e-4`, against
+// none agreeing with `lbfgs` to `1e-6`. Matching the fixture would mean reproducing
+// nlopt's LD_LBFGS trajectory step for step, including the overshoot that gets
+// clipped onto the `sigma` bound and is what carries it over the ridge.
+//
+// One gene is not stage one at all. On `gene_id` 299 both optimisers agree on
+// `[beta, sigma, phi]` to `3e-7`, and it is R's `nlminb` inside the refit that
+// fails: it returns the lower bound `1e-4` with `convergence == 0` at a point
+// where its own `pql_gamma_ll` is still falling. That objective's minimum is at
+// `5.5e-4`, which is what this crate returns, and it is worth `0.23` nats.
+//
+// Size of it in practice: the worst absolute coefficient disagreement across all
+// LN+HL genes is `4.4e-3` in log-fold-change units. The large relative figure
+// above is a coefficient of magnitude `8.6e-4` and is not meaningful.
+//
+// The two constants below record the measured divergence so that the suite fails
+// loudly if it grows. They are not an accepted tolerance.
 
 /// Coefficients on the LN+HL path. Measured worst case `5.9e-1`. See above.
 const LN_HL_COEF: Tol = Tol::new(1.0, 1e-2);
