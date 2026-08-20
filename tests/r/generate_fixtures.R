@@ -746,6 +746,85 @@ write_num(
 cat(sprintf("poisson legacy: bound moves %d of %d p-values\n",
             sum(qlt_bound$table$PValue != qlt_nobound$table$PValue), pois$ng))
 
+########
+# voom #
+########
+
+# voomLmFit with block = NULL and sample.weights = FALSE, which is what the
+# crate's voom_lmfit implements. Its defaults already agree with VoomParams:
+# span 0.5, adaptive.span TRUE, and a prior count hardcoded at 0.5 upstream.
+#
+# normalize.method stays at "none" throughout. The crate's normalize_method is
+# edgeR's calcNormFactors, scaling the library sizes, where limma's is
+# normalizeBetweenArrays, shifting the log ratios. They coincide only here, so a
+# non-default fixture would compare two different operations.
+#
+# save.plot = TRUE is what stores the fitted trend; without it voom.xy and
+# voom.line are absent. MArrayLM carries no fitted.values either, so the fitted
+# matrix is reconstructed from the coefficients.
+run_voom <- function(tag, counts, des) {
+  ns <- ncol(counts)
+  ncoef <- ncol(des)
+  v <- voomLmFit(counts, des, block = NULL, sample.weights = FALSE, save.plot = TRUE)
+
+  write_num(v$EList$E, paste0(tag, "_voom_e.csv"), paste0("e", seq_len(ns)))
+  write_num(v$EList$weights, paste0(tag, "_voom_weights.csv"), paste0("w", seq_len(ns)))
+  write_num(
+    cbind(v$coefficients, v$stdev.unscaled, sigma = v$sigma,
+          df_residual = v$df.residual, amean = v$Amean),
+    paste0(tag, "_voom_lmfit.csv"),
+    c(paste0("coef", seq_len(ncoef)), paste0("stdev", seq_len(ncoef)),
+      "sigma", "df_residual", "amean")
+  )
+  write_num(v$coefficients %*% t(des), paste0(tag, "_voom_fitted.csv"),
+            paste0("fit", seq_len(ns)))
+  write_num(cbind(x = v$voom.line$x, y = v$voom.line$y),
+            paste0(tag, "_voom_trend.csv"), c("x", "y"))
+
+  # squeezeVar on the resulting variances. The residual df are not constant here
+  # (the structural-zero genes lose observations), so legacy = NULL auto-resolves
+  # to FALSE and the fit goes through fitFDistUnequalDF1. The scalar-df call
+  # forces the legacy branch so both are gated.
+  invisible(uniroot_since())
+  sq <- tightS(v$sigma^2, df = v$df.residual)
+  sq_trend <- tightS(v$sigma^2, df = v$df.residual, covariate = v$Amean)
+  sq_robust <- tightS(v$sigma^2, df = v$df.residual, robust = TRUE)
+  df_one <- max(v$df.residual)
+  sq_legacy <- tightS(v$sigma^2, df = df_one)
+  put(paste0(tag, "_voom"), "squeeze_uniroot_calls", uniroot_since())
+
+  ng <- nrow(counts)
+  write_num(
+    cbind(
+      var_post = sq$var.post,
+      var_prior = rep_len(sq$var.prior, ng),
+      trend_var_post = sq_trend$var.post,
+      trend_var_prior = rep_len(sq_trend$var.prior, ng),
+      robust_var_post = sq_robust$var.post,
+      robust_df_prior = rep_len(sq_robust$df.prior, ng),
+      legacy_var_post = sq_legacy$var.post
+    ),
+    paste0(tag, "_voom_squeeze.csv"),
+    c("var_post", "var_prior", "trend_var_post", "trend_var_prior",
+      "robust_var_post", "robust_df_prior", "legacy_var_post")
+  )
+
+  put(paste0(tag, "_voom"), "df_prior", sq$df.prior[1])
+  put(paste0(tag, "_voom"), "var_prior", sq$var.prior[1])
+  put(paste0(tag, "_voom"), "trend_df_prior", sq_trend$df.prior[1])
+  put(paste0(tag, "_voom"), "robust_df_prior_len", length(sq_robust$df.prior))
+  put(paste0(tag, "_voom"), "legacy_df_prior", sq_legacy$df.prior[1])
+  put(paste0(tag, "_voom"), "legacy_df_one", df_one)
+  put(paste0(tag, "_voom"), "n_distinct_df", length(unique(v$df.residual)))
+
+  cat(sprintf("%s voom: df.residual {%s}, trend %d points\n", tag,
+              paste(sort(unique(v$df.residual)), collapse = ","),
+              length(v$voom.line$x)))
+}
+
+run_voom("fac", fac$yf$counts, fac_des)
+run_voom("unbal", unbal$yf$counts, unbal_des)
+
 ###############
 # Single cell #
 ###############
@@ -834,20 +913,27 @@ if (requireNamespace("nebula", quietly = TRUE)) {
       verbose = FALSE, ncore = 1
     )
 
-    # The thirteen columns are laid out exactly as the existing golden in
-    # tests/data/nebula_expected.csv, which the Rust reader already knows.
+    # The first thirteen columns are laid out exactly as the existing golden in
+    # tests/data/nebula_expected.csv, which the Rust reader already knows. The
+    # algorithm code is appended: nebula picks a sub-path per gene, and which one
+    # it took explains most of how closely the port can be expected to agree.
+    algo <- match(res$algorithm, c("NBGMM (LN)", "NBGMM (LN+HL)", "NBGMM (HL)"))
     write_num(
       cbind(as.matrix(res$summary[, 1:9]),
             gene_id = res$summary$gene_id,
             Subject = res$overdispersion$Subject,
             Cell = res$overdispersion$Cell,
-            convergence = res$convergence),
+            convergence = res$convergence,
+            algorithm = algo),
       paste0(tag, "_nebula.csv"),
       c("logFC_int", "logFC_grp", "logFC_cov2",
         "se_int", "se_grp", "se_cov2",
         "p_int", "p_grp", "p_cov2",
-        "gene_id", "Subject", "Cell", "convergence")
+        "gene_id", "Subject", "Cell", "convergence", "algorithm")
     )
+    for (k in seq_along(c("ln", "lnhl", "hl"))) {
+      put(tag, paste0("n_algo_", c("ln", "lnhl", "hl")[k]), sum(algo == k, na.rm = TRUE))
+    }
     # R packs the covariance lower-triangular column-major; the Rust repacks it.
     write_num(as.matrix(res$covariance), paste0(tag, "_covariance.csv"),
               paste0("cov_", seq_len(ncol(res$covariance))))
