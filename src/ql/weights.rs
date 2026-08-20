@@ -4,19 +4,8 @@
 //! [`crate::ql::chebyshev`] supplies the two moments of a single unit deviance,
 //! this module spends them: for each gene it rescales every observation's unit
 //! deviance by `alpha`, weights the complementary leverage by `kappa`, and sums
-//! both across samples. The ratio of the two is `s2`, the gene's quasi-likelihood
-//! dispersion, which `glmQLFit` then hands to `squeezeVar`.
-//!
-//! ### The prior
-//!
-//! Everything here is conditional on one scalar, the average quasi-dispersion.
-//! It divides the dispersion before the moments are taken, which is how edgeR
-//! separates the negative binomial dispersion it fitted with from the residual
-//! overdispersion it is about to model. [`update_prior`] finds it by running the
-//! whole adjustment twice, each time smoothing `s2^(1/4)` against average log-CPM
-//! and taking the 90th percentile of that trend. The fourth root and the fourth
-//! power are not decorative: they are what makes the trend of a chi-square-like
-//! quantity roughly homoscedastic, so a lowess fit through it is meaningful.
+//! both across samples. The ratio of the two is `s2`, the gene's
+//! quasi-likelihood dispersion, which `glmQLFit` then hands to `squeezeVar`.
 //!
 //! ### Layout
 //!
@@ -54,17 +43,15 @@ use crate::utils::design::hat_diagonal;
 use crate::utils::recycled::{Recycled, RecycledRow};
 use crate::utils::traits::EdgeFloat;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Complementary leverage below which an observation is dropped outright.
 ///
-/// edgeR's `thresholdzero`. A sample whose leverage is one is fitted exactly, so
-/// its residual carries no information; counting its unit deviance would inflate
-/// the numerator of `s2` without adding anything to the denominator. The same
-/// constant guards the final division, so a gene with no residual degrees of
-/// freedom reports `s2 = 0` rather than `0/0`.
+/// edgeR's `thresholdzero`. A sample whose leverage is one is fitted exactly,
+/// so its residual carries no information; counting its unit deviance would
+/// inflate the numerator of `s2` without adding anything to the denominator.
 const THRESHOLD_ZERO: f64 = 1e-4;
 
 /// Degrees of freedom below which a gene is excluded from the prior trend.
@@ -144,9 +131,10 @@ pub struct AdjustedDeviance {
 /// * `fitted` - Fitted means, row-major `n_genes * n_samples`
 /// * `design` - Design matrix, row-major `n_samples * n_coef`
 /// * `n_coef` - Number of coefficients
-/// * `dispersion` - Negative binomial dispersions, recycled over genes and samples
-/// * `prior` - Average quasi-dispersion. Length one for edgeR's scalar prior, or
-///   `n_genes` for a per-gene one. Every entry must be finite and positive.
+/// * `dispersion` - Negative binomial dispersions, recycled over genes and
+///   samples
+/// * `prior` - Average quasi-dispersion. Length one for edgeR's scalar prior,
+///   or `n_genes` for a per-gene one. Every entry must be finite and positive.
 /// * `weights` - Optional observation weights, recycled the same way
 ///
 /// ### Returns
@@ -235,8 +223,7 @@ pub fn compute_adjust_vec<T: EdgeFloat>(
 /// is a different algorithm with a different window rule and a different seed
 /// spacing. On 500 genes with a heavily overdispersed fit the two priors differ
 /// by 5.2e-5 relative, so the whole quasi-likelihood path inherits an error of
-/// that order. Reproducing edgeR exactly needs a `clowess` port, which does not
-/// exist in this crate yet.
+/// that order.
 ///
 /// ### Params
 ///
@@ -275,9 +262,6 @@ pub fn compute_prior(ave_log_cpm: &[f64], s2: &[f64], df: &[f64]) -> Result<Vec<
         }
     }
 
-    // A single surviving gene is its own trend, and the smoother needs two
-    // points. No survivors at all leaves nothing to smooth, so the prior is
-    // inert.
     let trend = match root_s2.len() {
         0 => return Ok(vec![PRIOR_FLOOR]),
         1 => root_s2,
@@ -291,8 +275,7 @@ pub fn compute_prior(ave_log_cpm: &[f64], s2: &[f64], df: &[f64]) -> Result<Vec<
     };
 
     let p = quantile_type7(&trend, PRIOR_QUANTILE)?.max(PRIOR_FLOOR);
-    // Written out rather than `powi(4)`: edgeR multiplies left to right and the
-    // two round differently in the last bit.
+
     Ok(vec![p * p * p * p])
 }
 
@@ -311,7 +294,8 @@ pub fn compute_prior(ave_log_cpm: &[f64], s2: &[f64], df: &[f64]) -> Result<Vec<
 /// * `fitted` - Fitted means, row-major `n_genes * n_samples`
 /// * `design` - Design matrix, row-major `n_samples * n_coef`
 /// * `n_coef` - Number of coefficients
-/// * `dispersion` - Negative binomial dispersions, recycled over genes and samples
+/// * `dispersion` - Negative binomial dispersions, recycled over genes and
+///   samples
 /// * `weights` - Optional observation weights, recycled the same way
 /// * `ave_log_cpm` - Average log-CPM, one per gene
 ///
@@ -350,9 +334,9 @@ pub fn update_prior<T: EdgeFloat>(
     Ok(prior)
 }
 
-//////////////
-// Internal //
-//////////////
+/////////////
+// Scratch //
+/////////////
 
 /// Per-thread buffers for the gene fan-out.
 struct Scratch {

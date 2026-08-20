@@ -36,9 +36,9 @@
 
 use crate::numeric::gamma::ln_gamma;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Below this mean every weight is reported as an exact zero.
 ///
@@ -46,20 +46,6 @@ use crate::numeric::gamma::ln_gamma;
 /// factors that lose meaning once `mu` underflows the fitted range, and a gene
 /// with a mean this small contributes nothing to the quasi-likelihood anyway.
 const MIN_MU: f64 = 1e-32;
-
-// There is deliberately no Poisson branch in the dispatch below, and no
-// constant bounding one.
-//
-// An earlier version of this module peeled one off the front, on the reasoning
-// that `phi = 0` has no overdispersion to model. That is wrong: edgeR's
-// `compute_weight` in `ql_weights.c` has no Poisson case at all, and `phi = 0`
-// falls into the case 1 fits, which already carry `pois_alpha` and `pois_kappa`
-// as internal factors. Diverting it cost 1.8e-4 relative on the adjusted
-// deviance at `dispersion = 0`, which `glmQLFit(dispersion = 0)` and any zero
-// entry in a tagwise dispersion vector both reach. The two Poisson functions
-// remain public because they are the `mu`-dependent factor of the case 1 fits,
-// not a branch of their own. See `ql::weights`'s
-// `test_zero_dispersion_matches_edger`.
 
 /// Upper bound of the case 1 negative binomial fits.
 const PHI_CASE1_MAX: f64 = 0.736;
@@ -146,6 +132,95 @@ const NB_SUM_SLACK: f64 = 10.0;
 /// Above `phi = 4.001` the negative binomial has almost all of its mass on the
 /// first few counts, so fifty terms is a generous tail.
 const NB_SUM_MAX: usize = 50;
+
+/// Blocks of the case 1 large-`mu` fit for alpha.
+const NB1_ALPHA_LARGE_BLOCKS: [(f64, usize); 3] = [(80.0, 0), (120.0, 6), (f64::INFINITY, 12)];
+
+/// Blocks of the case 1 large-`mu` fit for kappa, which needs one more than
+/// alpha does before it settles.
+const NB1_KAPPA_LARGE_BLOCKS: [(f64, usize); 4] =
+    [(80.0, 0), (120.0, 6), (250.0, 12), (f64::INFINITY, 18)];
+
+////////////
+// Panels //
+////////////
+
+/// Panels of the [`pois_alpha`] fit.
+#[rustfmt::skip]
+const POIS_ALPHA_PANELS: [Panel; 5] = [
+    Panel { upper: 0.02, centre2: 0.02, width2: 0.02, offset: 0 },
+    Panel { upper: 0.4249, centre2: 0.4449, width2: 0.4049, offset: 10 },
+    Panel { upper: 1.5, centre2: 1.9249, width2: 1.0751, offset: 20 },
+    Panel { upper: 3.544, centre2: 5.044, width2: 2.044, offset: 30 },
+    Panel { upper: 20.0, centre2: 23.544, width2: 16.456, offset: 40 },
+];
+
+/// Panels of the [`pois_kappa`] fit.
+#[rustfmt::skip]
+const POIS_KAPPA_PANELS: [Panel; 5] = [
+    Panel { upper: 0.02, centre2: 0.02, width2: 0.02, offset: 0 },
+    Panel { upper: 0.4966, centre2: 0.5166, width2: 0.4766, offset: 10 },
+    Panel { upper: 1.5, centre2: 1.9966, width2: 1.0034, offset: 20 },
+    Panel { upper: 4.2714, centre2: 5.7714, width2: 2.7714, offset: 30 },
+    Panel { upper: 20.0, centre2: 24.2714, width2: 15.7286, offset: 40 },
+];
+
+/// Panels of the case 1 joint fit for alpha, valid up to [`NB1_MID_MU`].
+#[rustfmt::skip]
+const NB1_ALPHA_PANELS: [Panel; 6] = [
+    Panel { upper: 0.01, centre2: 0.01, width2: 0.01, offset: 0 },
+    Panel { upper: 0.33, centre2: 0.34, width2: 0.32, offset: 49 },
+    Panel { upper: 1.77, centre2: 2.1, width2: 1.44, offset: 98 },
+    Panel { upper: 4.0, centre2: 5.77, width2: 2.23, offset: 147 },
+    Panel { upper: 10.0, centre2: 14.0, width2: 6.0, offset: 196 },
+    Panel { upper: f64::INFINITY, centre2: 30.0, width2: 10.0, offset: 245 },
+];
+
+/// Panels of the case 1 joint fit for kappa, valid up to [`NB1_MID_MU`].
+#[rustfmt::skip]
+const NB1_KAPPA_PANELS: [Panel; 6] = [
+    Panel { upper: 0.01, centre2: 0.01, width2: 0.01, offset: 0 },
+    Panel { upper: 0.33, centre2: 0.34, width2: 0.32, offset: 49 },
+    Panel { upper: 1.3, centre2: 1.63, width2: 0.97, offset: 98 },
+    Panel { upper: 4.0, centre2: 5.3, width2: 2.7, offset: 147 },
+    Panel { upper: 10.0, centre2: 14.0, width2: 6.0, offset: 196 },
+    Panel { upper: f64::INFINITY, centre2: 30.0, width2: 10.0, offset: 245 },
+];
+
+/// Panels of the case 1 separable fit, shared by both moments.
+#[rustfmt::skip]
+const NB1_MID_PANELS: [Panel; 4] = [
+    Panel { upper: 25.0, centre2: 45.0, width2: 5.0, offset: 0 },
+    Panel { upper: 30.0, centre2: 55.0, width2: 5.0, offset: 7 },
+    Panel { upper: 40.0, centre2: 70.0, width2: 10.0, offset: 14 },
+    Panel { upper: f64::INFINITY, centre2: 100.0, width2: 20.0, offset: 21 },
+];
+
+/// Panels of the case 2 joint fit for alpha, valid up to [`NB2_MID_MU`].
+///
+/// The first panel maps `[0, 0.02]` rather than `[0, 0.01]` onto `[-1, 1]`, so
+/// only the left half of its Chebyshev domain is ever used. That is how the C
+/// writes it.
+#[rustfmt::skip]
+const NB2_ALPHA_PANELS: [Panel; 6] = [
+    Panel { upper: 0.01, centre2: 0.02, width2: 0.02, offset: 0 },
+    Panel { upper: 0.43, centre2: 0.44, width2: 0.42, offset: 100 },
+    Panel { upper: 3.62, centre2: 4.05, width2: 3.19, offset: 200 },
+    Panel { upper: 10.0, centre2: 13.62, width2: 6.38, offset: 300 },
+    Panel { upper: 30.0, centre2: 40.0, width2: 20.0, offset: 400 },
+    Panel { upper: f64::INFINITY, centre2: 80.0, width2: 20.0, offset: 500 },
+];
+
+/// Panels of the case 2 joint fit for kappa, valid up to [`NB2_MID_MU`].
+#[rustfmt::skip]
+const NB2_KAPPA_PANELS: [Panel; 6] = [
+    Panel { upper: 0.01, centre2: 0.02, width2: 0.02, offset: 0 },
+    Panel { upper: 0.5, centre2: 0.51, width2: 0.49, offset: 100 },
+    Panel { upper: 3.88, centre2: 4.38, width2: 3.38, offset: 200 },
+    Panel { upper: 10.0, centre2: 13.88, width2: 6.12, offset: 300 },
+    Panel { upper: 30.0, centre2: 40.0, width2: 20.0, offset: 400 },
+    Panel { upper: f64::INFINITY, centre2: 80.0, width2: 20.0, offset: 500 },
+];
 
 ////////////////////
 // Panel dispatch //
@@ -248,91 +323,6 @@ fn edge_series(
         cheb_eval(&table[blend..blend + len], x),
     )
 }
-
-/// Panels of the [`pois_alpha`] fit.
-#[rustfmt::skip]
-const POIS_ALPHA_PANELS: [Panel; 5] = [
-    Panel { upper: 0.02, centre2: 0.02, width2: 0.02, offset: 0 },
-    Panel { upper: 0.4249, centre2: 0.4449, width2: 0.4049, offset: 10 },
-    Panel { upper: 1.5, centre2: 1.9249, width2: 1.0751, offset: 20 },
-    Panel { upper: 3.544, centre2: 5.044, width2: 2.044, offset: 30 },
-    Panel { upper: 20.0, centre2: 23.544, width2: 16.456, offset: 40 },
-];
-
-/// Panels of the [`pois_kappa`] fit.
-#[rustfmt::skip]
-const POIS_KAPPA_PANELS: [Panel; 5] = [
-    Panel { upper: 0.02, centre2: 0.02, width2: 0.02, offset: 0 },
-    Panel { upper: 0.4966, centre2: 0.5166, width2: 0.4766, offset: 10 },
-    Panel { upper: 1.5, centre2: 1.9966, width2: 1.0034, offset: 20 },
-    Panel { upper: 4.2714, centre2: 5.7714, width2: 2.7714, offset: 30 },
-    Panel { upper: 20.0, centre2: 24.2714, width2: 15.7286, offset: 40 },
-];
-
-/// Panels of the case 1 joint fit for alpha, valid up to [`NB1_MID_MU`].
-#[rustfmt::skip]
-const NB1_ALPHA_PANELS: [Panel; 6] = [
-    Panel { upper: 0.01, centre2: 0.01, width2: 0.01, offset: 0 },
-    Panel { upper: 0.33, centre2: 0.34, width2: 0.32, offset: 49 },
-    Panel { upper: 1.77, centre2: 2.1, width2: 1.44, offset: 98 },
-    Panel { upper: 4.0, centre2: 5.77, width2: 2.23, offset: 147 },
-    Panel { upper: 10.0, centre2: 14.0, width2: 6.0, offset: 196 },
-    Panel { upper: f64::INFINITY, centre2: 30.0, width2: 10.0, offset: 245 },
-];
-
-/// Panels of the case 1 joint fit for kappa, valid up to [`NB1_MID_MU`].
-#[rustfmt::skip]
-const NB1_KAPPA_PANELS: [Panel; 6] = [
-    Panel { upper: 0.01, centre2: 0.01, width2: 0.01, offset: 0 },
-    Panel { upper: 0.33, centre2: 0.34, width2: 0.32, offset: 49 },
-    Panel { upper: 1.3, centre2: 1.63, width2: 0.97, offset: 98 },
-    Panel { upper: 4.0, centre2: 5.3, width2: 2.7, offset: 147 },
-    Panel { upper: 10.0, centre2: 14.0, width2: 6.0, offset: 196 },
-    Panel { upper: f64::INFINITY, centre2: 30.0, width2: 10.0, offset: 245 },
-];
-
-/// Panels of the case 1 separable fit, shared by both moments.
-#[rustfmt::skip]
-const NB1_MID_PANELS: [Panel; 4] = [
-    Panel { upper: 25.0, centre2: 45.0, width2: 5.0, offset: 0 },
-    Panel { upper: 30.0, centre2: 55.0, width2: 5.0, offset: 7 },
-    Panel { upper: 40.0, centre2: 70.0, width2: 10.0, offset: 14 },
-    Panel { upper: f64::INFINITY, centre2: 100.0, width2: 20.0, offset: 21 },
-];
-
-/// Blocks of the case 1 large-`mu` fit for alpha.
-const NB1_ALPHA_LARGE_BLOCKS: [(f64, usize); 3] = [(80.0, 0), (120.0, 6), (f64::INFINITY, 12)];
-
-/// Blocks of the case 1 large-`mu` fit for kappa, which needs one more than
-/// alpha does before it settles.
-const NB1_KAPPA_LARGE_BLOCKS: [(f64, usize); 4] =
-    [(80.0, 0), (120.0, 6), (250.0, 12), (f64::INFINITY, 18)];
-
-/// Panels of the case 2 joint fit for alpha, valid up to [`NB2_MID_MU`].
-///
-/// The first panel maps `[0, 0.02]` rather than `[0, 0.01]` onto `[-1, 1]`, so
-/// only the left half of its Chebyshev domain is ever used. That is how the C
-/// writes it.
-#[rustfmt::skip]
-const NB2_ALPHA_PANELS: [Panel; 6] = [
-    Panel { upper: 0.01, centre2: 0.02, width2: 0.02, offset: 0 },
-    Panel { upper: 0.43, centre2: 0.44, width2: 0.42, offset: 100 },
-    Panel { upper: 3.62, centre2: 4.05, width2: 3.19, offset: 200 },
-    Panel { upper: 10.0, centre2: 13.62, width2: 6.38, offset: 300 },
-    Panel { upper: 30.0, centre2: 40.0, width2: 20.0, offset: 400 },
-    Panel { upper: f64::INFINITY, centre2: 80.0, width2: 20.0, offset: 500 },
-];
-
-/// Panels of the case 2 joint fit for kappa, valid up to [`NB2_MID_MU`].
-#[rustfmt::skip]
-const NB2_KAPPA_PANELS: [Panel; 6] = [
-    Panel { upper: 0.01, centre2: 0.02, width2: 0.02, offset: 0 },
-    Panel { upper: 0.5, centre2: 0.51, width2: 0.49, offset: 100 },
-    Panel { upper: 3.88, centre2: 4.38, width2: 3.38, offset: 200 },
-    Panel { upper: 10.0, centre2: 13.88, width2: 6.12, offset: 300 },
-    Panel { upper: 30.0, centre2: 40.0, width2: 20.0, offset: 400 },
-    Panel { upper: f64::INFINITY, centre2: 80.0, width2: 20.0, offset: 500 },
-];
 
 //////////////////////////
 // Chebyshev evaluation //
