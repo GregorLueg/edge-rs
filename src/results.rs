@@ -105,9 +105,9 @@ fn check_cutoff(name: &str, value: f64) -> Result<(), EdgeErrors> {
     Ok(())
 }
 
-//////////////
-// topTags  //
-//////////////
+/////////////
+// topTags //
+/////////////
 
 /// The top differentially expressed genes, edgeR's `topTags`.
 ///
@@ -165,8 +165,6 @@ pub fn top_tags(
 
     let fdr = p_adjust_bh(p_value);
 
-    // Stable throughout, so a tie keeps the caller's gene order, as R's `order`
-    // does.
     let mut order: Vec<usize> = (0..n_genes).collect();
     match sort_by {
         SortBy::PValue => order.sort_by(|&a, &b| {

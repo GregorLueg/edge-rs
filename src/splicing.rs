@@ -35,14 +35,16 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::core::dgelist::DgeList;
-use crate::errors::EdgeErrors;
 use crate::glm::fit::{DEFAULT_PRIOR_COUNT, GlmFit, glm_fit, glm_fit_dge};
 use crate::glm::test::{GlmTestInput, Tested, glm_lrt};
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 use crate::numeric::dist::{chisq_sf, f_sf};
+use crate::prelude::*;
 use crate::utils::design::contrast_as_coef;
-use crate::utils::recycled::Recycled;
-use crate::utils::traits::EdgeFloat;
+
+////////////
+// Consts //
+////////////
 
 /// Dispersion the gene-level fit runs at.
 ///
@@ -53,7 +55,7 @@ use crate::utils::traits::EdgeFloat;
 const GENE_LEVEL_DISPERSION: f64 = 0.05;
 
 //////////////////////
-// Public interface //
+// DiffSpliceParams //
 //////////////////////
 
 /// Tuning knobs for [`diff_splice`] and [`diff_splice_dge`].
@@ -99,6 +101,10 @@ impl Default for DiffSpliceParams {
     }
 }
 
+//////////////////
+// DiffSpliceQl //
+//////////////////
+
 /// The quasi-likelihood quantities [`diff_splice`] needs from `glmQLFit`.
 ///
 /// Passing `Some` switches the exon and gene tests from chi-squared to
@@ -137,6 +143,10 @@ pub struct DiffSpliceQl<'a> {
     pub average_ql_dispersion: Option<f64>,
 }
 
+//////////////////////
+// DiffSpliceResult //
+//////////////////////
+
 /// Result of a differential exon usage analysis.
 ///
 /// Exon-level vectors have one entry per input exon, in input order. Gene-level
@@ -167,14 +177,15 @@ pub struct DiffSpliceResult {
     pub gene_id: Vec<usize>,
     /// Gene-level Simes and F tests.
     ///
-    /// The Simes p-value is `min over k of (n * p_(k) / k)` on the gene's sorted
-    /// exon p-values. It answers "does this gene contain any differentially used
-    /// exon", which is a different question from the joint test below and is
-    /// usually the more sensitive of the two.
+    /// The Simes p-value is `min over k of (n * p_(k) / k)` on the gene's
+    /// sorted exon p-values. It answers "does this gene contain any
+    /// differentially used exon", which is a different question from the joint
+    /// test below and is usually the more sensitive of the two.
     pub gene_simes_p: Vec<f64>,
     /// Joint gene-level statistic: the summed exon statistics, read off a
-    /// chi-squared on the likelihood ratio path and an F on the quasi-likelihood
-    /// path. Named for the quasi-likelihood case, which is edgeR's default.
+    /// chi-squared on the likelihood ratio path and an F on the
+    /// quasi-likelihood path. Named for the quasi-likelihood case, which is
+    /// edgeR's default.
     pub gene_f_statistic: Vec<f64>,
     /// P-value for [`DiffSpliceResult::gene_f_statistic`].
     pub gene_f_p_value: Vec<f64>,
@@ -187,8 +198,8 @@ pub struct DiffSpliceResult {
 /// Port of edgeR's `diffSpliceDGE`. Given a negative binomial GLM already fitted
 /// at the exon level, it
 ///
-/// 1. sums each gene's exon counts and fits the same design to the totals, which
-///    gives the gene's own log-fold-change `betabar`,
+/// 1. sums each gene's exon counts and fits the same design to the totals,
+///    which gives the gene's own log-fold-change `betabar`,
 /// 2. folds `betabar * design[, coef]` into the exon-level offsets, so the
 ///    gene-level change is now a fixed, known part of every exon's expectation,
 /// 3. refits each exon under the reduced design with `coef` dropped, and
@@ -242,9 +253,6 @@ pub fn diff_splice<T: EdgeFloat>(
     let resolved = resolve_tested(input, fit, tested)?;
     let groups = group_by_gene(gene_id);
 
-    // A gene with one exon has no within-gene contrast: its single exon
-    // accounts for the whole gene by construction. edgeR drops such genes, and
-    // errors only when that leaves nothing at all.
     let kept_genes: Vec<usize> = (0..groups.ids.len())
         .filter(|g| groups.members[*g].len() > 1)
         .collect();
@@ -255,10 +263,6 @@ pub fn diff_splice<T: EdgeFloat>(
         ));
     }
 
-    // Kept exons, laid out one gene block after another so that every per-gene
-    // quantity below is a contiguous slice, plus the reverse map from exon slot
-    // to gene slot that the scatters go through. Within a gene the exons keep
-    // their input order.
     let mut kept_exons: Vec<usize> = Vec::new();
     let mut exon_gene: Vec<usize> = Vec::new();
     let mut gene_start: Vec<usize> = Vec::with_capacity(kept_genes.len());
@@ -276,8 +280,6 @@ pub fn diff_splice<T: EdgeFloat>(
         .map(|g| groups.members[*g].len())
         .collect();
 
-    // -- gene level fit --
-
     let mut gene_counts = vec![0.0_f64; n_kept_genes * n_samples];
     for (exon, &gene) in kept_exons.iter().zip(exon_gene.iter()) {
         let source = &input.counts[exon * n_samples..(exon + 1) * n_samples];
@@ -287,10 +289,6 @@ pub fn diff_splice<T: EdgeFloat>(
         }
     }
 
-    // edgeR takes the first kept exon's offset row and recycles it across
-    // genes. Summed counts have a larger library than any one exon, but the
-    // gene-level coefficient is only ever used as a difference, so the constant
-    // cancels out of `beta - betabar`.
     let gene_offset: Vec<f64> = input
         .offset
         .row(kept_exons[0], n_samples)
@@ -311,8 +309,6 @@ pub fn diff_splice<T: EdgeFloat>(
         .map(|g| gene_fit.coefficients[g * n_coef + resolved.coef])
         .collect();
 
-    // -- reduced model refit --
-
     let mut counts_kept: Vec<T> = Vec::with_capacity(n_kept_exons * n_samples);
     let mut offset_new: Vec<f64> = Vec::with_capacity(n_kept_exons * n_samples);
     for (exon, &gene) in kept_exons.iter().zip(exon_gene.iter()) {
@@ -326,9 +322,6 @@ pub fn diff_splice<T: EdgeFloat>(
     }
 
     let dispersion = subset_rows(input.dispersion, &kept_exons, n_samples);
-    // A quasi-likelihood fit stores the undivided dispersion but was fitted at
-    // `dispersion / average.ql.dispersion`. The reduced model has to be divided
-    // again or its deviance is not comparable with the full model's.
     let dispersion = match ql.and_then(|q| q.average_ql_dispersion) {
         Some(average) => scale_recycled(&dispersion, 1.0 / average),
         None => dispersion,
@@ -367,8 +360,6 @@ pub fn diff_splice<T: EdgeFloat>(
         .map(|n| *n as f64 * exon_df_test)
         .collect();
 
-    // -- tests --
-
     let tests = match ql {
         None => lrt_tests(&exon_lr, exon_df_test, &gene_lr, &gene_df_test)?,
         Some(q) => ql_tests(
@@ -384,17 +375,12 @@ pub fn diff_splice<T: EdgeFloat>(
         )?,
     };
 
-    // Kept exons were laid out gene block by gene block, so each gene's
-    // p-values are one contiguous slice and the Simes step is a sort per gene
-    // rather than a scan of the whole vector per gene.
     let gene_simes_p: Vec<f64> = gene_n_exons
         .par_iter()
         .zip(gene_start.par_iter())
         .map(|(n, start)| simes(&tests.exon_p[*start..start + n]))
         .collect();
 
-    // Scatter back to input order. Exons of a dropped gene keep the neutral
-    // values documented on the result: no relative change, no evidence.
     let mut exon_log_fc = vec![0.0_f64; n_exons];
     let mut exon_statistic = vec![0.0_f64; n_exons];
     let mut exon_p_value = vec![1.0_f64; n_exons];
@@ -418,19 +404,20 @@ pub fn diff_splice<T: EdgeFloat>(
 
 /// Fits a [`DgeList`] of exon counts and tests it for differential usage.
 ///
-/// The [`DgeList`] wrapper around [`diff_splice`], in the same relation to it as
-/// `glm_fit_dge` is to `glm_fit`: it fits the exon-level GLM from the
+/// The [`DgeList`] wrapper around [`diff_splice`], in the same relation to it
+/// as `glm_fit_dge` is to `glm_fit`: it fits the exon-level GLM from the
 /// container's own offsets and dispersion and then hands the fit straight on.
 /// The fit uses [`DEFAULT_PRIOR_COUNT`], as `glmFit` does;
-/// `params.prior_count` belongs to the gene-level fit inside [`diff_splice`] and
-/// is a separate knob.
+/// `params.prior_count` belongs to the gene-level fit inside [`diff_splice`]
+/// and is a separate knob.
 ///
 /// This is the likelihood ratio flavour. For the quasi-likelihood one, run
 /// `glm_ql_fit` yourself and call [`diff_splice`] with a [`DiffSpliceQl`].
 ///
 /// ### Params
 ///
-/// * `dge` - Exon-level counts, one row per exon, carrying a dispersion estimate
+/// * `dge` - Exon-level counts, one row per exon, carrying a dispersion
+///   estimate
 /// * `design` - Design matrix, row-major `n_samples * n_coef`
 /// * `n_coef` - Number of coefficients, at least two
 /// * `gene_id` - Gene label per exon
@@ -471,13 +458,14 @@ pub fn diff_splice_dge<T: EdgeFloat>(
 
 /// Identifies genes carrying splice variants.
 ///
-/// Port of edgeR's `spliceVariants`, which predates `diffSpliceDGE` and asks the
-/// question in one shot rather than exon by exon. Each gene is unrolled into a
-/// single row of `n_exons * n_samples` counts, laid out exon block by exon
-/// block, and fitted with `~ exon + group + exon:group`. The interaction is the
-/// splice signal: it is exactly the claim that the exon profile differs between
-/// groups. A likelihood ratio test on all `(n_exons - 1) * (n_groups - 1)`
-/// interaction coefficients gives one statistic per gene.
+/// Port of edgeR's `spliceVariants`, which predates `diffSpliceDGE` and asks
+/// the question in one shot rather than exon by exon. Each gene is unrolled
+/// into a single row of `n_exons * n_samples` counts, laid out exon block by
+/// exon block, and fitted with `~ exon + group + exon:group`. The interaction
+/// is the splice signal: it is exactly the claim that the exon profile differs
+/// between groups. A likelihood ratio test on all
+/// `(n_exons - 1) * (n_groups - 1)` interaction coefficients gives one
+/// statistic per gene.
 ///
 /// Genes are batched by exon count, since every gene with the same number of
 /// exons shares a design and can be fitted in one call.
@@ -739,8 +727,8 @@ fn lrt_tests(
 /// Moderated F tests against a gene-level squeezed dispersion.
 ///
 /// The quasi-likelihood flavour. Each gene's exon deviances are pooled into one
-/// residual variance, those variances are squeezed towards a fitted prior across
-/// genes, and the deviance differences are divided by the result. The
+/// residual variance, those variances are squeezed towards a fitted prior
+/// across genes, and the deviance differences are divided by the result. The
 /// denominator degrees of freedom are capped at the experiment's total residual
 /// degrees of freedom, so a large prior cannot claim more information than the
 /// data hold.
@@ -779,10 +767,6 @@ fn ql_tests(
         gene_df_residual[gene] += ql.df_residual[*exon];
         gene_deviance[gene] += ql.deviance[*exon];
     }
-    // A gene whose exons are all structural zeros has no residual degrees of
-    // freedom. edgeR divides anyway and lets the NaN through; squeezeVar will
-    // not accept one, so the uninformative gene is given a zero variance, which
-    // is what glmQLFit does for the same situation one level down.
     let gene_s2: Vec<f64> = gene_deviance
         .iter()
         .zip(gene_df_residual.iter())
@@ -883,9 +867,9 @@ fn simes(p: &[f64]) -> f64 {
 ///
 /// Every gene in the batch is unrolled into a row of `n_exon * n_samples`
 /// counts, ordered exon block by exon block, and the shared design
-/// `~ exon + group + exon:group` is built once. The interaction columns are then
-/// dropped and the deviance difference read off a chi-squared, which is exactly
-/// `glmLRT` on the trailing coefficients.
+/// `~ exon + group + exon:group` is built once. The interaction columns are
+/// then dropped and the deviance difference read off a chi-squared, which is
+/// exactly `glmLRT` on the trailing coefficients.
 ///
 /// ### Params
 ///
@@ -925,9 +909,6 @@ fn fit_exon_group_interaction<T: EdgeFloat>(
         )));
     }
 
-    // Treatment contrasts: intercept, exon dummies, group dummies, then every
-    // exon-by-group product. Observation `e * n_samples + j` is exon `e` in
-    // sample `j`.
     let mut design = vec![0.0_f64; n_obs * n_coef];
     for exon in 0..n_exon {
         for sample in 0..n_samples {

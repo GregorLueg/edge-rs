@@ -6,9 +6,9 @@
 //! the F-distribution fits, voom), and NEBULA, a negative binomial gamma mixed
 //! model for single cell.
 //!
-//! The bulk stack follows edgePython, itself a port of edgeR and limma, with the
-//! R winning wherever the two disagree. NEBULA is ported from the `nebula`
-//! package's own C++ instead, for the reasons in `UPSTREAM_DEVIATIONS.md`.
+//! The bulk stack follows edgePython, itself a port of edgeR and limma, with
+//! the R winning wherever the two disagree. NEBULA is ported from the `nebula`
+//! package's own C++ instead.
 //!
 //! ### Numeric policy
 //!
@@ -16,8 +16,8 @@
 //! single-cell counts can be held as `f32` and halve the memory. Likelihood
 //! evaluation, Cox-Reid log-determinants, the optimisers and every p-value run
 //! in `f64` regardless of `T`. A negative binomial deviance is a difference of
-//! large logs, and accumulating one in `f32` loses parity with edgeR well before
-//! it saves anything worth having.
+//! large logs, and accumulating one in `f32` loses parity with edgeR well
+//! before it saves anything worth having.
 //!
 //! ### Parallelism
 //!
@@ -27,8 +27,8 @@
 //!
 //! Normalisation is the exception, and deliberately so: TMM has no gene axis to
 //! fan out over, since the unit of work is one sample compared against a
-//! reference column. It parallelises over samples and transposes the counts once
-//! on entry so each sample is contiguous. Any module that departs from the
+//! reference column. It parallelises over samples and transposes the counts
+//! once on entry so each sample is contiguous. Any module that departs from the
 //! gene-major rule says so in its own header.
 
 #![warn(missing_docs)]
