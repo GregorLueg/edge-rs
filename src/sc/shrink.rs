@@ -1,9 +1,7 @@
 //! Empirical Bayes shrinkage of the per-gene cell-level overdispersion.
 //!
-//! This has **no upstream in edgeR, limma or `nebula`**. It is edgePython's own
-//! addition (`sc_fit.py`, `shrink_sc_disp`), and it is ported here because the
-//! plan asked for it, not because there is a reference implementation to match.
-//! Read the caveat below before using it.
+//! This has no upstream in edgeR, limma or `nebula`. It is edgePython's own
+//! addition (`sc_fit.py`, `shrink_sc_disp`).
 //!
 //! The idea is to treat `phi = 1 / dispersion` as if it were a sample variance
 //! on `df_residual` degrees of freedom and push it through limma's
@@ -20,9 +18,9 @@
 use crate::errors::EdgeErrors;
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 
-/////////////////
-// ShrinkParam //
-/////////////////
+////////////
+// Consts //
+////////////
 
 /// Smallest `phi` fed to [`squeeze_var`].
 ///
@@ -36,6 +34,10 @@ const PHI_FLOOR: f64 = 1e-8;
 /// Below this the moment estimator has nothing to work with, so the result is
 /// returned unshrunk rather than shrunk towards noise.
 const MIN_GENES_FOR_PRIOR: usize = 3;
+
+/////////////////
+// ShrinkParam //
+/////////////////
 
 /// Tuning knobs for [`shrink_sc_dispersion`].
 #[derive(Clone, Copy, Debug)]

@@ -20,8 +20,16 @@ use crate::errors::EdgeErrors;
 use crate::numeric::dist::chisq_sf;
 use crate::numeric::stats::p_adjust_bh;
 
+////////////
+// Consts //
+////////////
+
 /// Degrees of freedom of a single-contrast Wald test.
 const WALD_DF: f64 = 1.0;
+
+/////////////
+// ScTests //
+/////////////
 
 /// What to test.
 #[derive(Clone, Debug)]
@@ -67,14 +75,6 @@ pub const fn packed_len(n_coef: usize) -> usize {
 /// entry `(i, j)` with `i <= j` sits at `j (j + 1) / 2 + i` and the index does
 /// not depend on `n_coef`. For three coefficients that is
 /// `V11, V12, V22, V13, V23, V33`.
-///
-/// **This is not the R package's order for three or more coefficients.** nebula
-/// returns `fccov[lower.tri(fccov, diag = TRUE)]`, which R traverses
-/// column-major over the *lower* triangle, giving
-/// `V11, V21, V31, V22, V32, V33`. The two coincide only at `n_coef <= 2`.
-/// Comparing against a `covariance = TRUE` fixture means permuting one of them;
-/// the tests do that rather than bending the layout, since the packed upper
-/// triangle is what every other consumer of this crate expects.
 ///
 /// ### Params
 ///

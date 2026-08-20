@@ -47,9 +47,6 @@
 //!
 //! He et al., Communications Biology 4, 629, 2021
 
-// Loop indices here name a cell, a subject or a coefficient, and most loops walk
-// several parallel arrays at once. Rewriting them as iterator zips would hide
-// that and, in the accumulation loops, reorder the sums the port depends on.
 #![allow(clippy::needless_range_loop)]
 
 use crate::errors::EdgeErrors;
@@ -126,9 +123,9 @@ pub const CONV_STALLED: i32 = -40;
 /// [`check_convergence`] to raise it.
 pub const CONV_AT_BOUND: i32 = -60;
 
-//////////////
-// Inputs   //
-//////////////
+/////////////
+// PmlData //
+/////////////
 
 /// One gene's data, in the layout NEBULA's C++ expects.
 ///
@@ -237,6 +234,10 @@ impl PmlData<'_> {
     }
 }
 
+/////////////////
+// PmlVariance //
+/////////////////
+
 /// The two variance components, held on nebula's own scale.
 ///
 /// The meaning of `subject` differs between the two solvers, which is nebula's
@@ -256,6 +257,10 @@ pub struct PmlVariance {
     /// the reciprocal of the cell-level overdispersion.
     pub cell: f64,
 }
+
+///////////////
+// PmlParams //
+///////////////
 
 /// Tuning knobs shared by both solvers.
 #[derive(Clone, Copy, Debug)]
@@ -296,9 +301,9 @@ impl Default for PmlParams {
     }
 }
 
-//////////////
-// Outputs  //
-//////////////
+///////////////
+// PmlResult //
+///////////////
 
 /// The fitted penalised maximum likelihood solution for one gene.
 #[derive(Clone, Debug)]
@@ -357,9 +362,9 @@ pub struct PmlObjective {
     pub gradient: Vec<f64>,
 }
 
-/////////////////////
-// Random effects  //
-/////////////////////
+////////////////////
+// Random effects //
+////////////////////
 
 /// The prior on the subject random effects, with its scalars already resolved.
 #[derive(Clone, Copy, Debug)]
@@ -451,9 +456,9 @@ impl Penalty {
     }
 }
 
-//////////////////
-// Entry points //
-//////////////////
+///////////////
+// Front end //
+///////////////
 
 /// Penalised maximum likelihood fit with a gamma random effect, NEBULA's NBGMM.
 ///
@@ -622,9 +627,9 @@ pub fn pml_log_likelihood_gradient(
 /// nebula's `check_conv`, applied to a finished fit.
 ///
 /// [`opt_pml`] already runs this with `variance_at_bound` false and an initial
-/// code of [`CONV_SUCCESS`]. Re-run it from the outer overdispersion loop, which
-/// is the only place that knows whether a variance component landed on its box
-/// constraint or whether an earlier optimiser already failed.
+/// code of [`CONV_SUCCESS`]. Re-run it from the outer overdispersion loop,
+/// which is the only place that knows whether a variance component landed on
+/// its box constraint or whether an earlier optimiser already failed.
 ///
 /// The singular-information test overrides everything else, including
 /// [`CONV_AT_BOUND`], which is nebula's ordering.
@@ -1006,9 +1011,9 @@ impl Workspace {
     }
 }
 
-//////////////
-// Solver   //
-//////////////
+////////////
+// Solver //
+////////////
 
 /// The shared Newton loop behind [`opt_pml`] and [`opt_pml_nbm`].
 ///

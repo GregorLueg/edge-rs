@@ -7,45 +7,22 @@
 //! R package minimises with L-BFGS-B to get the starting values every later
 //! stage of NEBULA refines.
 //!
-//! ### What is ported
-//!
-//! Straight from `nebula/src/optimization.cpp`: `ptmg_ll_eigen` (193),
-//! `ptmg_der_eigen` (260), `ptmg_ll_der_eigen` (554) and `ptmg_ll_der_hes_eigen`
-//! (676), plus the helpers `call_cumsumy`, `call_posindy`, `center_m`,
-//! `cv_offset`, `get_cv` and `get_cell`.
-//!
-//! Those C++ kernels are only half the objective. The gamma-function terms that
-//! do not involve `beta`, `sum lgamma(cumsumy + alpha)` over subjects and
-//! `sum lgamma(y + phi)` over cells, live in the R wrappers in `R/ptmg.R` and
-//! are folded back in here, so [`ptmg_value_and_gradient`] equals
-//! `nebula:::ptmg_ll_der` and not the bare kernel. edgePython drops the
-//! marginal-likelihood Hessian entirely, which is why its standard errors
-//! disagree with the R package; [`ptmg_value_gradient_hessian`] is the piece it
-//! lacks.
-//!
 //! ### Layout and conventions
 //!
 //! Cells are sorted by subject and [`GeneData::fid`] holds the boundaries, so
 //! subject `s` owns cells `fid[s]..fid[s + 1]`. Every inner loop walks that
-//! structure. The design is row-major `n_cells * n_coef`, one contiguous row per
-//! cell, which is the orientation all the per-cell accumulations want. The
+//! structure. The design is row-major `n_cells * n_coef`, one contiguous row
+//! per cell, which is the orientation all the per-cell accumulations want. The
 //! parameter vector is `[beta (n_coef), sigma, phi]`.
 //!
-//! One gene is the unit of work here and everything is sequential; genes are the
-//! parallel axis and belong to the caller. The only exception is [`cumsum_y`],
-//! which sees the whole matrix and fans out over genes itself.
+//! One gene is the unit of work here and everything is sequential; genes are
+//! the parallel axis and belong to the caller. The only exception is
+//! [`cumsum_y`], which sees the whole matrix and fans out over genes itself.
 //!
-//! Scratch buffers are allocated per evaluation rather than threaded through the
-//! API, because the required signatures take none. They are `O(n_cells * n_coef)`
-//! and the optimiser calls this a few dozen times per gene.
-//!
-//! ### Deliberate fidelity to the reference
-//!
-//! `alpha = 1 / (exp(sigma) - 1)` is computed exactly that way rather than with
-//! `expm1`, even though `expm1` is more accurate at the lower bound
-//! `sigma = 1e-4`. Matching the reference matters more than the last few digits:
-//! the fitted `sigma` is a variance component read off this surface, and shifting
-//! the surface shifts the answer.
+//! Scratch buffers are allocated per evaluation rather than threaded through
+//! the API, because the required signatures take none. They are
+//! `O(n_cells * n_coef)` and the optimiser calls this a few dozen times per
+//! gene.
 //!
 //! ### References
 //!
@@ -53,9 +30,8 @@
 
 use rayon::prelude::*;
 
-use crate::errors::EdgeErrors;
 use crate::numeric::gamma::{digamma, ln_gamma, trigamma};
-use crate::utils::sparse::{CompressedSparse, SparseFormat};
+use crate::prelude::*;
 
 ///////////////
 // Gene data //
@@ -104,8 +80,8 @@ impl<'a> GeneData<'a> {
     /// ### Returns
     ///
     /// The validated view, or [`EdgeErrors`] if the pieces disagree in length,
-    /// `fid` is not a partition of `0..n_cells`, or a cell index is out of range
-    /// or out of order.
+    /// `fid` is not a partition of `0..n_cells`, or a cell index is out of
+    /// range or out of order.
     pub fn new(
         design: &'a [f64],
         log_offset: &'a [f64],
@@ -530,8 +506,9 @@ pub fn ptmg_value_and_gradient(data: &GeneData<'_>, params: &[f64]) -> (f64, Vec
 ///
 /// The Hessian is in the direct parametrisation `[beta, sigma, phi]`, matching
 /// the gradient. The R package's `ptmg_ll_der_hes2` and `ptmg_ll_der_hes3`
-/// additionally push it through `sigma -> exp(sigma)` for the `trust` optimiser;
-/// that chain rule belongs to whichever driver wants the log scale, not here.
+/// additionally push it through `sigma -> exp(sigma)` for the `trust`
+/// optimiser; that chain rule belongs to whichever driver wants the log scale,
+/// not here.
 ///
 /// ### Params
 ///
@@ -616,7 +593,6 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
     let terms = Terms::new(params[nb], params[nb + 1]);
     let gamma = terms.gamma;
 
-    // -- linear predictor --
     let mut y_cell = vec![0.0; n_cells];
     for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
         y_cell[c] = y;
@@ -624,7 +600,6 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
     let mut extb = vec![0.0; n_cells];
     let mut total = linear_predictor(data, beta, &y_cell, &mut extb);
 
-    // -- per-subject collapse --
     let mut cumsumxtb = vec![0.0; k];
     let mut mustar = vec![0.0; k];
     let mut mustar_log = vec![0.0; k];
@@ -647,7 +622,6 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
     total += (k as f64) * terms.alpha * terms.log_lambda;
     total += (n_cells as f64) * gamma * terms.log_gamma;
 
-    // -- per-cell weights against the collapsed subject mean --
     let mut tempa = vec![0.0; n_cells];
     let mut gstar = vec![0.0; n_cells];
     let mut slpey = 0.0;
@@ -666,7 +640,6 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
         }
     }
 
-    // -- gradient blocks --
     let mut xexb = vec![0.0; n_cells * nb];
     let mut xexb_f = vec![0.0; k * nb];
     let mut dbeta_41 = vec![0.0; k * nb];
@@ -767,8 +740,9 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
             - (-terms.alpha_pr * xf_hbl_imu + 2.0 * terms.lambda_pr * xf_hbl_ymm);
     }
 
-    // `alpha_pr / mustar - lambda_pr * ymustar / mustar`, the sensitivity of the
-    // collapsed subject weight to sigma. Appears squared in the sigma block.
+    // `alpha_pr / mustar - lambda_pr * ymustar / mustar`, the sensitivity of
+    // the collapsed subject weight to sigma. Appears squared in the sigma
+    // block.
     let apm: Vec<f64> = (0..k)
         .map(|s| terms.alpha_pr * imustar[s] - terms.lambda_pr * ymumustar[s])
         .collect();
@@ -899,7 +873,8 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
 ///
 /// ### Params
 ///
-/// * `counts` - Gene-major counts, [`SparseFormat::Csr`] over `(n_genes, n_cells)`
+/// * `counts` - Gene-major counts, [`SparseFormat::Csr`] over
+///   `(n_genes, n_cells)`
 /// * `fid` - Subject boundaries, length `n_subjects + 1`, running to `n_cells`
 ///
 /// ### Returns
@@ -956,6 +931,10 @@ pub fn cumsum_y(counts: &CompressedSparse<f64>, fid: &[usize]) -> Result<Vec<f64
     Ok(out)
 }
 
+////////////////
+// GeneCounts //
+////////////////
+
 /// The non-zero counts of one gene, and the summaries NEBULA derives from them.
 #[derive(Clone, Debug)]
 pub struct GeneCounts {
@@ -980,7 +959,8 @@ pub struct GeneCounts {
 ///
 /// ### Params
 ///
-/// * `counts` - Gene-major counts, [`SparseFormat::Csr`] over `(n_genes, n_cells)`
+/// * `counts` - Gene-major counts, [`SparseFormat::Csr`] over
+///   `(n_genes, n_cells)`
 /// * `gene` - Row index of the gene
 ///
 /// ### Returns
@@ -1039,10 +1019,10 @@ pub fn positive_indices(
 /// Centres and scales a design matrix.
 ///
 /// Port of `center_m`. Each column is centred, then divided by its population
-/// standard deviation. A column with no spread is not scaled: if its first entry
-/// is non-zero it becomes a column of ones, which is how the intercept survives
-/// centring, and otherwise it is left at zero and flagged with a standard
-/// deviation of `-1` so the caller can drop it.
+/// standard deviation. A column with no spread is not scaled: if its first
+/// entry is non-zero it becomes a column of ones, which is how the intercept
+/// survives centring, and otherwise it is left at zero and flagged with a
+/// standard deviation of `-1` so the caller can drop it.
 ///
 /// ### Params
 ///
@@ -1122,8 +1102,8 @@ pub struct OffsetSummary {
 /// Prepares the offsets and measures their spread.
 ///
 /// Port of `cv_offset`. With no offset every cell gets one, which logs to zero
-/// and has no spread. The coefficient of variation is what decides later whether
-/// NEBULA-LN's approximation is safe for this dataset.
+/// and has no spread. The coefficient of variation is what decides later
+/// whether NEBULA-LN's approximation is safe for this dataset.
 ///
 /// ### Params
 ///
@@ -1179,9 +1159,9 @@ pub fn offset_summary(offset: Option<&[f64]>, n_cells: usize) -> Result<OffsetSu
 
 /// Squared coefficient of variation of the fitted cell-level means.
 ///
-/// Port of `get_cv`. Only the cell-level columns of the design contribute, since
-/// subject-level columns are constant within a subject and cannot make the means
-/// vary across cells within one. Note this is the squared CV, unlike
+/// Port of `get_cv`. Only the cell-level columns of the design contribute,
+/// since subject-level columns are constant within a subject and cannot make
+/// the means vary across cells within one. Note this is the squared CV, unlike
 /// [`offset_summary`]'s `cv`, which is the reference's own asymmetry.
 ///
 /// ### Params

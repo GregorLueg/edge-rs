@@ -35,13 +35,11 @@
 
 use rayon::prelude::*;
 
-use crate::errors::EdgeErrors;
 use crate::limma::lowess::lowess;
 use crate::numeric::stats::quantile_type7;
+use crate::prelude::*;
 use crate::ql::chebyshev::{compute_weight, unit_nb_deviance};
 use crate::utils::design::hat_diagonal;
-use crate::utils::recycled::{Recycled, RecycledRow};
-use crate::utils::traits::EdgeFloat;
 
 ////////////
 // Consts //

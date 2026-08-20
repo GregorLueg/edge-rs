@@ -59,10 +59,10 @@ use std::cell::Cell;
 
 use rayon::prelude::*;
 
-use crate::errors::EdgeErrors;
 use crate::numeric::gamma::ln_gamma;
 use crate::numeric::lbfgsb::{LbfgsbParams, minimise};
 use crate::numeric::optimise::{NelderMeadParams, nelder_mead};
+use crate::prelude::*;
 use crate::sc::pml::{
     CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml,
 };
@@ -71,12 +71,10 @@ use crate::sc::ptmg::{
     positive_indices, ptmg_value_and_gradient,
 };
 use crate::sc::test::packed_len;
-use crate::utils::sparse::{CompressedSparse, SparseFormat};
-use crate::utils::traits::EdgeFloat;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Box constraint on every fixed effect in stage one, nebula's `rep(100, nb)`.
 ///
@@ -86,10 +84,9 @@ const BETA_BOUND: f64 = 100.0;
 
 /// Cells per subject below which NEBULA-LN is abandoned for NEBULA-HL.
 ///
-/// The large-sample approximation stage one relies on is an approximation in the
-/// number of cells per subject, so nebula silently overrides `method = "LN"`
-/// below thirty. Silently is the operative word: this is why a data set with
-/// twenty-five cells per subject reports itself as LN and runs HL.
+/// The large-sample approximation stage one relies on is an approximation in
+/// the number of cells per subject, so nebula silently overrides
+/// `method = "LN"` below thirty.
 const MIN_CELLS_PER_SUBJECT_LN: f64 = 30.0;
 
 /// Expected count per subject below which the Laplace expansion is pushed to
@@ -164,9 +161,9 @@ const VARIANCE_MAX_ITER: usize = 500;
 /// Convergence code for a stage-two search that never found a finite objective.
 ///
 /// nebula reports `-50` when its outer optimiser returns a negative nlopt code.
-/// Those codes are not reproducible without nlopt, so this port raises `-50` for
-/// the one failure that is unambiguous: no evaluation of the profile likelihood
-/// succeeded.
+/// Those codes are not reproducible without nlopt, so this port raises `-50`
+/// for the one failure that is unambiguous: no evaluation of the profile
+/// likelihood succeeded.
 pub const CONV_OUTER_FAILED: i32 = -50;
 
 ////////////////
@@ -285,9 +282,9 @@ impl NebulaParams {
     }
 }
 
-/////////////
-// Outputs //
-/////////////
+///////////////
+// NebulaFit //
+///////////////
 
 /// The fitted model for every gene that survived the expression filter.
 ///
@@ -319,9 +316,9 @@ pub struct NebulaFit {
     pub n_coef: usize,
 }
 
-//////////////////
-// Entry point  //
-//////////////////
+///////////////
+// Front end //
+///////////////
 
 /// Fits NEBULA's negative binomial gamma mixed model to every gene.
 ///
@@ -759,7 +756,7 @@ fn fit_gene(
 }
 
 /////////////////////////
-// Marginal likelihood  //
+// Marginal likelihood //
 /////////////////////////
 
 /// Minimises the marginal negative log-likelihood over `[beta, sigma, phi]`.
@@ -1188,12 +1185,7 @@ fn quadratic_polish(
     {
         return None;
     }
-    // No acceptance test on the result. The objective jitters at the `1e-6`
-    // level, so comparing the polished point against the incumbent compares two
-    // draws of that jitter, and on the validation fixture it rejects good steps
-    // often enough to cost a factor of four on the subject-level
-    // overdispersion. The guards above, a positive definite fitted curvature and
-    // a step inside the stencil, are the ones that hold.
+
     Some(
         (0..n)
             .map(|j| (x[j] + delta[j] * step[j]).clamp(lower[j], upper[j]))
@@ -1201,9 +1193,9 @@ fn quadratic_polish(
     )
 }
 
-//////////////////////
-// Linear algebra   //
-//////////////////////
+////////////////////
+// Linear algebra //
+////////////////////
 
 /// Cholesky factor of a symmetric positive definite matrix.
 ///
@@ -1460,8 +1452,6 @@ fn assemble(
 // Tests //
 ///////////
 
-// Every reference literal is `nebula` 1.5.8's own output printed at seventeen
-// significant figures, with the call that produced it quoted above the block.
 #[cfg(test)]
 #[allow(clippy::excessive_precision)]
 mod tests {
