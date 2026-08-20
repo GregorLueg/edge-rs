@@ -189,7 +189,22 @@ fn identified(want: &common::Table, n_genes: usize, n_coef: usize) -> Vec<bool> 
         .collect()
 }
 
-/// Keeps the entries of `v` where `mask` is true.
+/// Keeps the rows of `v` where `mask` is true.
+///
+/// The mask is per gene, not per element, so `stride` says how many values each
+/// gene occupies: one for a per-gene vector, `n_coef` for a coefficient matrix.
+/// Passing the wrong stride silently compares the wrong genes, so it is always
+/// given explicitly rather than inferred.
+///
+/// ### Params
+///
+/// * `v` - Values, row-major, `mask.len() * stride` long
+/// * `mask` - One flag per gene
+/// * `stride` - Values per gene
+///
+/// ### Returns
+///
+/// The retained rows, flattened, in the original order.
 fn masked(v: &[f64], mask: &[bool], stride: usize) -> Vec<f64> {
     v.chunks_exact(stride)
         .zip(mask)
@@ -289,6 +304,19 @@ fn test_glm_fit_without_a_prior_count_drops_the_unshrunk_copy() {
 //////////////
 
 /// Builds the test input for one dataset.
+///
+/// The dispersion and offsets are the ones the R fit used, taken from the
+/// fixtures, so that a failure here is the test rather than the dispersion
+/// estimation upstream of it.
+///
+/// ### Params
+///
+/// * `l` - The loaded dataset
+/// * `log_cpm` - Average log-CPM per gene, passed through to the result table
+///
+/// ### Returns
+///
+/// An input borrowing from `l`, so it cannot outlive it.
 fn input<'a>(l: &'a Loaded, log_cpm: &'a [f64]) -> GlmTestInput<'a, f64> {
     GlmTestInput {
         counts: &l.counts,
@@ -454,6 +482,21 @@ fn test_glm_lrt_with_a_contrast_matches_edger() {
 }
 
 /// Column name of the factorial design's `c`-th coefficient.
+///
+/// The contrast fixture is headed with the design's column names, so reading a
+/// contrast back needs the mapping from position to name.
+///
+/// ### Params
+///
+/// * `c` - Zero-based coefficient index
+///
+/// ### Returns
+///
+/// The header the generator wrote for that column.
+///
+/// ### Panics
+///
+/// If `c` is past the third column, since only the factorial design is read here.
 fn con_name(c: usize) -> &'static str {
     match c {
         0 => "Int",

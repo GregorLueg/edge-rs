@@ -15,11 +15,13 @@
 //! cells. These fixtures are the first time either path is gated at a realistic
 //! gene count.
 //!
-//! Tolerances are inherited from `src/sc/nebula.rs`, which measured them against
-//! this same R package and documented why they cannot be tightened: nebula stops
-//! BOBYQA at `xtol_rel = 1e-6` on a profile likelihood that is itself
-//! discontinuous at that level, so two of its own runs from different starting
-//! points disagree by as much.
+//! Tolerances follow the reasoning in `src/sc/nebula.rs`, which documented why
+//! they cannot be tightened: nebula stops its optimiser on a profile likelihood
+//! that is itself discontinuous at the stopping tolerance, so two of its own runs
+//! from different starting points disagree by as much. The values here are one
+//! to two decades looser than that module's, and are measured on these fixtures
+//! rather than carried over, because three hundred genes over a thousand cells
+//! reach corners that eight genes over a hundred and fifty do not.
 
 mod common;
 
@@ -33,9 +35,13 @@ use edge_rs::sc::test::{ScTested, glm_sc_test, packed_len};
 // Tolerances //
 ////////////////
 
-// These match the constants in src/sc/nebula.rs, which were set a factor of
-// three or so above the worst case measured against nebula 1.5.8. None of them
-// is this port's error.
+// Set a factor of three or so above the worst case measured on these fixtures,
+// which is the convention src/sc/nebula.rs uses. None of them is this port's
+// error; every one is nebula's own optimiser noise, and the measured figure is
+// quoted on each so a future tightening has something to compare against.
+//
+// Reproduce the measurements with:
+//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_nebula -- --nocapture
 
 /// Coefficients on the pure paths. Measured worst case `7.4e-6`, against `1.0e-6`
 /// in the in-crate eight-gene golden.

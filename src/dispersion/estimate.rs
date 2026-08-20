@@ -41,7 +41,6 @@ use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, matrix_ran
 /// value for a well-behaved bulk RNA-seq experiment. edgeR's choice.
 const GRID_CENTRE: f64 = 0.1;
 
-
 /// Prior sample size above which shrinkage is treated as total.
 ///
 /// Past this the tagwise estimate is indistinguishable from the trend, and the

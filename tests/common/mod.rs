@@ -10,7 +10,9 @@
 //! answer. Over a thousand it reports the first failing gene and nothing else,
 //! which is the wrong end of the problem: what you want to know is the worst
 //! disagreement, where it landed and how many genes are involved.
-//! [`assert_close`] scans the whole vector and says all three.
+//! [`assert_close`] scans the whole vector and says all three, and takes care to
+//! point at the worst *failing* gene rather than the worst gene, which are often
+//! different once a tolerance has an absolute leg.
 //!
 //! The same scan doubles as the calibration tool. With `EDGE_RS_TOL_REPORT` set
 //! it prints the worst observed error for every labelled quantity even when the
@@ -110,10 +112,13 @@ fn relative_difference(got: f64, want: f64) -> f64 {
     if scale == 0.0 { 0.0 } else { (got - want).abs() / scale }
 }
 
-/// Worst disagreement found in a comparison.
+/// One candidate for the worst disagreement in a comparison.
+///
+/// [`assert_close`] tracks two of these: the worst pair overall, for the
+/// calibration report, and the worst pair that actually failed, for the panic.
 #[derive(Clone, Copy, Debug)]
 struct Worst {
-    /// Index of the worst offender.
+    /// Index of the pair.
     index: usize,
     /// Relative difference there.
     relative: f64,
@@ -125,7 +130,14 @@ struct Worst {
     want: f64,
 }
 
-/// Compares two vectors elementwise and panics naming the worst offender.
+/// Compares two vectors elementwise and panics naming the worst failure.
+///
+/// Two running maxima are kept, and they are not the same entry. The panic
+/// message names the worst *failing* pair, because the largest relative
+/// difference in the vector is frequently one the absolute leg of the tolerance
+/// let through, and pointing at it sends the reader to a value that is fine. The
+/// calibration report names the worst pair overall, since that is the number a
+/// tolerance has to clear.
 ///
 /// `NaN` against `NaN` passes, since R writes `NA` where the crate carries
 /// `NaN` for a non-estimable coefficient. `NaN` against a finite value fails.

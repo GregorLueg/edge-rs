@@ -8,6 +8,13 @@
 #
 #   Rscript tests/r/generate_fixtures.R
 #
+# Run it from the repository root. The output directory is a relative path, so
+# running it from anywhere else quietly writes the fixtures somewhere the Rust
+# side will not look.
+#
+# The single-cell half is skipped when the nebula package is absent; the bulk
+# half needs only edgeR and limma.
+#
 # Input matrices are written once and read back on every later run, never
 # re-drawn. An R upgrade can therefore only move expected values, never the data
 # underneath them, so a fixture diff always means something. Delete the input

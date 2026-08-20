@@ -51,7 +51,8 @@ struct GeneScratch {
     mu: Vec<f64>,
     /// Information matrix, row-major.
     information: Vec<f64>,
-    /// Coefficients, reused as a warm start across grid points.
+    /// Coefficients, reused as a warm start across grid points and reset by
+    /// [`apl_grid`] at the start of each gene.
     beta: Vec<f64>,
     /// Scratch for the general Levenberg path.
     levenberg: Scratch,
@@ -249,9 +250,14 @@ fn fit_one_way_gene(
 
 /// Fits one gene on the general path and writes its fitted means.
 ///
+/// `scratch.beta` is read as the starting point and overwritten with the answer,
+/// which is what lets consecutive grid points warm-start each other. The caller
+/// owns that buffer's initial state and must reset it when it moves to a new
+/// gene; see [`apl_grid`].
+///
 /// ### Params
 ///
-/// * `scratch` - Per-thread buffers
+/// * `scratch` - Per-thread buffers. `beta` is in and out, `mu` is written
 /// * `design` - Row-major design
 /// * `n_samples` - Number of samples
 /// * `n_coef` - Number of coefficients
@@ -301,6 +307,11 @@ fn fit_general_gene(
 /// dispersion. The result feeds
 /// [`crate::numeric::interpolate::maximize_interpolant`], which finds the
 /// maximising dispersion by fitting a spline through the grid.
+///
+/// Genes are the parallel axis, with one scratch buffer per worker. Each gene is
+/// cold-started, so a gene's row depends only on that gene: the answer does not
+/// move with the batch it was submitted in, nor with how rayon happened to split
+/// the work.
 ///
 /// ### Params
 ///

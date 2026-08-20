@@ -1,9 +1,13 @@
 //! End-to-end parity for the quasi-likelihood chain: `glmQLFit` then
 //! `glmQLFTest`.
 //!
-//! This is the gate the original port plan named and never built: load counts,
-//! run the dispersion estimation, the quasi-likelihood fit and the F test, and
-//! match edgeR's `s2.post`, `F` and `PValue` columns.
+//! This is the gate the original port plan named and never built: match edgeR's
+//! `s2.post`, `F` and `PValue` columns on a real dataset.
+//!
+//! The abundances the fit keys off come from the fixture rather than from a
+//! fresh `estimate_disp` run, so a failure here is the quasi-likelihood stage
+//! and not the dispersion estimation feeding it. `estimate_disp` has its own
+//! gate in `e2e_bulk_classic.rs`.
 //!
 //! Both pipelines are covered. The current one carries `df.residual.adj`,
 //! `deviance.adj` and `average.ql.dispersion`; the legacy one carries
