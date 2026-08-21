@@ -85,20 +85,40 @@ const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 // the sign convention are all faithful, and the one-dimensional search finds
 // that objective's minimum.
 //
-// The divergence is in stage one, the marginal likelihood over
-// `[beta, sigma, phi]`. On these genes it is bimodal in `sigma`: one minimum
-// pinned at the lower bound `1e-4` and an interior one between `0.03` and
-// `0.15`, separated by a ridge near `sigma = 0.01`. Both are strict local
-// minima, confirmed by profiling `nebula:::ptmg_ll` over `sigma` with `beta` and
-// `phi` optimised out. R runs nlopt's LD_LBFGS there and this crate runs
-// L-BFGS-B, and on 37 of the 281 genes the two land in different basins. LN+HL
-// then holds stage one's `phi` fixed and refits only `sigma`, so the basin
-// choice propagates straight into both variance components and, through the
-// `-sigma/2` intercept shift, into the coefficients.
+// The divergence is in stage one, the joint optimisation over
+// `[beta, sigma, phi]`. R runs nlopt's `LD_LBFGS` there and this crate runs
+// L-BFGS-B, and on 37 of the 281 genes the two finish in different places. LN+HL
+// then holds stage one's `phi` fixed and refits only `sigma`, so the choice
+// propagates into both variance components and, through the `-sigma/2` intercept
+// shift, into the coefficients.
 //
-// Neither optimiser is the right one. This crate's stage-one optimum has the
-// strictly lower marginal negative log-likelihood on 9 of the 37; R's is lower
-// on 27. And R disagrees with itself: nebula's own documented `opt = "trust"`
+// The two places are not two local minima. R's is the lower bound on `sigma`,
+// and the marginal likelihood is still strictly decreasing there: lower the
+// bound from `1e-4` to `1e-8` and 13 of the 19 genes that sat on it follow it
+// straight down. R is on a legitimate Karush-Kuhn-Tucker point of the box
+// constraint, reached by sliding down a monotone descent onto the wall, and
+// `sigma = 1e-4` is the constraint rather than an estimate. This crate stops at
+// the one genuine interior stationary point. There is a real second basin around
+// `0.03` to `0.15` separated by a ridge near `0.01`; what there is not is a
+// minimum at the bound.
+//
+// Neither optimiser is broken; both satisfy KKT and both are converged, and R
+// reaching the lower marginal negative log-likelihood on 27 of the 37 against
+// this crate's 9 is not the endorsement it looks like, because it wins by
+// descending into a degeneracy. Sigma on the bound means no subject-level
+// variance at all, i.e. the mixed model collapsed to a plain negative binomial
+// GLM, in an approximation the LN+HL path exists precisely because it distrusts.
+//
+// The tiebreak is nebula's own `method = "HL"`, which fits both variance
+// components against the profile likelihood. Against that reference this crate
+// is closer on 29 of the 37 for `sigma`, 29 for `phi`, 32 for the standard
+// errors and 32 for the p-values; worst-case `sigma` error over all 281 genes is
+// 15.8% here against 84.4% for R. So the answers are not equally good, and the
+// obvious "multi-start and take the lower NLL" fix is measurably counter-
+// productive: it lands on the bound on 30 of the 37 and moves *away* from the HL
+// reference, for +81% runtime. It optimises the wrong objective harder.
+//
+// R also disagrees with itself: nebula's own documented `opt = "trust"`
 // moves the subject overdispersion by more than one per cent on 78 of the 281
 // genes, twice as many as the 37 where this crate differs from `opt = "lbfgs"`,
 // and on those 37 it lands on this crate's answer rather than on `lbfgs`'s:
@@ -418,6 +438,90 @@ fn test_nebula_matches_the_r_package() {
         for g in 0..n {
             assert_convergence(fit.convergence[g], want.column("convergence")[g] as i32, g);
         }
+    }
+}
+
+#[test]
+fn test_sigma_at_bound_marks_the_collapsed_fits() {
+    // The flag is the only thing in either implementation that tells a caller
+    // their mixed model has no random effect. nebula's `check_conv` tests the
+    // upper bound on `sigma^2` and not the lower, so these genes come back
+    // reporting convergence.
+    //
+    // Cross-checked against R rather than against the crate's own output: the
+    // fixture's `Subject` column is R's, and a gene is pinned there exactly when
+    // it is pinned here.
+    for d in &DATASETS {
+        let l = load(d);
+        let want = common::table(&format!("{}_nebula.csv", d.tag));
+
+        let fit = nebula(
+            &l.counts,
+            l.n_genes,
+            l.n_cells,
+            &l.subject,
+            &l.design,
+            3,
+            Some(&l.offset),
+            Some(golden_params()),
+        )
+        .expect("nebula failed");
+
+        let floor = NebulaParams::default().min.0;
+        let r_subject = want.column("Subject");
+        let n = fit.gene_index.len();
+        assert_eq!(fit.sigma_at_bound.len(), n);
+
+        let mismatched: Vec<(usize, bool, f64, f64)> = (0..n)
+            .filter(|&g| fit.sigma_at_bound[g] != (r_subject[g] <= floor))
+            .map(|g| {
+                (
+                    want.column_usize("gene_id")[g],
+                    fit.sigma_at_bound[g],
+                    fit.subject_overdispersion[g],
+                    r_subject[g],
+                )
+            })
+            .collect();
+        println!("{}: {} mismatched: {:?}", d.tag, mismatched.len(), mismatched);
+
+        let flagged = fit.sigma_at_bound.iter().filter(|b| **b).count();
+        assert_eq!(
+            flagged,
+            s_pinned(d.tag),
+            "{}: number of genes with no fitted subject variance",
+            d.tag
+        );
+        // A dataset where nothing is pinned would make this test vacuous.
+        assert!(flagged > 0, "{}: nothing pinned, so this gates nothing", d.tag);
+    }
+}
+
+/// Genes whose subject-level variance finishes on the lower bound, per dataset.
+///
+/// Recorded rather than derived, so a change in how many collapse is a test
+/// failure rather than a silent drift. These are R's numbers as much as this
+/// crate's: R pins the same 18 on `sc`, plus gene 299 where its `nlminb` fails,
+/// and the same 40 on `sc_small`.
+///
+/// The `sc_small` figure is the interesting one. A third of its genes come back
+/// with no fitted subject-level variance, which is what twenty cells per subject
+/// buys: there is too little between-subject replication to estimate the random
+/// effect, so the model collapses to a plain negative binomial GLM. nebula
+/// reports every one of them as converged.
+///
+/// ### Params
+///
+/// * `tag` - Dataset prefix
+///
+/// ### Returns
+///
+/// The expected count.
+fn s_pinned(tag: &str) -> usize {
+    match tag {
+        "sc" => 18,
+        "sc_small" => 40,
+        _ => unreachable!("unknown single-cell dataset"),
     }
 }
 

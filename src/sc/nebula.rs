@@ -99,6 +99,18 @@ const HIGH_ORDER_COUNT_CUTOFF: f64 = 3.0;
 /// Laplace order used when the expected count per subject is low.
 const HIGH_ORDER: u32 = 3;
 
+/// Relative slack allowed when deciding a fitted value sits on its lower bound.
+///
+/// The optimiser does not always return the constraint exactly; it can stop a
+/// few parts in `1e6` above it, which is inside its own stopping tolerance and
+/// means the same thing. Strict equality misses those, and on the small
+/// single-cell fixture it missed two genes of 118 that R reports as pinned.
+///
+/// The margin cannot reach a real estimate: the smallest genuinely fitted
+/// subject variance seen on any fixture is four times the bound, and this admits
+/// values within one part in `1e4` of it.
+const BOUND_SLACK: f64 = 1.0 + 1e-4;
+
 /// Value of `kappa_obs` below which NEBULA-LN always refits the subject-level
 /// overdispersion, whatever `kappa` was asked for.
 const KAPPA_FLOOR: f64 = 20.0;
@@ -310,6 +322,30 @@ pub struct NebulaFit {
     /// nebula's convergence code, one per kept gene. Anything at or below `-20`
     /// is a likely failure.
     pub convergence: Vec<i32>,
+    /// Whether [`NebulaFit::subject_overdispersion`] finished on its lower bound.
+    ///
+    /// The bound is [`NebulaParams::min`]`.0`, `1e-4` by default. A gene sitting
+    /// on it has no fitted subject-level variance at all: the mixed model has
+    /// collapsed to a plain negative binomial GLM, and the reported `sigma^2` is
+    /// the constraint rather than an estimate.
+    ///
+    /// This is not a convergence failure and [`NebulaFit::convergence`] will
+    /// usually say the gene converged, because it did. The marginal likelihood
+    /// really is still decreasing towards zero there, so the optimiser is
+    /// sitting on a legitimate Karush-Kuhn-Tucker point of the box constraint.
+    /// Lowering `min.0` simply moves the answer down with it.
+    ///
+    /// The R package has no equivalent flag. Its `check_conv` tests whether
+    /// `sigma^2` hit its *upper* bound and never the lower one, so these genes
+    /// come back from `nebula()` reporting success with no indication that the
+    /// random effect was never estimated.
+    ///
+    /// Not raised for the related case where *stage one* hits the bound but the
+    /// NEBULA-LN refit then moves `sigma^2` off it. That happens on roughly a
+    /// third of genes and the final `sigma^2` is fine; what it leaves behind is
+    /// a `phi` fitted jointly with the discarded boundary value. Flagging it
+    /// would bury the case above in noise for no action the caller could take.
+    pub sigma_at_bound: Vec<bool>,
     /// Zero-based indices of the input genes that survived the filter.
     pub gene_index: Vec<usize>,
     /// Number of coefficients, the stride of `coefficients` and `se`.
@@ -501,7 +537,7 @@ pub fn nebula<T: EdgeFloat>(
         })
         .collect::<Result<Vec<_>, EdgeErrors>>()?;
 
-    Ok(assemble(outcomes, &kept, &sds, intercept, n_coef))
+    Ok(assemble(outcomes, &kept, &sds, intercept, n_coef, params.min.0))
 }
 
 /////////////////////
@@ -1402,6 +1438,8 @@ fn build_csr<T: EdgeFloat>(
 /// * `sds` - Per-column standard deviations from [`centre_design`]
 /// * `intercept` - Index of the intercept column, which is not rescaled
 /// * `n_coef` - Number of design columns
+/// * `min_subject` - Lower bound the subject-level overdispersion was fitted
+///   under, used to raise [`NebulaFit::sigma_at_bound`]
 ///
 /// ### Returns
 ///
@@ -1412,6 +1450,7 @@ fn assemble(
     sds: &[f64],
     intercept: usize,
     n_coef: usize,
+    min_subject: f64,
 ) -> NebulaFit {
     let mut scale = sds.to_vec();
     scale[intercept] = 1.0;
@@ -1425,6 +1464,7 @@ fn assemble(
         subject_overdispersion: Vec::with_capacity(n),
         cell_overdispersion: Vec::with_capacity(n),
         convergence: Vec::with_capacity(n),
+        sigma_at_bound: Vec::with_capacity(n),
         gene_index: kept.to_vec(),
         n_coef,
     };
@@ -1443,6 +1483,7 @@ fn assemble(
         fit.subject_overdispersion.push(outcome.subject);
         fit.cell_overdispersion.push(outcome.cell);
         fit.convergence.push(outcome.convergence);
+        fit.sigma_at_bound.push(outcome.subject <= min_subject * BOUND_SLACK);
     }
 
     fit
@@ -1874,6 +1915,78 @@ mod tests {
                 assert_relative_eq!(fit.covariance[g * 3 + k], w, max_relative = TOL_COV);
             }
         }
+    }
+
+    /// `sigma_at_bound` marks a gene whose subject-level variance was never
+    /// estimated.
+    ///
+    /// Three of the eight genes in this golden are pinned, and R agrees: the
+    /// `Subject` column of `tests/data/nebula_expected.csv` is exactly `1e-4`
+    /// for genes 2, 4 and 7. nebula reports all three as converged, because they
+    /// are: the marginal likelihood is still descending at the bound, so the
+    /// optimiser is sitting on a legitimate constrained optimum. What it does
+    /// not report is that the mixed model has collapsed to a plain negative
+    /// binomial GLM on those genes, which is what this flag is for.
+    ///
+    /// Verified against nebula 1.5.8 by lowering the bound and watching the
+    /// estimate follow it, which is what tells a constraint from an estimate:
+    ///
+    /// ```r
+    /// a <- nebula(cnt, id, pred = pred, offset = sf, method = "LN")
+    /// b <- nebula(cnt, id, pred = pred, offset = sf, method = "LN",
+    ///             min = c(1e-8, 1e-4))
+    /// # On a 300-gene by 1005-cell dataset, 19 of 298 genes sit on 1e-4 in `a`,
+    /// # and 13 of those follow the bound down to 1e-8 in `b`.
+    /// ```
+    #[test]
+    fn test_sigma_at_bound_flags_a_pinned_subject_variance() {
+        let (counts, subject, design, offset) = fixture();
+        let fit = nebula(&counts, 8, 150, &subject, &design, 3, Some(&offset), None)
+            .expect("nebula failed");
+
+        assert_eq!(fit.sigma_at_bound.len(), fit.subject_overdispersion.len());
+
+        let (expected, _, _) = read_csv("nebula_expected.csv", true);
+        let floor = NebulaParams::default().min.0;
+        let mut flagged = Vec::new();
+        for g in 0..8 {
+            // Column 10 of the golden is R's `Subject`.
+            let r_subject = expected[g * 13 + 10];
+            let r_pinned = r_subject <= floor;
+            assert_eq!(
+                fit.sigma_at_bound[g], r_pinned,
+                "gene {g}: flag says {}, R reports sigma^2 = {r_subject:e}",
+                fit.sigma_at_bound[g]
+            );
+            if fit.sigma_at_bound[g] {
+                flagged.push(g);
+            }
+        }
+        assert_eq!(
+            flagged,
+            vec![1, 3, 6],
+            "genes 2, 4 and 7 of the golden are pinned, one-based"
+        );
+
+        // The flag has to track the bound rather than a hardcoded constant, so
+        // raising the floor past every fitted value must flag everything.
+        let highest = fit
+            .subject_overdispersion
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let params = NebulaParams {
+            min: (highest * 2.0, NebulaParams::default().min.1),
+            ..Default::default()
+        };
+        let pinned = nebula(
+            &counts, 8, 150, &subject, &design, 3, Some(&offset), Some(params),
+        )
+        .expect("nebula failed");
+        assert!(
+            pinned.sigma_at_bound.iter().all(|b| *b),
+            "every gene should be pinned once the floor is raised past the data"
+        );
     }
 
     /// The NEBULA-LN path, which the main golden never reaches.
