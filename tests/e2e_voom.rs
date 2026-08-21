@@ -25,38 +25,42 @@ use edge_rs::limma::voom::voom_lmfit;
 // Tolerances //
 ////////////////
 
+// Figures are `NEEDS rel` from:
+//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_voom -- --nocapture
+
 /// The log-CPM matrix. Arithmetic only: `log2((count + 0.5) / (lib + 1) * 1e6)`.
-/// Measured worst case `2.2e-15`.
+/// Needs `0` beyond a `1e-13` absolute floor, which covers the entries whose
+/// log lands near zero.
 const TOL_E: Tol = Tol::new(1e-12, 1e-13);
 
-/// Precision weights. These are the fourth power of a lowess fit read back at
-/// the fitted values, so a one-ULP wobble in a residual can move which points
-/// sit inside a neighbourhood. Measured worst case `1.4e-9`.
-const TOL_WEIGHTS: Tol = Tol::rel(1e-7);
+/// Precision weights, the reciprocal fourth power of a lowess fit read back at
+/// the fitted values. Needs `7.8e-15`, which is far better than the smoother's
+/// sensitivity would suggest and worth knowing: a one-ULP wobble in a residual
+/// can move which points sit inside a neighbourhood, and on this data it does
+/// not happen.
+const TOL_WEIGHTS: Tol = Tol::rel(1e-13);
 
 /// Coefficients and unscaled standard errors from the weighted least squares.
-/// Measured worst case `2.5e-10`.
-const TOL_COEF: Tol = Tol::new(1e-8, 1e-12);
+/// Needs `0` beyond a `1e-12` absolute floor.
+const TOL_COEF: Tol = Tol::new(1e-10, 1e-12);
 
-/// Residual standard deviations. Measured worst case `1.7e-10`.
-const TOL_SIGMA: Tol = Tol::rel(1e-8);
+/// Residual standard deviations. Needs `1.6e-14`.
+const TOL_SIGMA: Tol = Tol::rel(1e-13);
 
-/// The fitted mean-variance trend. Measured worst case `8.4e-13`.
+/// The fitted mean-variance trend. Needs `0` beyond a `1e-12` absolute floor.
 const TOL_TREND: Tol = Tol::new(1e-10, 1e-12);
 
 /// Squeezed variances from `squeezeVar`. With non-constant residual degrees of
 /// freedom this runs through `fitFDistUnequalDF1`, whose `optimize` call sits at
 /// R's default `tol` of `1.2e-4` on a very flat likelihood, and through
 /// statmod's `logmdigamma`, which is off in the fourteenth digit and gets
-/// exponentiated. `src/limma/squeeze_var.rs` documents both. Measured worst case
-/// `5.4e-10`.
-const TOL_SQUEEZE: Tol = Tol::rel(1e-8);
+/// exponentiated. `src/limma/squeeze_var.rs` documents both. Needs `5.6e-9`.
+const TOL_SQUEEZE: Tol = Tol::rel(2e-8);
 
 /// The prior degrees of freedom `squeezeVar` fits, which is the quantity
 /// `optimize` actually searches over and so the loosest thing it produces.
-/// `src/limma/squeeze_var.rs` pins its own unit tests at `1e-8` for the same
-/// reason. Measured worst case `1.4e-8`.
-const TOL_SQUEEZE_DF: Tol = Tol::rel(1e-7);
+/// Needs `1.4e-8`.
+const TOL_SQUEEZE_DF: Tol = Tol::rel(5e-8);
 
 /////////////
 // Loading //

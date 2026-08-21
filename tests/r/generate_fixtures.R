@@ -540,11 +540,18 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
       PValue = et$table$PValue,
       FDR = p.adjust(et$table$PValue, "BH"),
       logFC_big5 = et_big5$table$logFC,
-      PValue_big5 = et_big5$table$PValue
+      PValue_big5 = et_big5$table$PValue,
+      # The exact test has no log-scale output of its own, so the log is taken
+      # here. It is the only check with any resolution once a p-value drops
+      # below the absolute floor the natural scale needs: on the factorial set
+      # the smallest is 1.4e-28, where a relative comparison of the raw value is
+      # meaningless but the log still pins it.
+      logPValue = log(et$table$PValue),
+      logPValue_big5 = log(et_big5$table$PValue)
     ),
     paste0(tag, "_exact.csv"),
     c("tagwise", "ave_log_cpm", "logFC", "logCPM", "PValue", "FDR",
-      "logFC_big5", "PValue_big5")
+      "logFC_big5", "PValue_big5", "logPValue", "logPValue_big5")
   )
   put(tag, "exact_common_dispersion", de$common.dispersion)
 

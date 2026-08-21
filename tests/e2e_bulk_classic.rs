@@ -32,45 +32,55 @@ use edge_rs::results::{SortBy, top_tags};
 // Tolerances    //
 ///////////////////
 
+// Every constant below is set about three times the figure the calibration
+// report gives as `NEEDS rel`, which is the worst relative difference among the
+// entries the absolute leg does not already cover. That is the only number a
+// relative tolerance can honestly be read off: the unconditional worst is
+// routinely a near-zero value the epsilon handles, and quoting that instead is
+// how an earlier revision of this file ended up citing figures three orders of
+// magnitude away from what it gated.
+//
+//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_classic -- --nocapture
+
 /// Normalisation factors. Trimmed means over logs, no iteration anywhere, so
-/// the only cost is summation order. Measured worst case `2.0e-15`.
+/// the only cost is summation order. Needs `2.0e-15`.
 const TOL_NORM: Tol = Tol::rel(1e-13);
 
-/// CPM. Pure arithmetic on the counts and library sizes. Measured worst case
-/// `3.5e-16`.
+/// CPM. Pure arithmetic on the counts and library sizes. Needs `2.2e-16`.
 const TOL_CPM: Tol = Tol::rel(1e-13);
 
 /// log-CPM. The same arithmetic wrapped in a logarithm, so a gene whose CPM
 /// lands near one gives a log near zero and the relative test stops meaning
-/// anything. Measured worst case `2.7e-12` relative but only `9.6e-16`
-/// absolute, which is what the epsilon is for.
+/// anything. The epsilon covers those; beyond it nothing disagrees at all.
+/// Needs `0` at `1e-13` absolute.
 const TOL_LOG_CPM: Tol = Tol::new(1e-12, 1e-13);
 
 /// `aveLogCPM`, which fits an intercept-only negative binomial per gene with
 /// edgeR's own Newton stopping rule, so it is converged but not to machine
-/// precision. Measured worst case `4.9e-10`.
-const TOL_AVE_LOG_CPM: Tol = Tol::rel(5e-9);
+/// precision. Needs `4.9e-10`.
+const TOL_AVE_LOG_CPM: Tol = Tol::rel(2e-9);
 
 /// Common dispersion, maximised over the 21-point grid and then interpolated.
-/// Measured worst case `2.9e-7`, on the unbalanced set.
+/// Needs `7.8e-6` on the unbalanced set, `2.9e-6` on the factorial one and
+/// `4.4e-10` on the near-Poisson one.
 ///
-/// The floor here is not the interpolation. It is the two genes per dataset with
-/// an entirely empty group, whose adjusted profile likelihood is arbitrary; see
+/// The floor is not the interpolation. It is the two genes per dataset with an
+/// entirely empty group, whose adjusted profile likelihood is arbitrary; see
 /// [`TOL_DISPERSION`]. The common dispersion sums the APL over every gene, so
-/// their disagreement lands on it directly.
-const TOL_COMMON: Tol = Tol::rel(2e-6);
+/// their disagreement lands on it directly, which is also why the near-Poisson
+/// set, which has no such gene, is four orders of magnitude better.
+const TOL_COMMON: Tol = Tol::rel(3e-5);
 
-/// Prior degrees of freedom from the empirical Bayes fit. Measured worst case
-/// `2.2e-5` on the factorial set, `1.8e-10` on the near-Poisson one.
-///
-/// Same cause as [`TOL_DISPERSION`], one step further on: the prior is fitted to
-/// the residual variances, and the genes with an empty group contribute two of
-/// those.
+/// Prior degrees of freedom from the empirical Bayes fit. Needs `1.9e-5` on the
+/// factorial set, `1.8e-10` on the near-Poisson one. Same cause as
+/// [`TOL_DISPERSION`], one step further on.
 const TOL_PRIOR_DF: Tol = Tol::rel(1e-4);
 
-/// Trended and tagwise dispersions. Measured worst case `5.8e-5` trended and
-/// `6.5e-4` tagwise, both on the unbalanced set; the near-Poisson set manages
-/// `4.2e-8` and `2.7e-7`.
+/// Trended and tagwise dispersions. Needs `8.8e-4` tagwise and `5.9e-5`
+/// trended on the default fit, and `9.1e-3` on the fixed-`prior_df` variant,
+/// where less shrinkage leaves an empty-group gene closer to its own runaway
+/// estimate. All three are driven by those genes; the near-Poisson set, which
+/// has none, needs `2.7e-7` and `4.2e-8`.
 ///
 /// The gap is one specific, deliberately planted situation: a gene whose counts
 /// are entirely zero in one group. Its coefficient MLE is negative infinity, the
@@ -84,24 +94,29 @@ const TOL_PRIOR_DF: Tol = Tol::rel(1e-4);
 /// agreeing to nine figures throughout. Neither implementation is wrong; the
 /// quantity is not identified. Two such genes in 890 move the smoothed trend by
 /// the amounts above.
-const TOL_DISPERSION: Tol = Tol::rel(5e-3);
+const TOL_DISPERSION: Tol = Tol::rel(3e-2);
 
-/// Exact test fold changes and abundances. Measured worst case `4.7e-10`.
-const TOL_EXACT_FC: Tol = Tol::new(1e-8, 1e-12);
+/// Exact test fold changes and abundances. Needs `3.9e-9` beyond a `1e-12`
+/// absolute floor, which covers the fold changes that are legitimately zero.
+const TOL_EXACT_FC: Tol = Tol::new(2e-8, 1e-12);
 
-/// Exact test p-values: sums of negative binomial tail probabilities below
-/// `big_count`, a beta approximation above it. Measured worst case `2.8e-10`.
+/// Exact test p-values on the natural scale. Needs `2.8e-10` beyond the floor.
 ///
-/// The absolute floor covers the genes with an empty group, where the p-value is
-/// far below anything that matters and the crate underflows to exactly zero
-/// where edgeR reports `1.4e-28`.
+/// The floor has to swallow the empty-group genes, where the crate underflows to
+/// exactly zero and edgeR reports `1.4e-28`. That makes the natural-scale check
+/// blind below `1e-25`, which is why [`TOL_EXACT_LOG_P`] exists: the log scale
+/// is what actually gates the significant end.
 const TOL_EXACT_P: Tol = Tol::new(1e-8, 1e-25);
 
+/// Exact test p-values as `log(p)`, which is the check with resolution where it
+/// matters. Needs `2.6e-10`.
+const TOL_EXACT_LOG_P: Tol = Tol::new(1e-8, 1e-9);
+
 /// Benjamini-Hochberg adjusted p-values, a cumulative minimum over a sort.
-/// Measured worst case `0`: these agree exactly.
+/// Needs `0`: these agree exactly.
 const TOL_FDR: Tol = Tol::rel(1e-12);
 
-////////////////
+////////////
 // Datasets   //
 ////////////////
 
@@ -196,6 +211,56 @@ fn load(d: &Dataset) -> Loaded {
     }
 }
 
+/// Pairs up the log p-values the crate can actually report.
+///
+/// The crate's exact test underflows to exactly zero on a gene whose counts are
+/// entirely zero in one group, where edgeR still carries `1.4e-28`. Both are
+/// "certainly significant" and the difference matters to nobody, but taking the
+/// log turns it into `-inf` against `-64.1`, which no tolerance can absorb and
+/// none should try to. Those genes are dropped here and counted by the caller
+/// instead, so that the comparison keeps its resolution everywhere else and a
+/// change in how much underflows still fails the suite.
+///
+/// ### Params
+///
+/// * `p` - The crate's p-values, natural scale
+/// * `want_log` - R's log p-values
+///
+/// ### Returns
+///
+/// The crate's log p-values and R's, restricted to the genes where the crate's
+/// p-value is strictly positive.
+fn finite_log_pairs(p: &[f64], want_log: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let mut got = Vec::with_capacity(p.len());
+    let mut want = Vec::with_capacity(p.len());
+    for (i, &v) in p.iter().enumerate() {
+        if v > 0.0 {
+            got.push(v.ln());
+            want.push(want_log[i]);
+        }
+    }
+    (got, want)
+}
+
+/// How many exact-test p-values underflow to zero on each dataset.
+///
+/// One gene on the factorial set, none elsewhere. Recorded rather than tolerated:
+/// if the crate starts losing more of the tail this fails.
+///
+/// ### Params
+///
+/// * `tag` - Dataset prefix
+///
+/// ### Returns
+///
+/// The expected count.
+fn underflowed(tag: &str) -> usize {
+    match tag {
+        "fac" => 1,
+        _ => 0,
+    }
+}
+
 /// Effective library sizes, the product edgeR normalises by.
 fn effective_lib(l: &Loaded) -> Vec<f64> {
     l.lib_size.iter().zip(&l.norm_factors).map(|(a, b)| a * b).collect()
@@ -211,23 +276,32 @@ fn test_filter_by_expr_matches_edger() {
         let l = load(d);
         let want = common::table(&format!("{}_filter.csv", d.tag));
 
-        // The group path. edgeR takes the group from the DGEList when neither a
-        // group nor a design is given, so `default` and `group` agree here.
-        for column in ["default", "group"] {
-            let got = filter_by_expr(
-                &l.counts, l.n_genes, l.n_samples, None, Some(&l.group), None, None,
-            )
-            .expect("filter_by_expr failed");
-            let expected = want.column_bool(column);
-            let diffs: Vec<usize> = (0..l.n_genes).filter(|&g| got[g] != expected[g]).collect();
-            assert!(
-                diffs.is_empty(),
-                "{}/{column}: {} genes differ, first at {}",
-                d.tag,
-                diffs.len(),
-                diffs[0]
-            );
-        }
+        // The group path. edgeR takes the group off the DGEList when neither a
+        // group nor a design is given, and the generator built that object with
+        // `DGEList(counts, group = grp)`, so its `default` and `group` columns
+        // are the same computation. They are checked as one rather than looped
+        // over, which would have read as covering two API paths while issuing
+        // one call.
+        let want_default = want.column_bool("default");
+        let want_group = want.column_bool("group");
+        assert_eq!(
+            want_default, want_group,
+            "{}: the fixture's default and group columns should be identical, \
+             since the DGEList carried the group",
+            d.tag
+        );
+        let got = filter_by_expr(
+            &l.counts, l.n_genes, l.n_samples, None, Some(&l.group), None, None,
+        )
+        .expect("filter_by_expr failed");
+        let diffs: Vec<usize> = (0..l.n_genes).filter(|&g| got[g] != want_group[g]).collect();
+        assert!(
+            diffs.is_empty(),
+            "{}/group: {} genes differ, first at {}",
+            d.tag,
+            diffs.len(),
+            diffs[0]
+        );
 
         // The design path. A disagreement here is a different gene set rather
         // than a numeric drift, which is why it is compared exactly.
@@ -592,6 +666,25 @@ fn test_exact_test_matches_edger() {
             TOL_EXACT_P,
             &format!("{}/exact_PValue", d.tag),
         );
+        // The natural-scale check above is blind below its absolute floor, and
+        // the floor has to be there because a p-value that underflowed to zero
+        // in one implementation and not the other cannot be compared relatively.
+        // So the significant end is gated on the log instead, over the genes
+        // where the crate did not underflow, with the underflow itself counted
+        // rather than swallowed.
+        let (log_got, log_want) = finite_log_pairs(&got.p_value, want.column("logPValue"));
+        assert_close(
+            &log_got,
+            &log_want,
+            TOL_EXACT_LOG_P,
+            &format!("{}/exact_logPValue", d.tag),
+        );
+        assert_eq!(
+            got.p_value.len() - log_got.len(),
+            underflowed(d.tag),
+            "{}: number of p-values underflowing to zero has changed",
+            d.tag
+        );
 
         // big_count = 5 forces almost every gene onto the beta approximation
         // instead of the exact negative binomial sum.
@@ -607,6 +700,20 @@ fn test_exact_test_matches_edger() {
             want.column("PValue_big5"),
             TOL_EXACT_P,
             &format!("{}/exact_PValue_big5", d.tag),
+        );
+        let (log_got, log_want) =
+            finite_log_pairs(&got.p_value, want.column("logPValue_big5"));
+        assert_close(
+            &log_got,
+            &log_want,
+            TOL_EXACT_LOG_P,
+            &format!("{}/exact_logPValue_big5", d.tag),
+        );
+        assert_close(
+            &got.log_fc,
+            want.column("logFC_big5"),
+            TOL_EXACT_FC,
+            &format!("{}/exact_logFC_big5", d.tag),
         );
     }
 }

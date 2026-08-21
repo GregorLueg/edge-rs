@@ -33,47 +33,47 @@ use edge_rs::prelude::Recycled;
 // Tolerances //
 ////////////////
 
+// Figures are `NEEDS rel` from the calibration report, which is the worst
+// relative difference among the entries the absolute leg does not cover:
+//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_ql -- --nocapture
+
 /// Coefficients from the quasi-likelihood fit. Same story as the plain GLM: the
-/// stopping rule is on the deviance, so the coefficients are only settled to
-/// around `1e-4`. Measured worst case `6.0e-4` absolute.
-const TOL_COEF: Tol = Tol::new(1e-2, 2e-3);
+/// stopping rule is on the deviance, so the absolute leg is the honest one.
+/// Needs `0` beyond a `2e-3` absolute floor.
+const TOL_COEF: Tol = Tol::new(1e-5, 2e-3);
 
-/// Largest coefficient magnitude, on the natural log scale, that counts as
-/// identified. A gene with an entirely empty group sits above this and its
-/// estimate is arbitrary in both implementations.
-const IDENTIFIED_COEF_LIMIT: f64 = 20.0;
-
-/// Residual deviance. Measured worst case `4.0e-7`.
+/// Residual deviance. Needs `3.2e-6`.
 const TOL_DEVIANCE: Tol = Tol::new(1e-5, 1e-9);
 
 /// Posterior and prior quasi-likelihood dispersions, and the adjusted residual
 /// degrees of freedom. These run the deviance through the Chebyshev
 /// approximation in `src/ql/chebyshev.rs` and then through `squeezeVar`.
-/// Measured worst case `1.5e-5`.
-const TOL_S2: Tol = Tol::new(1e-4, 1e-9);
-
-/// Prior degrees of freedom from the empirical Bayes fit. Measured worst case
-/// `6.1e-5`.
-const TOL_DF_PRIOR: Tol = Tol::new(1e-3, 1e-9);
-
-/// F statistics. Measured worst case `4.2e-5` relative, `4.5e-6` absolute.
 ///
-/// The absolute floor covers genes whose F is around `1e-4`, which is a p-value
-/// of one whichever implementation computed it.
-const TOL_F: Tol = Tol::new(1e-3, 1e-4);
+/// Needs `4.4e-5`, and the binding quantity is `df_residual_adj` on the
+/// unbalanced set rather than `s2_post`, which needs only `3.9e-6`. An earlier
+/// revision sat at `1e-4` against that same `4.4e-5`, i.e. inside a factor of
+/// three of failing, which is close enough to flake on a different BLAS.
+const TOL_S2: Tol = Tol::new(2e-4, 1e-9);
+
+/// Prior degrees of freedom from the empirical Bayes fit. Needs `3.3e-6`.
+const TOL_DF_PRIOR: Tol = Tol::new(1e-5, 1e-9);
+
+/// F statistics. Needs `0` beyond a `1e-4` absolute floor, which covers genes
+/// whose F is around `1e-4` and is a p-value of one whichever implementation
+/// computed it.
+const TOL_F: Tol = Tol::new(1e-5, 1e-4);
 
 /// The top-abundance proportion used when the negative binomial dispersion is
 /// estimated rather than supplied. It comes off its own lowess span, so it is
-/// coarser than the quantities it feeds. Measured worst case `2.4e-4`.
+/// coarser than the quantities it feeds. Needs `2.4e-4`.
 const TOL_TOP_PROPORTION: Tol = Tol::rel(1e-3);
 
-/// P-values on the natural scale. Measured worst case `1.1e-4`.
+/// P-values on the natural scale. Needs `1.6e-4`.
 const TOL_P_VALUE: Tol = Tol::new(1e-3, 1e-300);
 
-/// P-values as `log(p)`, which is where the small ones live. The absolute floor
-/// covers the near-one end, where `log p` approaches zero and the relative test
-/// stops meaning anything. Measured worst case `2.6e-4` absolute.
-const TOL_LOG_P: Tol = Tol::new(1e-3, 1e-3);
+/// P-values as `log(p)`. Needs `0` beyond a `1e-3` absolute floor, which covers
+/// the near-one end where `log p` approaches zero.
+const TOL_LOG_P: Tol = Tol::new(1e-5, 1e-3);
 
 /////////////
 // Loading //
@@ -224,23 +224,21 @@ fn test_glm_ql_fit_matches_edger() {
             &format!("{}/resolved_dispersion", d.tag),
         );
 
-        // Coefficients, over the genes where they are identified. A gene with an
-        // entirely empty group has an infinite estimate and both implementations
-        // stop somewhere arbitrary; see the note in e2e_bulk_glm.rs.
-        let mut got_coef = Vec::new();
-        let mut want_coef = Vec::new();
+        // Every gene, unmasked. Unlike the plain GLM fit these coefficients are
+        // shrunk by the prior count, which bounds the empty-group genes instead
+        // of letting them run to infinity, so there is nothing to exclude.
+        let mut want_coef = Vec::with_capacity(l.n_genes * l.n_coef);
         for g in 0..l.n_genes {
-            let cols: Vec<f64> = (0..l.n_coef)
-                .map(|c| want.column(&format!("coef{}", c + 1))[g])
-                .collect();
-            if cols.iter().all(|v| v.is_finite() && v.abs() < IDENTIFIED_COEF_LIMIT) {
-                for (c, w) in cols.iter().enumerate() {
-                    got_coef.push(fit.coefficients[g * l.n_coef + c]);
-                    want_coef.push(*w);
-                }
+            for c in 0..l.n_coef {
+                want_coef.push(want.column(&format!("coef{}", c + 1))[g]);
             }
         }
-        assert_close(&got_coef, &want_coef, TOL_COEF, &format!("{}/ql_coefficients", d.tag));
+        assert_close(
+            &fit.coefficients,
+            &want_coef,
+            TOL_COEF,
+            &format!("{}/ql_coefficients", d.tag),
+        );
 
         assert_close(
             &fit.s2_post,
@@ -551,6 +549,57 @@ fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
     assert_eq!(
         moved, expected,
         "the bound moved {moved} p-values where edgeR moved {expected}"
+    );
+
+    // The other half of the claim. `glmQLFTest` forces `poisson.bound` off when
+    // `df.residual.zeros` is absent, so on the current pipeline the flag must do
+    // nothing at all. Without this the test only shows the bound works, not that
+    // it is correctly disabled, and a crate that honoured the flag
+    // unconditionally would pass.
+    let current = glm_ql_fit(
+        &l.counts,
+        l.n_genes,
+        l.n_samples,
+        &l.design,
+        l.n_coef,
+        None,
+        &l.offset,
+        None,
+        &l.ave_log_cpm,
+        None,
+    )
+    .expect("glm_ql_fit failed");
+    let base_current = as_glm_fit(&current);
+    let ql_current = QlSummary {
+        s2_post: &current.s2_post,
+        df_prior: &current.df_prior,
+        df_residual_adj: current.df_residual_adj.as_ref().expect("current pipeline"),
+        df_residual_zeros: None,
+        fitted: &current.fitted,
+        average_ql_dispersion: current.average_ql_dispersion,
+    };
+    let input_current = GlmTestInput {
+        counts: &l.counts,
+        n_genes: l.n_genes,
+        n_samples: l.n_samples,
+        design: &l.design,
+        n_coef: l.n_coef,
+        dispersion: &current.dispersion,
+        offset: &l.offset,
+        weights: None,
+        log_cpm: Some(&l.ave_log_cpm),
+    };
+    let on = glm_ql_ftest(&input_current, &base_current, &ql_current, &Tested::Coef(vec![1]), true)
+        .expect("glm_ql_ftest failed");
+    let off = glm_ql_ftest(&input_current, &base_current, &ql_current, &Tested::Coef(vec![1]), false)
+        .expect("glm_ql_ftest failed");
+    let moved_current = (0..l.n_genes)
+        .filter(|&g| on.p_value[g] != off.p_value[g])
+        .count();
+    assert_eq!(
+        moved_current, 0,
+        "the Poisson bound is dead without df_residual_zeros, but it moved \
+         {moved_current} p-values on the current pipeline"
     );
 }
 

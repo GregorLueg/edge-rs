@@ -28,45 +28,45 @@ mod common;
 use common::{Tol, assert_close, assert_close_scalar, assert_eq_usize};
 
 use edge_rs::sc::nebula::{NebulaParams, nebula};
-use edge_rs::sc::shrink::sc_residual_df;
+use edge_rs::sc::shrink::{sc_residual_df, shrink_sc_dispersion};
 use edge_rs::sc::test::{ScTested, glm_sc_test, packed_len};
 
 ////////////////
 // Tolerances //
 ////////////////
 
-// Set a factor of three or so above the worst case measured on these fixtures,
-// which is the convention src/sc/nebula.rs uses. None of them is this port's
-// error; every one is nebula's own optimiser noise, and the measured figure is
-// quoted on each so a future tightening has something to compare against.
-//
-// Reproduce the measurements with:
+// Figures are `NEEDS rel` from the calibration report, the worst relative
+// difference among entries the absolute leg does not cover:
 //   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_nebula -- --nocapture
+//
+// None of these is this port's error. nebula stops its optimiser on a profile
+// likelihood that is discontinuous at the stopping tolerance, so two of its own
+// runs from different starting points disagree by as much.
 
-/// Coefficients on the pure paths. Measured worst case `7.4e-6`, against `1.0e-6`
-/// in the in-crate eight-gene golden.
+/// Coefficients on the pure paths. Needs `7.4e-6`, against `1.0e-6` in the
+/// in-crate eight-gene golden.
 const TOL_COEF: Tol = Tol::new(3e-5, 1e-9);
 
-/// Standard errors. Measured worst case `2.3e-5` on the pure paths.
+/// Standard errors. Needs `2.3e-5`.
 const TOL_SE: Tol = Tol::rel(1e-4);
 
 /// Covariance entries, which are standard errors squared and so carry twice the
-/// relative error. Measured worst case `2.3e-4` on the pure paths.
+/// relative error. Needs `2.3e-4`.
 const TOL_COV: Tol = Tol::new(1e-3, 1e-12);
 
 /// Subject-level overdispersion. The profile likelihood is far flatter in this
 /// direction than in the cell-level one, so the same jitter moves it further.
-/// Measured worst case `3.8e-5` on the pure paths.
+/// Needs `3.8e-5`.
 const TOL_SUBJECT: Tol = Tol::rel(2e-4);
 
-/// Cell-level overdispersion. Measured worst case `2.2e-5` on the pure paths.
+/// Cell-level overdispersion. Needs `2.2e-5`.
 const TOL_CELL: Tol = Tol::rel(1e-4);
 
 /// Wald p-values. These amplify whatever error is in the standard error by
 /// roughly `z^2`, because the tail of a normal falls like `exp(-z^2/2)`: at
 /// `p = 1e-16` the score is `z = 8.2`, so a `2e-5` relative error in the
-/// standard error arrives as `1.4e-3` in the p-value. Measured worst case
-/// `1.4e-3` on the pure paths, which is that arithmetic exactly.
+/// standard error arrives as `1.4e-3` in the p-value. Needs `1.5e-3`, which is
+/// that arithmetic exactly.
 const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 
 // -- The LN+HL path, held apart because the two optimisers pick different basins --
@@ -97,35 +97,48 @@ const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 // `-sigma/2` intercept shift, into the coefficients.
 //
 // Neither optimiser is the right one. This crate's stage-one optimum has the
-// strictly lower marginal negative log-likelihood on 9 of the 37, by up to
-// `7.2` nats; R's is lower on 27. And R disagrees with itself: nebula's own
-// documented `opt = "trust"` moves the subject overdispersion by more than one
-// per cent on 78 of the 281 genes, twice as many as the 37 where this crate
-// differs from `opt = "lbfgs"`, and on those 37 it lands on this crate's answer
-// rather than on `lbfgs`'s: 22 of them agree to `1e-6` and 32 to `1e-4`, against
-// none agreeing with `lbfgs` to `1e-6`. Matching the fixture would mean reproducing
-// nlopt's LD_LBFGS trajectory step for step, including the overshoot that gets
-// clipped onto the `sigma` bound and is what carries it over the ridge.
+// strictly lower marginal negative log-likelihood on 9 of the 37; R's is lower
+// on 27. And R disagrees with itself: nebula's own documented `opt = "trust"`
+// moves the subject overdispersion by more than one per cent on 78 of the 281
+// genes, twice as many as the 37 where this crate differs from `opt = "lbfgs"`,
+// and on those 37 it lands on this crate's answer rather than on `lbfgs`'s:
+// 22 agree to `1e-6` and 32 to `1e-4`, against none agreeing with `lbfgs` to
+// `1e-6`. Matching the fixture would mean reproducing nlopt's LD_LBFGS
+// trajectory step for step, including the overshoot that gets clipped onto the
+// `sigma` bound and is what carries it over the ridge.
 //
 // One gene is not stage one at all. On `gene_id` 299 both optimisers agree on
 // `[beta, sigma, phi]` to `3e-7`, and it is R's `nlminb` inside the refit that
 // fails: it returns the lower bound `1e-4` with `convergence == 0` at a point
-// where its own `pql_gamma_ll` is still falling. That objective's minimum is at
-// `5.5e-4`, which is what this crate returns, and it is worth `0.23` nats.
+// where its own `pql_gamma_ll` is still falling.
 //
-// Size of it in practice: the worst absolute coefficient disagreement across all
-// LN+HL genes is `4.4e-3` in log-fold-change units. The large relative figure
-// above is a coefficient of magnitude `8.6e-4` and is not meaningful.
-//
-// The two constants below record the measured divergence so that the suite fails
-// loudly if it grows. They are not an accepted tolerance.
+// The two constants below are gated on their absolute legs, which is what makes
+// them falsifiable. Stated as pure relative bounds they would not be: the
+// comparator normalises by `max(|a|, |b|)`, so a relative difference cannot
+// exceed 2 and any `max_relative` at or above that can never fail. An earlier
+// revision had the subject bound at 6.0, which was exactly that mistake.
 
-/// Coefficients on the LN+HL path. Measured worst case `5.9e-1`. See above.
-const LN_HL_COEF: Tol = Tol::new(1.0, 1e-2);
+/// Coefficients on the LN+HL path. Needs `0` beyond a `1e-2` absolute floor;
+/// the worst absolute disagreement across all 281 genes is `4.4e-3` in
+/// log-fold-change units. The headline `5.9e-1` relative figure is a
+/// coefficient of magnitude `8.6e-4` and is not meaningful.
+const LN_HL_COEF: Tol = Tol::new(1e-5, 1e-2);
 
-/// Subject-level overdispersion on the LN+HL path. Measured worst case `4.5`.
-/// See above.
-const LN_HL_SUBJECT: Tol = Tol::new(6.0, 1e-3);
+/// Subject-level overdispersion on the LN+HL path. Needs `7.9e-2` beyond a
+/// `1e-3` absolute floor.
+const LN_HL_SUBJECT: Tol = Tol::new(2.5e-1, 1e-3);
+
+/// Shrunk dispersions from `shrink_sc_dispersion`, against limma's `squeezeVar`
+/// on the same inputs. Needs `7.7e-14`.
+///
+/// This is the tightest thing in the file, and it should be: the test hands the
+/// crate R's own cell overdispersions, so the only thing under comparison is the
+/// empirical Bayes step. `shrink_sc_dispersion` has no upstream of its own,
+/// being edgePython's invention, so limma applied directly is the reference.
+const TOL_SHRINK: Tol = Tol::rel(1e-12);
+
+/// Prior degrees of freedom from that shrinkage. Needs `8.3e-13`.
+const TOL_SHRINK_DF: Tol = Tol::rel(1e-11);
 
 /////////////
 // Loading //
@@ -520,13 +533,15 @@ fn test_glm_sc_test_reproduces_the_r_p_values() {
 #[test]
 fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
     // `shrink_sc_dispersion` has no upstream of its own: it is edgePython's
-    // invention, so the reference is limma's squeezeVar applied directly to the
-    // reciprocal cell overdispersions on the crate's own residual degrees of
-    // freedom. This is the one fixture in the suite where limma's uniroot
-    // actually runs, which is why the generator converges it.
+    // invention, so the reference is limma's `squeezeVar` applied directly to the
+    // reciprocal cell overdispersions on the residual degrees of freedom
+    // `sc_residual_df` computes. The generator runs exactly that, through the
+    // converged-`uniroot` `squeezeVar`, and this is the one fixture in the suite
+    // where that override changes the answer.
     let s = common::scalars();
     let l = load(&DATASETS[0]);
     let want = common::table("sc_shrink.csv");
+    let nebula_fixture = common::table("sc_nebula.csv");
 
     let df_residual = sc_residual_df(l.n_cells, 3, l.n_subjects);
     assert_close_scalar(
@@ -536,50 +551,74 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
         "sc/residual_df",
     );
 
-    let fit = nebula(
-        &l.counts,
-        l.n_genes,
-        l.n_cells,
-        &l.subject,
-        &l.design,
-        3,
-        Some(&l.offset),
-        Some(golden_params()),
-    )
-    .expect("nebula failed");
-
-    // The generator kept the genes nebula called converged with a usable cell
-    // overdispersion, and took phi as its reciprocal floored at 1e-8.
-    let want_ids: Vec<usize> = want.column_usize("gene_id").iter().map(|g| g - 1).collect();
-    let position: std::collections::HashMap<usize, usize> = fit
-        .gene_index
+    // The inputs are R's, not the crate's. Feeding the crate its own nebula
+    // output would drag the LN+HL divergence documented above into a test that
+    // is supposed to be about the shrinkage, and the shrinkage is a joint fit
+    // over every usable gene, so one bad input moves every output. This is the
+    // same isolation the bulk GLM and QL files use.
+    let dispersion: Vec<f64> = nebula_fixture.column("Cell").to_vec();
+    let convergence: Vec<i32> = nebula_fixture
+        .column("convergence")
         .iter()
-        .enumerate()
-        .map(|(i, g)| (*g, i))
+        .map(|v| *v as i32)
         .collect();
+    let covariate: Vec<f64> = nebula_fixture.column("logFC_int").to_vec();
+    let n = dispersion.len();
 
-    // Restricted to the pure-path genes for the same reason as the Wald test:
-    // phi is the reciprocal of the cell overdispersion, so on LN+HL genes this
-    // would only restate the gap recorded above.
-    let nebula_fixture = common::table("sc_nebula.csv");
-    let algorithm = nebula_fixture.column("algorithm");
+    let shrunk = shrink_sc_dispersion(
+        &dispersion,
+        &convergence,
+        Some(&covariate),
+        df_residual,
+        None,
+    )
+    .expect("shrink_sc_dispersion failed");
 
-    let mut got_phi = Vec::new();
-    let mut want_phi = Vec::new();
-    for (k, id) in want_ids.iter().enumerate() {
-        let i = position[id];
-        if algorithm[i] as usize == 2 {
-            continue;
-        }
-        got_phi.push((1.0 / fit.cell_overdispersion[i]).max(1e-8));
-        want_phi.push(want.column("phi_raw")[k]);
-    }
-    assert!(!got_phi.is_empty(), "no pure-path genes survived the shrinkage filter");
-    assert_close(&got_phi, &want_phi, TOL_CELL, "sc/shrink_phi_raw_pure");
-
+    // R writes only the usable genes, the ones nebula converged on with a
+    // positive cell overdispersion, so the comparison is indexed by gene.
+    let gene_ids: Vec<usize> = nebula_fixture
+        .column_usize("gene_id")
+        .iter()
+        .map(|g| g - 1)
+        .collect();
+    let position: std::collections::HashMap<usize, usize> =
+        gene_ids.iter().enumerate().map(|(i, g)| (*g, i)).collect();
+    let want_ids: Vec<usize> = want.column_usize("gene_id").iter().map(|g| g - 1).collect();
     assert_eq!(
         want_ids.len(),
         s.get_usize("sc_shrink", "n_usable"),
         "usable gene count"
+    );
+    assert!(want_ids.len() < n, "some genes must be excluded, or the filter is inert");
+
+    let mut phi_raw = Vec::with_capacity(want_ids.len());
+    let mut phi_post = Vec::with_capacity(want_ids.len());
+    let mut phi_prior = Vec::with_capacity(want_ids.len());
+    let mut df_prior = Vec::with_capacity(want_ids.len());
+    // `phi_raw`, `phi_post` and `phi_prior` are indexed by gene, but `df_prior`
+    // is indexed by *usable* gene: the robust fit returns one entry per gene it
+    // actually fitted, not one per gene it was handed. Conflating the two reads
+    // the right numbers off the wrong rows and looks like a 94% disagreement.
+    assert_eq!(
+        shrunk.df_prior.len(),
+        want_ids.len(),
+        "df_prior should carry one entry per usable gene"
+    );
+    for (k, id) in want_ids.iter().enumerate() {
+        let i = position[id];
+        phi_raw.push(shrunk.phi_raw[i].max(1e-8));
+        phi_post.push(shrunk.phi_post[i]);
+        phi_prior.push(shrunk.phi_prior[i % shrunk.phi_prior.len()]);
+        df_prior.push(shrunk.df_prior[k]);
+    }
+
+    assert_close(&phi_raw, want.column("phi_raw"), TOL_CELL, "sc/shrink_phi_raw");
+    assert_close(&phi_post, want.column("var_post"), TOL_SHRINK, "sc/shrink_phi_post");
+    assert_close(&phi_prior, want.column("var_prior"), TOL_SHRINK, "sc/shrink_phi_prior");
+    assert_close(&df_prior, want.column("df_prior"), TOL_SHRINK_DF, "sc/shrink_df_prior");
+
+    assert_eq!(
+        shrunk.df_residual, df_residual,
+        "the result should carry the residual df it was given"
     );
 }

@@ -12,7 +12,7 @@ mod common;
 
 use common::{Tol, assert_close};
 
-use edge_rs::glm::fit::glm_fit;
+use edge_rs::glm::fit::{FitMethod, glm_fit};
 use edge_rs::glm::test::{GlmTestInput, Tested, TreatNull, glm_lrt, glm_treat};
 use edge_rs::prelude::Recycled;
 
@@ -20,64 +20,63 @@ use edge_rs::prelude::Recycled;
 // Tolerances //
 ////////////////
 
-// The coefficient tolerances below are set by edgeR's own stopping rule, not by
-// anything this crate does. `mglmLevenberg` stops when the deviance improves by
-// less than `tol * (|deviance| + 0.1)`, and near the optimum the deviance is
+// The coefficient family is gated on its absolute leg, not its relative one,
+// and that is deliberate. `mglmLevenberg` stops when the deviance improves by
+// less than `tol * (|deviance| + 0.1)`; near the optimum the deviance is
 // quadratic in the coefficients, so a deviance settled to 1e-6 leaves the
-// coefficients loose at around 1e-4.
+// coefficients loose at around 1e-4 in absolute terms regardless of how large
+// they are. Measured on the factorial set over the 869 genes with no zero count,
+// running edgeR against itself at `tol = 1e-6` and `tol = 1e-14`:
 //
-// Measured on the factorial set, over the 869 genes with no zero count, running
-// edgeR against itself at `tol = 1e-6` and `tol = 1e-14`:
-//
-//   coefficient movement   1.2e-4 absolute, 5.1e-3 relative
+//   coefficient movement   1.2e-4 absolute
 //   deviance movement      2.9e-7 absolute
 //
-// So the deviance is well determined and the coefficients are not. This crate
-// sits 5.6e-4 from edgeR on the coefficients, the same order as edgeR's distance
-// from itself. Gating coefficients any tighter would be pinning a test to the
-// convergence tolerance of the reference rather than to its answer.
+// An absolute floor is therefore the honest instrument here, and once it is in
+// place the relative leg has nothing left to carry: the report gives `NEEDS rel`
+// of exactly zero for every coefficient and fold-change label. Keeping the
+// relative leg tight at 1e-5 means a proportional error on a large coefficient
+// is still caught, which a pure absolute test would miss.
+//
+// Figures below are `NEEDS rel` from:
+//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_glm -- --nocapture
 
-/// Fitted coefficients, shrunk and unshrunk. Measured worst case `5.6e-4`
-/// absolute against edgeR, on coefficients of order 1.
-const TOL_COEF: Tol = Tol::new(1e-2, 2e-3);
+/// Fitted coefficients, shrunk and unshrunk. Needs `0` beyond a `2e-3` absolute
+/// floor, against edgeR's own `1.2e-4` self-movement.
+const TOL_COEF: Tol = Tol::new(1e-5, 2e-3);
 
 /// Fitted means, which inherit the coefficient slack through `exp(X beta)`.
-/// Measured worst case `2.3e-3` relative, on the unbalanced set.
+/// Needs `1.8e-3` beyond a `1e-4` absolute floor.
 ///
-/// The absolute floor covers the empty-group genes, whose fitted counts for the
-/// empty side sit around `1e-7` and differ between implementations only because
-/// the runaway coefficient stopped in a different place. No real fitted count is
-/// anywhere near that small.
-const TOL_FITTED: Tol = Tol::new(1e-2, 1e-4);
+/// The floor covers the empty-group genes, whose fitted counts on the empty side
+/// sit around `1e-7` and differ only because the runaway coefficient stopped in
+/// a different place. No real fitted count is anywhere near that small.
+const TOL_FITTED: Tol = Tol::new(5e-3, 1e-4);
 
-/// Residual deviance, which unlike the coefficients is well determined.
-/// Measured worst case `4.0e-7`, against edgeR's own `2.9e-7` self-movement.
+/// Residual deviance, which unlike the coefficients is well determined. Needs
+/// `6.6e-7`, against edgeR's own `2.9e-7` self-movement.
 const TOL_DEVIANCE: Tol = Tol::new(2e-6, 1e-9);
 
-/// Log fold changes, which are just a coefficient over `ln 2` and inherit
-/// [`TOL_COEF`]. Measured worst case `8.1e-4` absolute.
-const TOL_LOG_FC: Tol = Tol::new(1e-2, 3e-3);
+/// Log fold changes, a coefficient over `ln 2`, so they inherit [`TOL_COEF`].
+/// Needs `0` beyond a `3e-3` absolute floor.
+const TOL_LOG_FC: Tol = Tol::new(1e-5, 3e-3);
 
-/// Likelihood ratio and F statistics. These are deviance differences, so they
-/// are far better determined than the coefficients. Measured worst case
-/// `3.7e-5` relative, `4.5e-6` absolute. The absolute floor covers genes whose statistic is around
-/// `1e-8`, where the relative test says nothing and any chi-squared that small
-/// is a p-value of one either way.
+/// Likelihood ratio statistics. These are deviance differences, so they are far
+/// better determined than the coefficients. Needs `0` beyond a `1e-5` absolute
+/// floor, which covers genes whose statistic is around `1e-8`, where a
+/// chi-squared that small is a p-value of one either way.
 const TOL_STATISTIC: Tol = Tol::new(1e-5, 1e-5);
 
-/// P-values on the natural scale. Measured worst case `1.4e-6`.
+/// P-values on the natural scale. Needs `3.4e-5`.
 ///
 /// The absolute floor stops a p-value that underflowed to zero in one
 /// implementation and not the other from failing a relative test. The log-scale
 /// check below is the one with teeth down there.
 const TOL_P_VALUE: Tol = Tol::new(1e-4, 1e-300);
 
-/// P-values compared as `log(p)`, which is where the very small ones live.
-/// Measured worst case `2.5e-3` relative, `3.1e-5` absolute, both at the
-/// near-one end.
+/// P-values as `log(p)`. Needs `0` beyond a `1e-4` absolute floor.
 ///
-/// The absolute floor matters at the *other* end from the one this check is for:
-/// a gene with `p` near one has `log p` near zero, where the relative test is as
+/// The floor matters at the *other* end from the one this check is for: a gene
+/// with `p` near one has `log p` near zero, where the relative test is as
 /// meaningless as the natural-scale test is for a `p` near zero.
 const TOL_LOG_P: Tol = Tol::new(1e-5, 1e-4);
 
@@ -206,6 +205,17 @@ fn identified(want: &common::Table, n_genes: usize, n_coef: usize) -> Vec<bool> 
 ///
 /// The retained rows, flattened, in the original order.
 fn masked(v: &[f64], mask: &[bool], stride: usize) -> Vec<f64> {
+    // `chunks_exact` drops a trailing partial chunk and `zip` truncates to the
+    // shorter side, so a wrong stride silently compares a subset of the wrong
+    // genes instead of failing. Both sides get the same wrong treatment, so
+    // nothing downstream notices.
+    assert_eq!(
+        v.len(),
+        mask.len() * stride,
+        "masked: {} values against {} genes at stride {stride}",
+        v.len(),
+        mask.len()
+    );
     v.chunks_exact(stride)
         .zip(mask)
         .filter(|(_, keep)| **keep)
@@ -219,6 +229,7 @@ fn masked(v: &[f64], mask: &[bool], stride: usize) -> Vec<f64> {
 
 #[test]
 fn test_glm_fit_matches_edger() {
+    let s = common::scalars();
     for d in &DATASETS {
         let l = load(d);
         let want = common::table(&format!("{}_glmfit.csv", d.tag));
@@ -245,6 +256,26 @@ fn test_glm_fit_matches_edger() {
             &format!("{}/deviance", d.tag),
         );
         assert_close(&fit.fitted, &want_fitted, TOL_FITTED, &format!("{}/fitted", d.tag));
+
+        // Which fitter ran. The near-Poisson set exists partly because its
+        // group-only design is a factor coding and so takes the closed-form
+        // one-way path, where the other two go through Levenberg. Nothing else
+        // in the suite would notice if that dispatch changed: the answers agree
+        // to 1e-13 either way, so only this asserts the intended path was taken.
+        let want_one_way = s.get(d.tag, "glm_method_oneway") != 0.0;
+        assert_eq!(
+            fit.method == FitMethod::OneWay,
+            want_one_way,
+            "{}: expected {} dispatch",
+            d.tag,
+            if want_one_way { "one-way" } else { "Levenberg" }
+        );
+        assert_eq!(
+            fit.df_residual,
+            s.get_usize(d.tag, "glm_df_residual"),
+            "{}: residual degrees of freedom",
+            d.tag
+        );
 
         let mask = identified(&common::table(&format!("{}_glmfit.csv", d.tag)), l.n_genes, l.n_coef);
         let mut want_coef = Vec::with_capacity(l.n_genes * l.n_coef);

@@ -401,11 +401,17 @@ pub fn apl_grid<T: EdgeFloat>(
             // are close together; neighbouring genes need not be, and over a wide
             // abundance range that start is far enough out that the fit lands on
             // the wrong optimum.
+            // The start is built at the first grid point's dispersion and then
+            // carried forward, which is what `estimateDisp` does: it clears its
+            // warm start once per gene and hands the rest of the grid the
+            // previous point's answer.
             if !one_way {
                 initial_coefficients(
                     &scratch.y,
                     design,
                     offset_row,
+                    RecycledRow::Constant(grid[0]),
+                    weight_row,
                     n_samples,
                     n_coef,
                     LevenbergParams::default().start_method,

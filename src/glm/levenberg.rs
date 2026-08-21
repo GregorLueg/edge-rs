@@ -296,21 +296,101 @@ fn deviance_of(
         .sum()
 }
 
+/// Log-rate assigned to a gene with nothing to fit.
+///
+/// edgeR starts an all-zero gene at a very small mean rather than at negative
+/// infinity, so that the first step is finite.
+const EMPTY_GENE_LOG_RATE: f64 = -20.0;
+
+/// Least-squares projection of a per-sample target onto the design.
+///
+/// Solves `design * beta = z` in the least-squares sense through the normal
+/// equations, which is what edgeR's start does with a QR. The system is
+/// `n_coef` square and `n_coef` is a handful of columns for any real design, so
+/// the normal equations cost nothing and lose no accuracy that survives the
+/// damped iteration afterwards.
+///
+/// ### Params
+///
+/// * `design` - Row-major design, `n_samples * n_coef`
+/// * `z` - Target, one value per sample
+/// * `n_samples` - Number of samples
+/// * `n_coef` - Number of coefficients
+/// * `beta` - Output, length `n_coef`
+///
+/// ### Returns
+///
+/// `false` if the design is rank deficient, leaving `beta` untouched.
+fn project_onto_design(
+    design: &[f64],
+    z: &[f64],
+    n_samples: usize,
+    n_coef: usize,
+    beta: &mut [f64],
+) -> bool {
+    let mut xtx = vec![0.0; n_coef * n_coef];
+    let mut xtz = vec![0.0; n_coef];
+
+    for j in 0..n_samples {
+        let row = &design[j * n_coef..(j + 1) * n_coef];
+        for (a, &x_a) in row.iter().enumerate() {
+            xtz[a] += x_a * z[j];
+            for (b, &x_b) in row[..=a].iter().enumerate() {
+                xtx[a * n_coef + b] += x_a * x_b;
+            }
+        }
+    }
+    for a in 0..n_coef {
+        for b in 0..a {
+            xtx[b * n_coef + a] = xtx[a * n_coef + b];
+        }
+    }
+
+    if !solve_spd_in_place(&mut xtx, &mut xtz, n_coef) {
+        return false;
+    }
+    beta.copy_from_slice(&xtz);
+    true
+}
+
 /// Chooses starting coefficients for one gene.
+///
+/// Port of edgeR's `.cxx_get_levenberg_start`. Both methods build a per-sample
+/// target on the log scale and project it onto the design by least squares:
+///
+/// * [`StartMethod::Null`] uses a single working-weighted log rate shared by
+///   every sample, `log(sum(cw * y/N) / sum(cw))` with `cw = w N / (1 + phi N)`.
+///   That weighting is why the dispersion and the weights are needed; the
+///   unweighted ratio of totals agrees only when every library is the same size.
+/// * [`StartMethod::LogCounts`] uses each sample's own log rate.
+///
+/// The projection is the part that is easy to skip and must not be. Writing the
+/// scalar into `beta[0]` and zeroing the rest is only equivalent when the first
+/// design column is an intercept. On `~0 + group + covariate` it leaves every
+/// sample outside the first column starting at `mu` equal to its library size,
+/// which for a dispersion below
+/// [`crate::glm::deviance::POISSON_REGIME`] sits inside the region where the
+/// unit deviance underflows to zero. That is the global minimum of the fitter's
+/// objective, so the iteration never leaves it.
 ///
 /// ### Params
 ///
 /// * `y` - Counts for this gene
-/// * `design` - Row-major design
-/// * `offset` - Offset row
+/// * `design` - Row-major design, `n_samples * n_coef`
+/// * `offset` - Log-scale offset row
+/// * `dispersion` - Dispersion row, used for the working weights
+/// * `weights` - Optional observation weight row
 /// * `n_samples` - Number of samples
 /// * `n_coef` - Number of coefficients
 /// * `method` - Which initialisation to use
 /// * `beta` - Output, length `n_coef`
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn initial_coefficients(
     y: &[f64],
     design: &[f64],
     offset: RecycledRow<'_, f64>,
+    dispersion: RecycledRow<'_, f64>,
+    weights: Option<RecycledRow<'_, f64>>,
     n_samples: usize,
     n_coef: usize,
     method: StartMethod,
@@ -318,33 +398,42 @@ pub(crate) fn initial_coefficients(
 ) {
     beta.fill(0.0);
 
-    match method {
+    let target: Vec<f64> = match method {
         StartMethod::Null => {
-            let total_counts: f64 = y.iter().sum();
-            let total_library: f64 = (0..n_samples).map(|j| offset.get(j).exp()).sum();
-            beta[0] = if total_counts > 0.0 && total_library > 0.0 {
-                (total_counts / total_library).max(MIN_POSITIVE).ln()
+            let mut num = 0.0;
+            let mut den = 0.0;
+            for (j, &y_j) in y.iter().enumerate() {
+                let library = offset.get(j).exp();
+                let w = weights.map_or(1.0, |w| w.get(j));
+                let cw = w * library / (1.0 + dispersion.get(j) * library);
+                if cw.is_finite() && library > 0.0 {
+                    num += cw * y_j / library;
+                    den += cw;
+                }
+            }
+            let rate = if num > 0.0 && den > 0.0 {
+                (num / den).max(MIN_POSITIVE).ln()
             } else {
-                // No signal to fit. edgeR starts these at a very small mean
-                // rather than negative infinity so the first step is finite.
-                -20.0
+                EMPTY_GENE_LOG_RATE
             };
+            vec![rate; n_samples]
         }
-        StartMethod::LogCounts => {
-            // Intercept-only least squares on the log scale. A full solve buys
-            // nothing here: the damped iteration converges from either start,
-            // and this avoids a per-gene factorisation.
-            let total: f64 = y
-                .iter()
-                .enumerate()
-                .map(|(j, &y_j)| {
-                    let library = offset.get(j).exp().max(MIN_POSITIVE);
-                    (y_j / library).max(MIN_POSITIVE).ln()
-                })
-                .sum();
-            beta[0] = total / n_samples as f64;
-            let _ = (design, n_coef);
-        }
+        StartMethod::LogCounts => (0..n_samples)
+            .map(|j| {
+                let library = offset.get(j).exp().max(MIN_POSITIVE);
+                (y[j] / library).max(MIN_POSITIVE).ln()
+            })
+            .collect(),
+    };
+
+    if !project_onto_design(design, &target, n_samples, n_coef, beta) {
+        // Rank deficient. edgeR's QR pivots through this; the normal equations
+        // cannot, so fall back to putting the whole rate on the first column.
+        // The damped iteration recovers from a poor start, just not from one
+        // inside the zero-deviance basin, and a rank-deficient design has no
+        // such basin to fall into.
+        beta.fill(0.0);
+        beta[0] = target[0];
     }
 }
 
@@ -592,6 +681,8 @@ pub fn mglm_levenberg<T: EdgeFloat>(
                         &scratch.y,
                         design,
                         offset_row,
+                        disp_row,
+                        weight_row,
                         n_samples,
                         n_coef,
                         params.start_method,
@@ -1073,6 +1164,83 @@ mod tests {
                 max_relative = 1e-10
             );
         }
+    }
+
+    /// The starting coefficients, against edgeR's `.cxx_get_levenberg_start`.
+    ///
+    /// `maxit = 0` returns the start unchanged, which is how these were read out
+    /// of edgeR. The design deliberately has no intercept column: with one, any
+    /// implementation that drops the scalar into `beta[0]` and zeroes the rest
+    /// happens to be right, so an intercept-bearing fixture cannot tell a
+    /// correct start from a broken one. The weighted case is here for the same
+    /// reason, since the working weights only bite when the libraries differ.
+    ///
+    /// ```r
+    /// # Rscript, edgeR 4.8.2
+    /// y <- matrix(c(493,205,215,683,465,538, 100,120,90,110,105,95), 2, 6, byrow = TRUE)
+    /// lib <- c(1e6, 1.1e6, 0.9e6, 1.2e6, 1e6, 1.05e6)
+    /// off <- matrix(rep(log(lib), each = 2), 2, 6)
+    /// score <- c(0.1, 0.4, 0.2, 0.9, 0.3, 0.7)
+    /// X <- cbind(c(1,1,1,0,0,0), c(0,0,0,1,1,1), score)
+    /// w <- matrix(rep(c(.1,.1,.1,10,10,10), each = 2), 2, 6)
+    /// mglmLevenberg(y, X, dispersion = 0.1, offset = off, maxit = 0)$coefficients
+    /// mglmLevenberg(y, X, dispersion = 0.1, offset = off, weights = w, maxit = 0)$coefficients
+    /// ```
+    #[test]
+    fn test_start_matches_edger_on_a_design_without_an_intercept() {
+        let y: Vec<f64> = vec![
+            493.0, 205.0, 215.0, 683.0, 465.0, 538.0, //
+            100.0, 120.0, 90.0, 110.0, 105.0, 95.0,
+        ];
+        let lib: [f64; 6] = [1e6, 1.1e6, 0.9e6, 1.2e6, 1e6, 1.05e6];
+        let offset = Recycled::by_sample(lib.iter().map(|v| v.ln()).collect());
+        let score = [0.1, 0.4, 0.2, 0.9, 0.3, 0.7];
+        let mut design = Vec::with_capacity(18);
+        for (j, s) in score.iter().enumerate() {
+            design.push(if j < 3 { 1.0 } else { 0.0 });
+            design.push(if j < 3 { 0.0 } else { 1.0 });
+            design.push(*s);
+        }
+        let stopped = LevenbergParams { max_iter: 0, ..Default::default() };
+
+        let fit = mglm_levenberg(
+            &y,
+            2,
+            6,
+            &design,
+            3,
+            &Recycled::scalar(0.1),
+            &offset,
+            None,
+            None,
+            Some(stopped),
+        )
+        .unwrap();
+        // Both group columns carry the rate; edgeR projects, it does not just
+        // fill the first column.
+        assert_relative_eq!(fit.coefficients[0], -7.797_403_899_938_82, max_relative = 1e-12);
+        assert_relative_eq!(fit.coefficients[1], -7.797_403_899_938_82, max_relative = 1e-12);
+        assert!(fit.coefficients[2].abs() < 1e-12);
+        assert_relative_eq!(fit.coefficients[3], -9.216_637_226_798_91, max_relative = 1e-12);
+        assert_relative_eq!(fit.coefficients[4], -9.216_637_226_798_91, max_relative = 1e-12);
+        assert!(fit.coefficients[5].abs() < 1e-12);
+
+        let weights = Recycled::by_sample(vec![0.1, 0.1, 0.1, 10.0, 10.0, 10.0]);
+        let fit = mglm_levenberg(
+            &y,
+            2,
+            6,
+            &design,
+            3,
+            &Recycled::scalar(0.1),
+            &offset,
+            Some(&weights),
+            None,
+            Some(stopped),
+        )
+        .unwrap();
+        assert_relative_eq!(fit.coefficients[0], -7.574_372_857_478_63, max_relative = 1e-12);
+        assert_relative_eq!(fit.coefficients[3], -9.253_386_520_876_94, max_relative = 1e-12);
     }
 
     #[test]

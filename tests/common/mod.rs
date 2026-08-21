@@ -165,13 +165,32 @@ pub fn assert_close(got: &[f64], want: &[f64], tol: Tol, label: &str) {
         want.len()
     );
 
-    // Two running maxima. `worst` is over everything and drives the calibration
-    // report; `worst_failing` is over the failures only and drives the panic
-    // message, because the largest relative difference is often a passing entry
-    // that the absolute leg of the tolerance let through.
+    assert!(!got.is_empty(), "{label}: nothing to compare, both sides are empty");
+
+    // Three running maxima, because a tolerance has two legs and the panic wants
+    // a third thing again.
+    //
+    // `worst` and `worst_abs` are over everything and drive the calibration
+    // report. Both are needed: a constant whose binding entry passes on the
+    // absolute leg has a relative figure that says nothing about what the
+    // tolerance must clear, and reporting only one of them is how the measured
+    // values in these files came to be quoted wrong.
+    //
+    // `worst_failing` is over the failures only and drives the panic message,
+    // because the largest relative difference is often a passing entry that the
+    // absolute leg let through, and pointing at it sends the reader to a healthy
+    // value.
     let mut worst: Option<Worst> = None;
+    let mut worst_abs: Option<Worst> = None;
     let mut worst_failing: Option<Worst> = None;
     let mut n_failed = 0_usize;
+    // The relative difference that `max_relative` actually has to clear, namely
+    // the worst one among the entries the epsilon does not already cover. This
+    // is the only number a relative tolerance can be set from: the unconditional
+    // worst is routinely a near-zero value that the absolute leg handles, and
+    // reading the constant off that instead is how these files ended up quoting
+    // figures three orders of magnitude from what they gate.
+    let mut worst_beyond_eps = 0.0_f64;
 
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         let relative = relative_difference(g, w);
@@ -181,10 +200,16 @@ pub fn assert_close(got: &[f64], want: &[f64], tol: Tol, label: &str) {
         if worst.is_none_or(|prev| relative > prev.relative) {
             worst = Some(here);
         }
-        if absolute > tol.epsilon && relative > tol.max_relative {
-            n_failed += 1;
-            if worst_failing.is_none_or(|prev| relative > prev.relative) {
-                worst_failing = Some(here);
+        if worst_abs.is_none_or(|prev| absolute > prev.absolute) {
+            worst_abs = Some(here);
+        }
+        if absolute > tol.epsilon {
+            worst_beyond_eps = worst_beyond_eps.max(relative);
+            if relative > tol.max_relative {
+                n_failed += 1;
+                if worst_failing.is_none_or(|prev| relative > prev.relative) {
+                    worst_failing = Some(here);
+                }
             }
         }
     }
@@ -193,15 +218,19 @@ pub fn assert_close(got: &[f64], want: &[f64], tol: Tol, label: &str) {
         Some(w) => w,
         None => return,
     };
+    let worst_abs = worst_abs.expect("non-empty, so a maximum exists");
 
     if report_enabled() {
         println!(
-            "[tol] {label:<34} n={:<6} worst rel {:.3e} at {} (got {:.17e}, want {:.17e})",
+            "[tol] {label:<34} n={:<6} NEEDS rel {:.3e} (eps {:.0e})  \
+             raw: rel {:.3e} @{} abs {:.3e} @{}",
             got.len(),
+            worst_beyond_eps,
+            tol.epsilon,
             worst.relative,
             worst.index,
-            worst.got,
-            worst.want
+            worst_abs.absolute,
+            worst_abs.index
         );
     }
 
