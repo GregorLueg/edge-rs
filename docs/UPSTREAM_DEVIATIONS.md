@@ -8,6 +8,13 @@ and C++ it came from, upstream wins: those packages are what users compare
 against, and their output is what the test suite gates on. Section A covers those
 cases.
 
+Every `edgepython/*.py` file and line below was read against **version 0.2.6,
+commit `1e572ae`**, dated 2026-06-16. That pin is the point: a line number with no
+commit behind it rots the moment upstream edits the file, and these are findings
+about one revision of a young package rather than standing judgements on it. Any
+of them may have been fixed since. Re-pin this paragraph if the entries are ever
+re-checked against a newer checkout.
+
 Section B is different and rarer: places where **edgeR or limma themselves are
 wrong**, verified by reproducing the fault in the installed package. There the R
 does not win, because reproducing a bug faithfully is not parity worth having.
@@ -57,7 +64,7 @@ happens on designs with many residual degrees of freedom.
 ## 2. `glm_sc_test` discards the off-diagonal covariance
 
 **Where:** `edgepython/sc_fit.py:1494` (`glm_sc_test`)
-**Ported to:** `src/sc/test.rs` (phase 8, not yet written)
+**Ported to:** `src/sc/test.rs`
 **Severity:** wrong standard errors for contrasts on correlated designs
 
 Contrast standard errors are computed as `sqrt(sum(se^2 * c^2))`, which is only
@@ -160,7 +167,7 @@ not fine against the 1e-8 ones the Python suite uses in places.
 
 ---
 
-## 5. edgePython "fixes" an integer division that edgeR relies on
+## 5. edgePython corrects an integer division that edgeR relies on
 
 **Where:** `edgepython/ql_weights.py:514` (`compute_unit_nb_deviance`)
 **Ported to:** `src/glm/deviance.rs`, `unit_nb_deviance`
@@ -540,7 +547,7 @@ On top of the estimator itself:
 
 ---
 
-## 24. NEBULA has no marginal-likelihood Hessian, so its standard errors are wrong
+## 24. edgePython's NEBULA has no marginal-likelihood Hessian
 
 **Where:** `edgepython/sc_fit.py`, the whole NEBULA-LN path
 **Ported to:** `src/sc/ptmg.rs`, `src/sc/nebula.rs`
@@ -566,9 +573,8 @@ Log fold changes converge as subjects are added. Standard errors do not, and the
 are what produces the p-values. A NEBULA that cannot be used for inference is not
 NEBULA.
 
-`edge-rs` therefore ports phase 8 from the `nebula` package's own C++
-(`src/optimization.cpp`) and R driver, not from edgePython. See the decision log
-in `plans/delegated-cuddling-riddle.md`.
+`edge-rs` therefore ports the single-cell stack from the `nebula` package's own
+C++ (`src/optimization.cpp`) and R driver, not from edgePython.
 
 A second, smaller problem in the same area: edgePython hand-rolls `_digamma_nb`
 as an asymptotic series with a recurrence shift to `x >= 7`, documented as "~15
