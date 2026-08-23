@@ -62,7 +62,9 @@ const TOL_CELL: Tol = Tol::rel(1e-4);
 /// that arithmetic exactly.
 const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 
-// -- The LN+HL path, held apart because the two optimisers pick different basins --
+// Longer Claude explanation. Left it in, because this took time to find, debug.
+//
+// The LN+HL path, held apart because the two optimisers pick different basins
 //
 // nebula picks one of three sub-paths per gene. Measured on the 1005-cell set,
 // worst relative disagreement on the coefficients:
@@ -80,10 +82,10 @@ const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 //
 // The divergence is in stage one, the joint optimisation over
 // `[beta, sigma, phi]`. R runs nlopt's `LD_LBFGS` there and this crate runs
-// L-BFGS-B, and on 37 of the 281 genes the two finish in different places. LN+HL
-// then holds stage one's `phi` fixed and refits only `sigma`, so the choice
-// propagates into both variance components and, through the `-sigma/2` intercept
-// shift, into the coefficients.
+// L-BFGS-B, and on 37 of the 281 genes the two finish in different places.
+// LN+HL then holds stage one's `phi` fixed and refits only `sigma`, so the
+// choice propagates into both variance components and, through the `-sigma/2`
+// intercept shift, into the coefficients.
 //
 // The two places are not two local minima. R's is the lower bound on `sigma`,
 // and the marginal likelihood is still strictly decreasing there: lower the
@@ -91,16 +93,17 @@ const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 // straight down. R is on a legitimate Karush-Kuhn-Tucker point of the box
 // constraint, reached by sliding down a monotone descent onto the wall, and
 // `sigma = 1e-4` is the constraint rather than an estimate. This crate stops at
-// the one genuine interior stationary point. There is a real second basin around
-// `0.03` to `0.15` separated by a ridge near `0.01`; what there is not is a
-// minimum at the bound.
+// the one genuine interior stationary point. There is a real second basin
+// around `0.03` to `0.15` separated by a ridge near `0.01`; what there is not
+// is a minimum at the bound.
 //
 // Neither optimiser is broken; both satisfy KKT and both are converged, and R
 // reaching the lower marginal negative log-likelihood on 27 of the 37 against
 // this crate's 9 is not the endorsement it looks like, because it wins by
 // descending into a degeneracy. Sigma on the bound means no subject-level
 // variance at all, i.e. the mixed model collapsed to a plain negative binomial
-// GLM, in an approximation the LN+HL path exists precisely because it distrusts.
+// GLM, in an approximation the LN+HL path exists precisely because it
+// distrusts.
 //
 // The tiebreak is nebula's own `method = "HL"`, which fits both variance
 // components against the profile likelihood. Against that reference this crate
@@ -282,11 +285,6 @@ fn repack(row: &[f64]) -> Vec<f64> {
 /// * `want` - The R package's code
 /// * `gene` - Gene index, for the message
 fn assert_convergence(got: i32, want: i32, gene: usize) {
-    // Success and "critical point" are interchangeable in either direction. The
-    // grade is a count of halved Newton steps at a point where the likelihood is
-    // already flat, so which side of the rounding it lands on is not information
-    // about the fit. `src/sc/nebula.rs` allows the same swap one way round; over
-    // 298 genes it shows up the other way round too.
     let equivalent = |c: i32| c == 1 || c == -10;
     if equivalent(want) {
         assert!(
