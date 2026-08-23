@@ -1201,7 +1201,10 @@ mod tests {
             design.push(if j < 3 { 0.0 } else { 1.0 });
             design.push(*s);
         }
-        let stopped = LevenbergParams { max_iter: 0, ..Default::default() };
+        let stopped = LevenbergParams {
+            max_iter: 0,
+            ..Default::default()
+        };
 
         let fit = mglm_levenberg(
             &y,
@@ -1218,11 +1221,27 @@ mod tests {
         .unwrap();
         // Both group columns carry the rate; edgeR projects, it does not just
         // fill the first column.
-        assert_relative_eq!(fit.coefficients[0], -7.797_403_899_938_82, max_relative = 1e-12);
-        assert_relative_eq!(fit.coefficients[1], -7.797_403_899_938_82, max_relative = 1e-12);
+        assert_relative_eq!(
+            fit.coefficients[0],
+            -7.797_403_899_938_82,
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(
+            fit.coefficients[1],
+            -7.797_403_899_938_82,
+            max_relative = 1e-12
+        );
         assert!(fit.coefficients[2].abs() < 1e-12);
-        assert_relative_eq!(fit.coefficients[3], -9.216_637_226_798_91, max_relative = 1e-12);
-        assert_relative_eq!(fit.coefficients[4], -9.216_637_226_798_91, max_relative = 1e-12);
+        assert_relative_eq!(
+            fit.coefficients[3],
+            -9.216_637_226_798_91,
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(
+            fit.coefficients[4],
+            -9.216_637_226_798_91,
+            max_relative = 1e-12
+        );
         assert!(fit.coefficients[5].abs() < 1e-12);
 
         let weights = Recycled::by_sample(vec![0.1, 0.1, 0.1, 10.0, 10.0, 10.0]);
@@ -1239,8 +1258,16 @@ mod tests {
             Some(stopped),
         )
         .unwrap();
-        assert_relative_eq!(fit.coefficients[0], -7.574_372_857_478_63, max_relative = 1e-12);
-        assert_relative_eq!(fit.coefficients[3], -9.253_386_520_876_94, max_relative = 1e-12);
+        assert_relative_eq!(
+            fit.coefficients[0],
+            -7.574_372_857_478_63,
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(
+            fit.coefficients[3],
+            -9.253_386_520_876_94,
+            max_relative = 1e-12
+        );
     }
 
     #[test]

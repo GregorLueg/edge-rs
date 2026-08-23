@@ -281,7 +281,10 @@ fn fit_general_gene(
     //
     // The budget is `glmFit`'s rather than `mglmLevenberg`'s, because that is the
     // route `adjustedProfileLik` takes to the fitter.
-    let params = LevenbergParams { max_iter: GLM_FIT_MAX_ITER, ..Default::default() };
+    let params = LevenbergParams {
+        max_iter: GLM_FIT_MAX_ITER,
+        ..Default::default()
+    };
     crate::glm::levenberg::fit_one_gene(
         &mut scratch.levenberg,
         &mut scratch.beta,

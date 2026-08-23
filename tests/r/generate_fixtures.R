@@ -118,16 +118,17 @@ flush_scalars <- function() {
 
 # limma solves for df2 with uniroot(tol = 1e-8), a bracket width in the
 # d / (1 + d) link worth around 1e-4 on a df2 near 100, so its answer sits a few
-# parts in 1e8 from the root of its own objective. edge-rs converges properly
-# (UPSTREAM_DEVIATIONS.md, Section B, entry 12), so the reference has to be
-# limma-with-converged-uniroot rather than stock limma.
+# parts in 1e8 from the root of its own objective. edge-rs converges properly,
+# so the reference has to be limma-with-converged-uniroot rather than stock
+# limma.
 #
 # Only the legacy branch of squeezeVar reaches fitFDistRobustly and its uniroot.
-# The current pipeline goes to fitFDistUnequalDF1, which solves with optimize and
-# is reproduced exactly by the crate. The override is therefore bit-identical
-# wherever the branch is not taken, which is why it is applied unconditionally
-# and the entry count recorded per scenario rather than assumed. On the bulk data
-# the count is zero; the single-cell shrinkage is where it earns its keep.
+# The current pipeline goes to fitFDistUnequalDF1, which solves with optimize
+# and is reproduced exactly by the crate. The override is therefore
+# bit-identical wherever the branch is not taken, which is why it is applied
+# unconditionally and the entry count recorded per scenario rather than assumed.
+# On the bulk data the count is zero; the single-cell shrinkage is where it
+# earns its keep.
 #
 # The S3 generic must be bypassed: calling estimateDisp() or glmQLFit() goes to
 # the namespace copy and silently ignores the patched environment.

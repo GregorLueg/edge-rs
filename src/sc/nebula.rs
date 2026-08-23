@@ -537,7 +537,14 @@ pub fn nebula<T: EdgeFloat>(
         })
         .collect::<Result<Vec<_>, EdgeErrors>>()?;
 
-    Ok(assemble(outcomes, &kept, &sds, intercept, n_coef, params.min.0))
+    Ok(assemble(
+        outcomes,
+        &kept,
+        &sds,
+        intercept,
+        n_coef,
+        params.min.0,
+    ))
 }
 
 /////////////////////
@@ -1483,7 +1490,8 @@ fn assemble(
         fit.subject_overdispersion.push(outcome.subject);
         fit.cell_overdispersion.push(outcome.cell);
         fit.convergence.push(outcome.convergence);
-        fit.sigma_at_bound.push(outcome.subject <= min_subject * BOUND_SLACK);
+        fit.sigma_at_bound
+            .push(outcome.subject <= min_subject * BOUND_SLACK);
     }
 
     fit
@@ -1980,7 +1988,14 @@ mod tests {
             ..Default::default()
         };
         let pinned = nebula(
-            &counts, 8, 150, &subject, &design, 3, Some(&offset), Some(params),
+            &counts,
+            8,
+            150,
+            &subject,
+            &design,
+            3,
+            Some(&offset),
+            Some(params),
         )
         .expect("nebula failed");
         assert!(

@@ -1,10 +1,9 @@
 //! Fixture loading and comparison for the end-to-end parity tests.
 //!
-//! Every fixture under `tests/data/e2e` is written by `tests/r/generate_fixtures.R`
-//! against edgeR 4.8.2, limma 3.66 and nebula 1.5.8. CI never runs the R; the
-//! files are committed and read from here.
-//!
-//! ### Why the comparator is not `assert_relative_eq!` in a loop
+//! Every fixture under `tests/data/e2e` is written by
+//! `tests/r/generate_fixtures.R`
+//! against edgeR `4.8.2`, limma `3.66` and nebula `1.5.8`. CI never runs the R;
+//! the files are committed and read from here.
 //!
 //! That is what the in-crate tests do, and at thirty genes it is the right
 //! answer. Over a thousand it reports the first failing gene and nothing else,
@@ -28,12 +27,12 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 
-///////////////
-// Tolerance //
-///////////////
+//////////
+// Tols //
+//////////
 
 /// A comparison tolerance, split the way `approx` splits it.
 ///
@@ -60,7 +59,10 @@ impl Tol {
     ///
     /// The tolerance.
     pub const fn rel(max_relative: f64) -> Self {
-        Self { max_relative, epsilon: 0.0 }
+        Self {
+            max_relative,
+            epsilon: 0.0,
+        }
     }
 
     /// A relative tolerance with an absolute floor.
@@ -74,13 +76,16 @@ impl Tol {
     ///
     /// The tolerance.
     pub const fn new(max_relative: f64, epsilon: f64) -> Self {
-        Self { max_relative, epsilon }
+        Self {
+            max_relative,
+            epsilon,
+        }
     }
 }
 
-//////////////////
-// Comparisons  //
-//////////////////
+/////////////////
+// Comparisons //
+/////////////////
 
 /// Relative difference between two values, on the `approx` convention.
 ///
@@ -109,8 +114,16 @@ fn relative_difference(got: f64, want: f64) -> f64 {
         return f64::INFINITY;
     }
     let scale = got.abs().max(want.abs());
-    if scale == 0.0 { 0.0 } else { (got - want).abs() / scale }
+    if scale == 0.0 {
+        0.0
+    } else {
+        (got - want).abs() / scale
+    }
 }
+
+///////////
+// Worst //
+///////////
 
 /// One candidate for the worst disagreement in a comparison.
 ///
@@ -165,37 +178,31 @@ pub fn assert_close(got: &[f64], want: &[f64], tol: Tol, label: &str) {
         want.len()
     );
 
-    assert!(!got.is_empty(), "{label}: nothing to compare, both sides are empty");
+    assert!(
+        !got.is_empty(),
+        "{label}: nothing to compare, both sides are empty"
+    );
 
-    // Three running maxima, because a tolerance has two legs and the panic wants
-    // a third thing again.
-    //
-    // `worst` and `worst_abs` are over everything and drive the calibration
-    // report. Both are needed: a constant whose binding entry passes on the
-    // absolute leg has a relative figure that says nothing about what the
-    // tolerance must clear, and reporting only one of them is how the measured
-    // values in these files came to be quoted wrong.
-    //
-    // `worst_failing` is over the failures only and drives the panic message,
-    // because the largest relative difference is often a passing entry that the
-    // absolute leg let through, and pointing at it sends the reader to a healthy
-    // value.
     let mut worst: Option<Worst> = None;
     let mut worst_abs: Option<Worst> = None;
     let mut worst_failing: Option<Worst> = None;
     let mut n_failed = 0_usize;
-    // The relative difference that `max_relative` actually has to clear, namely
-    // the worst one among the entries the epsilon does not already cover. This
-    // is the only number a relative tolerance can be set from: the unconditional
-    // worst is routinely a near-zero value that the absolute leg handles, and
-    // reading the constant off that instead is how these files ended up quoting
-    // figures three orders of magnitude from what they gate.
     let mut worst_beyond_eps = 0.0_f64;
 
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         let relative = relative_difference(g, w);
-        let absolute = if g.is_finite() && w.is_finite() { (g - w).abs() } else { f64::INFINITY };
-        let here = Worst { index: i, relative, absolute, got: g, want: w };
+        let absolute = if g.is_finite() && w.is_finite() {
+            (g - w).abs()
+        } else {
+            f64::INFINITY
+        };
+        let here = Worst {
+            index: i,
+            relative,
+            absolute,
+            got: g,
+            want: w,
+        };
 
         if worst.is_none_or(|prev| relative > prev.relative) {
             worst = Some(here);
@@ -502,7 +509,9 @@ pub fn table(name: &str) -> Table {
     });
 
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let header = lines.next().unwrap_or_else(|| panic!("{name} has no header"));
+    let header = lines
+        .next()
+        .unwrap_or_else(|| panic!("{name} has no header"));
     let names: Vec<String> = header
         .split(',')
         .map(|h| h.trim().trim_matches('"').to_string())
@@ -525,7 +534,12 @@ pub fn table(name: &str) -> Table {
         n_rows += 1;
     }
 
-    Table { names, columns, n_rows, source: name.to_string() }
+    Table {
+        names,
+        columns,
+        n_rows,
+        source: name.to_string(),
+    }
 }
 
 /// Reads a fixture and returns it flattened row-major with its shape.
@@ -551,7 +565,7 @@ pub fn matrix(name: &str) -> (Vec<f64>, usize, usize) {
 #[derive(Clone, Debug)]
 pub struct Scalars {
     /// Values keyed by `(scenario, name)`.
-    values: HashMap<(String, String), f64>,
+    values: FxHashMap<(String, String), f64>,
 }
 
 impl Scalars {
@@ -607,7 +621,7 @@ pub fn scalars() -> Scalars {
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
 
-    let mut values = HashMap::new();
+    let mut values = FxHashMap::default();
     for line in text.lines().skip(1).filter(|l| !l.trim().is_empty()) {
         let mut parts = line.splitn(3, ',');
         let scenario = parts.next().expect("scenario").trim().to_string();

@@ -1,8 +1,8 @@
 //! End-to-end parity for the quasi-likelihood chain: `glmQLFit` then
 //! `glmQLFTest`.
 //!
-//! This is the gate the original port plan named and never built: match edgeR's
-//! `s2.post`, `F` and `PValue` columns on a real dataset.
+//! This is the gate the original port plan named and never built: match
+//! edgeR's `s2.post`, `F` and `PValue` columns on a real dataset.
 //!
 //! The abundances the fit keys off come from the fixture rather than from a
 //! fresh `estimate_disp` run, so a failure here is the quasi-likelihood stage
@@ -11,11 +11,11 @@
 //!
 //! Both pipelines are covered. The current one carries `df.residual.adj`,
 //! `deviance.adj` and `average.ql.dispersion`; the legacy one carries
-//! `df.residual.zeros` instead, and is the only one where the Poisson bound does
-//! anything. That last point is why the near-Poisson dataset exists: on it the
-//! bound moves 83 of 226 p-values under the legacy pipeline and exactly none
-//! under the current one, matching edgeR, which quietly forces the flag off when
-//! `df.residual.zeros` is absent.
+//! `df.residual.zeros` instead, and is the only one where the Poisson bound
+//! does anything. That last point is why the near-Poisson dataset exists: on it
+//! the bound moves 83 of 226 p-values under the legacy pipeline and exactly
+//! none under the current one, matching edgeR, which quietly forces the flag
+//! off when `df.residual.zeros` is absent.
 //!
 //! Tolerances are measured, not guessed:
 //! `EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_ql -- --nocapture`.
@@ -32,10 +32,6 @@ use edge_rs::prelude::Recycled;
 ////////////////
 // Tolerances //
 ////////////////
-
-// Figures are `NEEDS rel` from the calibration report, which is the worst
-// relative difference among the entries the absolute leg does not cover:
-//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_ql -- --nocapture
 
 /// Coefficients from the quasi-likelihood fit. Same story as the plain GLM: the
 /// stopping rule is on the deviance, so the absolute leg is the honest one.
@@ -89,9 +85,18 @@ struct Dataset {
 
 /// The three bulk datasets.
 const DATASETS: [Dataset; 3] = [
-    Dataset { tag: "fac", n_coef: 3 },
-    Dataset { tag: "unbal", n_coef: 4 },
-    Dataset { tag: "pois", n_coef: 2 },
+    Dataset {
+        tag: "fac",
+        n_coef: 3,
+    },
+    Dataset {
+        tag: "unbal",
+        n_coef: 4,
+    },
+    Dataset {
+        tag: "pois",
+        n_coef: 2,
+    },
 ];
 
 /// The retained counts, design and offsets for one dataset.
@@ -119,9 +124,9 @@ struct Loaded {
 /// `glm_ql_ftest` wants a [`GlmFit`], and the right one is the fit
 /// `glm_ql_fit` already performed, not a fresh one. Refitting at
 /// `QlFit::dispersion` would be wrong: that field holds the *undivided*
-/// dispersion, while the fit itself ran at `dispersion / average_ql_dispersion`.
-/// edgeR has no equivalent trap because its `DGEGLM` is one object carrying
-/// both halves.
+/// dispersion, while the fit itself ran at
+/// `dispersion / average_ql_dispersion`. edgeR has no equivalent trap because
+/// its `DGEGLM` is one object carrying both halves.
 ///
 /// ### Params
 ///
@@ -174,9 +179,9 @@ fn load(d: &Dataset) -> Loaded {
     }
 }
 
-////////////////////////
+//////////////////////////
 // The current pipeline //
-////////////////////////
+//////////////////////////
 
 #[test]
 fn test_glm_ql_fit_matches_edger() {
@@ -212,7 +217,8 @@ fn test_glm_ql_fit_matches_edger() {
             &format!("{}/average_ql_dispersion", d.tag),
         );
         assert_close_scalar(
-            fit.top_proportion.expect("a dispersion was estimated, so this is reported"),
+            fit.top_proportion
+                .expect("a dispersion was estimated, so this is reported"),
             s.get(d.tag, "ql_top_proportion"),
             TOL_TOP_PROPORTION,
             &format!("{}/top_proportion", d.tag),
@@ -256,7 +262,9 @@ fn test_glm_ql_fit_matches_edger() {
         // s2.prior and df.prior are length one or length n_genes depending on
         // whether the fit was trended or robust, so both are compared recycled.
         let n = l.n_genes;
-        let s2_prior: Vec<f64> = (0..n).map(|g| fit.s2_prior[g % fit.s2_prior.len()]).collect();
+        let s2_prior: Vec<f64> = (0..n)
+            .map(|g| fit.s2_prior[g % fit.s2_prior.len()])
+            .collect();
         assert_close(
             &s2_prior,
             want.column("s2_prior"),
@@ -270,7 +278,9 @@ fn test_glm_ql_fit_matches_edger() {
             d.tag
         );
 
-        let df_prior: Vec<f64> = (0..n).map(|g| fit.df_prior[g % fit.df_prior.len()]).collect();
+        let df_prior: Vec<f64> = (0..n)
+            .map(|g| fit.df_prior[g % fit.df_prior.len()])
+            .collect();
         assert_close(
             &df_prior,
             want.column("df_prior"),
@@ -364,7 +374,12 @@ fn test_glm_ql_ftest_matches_edger() {
         let got = glm_ql_ftest(&input, &base, &ql, &Tested::Coef(vec![1]), false)
             .expect("glm_ql_ftest failed");
 
-        assert_close(&got.statistic, want.column("F"), TOL_F, &format!("{}/qlf_F", d.tag));
+        assert_close(
+            &got.statistic,
+            want.column("F"),
+            TOL_F,
+            &format!("{}/qlf_F", d.tag),
+        );
         assert_close(
             &got.p_value,
             want.column("PValue"),
@@ -380,7 +395,10 @@ fn test_glm_ql_ftest_matches_edger() {
             &format!("{}/qlf_logPValue", d.tag),
         );
 
-        let df_total = got.df_total.as_ref().expect("the F test reports denominator df");
+        let df_total = got
+            .df_total
+            .as_ref()
+            .expect("the F test reports denominator df");
         assert_close(
             df_total,
             want.column("df_total"),
@@ -410,7 +428,10 @@ fn test_glm_ql_fit_legacy_matches_edger() {
     let s = common::scalars();
 
     let dispersion = Recycled::by_gene(l.trended.clone());
-    let params = QlFitParams { legacy: true, ..Default::default() };
+    let params = QlFitParams {
+        legacy: true,
+        ..Default::default()
+    };
     let fit = glm_ql_fit(
         &l.counts,
         l.n_genes,
@@ -429,7 +450,10 @@ fn test_glm_ql_fit_legacy_matches_edger() {
         fit.average_ql_dispersion.is_none(),
         "the legacy pipeline has no average quasi-dispersion"
     );
-    assert!(fit.df_residual_adj.is_none(), "the legacy pipeline has no adjusted df");
+    assert!(
+        fit.df_residual_adj.is_none(),
+        "the legacy pipeline has no adjusted df"
+    );
 
     let zeros = fit
         .df_residual_zeros
@@ -441,7 +465,12 @@ fn test_glm_ql_fit_legacy_matches_edger() {
         TOL_S2,
         "pois/legacy_df_residual_zeros",
     );
-    assert_close(&fit.s2_post, want.column("s2_post"), TOL_S2, "pois/legacy_s2_post");
+    assert_close(
+        &fit.s2_post,
+        want.column("s2_post"),
+        TOL_S2,
+        "pois/legacy_s2_post",
+    );
     assert_close(
         &fit.deviance,
         want.column("deviance"),
@@ -450,7 +479,9 @@ fn test_glm_ql_fit_legacy_matches_edger() {
     );
 
     let n = l.n_genes;
-    let df_prior: Vec<f64> = (0..n).map(|g| fit.df_prior[g % fit.df_prior.len()]).collect();
+    let df_prior: Vec<f64> = (0..n)
+        .map(|g| fit.df_prior[g % fit.df_prior.len()])
+        .collect();
     assert_close(
         &df_prior,
         want.column("df_prior"),
@@ -475,7 +506,10 @@ fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
     let s = common::scalars();
 
     let dispersion = Recycled::by_gene(l.trended.clone());
-    let params = QlFitParams { legacy: true, ..Default::default() };
+    let params = QlFitParams {
+        legacy: true,
+        ..Default::default()
+    };
     let fit = glm_ql_fit(
         &l.counts,
         l.n_genes,
@@ -551,11 +585,6 @@ fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
         "the bound moved {moved} p-values where edgeR moved {expected}"
     );
 
-    // The other half of the claim. `glmQLFTest` forces `poisson.bound` off when
-    // `df.residual.zeros` is absent, so on the current pipeline the flag must do
-    // nothing at all. Without this the test only shows the bound works, not that
-    // it is correctly disabled, and a crate that honoured the flag
-    // unconditionally would pass.
     let current = glm_ql_fit(
         &l.counts,
         l.n_genes,
@@ -589,10 +618,22 @@ fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
         weights: None,
         log_cpm: Some(&l.ave_log_cpm),
     };
-    let on = glm_ql_ftest(&input_current, &base_current, &ql_current, &Tested::Coef(vec![1]), true)
-        .expect("glm_ql_ftest failed");
-    let off = glm_ql_ftest(&input_current, &base_current, &ql_current, &Tested::Coef(vec![1]), false)
-        .expect("glm_ql_ftest failed");
+    let on = glm_ql_ftest(
+        &input_current,
+        &base_current,
+        &ql_current,
+        &Tested::Coef(vec![1]),
+        true,
+    )
+    .expect("glm_ql_ftest failed");
+    let off = glm_ql_ftest(
+        &input_current,
+        &base_current,
+        &ql_current,
+        &Tested::Coef(vec![1]),
+        false,
+    )
+    .expect("glm_ql_ftest failed");
     let moved_current = (0..l.n_genes)
         .filter(|&g| on.p_value[g] != off.p_value[g])
         .count();
@@ -652,10 +693,8 @@ fn test_lrt_and_ftest_disagree_as_they_should() {
         average_ql_dispersion: fit.average_ql_dispersion,
     };
 
-    let with = glm_lrt(&input, &base, &Tested::Coef(vec![1]), Some(&ql))
-        .expect("glm_lrt failed");
-    let without = glm_lrt(&input, &base, &Tested::Coef(vec![1]), None)
-        .expect("glm_lrt failed");
+    let with = glm_lrt(&input, &base, &Tested::Coef(vec![1]), Some(&ql)).expect("glm_lrt failed");
+    let without = glm_lrt(&input, &base, &Tested::Coef(vec![1]), None).expect("glm_lrt failed");
 
     let differing = (0..l.n_genes)
         .filter(|&g| with.statistic[g] != without.statistic[g])

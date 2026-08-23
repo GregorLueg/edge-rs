@@ -3,7 +3,8 @@
 //! Runs over the same three datasets as `e2e_bulk_classic.rs`, so the
 //! likelihood ratio test is exercised on a balanced factorial, on an unbalanced
 //! design with a continuous covariate and five residual degrees of freedom, and
-//! on near-Poisson counts where the fit dispatches one-way instead of Levenberg.
+//! on near-Poisson counts where the fit dispatches one-way instead of
+//! Levenberg.
 //!
 //! Tolerances are measured, not guessed:
 //! `EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_glm -- --nocapture`.
@@ -20,26 +21,6 @@ use edge_rs::prelude::Recycled;
 // Tolerances //
 ////////////////
 
-// The coefficient family is gated on its absolute leg, not its relative one,
-// and that is deliberate. `mglmLevenberg` stops when the deviance improves by
-// less than `tol * (|deviance| + 0.1)`; near the optimum the deviance is
-// quadratic in the coefficients, so a deviance settled to 1e-6 leaves the
-// coefficients loose at around 1e-4 in absolute terms regardless of how large
-// they are. Measured on the factorial set over the 869 genes with no zero count,
-// running edgeR against itself at `tol = 1e-6` and `tol = 1e-14`:
-//
-//   coefficient movement   1.2e-4 absolute
-//   deviance movement      2.9e-7 absolute
-//
-// An absolute floor is therefore the honest instrument here, and once it is in
-// place the relative leg has nothing left to carry: the report gives `NEEDS rel`
-// of exactly zero for every coefficient and fold-change label. Keeping the
-// relative leg tight at 1e-5 means a proportional error on a large coefficient
-// is still caught, which a pure absolute test would miss.
-//
-// Figures below are `NEEDS rel` from:
-//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_glm -- --nocapture
-
 /// Fitted coefficients, shrunk and unshrunk. Needs `0` beyond a `2e-3` absolute
 /// floor, against edgeR's own `1.2e-4` self-movement.
 const TOL_COEF: Tol = Tol::new(1e-5, 2e-3);
@@ -47,9 +28,10 @@ const TOL_COEF: Tol = Tol::new(1e-5, 2e-3);
 /// Fitted means, which inherit the coefficient slack through `exp(X beta)`.
 /// Needs `1.8e-3` beyond a `1e-4` absolute floor.
 ///
-/// The floor covers the empty-group genes, whose fitted counts on the empty side
-/// sit around `1e-7` and differ only because the runaway coefficient stopped in
-/// a different place. No real fitted count is anywhere near that small.
+/// The floor covers the empty-group genes, whose fitted counts on the empty
+/// side sit around `1e-7` and differ only because the runaway coefficient
+/// stopped in a different place. No real fitted count is anywhere near that
+/// small.
 const TOL_FITTED: Tol = Tol::new(5e-3, 1e-4);
 
 /// Residual deviance, which unlike the coefficients is well determined. Needs
@@ -94,9 +76,18 @@ struct Dataset {
 
 /// The three bulk datasets.
 const DATASETS: [Dataset; 3] = [
-    Dataset { tag: "fac", n_coef: 3 },
-    Dataset { tag: "unbal", n_coef: 4 },
-    Dataset { tag: "pois", n_coef: 2 },
+    Dataset {
+        tag: "fac",
+        n_coef: 3,
+    },
+    Dataset {
+        tag: "unbal",
+        n_coef: 4,
+    },
+    Dataset {
+        tag: "pois",
+        n_coef: 2,
+    },
 ];
 
 /// The retained counts, design and offsets for one dataset.
@@ -163,7 +154,8 @@ fn load(d: &Dataset) -> Loaded {
 /// Nothing real sits above this: a coefficient of 20 is a fold change of 5e8.
 const IDENTIFIED_COEF_LIMIT: f64 = 20.0;
 
-/// Genes whose coefficients are identified, judged from edgeR's own unshrunk fit.
+/// Genes whose coefficients are identified, judged from edgeR's own unshrunk
+/// fit.
 ///
 /// The deviance stays comparable on every gene and is checked everywhere; only
 /// the coefficients and the fold changes are restricted to this mask.
@@ -205,10 +197,6 @@ fn identified(want: &common::Table, n_genes: usize, n_coef: usize) -> Vec<bool> 
 ///
 /// The retained rows, flattened, in the original order.
 fn masked(v: &[f64], mask: &[bool], stride: usize) -> Vec<f64> {
-    // `chunks_exact` drops a trailing partial chunk and `zip` truncates to the
-    // shorter side, so a wrong stride silently compares a subset of the wrong
-    // genes instead of failing. Both sides get the same wrong treatment, so
-    // nothing downstream notices.
     assert_eq!(
         v.len(),
         mask.len() * stride,
@@ -223,9 +211,9 @@ fn masked(v: &[f64], mask: &[bool], stride: usize) -> Vec<f64> {
         .collect()
 }
 
-//////////////
-// glmFit   //
-//////////////
+////////////
+// glmFit //
+////////////
 
 #[test]
 fn test_glm_fit_matches_edger() {
@@ -255,13 +243,13 @@ fn test_glm_fit_matches_edger() {
             TOL_DEVIANCE,
             &format!("{}/deviance", d.tag),
         );
-        assert_close(&fit.fitted, &want_fitted, TOL_FITTED, &format!("{}/fitted", d.tag));
+        assert_close(
+            &fit.fitted,
+            &want_fitted,
+            TOL_FITTED,
+            &format!("{}/fitted", d.tag),
+        );
 
-        // Which fitter ran. The near-Poisson set exists partly because its
-        // group-only design is a factor coding and so takes the closed-form
-        // one-way path, where the other two go through Levenberg. Nothing else
-        // in the suite would notice if that dispatch changed: the answers agree
-        // to 1e-13 either way, so only this asserts the intended path was taken.
         let want_one_way = s.get(d.tag, "glm_method_oneway") != 0.0;
         assert_eq!(
             fit.method == FitMethod::OneWay,
@@ -277,7 +265,11 @@ fn test_glm_fit_matches_edger() {
             d.tag
         );
 
-        let mask = identified(&common::table(&format!("{}_glmfit.csv", d.tag)), l.n_genes, l.n_coef);
+        let mask = identified(
+            &common::table(&format!("{}_glmfit.csv", d.tag)),
+            l.n_genes,
+            l.n_coef,
+        );
         let mut want_coef = Vec::with_capacity(l.n_genes * l.n_coef);
         let mut want_unshrunk = Vec::with_capacity(l.n_genes * l.n_coef);
         for g in 0..l.n_genes {
@@ -330,9 +322,9 @@ fn test_glm_fit_without_a_prior_count_drops_the_unshrunk_copy() {
     );
 }
 
-//////////////
-// glmLRT   //
-//////////////
+////////////
+// glmLRT //
+////////////
 
 /// Builds the test input for one dataset.
 ///
@@ -384,7 +376,11 @@ fn test_glm_lrt_matches_edger() {
         let inp = input(&l, &l.ave_log_cpm);
         let got = glm_lrt(&inp, &fit, &Tested::Coef(vec![1]), None).expect("glm_lrt failed");
 
-        let mask = identified(&common::table(&format!("{}_glmfit.csv", d.tag)), l.n_genes, l.n_coef);
+        let mask = identified(
+            &common::table(&format!("{}_glmfit.csv", d.tag)),
+            l.n_genes,
+            l.n_coef,
+        );
         assert_close(
             &masked(&got.log_fc, &mask, 1),
             &masked(want.column("logFC"), &mask, 1),
@@ -415,7 +411,11 @@ fn test_glm_lrt_matches_edger() {
         );
 
         assert_eq!(got.df_test, 1.0, "{}: one coefficient dropped", d.tag);
-        assert!(got.df_total.is_none(), "{}: glmLRT reports no df.total", d.tag);
+        assert!(
+            got.df_total.is_none(),
+            "{}: glmLRT reports no df.total",
+            d.tag
+        );
     }
 }
 
@@ -451,8 +451,18 @@ fn test_glm_lrt_on_several_coefficients_matches_edger() {
         TOL_LOG_FC,
         "fac/lrt_multi_logFC",
     );
-    assert_close(&got.statistic, want.column("multi_LR"), TOL_STATISTIC, "fac/lrt_multi_LR");
-    assert_close(&got.p_value, want.column("multi_PValue"), TOL_P_VALUE, "fac/lrt_multi_PValue");
+    assert_close(
+        &got.statistic,
+        want.column("multi_LR"),
+        TOL_STATISTIC,
+        "fac/lrt_multi_LR",
+    );
+    assert_close(
+        &got.p_value,
+        want.column("multi_PValue"),
+        TOL_P_VALUE,
+        "fac/lrt_multi_PValue",
+    );
 }
 
 #[test]
@@ -486,7 +496,10 @@ fn test_glm_lrt_with_a_contrast_matches_edger() {
         let got = glm_lrt(
             &inp,
             &fit,
-            &Tested::Contrast { values, n_contrasts: 1 },
+            &Tested::Contrast {
+                values,
+                n_contrasts: 1,
+            },
             None,
         )
         .expect("glm_lrt failed");

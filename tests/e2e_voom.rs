@@ -6,8 +6,8 @@
 //! empirical Bayes squeeze on its residual variances.
 //!
 //! Both datasets here have non-constant residual degrees of freedom, {4, 9} on
-//! the factorial set and {4, 5} on the unbalanced one, because the planted genes
-//! with an empty group lose observations to `voomLmFit`'s structural-zero
+//! the factorial set and {4, 5} on the unbalanced one, because the planted
+//! genes with an empty group lose observations to `voomLmFit`'s structural-zero
 //! masking. That is the branch where the trend switches from `stats::lowess` to
 //! `weightedLowess`, and it would never fire on plain random counts.
 //!
@@ -76,8 +76,16 @@ struct Dataset {
 
 /// The two datasets voom runs on. The near-Poisson set is left out: its counts
 /// are too low for a mean-variance trend to mean anything.
-const DATASETS: [Dataset; 2] =
-    [Dataset { tag: "fac", n_coef: 3 }, Dataset { tag: "unbal", n_coef: 4 }];
+const DATASETS: [Dataset; 2] = [
+    Dataset {
+        tag: "fac",
+        n_coef: 3,
+    },
+    Dataset {
+        tag: "unbal",
+        n_coef: 4,
+    },
+];
 
 /// Counts, design and shape for one dataset.
 struct Loaded {
@@ -109,12 +117,18 @@ fn load(d: &Dataset) -> Loaded {
     let counts = counts_t.row_major_counts();
     let (design, _, n_coef) = common::matrix(&format!("{}_design.csv", d.tag));
     assert_eq!(n_coef, d.n_coef, "{}: unexpected design width", d.tag);
-    Loaded { counts, n_genes, n_samples, design, n_coef }
+    Loaded {
+        counts,
+        n_genes,
+        n_samples,
+        design,
+        n_coef,
+    }
 }
 
-//////////////
+///////////////
 // voomLmFit //
-//////////////
+///////////////
 
 #[test]
 fn test_voom_lmfit_matches_edger() {
@@ -139,7 +153,12 @@ fn test_voom_lmfit_matches_edger() {
         .expect("voom_lmfit failed");
 
         assert_close(&voom.e, &want_e, TOL_E, &format!("{}/voom_E", d.tag));
-        assert_close(&voom.weights, &want_w, TOL_WEIGHTS, &format!("{}/voom_weights", d.tag));
+        assert_close(
+            &voom.weights,
+            &want_w,
+            TOL_WEIGHTS,
+            &format!("{}/voom_weights", d.tag),
+        );
 
         assert_close(
             &voom.trend_x,
@@ -303,9 +322,12 @@ fn test_squeeze_var_on_voom_variances_matches_limma() {
         // Robust. The reference is limma with its uniroot converged past its own
         // default, per UPSTREAM_DEVIATIONS.md entry 12; on this data the branch
         // that uses uniroot is not reached, which the generator records.
-        let params = SqueezeVarParams { robust: true, ..Default::default() };
-        let got = squeeze_var(&var, &fit.df_residual, None, Some(params))
-            .expect("squeeze_var failed");
+        let params = SqueezeVarParams {
+            robust: true,
+            ..Default::default()
+        };
+        let got =
+            squeeze_var(&var, &fit.df_residual, None, Some(params)).expect("squeeze_var failed");
         assert_close(
             &got.var_post,
             want.column("robust_var_post"),

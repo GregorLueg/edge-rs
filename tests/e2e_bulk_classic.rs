@@ -1,9 +1,9 @@
 //! End-to-end parity for the classic edgeR chain: filter, normalise, transform,
 //! estimate dispersions, exact test, rank.
 //!
-//! Every reference comes from `tests/r/generate_fixtures.R` against edgeR 4.8.2.
-//! Three datasets run the same assertions, chosen to differ in structure rather
-//! than in seed:
+//! Every reference comes from `tests/r/generate_fixtures.R` against edgeR
+//! 4.8.2. Three datasets run the same assertions, chosen to differ in structure
+//! rather than in seed:
 //!
 //! * `fac`, 1000 genes by 12 samples, balanced two-by-two factorial, abundances
 //!   over sixteen log2 units, ten planted edge-case rows.
@@ -13,7 +13,10 @@
 //!
 //! Tolerances are measured rather than guessed. Each constant carries the worst
 //! case actually observed across all three datasets, from
-//! `EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_classic -- --nocapture`.
+//!
+//! ```text
+//! EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_classic -- --nocapture
+//! ```
 
 mod common;
 
@@ -28,19 +31,9 @@ use edge_rs::exact::{ExactTestParams, RejectionRegion, exact_test};
 use edge_rs::prelude::Recycled;
 use edge_rs::results::{SortBy, top_tags};
 
-///////////////////
-// Tolerances    //
-///////////////////
-
-// Every constant below is set about three times the figure the calibration
-// report gives as `NEEDS rel`, which is the worst relative difference among the
-// entries the absolute leg does not already cover. That is the only number a
-// relative tolerance can honestly be read off: the unconditional worst is
-// routinely a near-zero value the epsilon handles, and quoting that instead is
-// how an earlier revision of this file ended up citing figures three orders of
-// magnitude away from what it gated.
-//
-//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_classic -- --nocapture
+////////////////
+// Tolerances //
+////////////////
 
 /// Normalisation factors. Trimmed means over logs, no iteration anywhere, so
 /// the only cost is summation order. Needs `2.0e-15`.
@@ -83,10 +76,11 @@ const TOL_PRIOR_DF: Tol = Tol::rel(1e-4);
 /// has none, needs `2.7e-7` and `4.2e-8`.
 ///
 /// The gap is one specific, deliberately planted situation: a gene whose counts
-/// are entirely zero in one group. Its coefficient MLE is negative infinity, the
-/// deviance is flat along that ridge, and the Cox-Reid term is a log determinant
-/// of weights that keep shrinking as the intercept runs away, so the adjusted
-/// profile likelihood depends on exactly where the damped iteration stops.
+/// are entirely zero in one group. Its coefficient MLE is negative infinity,
+/// the deviance is flat along that ridge, and the Cox-Reid term is a log
+/// determinant of weights that keep shrinking as the intercept runs away, so
+/// the adjusted profile likelihood depends on exactly where the damped
+/// iteration stops.
 ///
 /// edgeR is no more settled than the crate about where that is. On the same
 /// gene it returns an intercept of -34.90 from a null start, -33.30 when started
@@ -134,9 +128,24 @@ struct Dataset {
 
 /// The three bulk datasets.
 const DATASETS: [Dataset; 3] = [
-    Dataset { tag: "fac", n_coef: 3, n_coef_grp: 2, pair: (0, 1) },
-    Dataset { tag: "unbal", n_coef: 4, n_coef_grp: 3, pair: (0, 2) },
-    Dataset { tag: "pois", n_coef: 2, n_coef_grp: 2, pair: (0, 1) },
+    Dataset {
+        tag: "fac",
+        n_coef: 3,
+        n_coef_grp: 2,
+        pair: (0, 1),
+    },
+    Dataset {
+        tag: "unbal",
+        n_coef: 4,
+        n_coef_grp: 3,
+        pair: (0, 2),
+    },
+    Dataset {
+        tag: "pois",
+        n_coef: 2,
+        n_coef_grp: 2,
+        pair: (0, 1),
+    },
 ];
 
 /// Everything a test needs about one dataset, loaded from the fixtures.
@@ -188,7 +197,11 @@ fn load(d: &Dataset) -> Loaded {
     // Loaded only as a shape check: the exact test takes its dispersion from the
     // fixture rather than refitting against the group-only design here.
     let (_, _, n_coef_grp) = common::matrix(&format!("{}_design_grp.csv", d.tag));
-    assert_eq!(n_coef_grp, d.n_coef_grp, "{}: unexpected group design width", d.tag);
+    assert_eq!(
+        n_coef_grp, d.n_coef_grp,
+        "{}: unexpected group design width",
+        d.tag
+    );
 
     let kept_t = common::table(&format!("{}_kept_counts.csv", d.tag));
     let n_kept = kept_t.n_rows();
@@ -263,7 +276,11 @@ fn underflowed(tag: &str) -> usize {
 
 /// Effective library sizes, the product edgeR normalises by.
 fn effective_lib(l: &Loaded) -> Vec<f64> {
-    l.lib_size.iter().zip(&l.norm_factors).map(|(a, b)| a * b).collect()
+    l.lib_size
+        .iter()
+        .zip(&l.norm_factors)
+        .map(|(a, b)| a * b)
+        .collect()
 }
 
 //////////////////
@@ -291,10 +308,18 @@ fn test_filter_by_expr_matches_edger() {
             d.tag
         );
         let got = filter_by_expr(
-            &l.counts, l.n_genes, l.n_samples, None, Some(&l.group), None, None,
+            &l.counts,
+            l.n_genes,
+            l.n_samples,
+            None,
+            Some(&l.group),
+            None,
+            None,
         )
         .expect("filter_by_expr failed");
-        let diffs: Vec<usize> = (0..l.n_genes).filter(|&g| got[g] != want_group[g]).collect();
+        let diffs: Vec<usize> = (0..l.n_genes)
+            .filter(|&g| got[g] != want_group[g])
+            .collect();
         assert!(
             diffs.is_empty(),
             "{}/group: {} genes differ, first at {}",
@@ -338,7 +363,13 @@ fn test_filter_by_expr_after_normalisation_uses_effective_libraries() {
         let want = common::table(&format!("{}_filter.csv", d.tag));
 
         let nf = calc_norm_factors(
-            &l.counts, l.n_genes, l.n_samples, None, NormMethod::Tmm, None, None,
+            &l.counts,
+            l.n_genes,
+            l.n_samples,
+            None,
+            NormMethod::Tmm,
+            None,
+            None,
         )
         .expect("calc_norm_factors failed");
         let raw_lib: Vec<f64> = (0..l.n_samples)
@@ -368,9 +399,9 @@ fn test_filter_by_expr_after_normalisation_uses_effective_libraries() {
     }
 }
 
-//////////////////////
-// calcNormFactors  //
-//////////////////////
+/////////////////////
+// calcNormFactors //
+/////////////////////
 
 #[test]
 fn test_calc_norm_factors_matches_edger() {
@@ -389,10 +420,21 @@ fn test_calc_norm_factors_matches_edger() {
 
         for (column, method) in methods {
             let got = calc_norm_factors(
-                &l.counts, l.n_genes, l.n_samples, Some(lib), method, None, None,
+                &l.counts,
+                l.n_genes,
+                l.n_samples,
+                Some(lib),
+                method,
+                None,
+                None,
             )
             .expect("calc_norm_factors failed");
-            assert_close(&got, want.column(column), TOL_NORM, &format!("{}/{column}", d.tag));
+            assert_close(
+                &got,
+                want.column(column),
+                TOL_NORM,
+                &format!("{}/{column}", d.tag),
+            );
         }
 
         // refColumn is one-based in R, so R's 3 is index 2 here.
@@ -425,13 +467,29 @@ fn test_cpm_matches_edger() {
         let l = load(d);
         let eff = effective_lib(&l);
 
-        let got = cpm(&l.kept_counts, l.n_kept, l.n_samples, Some(&eff), None, false, 0.0)
-            .expect("cpm failed");
+        let got = cpm(
+            &l.kept_counts,
+            l.n_kept,
+            l.n_samples,
+            Some(&eff),
+            None,
+            false,
+            0.0,
+        )
+        .expect("cpm failed");
         let (want, _, _) = common::matrix(&format!("{}_cpm.csv", d.tag));
         assert_close(&got, &want, TOL_CPM, &format!("{}/cpm", d.tag));
 
-        let got = cpm(&l.kept_counts, l.n_kept, l.n_samples, Some(&eff), None, true, 2.0)
-            .expect("cpm failed");
+        let got = cpm(
+            &l.kept_counts,
+            l.n_kept,
+            l.n_samples,
+            Some(&eff),
+            None,
+            true,
+            2.0,
+        )
+        .expect("cpm failed");
         let (want, _, _) = common::matrix(&format!("{}_logcpm.csv", d.tag));
         assert_close(&got, &want, TOL_LOG_CPM, &format!("{}/logcpm", d.tag));
     }
@@ -455,7 +513,12 @@ fn test_ave_log_cpm_matches_edger() {
             Some(&Recycled::Scalar(0.05)),
         )
         .expect("ave_log_cpm failed");
-        assert_close(&got, want.column("default"), TOL_AVE_LOG_CPM, &format!("{}/avelogcpm", d.tag));
+        assert_close(
+            &got,
+            want.column("default"),
+            TOL_AVE_LOG_CPM,
+            &format!("{}/avelogcpm", d.tag),
+        );
 
         let got = ave_log_cpm(
             &l.kept_counts,
@@ -532,13 +595,28 @@ fn test_estimate_disp_matches_edger() {
             TOL_COMMON,
             &format!("{}/common", d.tag),
         );
-        assert_close_scalar(got.span, s.get(d.tag, "span"), TOL_COMMON, &format!("{}/span", d.tag));
+        assert_close_scalar(
+            got.span,
+            s.get(d.tag, "span"),
+            TOL_COMMON,
+            &format!("{}/span", d.tag),
+        );
 
         let trended = got.trended.as_ref().expect("trended dispersion missing");
-        assert_close(trended, want.column("trended"), TOL_DISPERSION, &format!("{}/trended", d.tag));
+        assert_close(
+            trended,
+            want.column("trended"),
+            TOL_DISPERSION,
+            &format!("{}/trended", d.tag),
+        );
 
         let tagwise = got.tagwise.as_ref().expect("tagwise dispersion missing");
-        assert_close(tagwise, want.column("tagwise"), TOL_DISPERSION, &format!("{}/tagwise", d.tag));
+        assert_close(
+            tagwise,
+            want.column("tagwise"),
+            TOL_DISPERSION,
+            &format!("{}/tagwise", d.tag),
+        );
 
         let prior_df = got.prior_df.as_ref().expect("prior df missing");
         assert_eq!(
@@ -566,7 +644,10 @@ fn test_estimate_disp_without_tagwise_matches_edger() {
     let extra = common::table("fac_trend_extra.csv");
     let offset = Recycled::by_sample(l.offset.clone());
 
-    let params = EstimateDispParams { tagwise: false, ..Default::default() };
+    let params = EstimateDispParams {
+        tagwise: false,
+        ..Default::default()
+    };
     let got = estimate_disp(
         &l.kept_counts,
         l.n_kept,
@@ -580,7 +661,10 @@ fn test_estimate_disp_without_tagwise_matches_edger() {
     )
     .expect("estimate_disp failed");
 
-    assert!(got.tagwise.is_none(), "tagwise should be absent when it was not asked for");
+    assert!(
+        got.tagwise.is_none(),
+        "tagwise should be absent when it was not asked for"
+    );
     assert_close_scalar(
         got.common,
         s.get("fac_trend", "common_no_tagwise"),
@@ -602,7 +686,10 @@ fn test_estimate_disp_with_a_fixed_prior_df_matches_edger() {
     let extra = common::table("fac_trend_extra.csv");
     let offset = Recycled::by_sample(l.offset.clone());
 
-    let params = EstimateDispParams { prior_df: Some(10.0), ..Default::default() };
+    let params = EstimateDispParams {
+        prior_df: Some(10.0),
+        ..Default::default()
+    };
     let got = estimate_disp(
         &l.kept_counts,
         l.n_kept,
@@ -653,7 +740,12 @@ fn test_exact_test_matches_edger() {
         let dispersion = Recycled::by_gene(want.column("tagwise").to_vec());
 
         let got = exact_test(&dge, d.pair, Some(&dispersion), None).expect("exact_test failed");
-        assert_close(&got.log_fc, want.column("logFC"), TOL_EXACT_FC, &format!("{}/exact_logFC", d.tag));
+        assert_close(
+            &got.log_fc,
+            want.column("logFC"),
+            TOL_EXACT_FC,
+            &format!("{}/exact_logFC", d.tag),
+        );
         assert_close(
             &got.log_cpm,
             want.column("logCPM"),
@@ -693,16 +785,15 @@ fn test_exact_test_matches_edger() {
             big_count: 5.0,
             prior_count: 0.125,
         };
-        let got = exact_test(&dge, d.pair, Some(&dispersion), Some(params))
-            .expect("exact_test failed");
+        let got =
+            exact_test(&dge, d.pair, Some(&dispersion), Some(params)).expect("exact_test failed");
         assert_close(
             &got.p_value,
             want.column("PValue_big5"),
             TOL_EXACT_P,
             &format!("{}/exact_PValue_big5", d.tag),
         );
-        let (log_got, log_want) =
-            finite_log_pairs(&got.p_value, want.column("logPValue_big5"));
+        let (log_got, log_want) = finite_log_pairs(&got.p_value, want.column("logPValue_big5"));
         assert_close(
             &log_got,
             &log_want,
@@ -741,14 +832,22 @@ fn test_top_tags_matches_edger() {
             let got = top_tags(log_fc, log_cpm, Some(statistic), p_value, 50, sort_by, 1.0)
                 .expect("top_tags failed");
 
-            assert_eq!(got.index.len(), want.n_rows(), "{}/{variant}: row count", d.tag);
+            assert_eq!(
+                got.index.len(),
+                want.n_rows(),
+                "{}/{variant}: row count",
+                d.tag
+            );
 
             // R's index column is one-based. edgeR orders with a stable radix
             // sort and the crate documents that it matches, so this is compared
             // exactly rather than as a set.
-            let want_index: Vec<usize> =
-                want.column_usize("index").iter().map(|i| i - 1).collect();
-            common::assert_eq_usize(&got.index, &want_index, &format!("{}/{variant}_index", d.tag));
+            let want_index: Vec<usize> = want.column_usize("index").iter().map(|i| i - 1).collect();
+            common::assert_eq_usize(
+                &got.index,
+                &want_index,
+                &format!("{}/{variant}_index", d.tag),
+            );
 
             assert_close(
                 &got.p_value,
@@ -795,5 +894,10 @@ fn test_top_tags_fdr_is_computed_over_the_whole_table() {
     )
     .expect("top_tags failed");
 
-    assert_close(&small.fdr, &full.fdr[..10], Tol::rel(0.0), "fac/fdr_independent_of_n");
+    assert_close(
+        &small.fdr,
+        &full.fdr[..10],
+        Tol::rel(0.0),
+        "fac/fdr_independent_of_n",
+    );
 }

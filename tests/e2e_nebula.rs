@@ -5,8 +5,8 @@
 //! that decides between NEBULA-LN and NEBULA-HL:
 //!
 //! * `sc`, 300 genes over 1005 cells and 15 subjects, so 67 cells per subject.
-//!   `method = "LN"` survives and all three of nebula's sub-algorithms appear in
-//!   one run.
+//!   `method = "LN"` survives and all three of nebula's sub-algorithms appear
+//!   in one run.
 //! * `sc_small`, 120 genes over 300 cells and 15 subjects, so 20 per subject.
 //!   `method = "LN"` is silently downgraded and every gene takes the HL path.
 //!
@@ -17,11 +17,12 @@
 //!
 //! Tolerances follow the reasoning in `src/sc/nebula.rs`, which documented why
 //! they cannot be tightened: nebula stops its optimiser on a profile likelihood
-//! that is itself discontinuous at the stopping tolerance, so two of its own runs
-//! from different starting points disagree by as much. The values here are one
-//! to two decades looser than that module's, and are measured on these fixtures
-//! rather than carried over, because three hundred genes over a thousand cells
-//! reach corners that eight genes over a hundred and fifty do not.
+//! that is itself discontinuous at the stopping tolerance, so two of its own
+//! runs from different starting points disagree by as much. The values here are
+//! one to two decades looser than that module's, and are measured on these
+//! fixtures rather than carried over, because three hundred genes over a
+//! thousand cells reach corners that eight genes over a hundred and fifty do
+//! not.
 
 mod common;
 
@@ -34,14 +35,6 @@ use edge_rs::sc::test::{ScTested, glm_sc_test, packed_len};
 ////////////////
 // Tolerances //
 ////////////////
-
-// Figures are `NEEDS rel` from the calibration report, the worst relative
-// difference among entries the absolute leg does not cover:
-//   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_nebula -- --nocapture
-//
-// None of these is this port's error. nebula stops its optimiser on a profile
-// likelihood that is discontinuous at the stopping tolerance, so two of its own
-// runs from different starting points disagree by as much.
 
 /// Coefficients on the pure paths. Needs `7.4e-6`, against `1.0e-6` in the
 /// in-crate eight-gene golden.
@@ -174,8 +167,14 @@ struct Dataset {
 
 /// The two single-cell datasets.
 const DATASETS: [Dataset; 2] = [
-    Dataset { tag: "sc", expect_ln: true },
-    Dataset { tag: "sc_small", expect_ln: false },
+    Dataset {
+        tag: "sc",
+        expect_ln: true,
+    },
+    Dataset {
+        tag: "sc_small",
+        expect_ln: false,
+    },
 ];
 
 /// Counts, subject labels, design and offsets for one dataset.
@@ -212,7 +211,12 @@ fn load(d: &Dataset) -> Loaded {
     let counts = counts_t.row_major_counts();
 
     let meta = common::table(&format!("{}_meta.csv", d.tag));
-    assert_eq!(meta.n_rows(), n_cells, "{}: meta rows must match cells", d.tag);
+    assert_eq!(
+        meta.n_rows(),
+        n_cells,
+        "{}: meta rows must match cells",
+        d.tag
+    );
 
     // R labels subjects from one; the crate wants them zero-based, and requires
     // them already grouped into contiguous runs.
@@ -334,12 +338,12 @@ fn test_nebula_matches_the_r_package() {
         .expect("nebula failed");
 
         // Gene filtering. R reports the surviving genes one-based.
-        let want_index: Vec<usize> = want
-            .column_usize("gene_id")
-            .iter()
-            .map(|g| g - 1)
-            .collect();
-        assert_eq_usize(&fit.gene_index, &want_index, &format!("{}/gene_index", d.tag));
+        let want_index: Vec<usize> = want.column_usize("gene_id").iter().map(|g| g - 1).collect();
+        assert_eq_usize(
+            &fit.gene_index,
+            &want_index,
+            &format!("{}/gene_index", d.tag),
+        );
         assert_eq!(
             fit.gene_index.len(),
             s.get_usize(d.tag, "n_genes_out"),
@@ -483,7 +487,12 @@ fn test_sigma_at_bound_marks_the_collapsed_fits() {
                 )
             })
             .collect();
-        println!("{}: {} mismatched: {:?}", d.tag, mismatched.len(), mismatched);
+        println!(
+            "{}: {} mismatched: {:?}",
+            d.tag,
+            mismatched.len(),
+            mismatched
+        );
 
         let flagged = fit.sigma_at_bound.iter().filter(|b| **b).count();
         assert_eq!(
@@ -493,7 +502,11 @@ fn test_sigma_at_bound_marks_the_collapsed_fits() {
             d.tag
         );
         // A dataset where nothing is pinned would make this test vacuous.
-        assert!(flagged > 0, "{}: nothing pinned, so this gates nothing", d.tag);
+        assert!(
+            flagged > 0,
+            "{}: nothing pinned, so this gates nothing",
+            d.tag
+        );
     }
 }
 
@@ -601,7 +614,11 @@ fn test_glm_sc_test_reproduces_the_r_p_values() {
         // the LN+HL ones would just re-report that gap one step downstream.
         let pure: Vec<bool> = (0..n).map(|g| algorithm[g] as usize != 2).collect();
         let keep = |v: &[f64]| -> Vec<f64> {
-            v.iter().zip(&pure).filter(|(_, k)| **k).map(|(x, _)| *x).collect()
+            v.iter()
+                .zip(&pure)
+                .filter(|(_, k)| **k)
+                .map(|(x, _)| *x)
+                .collect()
         };
 
         for (coef, name) in [(0usize, "int"), (1, "grp"), (2, "cov2")] {
@@ -693,7 +710,10 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
         s.get_usize("sc_shrink", "n_usable"),
         "usable gene count"
     );
-    assert!(want_ids.len() < n, "some genes must be excluded, or the filter is inert");
+    assert!(
+        want_ids.len() < n,
+        "some genes must be excluded, or the filter is inert"
+    );
 
     let mut phi_raw = Vec::with_capacity(want_ids.len());
     let mut phi_post = Vec::with_capacity(want_ids.len());
@@ -716,10 +736,30 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
         df_prior.push(shrunk.df_prior[k]);
     }
 
-    assert_close(&phi_raw, want.column("phi_raw"), TOL_CELL, "sc/shrink_phi_raw");
-    assert_close(&phi_post, want.column("var_post"), TOL_SHRINK, "sc/shrink_phi_post");
-    assert_close(&phi_prior, want.column("var_prior"), TOL_SHRINK, "sc/shrink_phi_prior");
-    assert_close(&df_prior, want.column("df_prior"), TOL_SHRINK_DF, "sc/shrink_df_prior");
+    assert_close(
+        &phi_raw,
+        want.column("phi_raw"),
+        TOL_CELL,
+        "sc/shrink_phi_raw",
+    );
+    assert_close(
+        &phi_post,
+        want.column("var_post"),
+        TOL_SHRINK,
+        "sc/shrink_phi_post",
+    );
+    assert_close(
+        &phi_prior,
+        want.column("var_prior"),
+        TOL_SHRINK,
+        "sc/shrink_phi_prior",
+    );
+    assert_close(
+        &df_prior,
+        want.column("df_prior"),
+        TOL_SHRINK_DF,
+        "sc/shrink_df_prior",
+    );
 
     assert_eq!(
         shrunk.df_residual, df_residual,
