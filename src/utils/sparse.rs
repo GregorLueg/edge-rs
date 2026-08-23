@@ -265,8 +265,8 @@ impl<T: Copy> CompressedSparse<T> {
     /// The same matrix stored in the other format.
     ///
     /// This is a real transposition of the storage and costs a pass over the
-    /// non-zeros plus a counting sort. Sequential for now; the call sites so far
-    /// do this once at ingest, not in a loop.
+    /// non-zeros plus a counting sort. Sequential for now; the intended call
+    /// site, ingest in `bixverse-rs`, does this once, not in a loop.
     ///
     /// ### Returns
     ///

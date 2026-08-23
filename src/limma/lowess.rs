@@ -554,12 +554,7 @@ pub fn weighted_lowess(
                 got: w.len(),
             });
         }
-        if let Some(i) = w.iter().position(|v| *v < 0.0) {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "prior weights must be non-negative; weights[{i}] is {}",
-                w[i]
-            )));
-        }
+        crate::limma::check_nonneg_weights(w)?;
     }
     if n < 2 {
         return Err(EdgeErrors::InvalidArgument(format!(

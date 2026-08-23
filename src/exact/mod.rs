@@ -38,7 +38,7 @@ use std::f64::consts::LN_2;
 use rayon::prelude::*;
 
 use crate::core::dgelist::DgeList;
-use crate::core::expression::ave_log_cpm;
+use crate::core::expression::{ave_log_cpm, column_sums};
 use crate::glm::deviance::unit_nb_deviance;
 use crate::glm::one_group::mglm_one_group;
 use crate::numeric::dist::nbinom_ln_pmf;
@@ -642,26 +642,6 @@ fn select_columns<T: EdgeFloat>(
             }
         });
     out
-}
-
-/// Column sums of a row-major matrix, in `f64`.
-///
-/// ### Params
-///
-/// * `values` - Row-major values, a whole number of rows of `n_samples`
-/// * `n_samples` - Number of columns
-///
-/// ### Returns
-///
-/// One sum per column.
-fn column_sums<T: EdgeFloat>(values: &[T], n_samples: usize) -> Vec<f64> {
-    let mut sums = vec![0.0_f64; n_samples];
-    for row in values.chunks_exact(n_samples) {
-        for (acc, v) in sums.iter_mut().zip(row.iter()) {
-            *acc += v.to_f64().unwrap_or(f64::NAN);
-        }
-    }
-    sums
 }
 
 /// Expands a recycled dispersion into one value per gene.

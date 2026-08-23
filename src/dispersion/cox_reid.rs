@@ -59,36 +59,6 @@ impl Default for CoxReidParams {
     }
 }
 
-/////////////
-// Helpers //
-/////////////
-
-/// Restricts a recycled matrix to a subset of genes.
-///
-/// ### Params
-///
-/// * `source` - The recycled matrix
-/// * `kept` - Indices of the retained genes
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// A recycled matrix over the retained genes only.
-fn subset_recycled(source: &Recycled<f64>, kept: &[usize], n_samples: usize) -> Recycled<f64> {
-    match source {
-        Recycled::Scalar(v) => Recycled::Scalar(*v),
-        Recycled::BySample(v) => Recycled::BySample(v.clone()),
-        Recycled::ByGene(v) => Recycled::ByGene(kept.iter().map(|&g| v[g]).collect()),
-        Recycled::Full(v) => {
-            let mut out = Vec::with_capacity(kept.len() * n_samples);
-            for &gene in kept {
-                out.extend_from_slice(&v[gene * n_samples..(gene + 1) * n_samples]);
-            }
-            Recycled::Full(out)
-        }
-    }
-}
-
 ///////////////
 // Front-end //
 ///////////////
@@ -180,18 +150,12 @@ pub fn common_dispersion_cox_reid<T: EdgeFloat>(
     }
 
     // Drop genes carrying no information about the dispersion.
-    let kept: Vec<usize> = (0..n_genes)
-        .filter(|&gene| {
-            counts[gene * n_samples..(gene + 1) * n_samples]
-                .iter()
-                .map(|v| v.to_f64().unwrap_or(0.0))
-                .sum::<f64>()
-                >= params.min_row_sum
-        })
-        .collect();
-    if kept.is_empty() {
-        return Err(EdgeErrors::NoGenesAfterFiltering { n_genes });
-    }
+    let kept = crate::dispersion::filter_by_min_row_sum(
+        counts,
+        n_genes,
+        n_samples,
+        params.min_row_sum,
+    )?;
 
     // Subsample on large experiments, exactly as edgeR does.
     let chosen: Vec<usize> = match params.subset {
@@ -222,8 +186,8 @@ pub fn common_dispersion_cox_reid<T: EdgeFloat>(
     for &gene in &chosen {
         selected.extend_from_slice(&counts[gene * n_samples..(gene + 1) * n_samples]);
     }
-    let selected_offset = subset_recycled(offset, &chosen, n_samples);
-    let selected_weights = weights.map(|w| subset_recycled(w, &chosen, n_samples));
+    let selected_offset = offset.subset(&chosen, n_samples);
+    let selected_weights = weights.map(|w| w.subset(&chosen, n_samples));
 
     // Optimise over the fourth root of the dispersion.
     let lower = params.interval.0.powf(0.25).max(MIN_ROOT);

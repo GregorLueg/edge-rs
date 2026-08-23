@@ -48,17 +48,35 @@ pub const LIMMA_LOWESS_DEFAULTS: (usize, f64, f64) = (50, 0.3, 1.0 / 3.0);
 /// The borrowed matrix, or [`EdgeErrors::LengthMismatch`] if the slice does not
 /// match the stated shape.
 fn as_matrix(design: &[f64], n_rows: usize, n_cols: usize) -> Result<MatRef<'_, f64>, EdgeErrors> {
-    if design.len() != n_rows * n_cols {
+    validate_shape(design.len(), n_rows, n_cols)?;
+    Ok(MatRef::from_row_major_slice(design, n_rows, n_cols))
+}
+
+/// Checks that a row-major design's length matches its stated shape, and that
+/// the shape itself is non-degenerate.
+///
+/// ### Params
+///
+/// * `len` - Length of the row-major slice
+/// * `n_rows` - Number of rows
+/// * `n_cols` - Number of columns
+///
+/// ### Returns
+///
+/// `Ok(())` when `len == n_rows * n_cols` and both dimensions are positive,
+/// otherwise [`EdgeErrors::LengthMismatch`] or [`EdgeErrors::MustBePositive`].
+fn validate_shape(len: usize, n_rows: usize, n_cols: usize) -> Result<(), EdgeErrors> {
+    if len != n_rows * n_cols {
         return Err(EdgeErrors::LengthMismatch {
             name: "design",
             expected: n_rows * n_cols,
-            got: design.len(),
+            got: len,
         });
     }
     if n_rows == 0 || n_cols == 0 {
         return Err(EdgeErrors::MustBePositive("design dimensions".to_string()));
     }
-    Ok(MatRef::from_row_major_slice(design, n_rows, n_cols))
+    Ok(())
 }
 
 ///////////////
@@ -204,16 +222,7 @@ pub fn design_as_factor(
     n_rows: usize,
     n_cols: usize,
 ) -> Result<(Vec<usize>, usize), EdgeErrors> {
-    if design.len() != n_rows * n_cols {
-        return Err(EdgeErrors::LengthMismatch {
-            name: "design",
-            expected: n_rows * n_cols,
-            got: design.len(),
-        });
-    }
-    if n_rows == 0 || n_cols == 0 {
-        return Err(EdgeErrors::MustBePositive("design dimensions".to_string()));
-    }
+    validate_shape(design.len(), n_rows, n_cols)?;
 
     let mut powers = Vec::with_capacity(n_cols);
     let mut power = 1.0_f64;
@@ -285,7 +294,8 @@ pub struct ContrastDesign {
 /// ### Returns
 ///
 /// The reformed design and the indices of its contrast columns, or
-/// [`EdgeErrors`] if the shapes disagree or the contrast is entirely zero.
+/// [`EdgeErrors`] if the shapes disagree, either design dimension is zero, or
+/// the contrast is entirely zero.
 pub fn contrast_as_coef(
     design: &[f64],
     n_rows: usize,
@@ -294,13 +304,7 @@ pub fn contrast_as_coef(
     n_contrasts: usize,
     first: bool,
 ) -> Result<ContrastDesign, EdgeErrors> {
-    if design.len() != n_rows * n_cols {
-        return Err(EdgeErrors::LengthMismatch {
-            name: "design",
-            expected: n_rows * n_cols,
-            got: design.len(),
-        });
-    }
+    validate_shape(design.len(), n_rows, n_cols)?;
     if contrast.len() != n_cols * n_contrasts {
         return Err(EdgeErrors::LengthMismatch {
             name: "contrast",

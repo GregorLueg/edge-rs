@@ -28,13 +28,6 @@ use crate::utils::design::{contrast_as_coef, design_as_factor, matrix_rank, non_
 // Consts //
 ////////////
 
-/// Iteration budget for a warm-started null fit.
-///
-/// Mirrors the budget `glm_fit` gives its own general path. The null fit is the
-/// last thing standing between the caller and a missing p-value, so it gets the
-/// same allowance rather than `mglmLevenberg`'s stingier default of 200.
-const NULL_FIT_MAX_ITER: usize = 250;
-
 /// Half-width of the interval null in [`glm_treat`], on the z scale.
 ///
 /// edgeR's `glmTreat` hard-codes this. It is the constant that makes the
@@ -110,9 +103,7 @@ fn resolve_tested<T: EdgeFloat>(
                 ));
             }
             let first = coef[0];
-            let log_fc = (0..input.n_genes)
-                .map(|gene| fit.coefficients[gene * input.n_coef + first] / std::f64::consts::LN_2)
-                .collect();
+            let log_fc = project(&fit.coefficients, input.n_genes, input.n_coef, tested, first);
             coef.sort_unstable();
             Ok(Resolved {
                 design: input.design.to_vec(),
@@ -153,17 +144,11 @@ fn resolve_tested<T: EdgeFloat>(
                 *n_contrasts,
                 true,
             )?;
-            let log_fc = (0..input.n_genes)
-                .map(|gene| {
-                    let beta = &fit.coefficients[gene * input.n_coef..(gene + 1) * input.n_coef];
-                    let dot: f64 = beta
-                        .iter()
-                        .zip(values[..input.n_coef].iter())
-                        .map(|(b, c)| b * c)
-                        .sum();
-                    dot / std::f64::consts::LN_2
-                })
-                .collect();
+            // `project`'s zip against `values` naturally stops at `n_coef`
+            // elements, so passing the un-narrowed, possibly multi-column
+            // `tested` here still reads only the first contrast column - the
+            // same restriction `values[..input.n_coef]` made explicit above.
+            let log_fc = project(&fit.coefficients, input.n_genes, input.n_coef, tested, 0);
             Ok(Resolved {
                 design: reform.design,
                 coef: reform.coef,
@@ -286,8 +271,11 @@ fn fit_null<T: EdgeFloat>(
                     rank: n_coef_null - bad.len(),
                 });
             }
+            // The null fit is the last thing standing between the caller and a
+            // missing p-value, so it gets `glm_fit`'s own iteration budget
+            // rather than `mglmLevenberg`'s stingier default of 200.
             let params = LevenbergParams {
-                max_iter: NULL_FIT_MAX_ITER,
+                max_iter: crate::glm::fit::GLM_FIT_MAX_ITER,
                 ..Default::default()
             };
             let fit = mglm_levenberg(
@@ -620,26 +608,6 @@ fn drop_columns(design: &[f64], n_rows: usize, n_cols: usize, drop: &[usize]) ->
         out.extend(kept.iter().map(|c| row[*c]));
     }
     out
-}
-
-/// Divides every entry of a recycled dispersion by a scalar.
-///
-/// ### Params
-///
-/// * `dispersion` - Dispersion to scale
-/// * `average` - Divisor, edgeR's `average.ql.dispersion`
-///
-/// ### Returns
-///
-/// A new recycled matrix in the same storage form.
-fn divide_dispersion(dispersion: &Recycled<f64>, average: f64) -> Recycled<f64> {
-    let scale = |v: &Vec<f64>| v.iter().map(|d| d / average).collect();
-    match dispersion {
-        Recycled::Scalar(d) => Recycled::Scalar(d / average),
-        Recycled::ByGene(v) => Recycled::ByGene(scale(v)),
-        Recycled::BySample(v) => Recycled::BySample(scale(v)),
-        Recycled::Full(v) => Recycled::Full(scale(v)),
-    }
 }
 
 /// Adds a per-sample shift to a recycled offset matrix.
@@ -1010,7 +978,7 @@ pub fn glm_lrt<T: EdgeFloat>(
     // again or the two models sit on different scales.
     let scaled = ql
         .and_then(|q| q.average_ql_dispersion)
-        .map(|a| divide_dispersion(input.dispersion, a));
+        .map(|a| input.dispersion.map(|d| d / a));
     let dispersion = scaled.as_ref().unwrap_or(input.dispersion);
 
     // Warm start only when the coefficients are still in the original basis. A
@@ -1223,7 +1191,7 @@ pub fn glm_treat<T: EdgeFloat>(
 
     let scaled = ql
         .and_then(|q| q.average_ql_dispersion)
-        .map(|a| divide_dispersion(input.dispersion, a));
+        .map(|a| input.dispersion.map(|d| d / a));
     let dispersion = scaled.as_ref().unwrap_or(input.dispersion);
 
     // The threshold enters as an offset shift along the tested column, so both

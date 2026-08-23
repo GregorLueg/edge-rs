@@ -31,6 +31,7 @@
 
 use rayon::prelude::*;
 
+use crate::core::expression::column_sums;
 use crate::errors::EdgeErrors;
 use crate::numeric::stats::{quantile_type7, rank_average};
 use crate::utils::traits::EdgeFloat;
@@ -263,7 +264,6 @@ fn validate_params(params: &NormParams) -> Result<(), EdgeErrors> {
 /// ### Params
 ///
 /// * `counts` - Row-major counts, `n_genes * n_samples`
-/// * `n_genes` - Number of genes
 /// * `n_samples` - Number of samples
 /// * `lib_size` - Supplied library sizes, or `None` for the column sums
 ///
@@ -274,7 +274,6 @@ fn validate_params(params: &NormParams) -> Result<(), EdgeErrors> {
 /// usable as a denominator.
 fn resolve_lib_size<T: EdgeFloat>(
     counts: &[T],
-    n_genes: usize,
     n_samples: usize,
     lib_size: Option<&[f64]>,
 ) -> Result<Vec<f64>, EdgeErrors> {
@@ -289,15 +288,7 @@ fn resolve_lib_size<T: EdgeFloat>(
             }
             ls.to_vec()
         }
-        None => {
-            let mut sums = vec![0.0_f64; n_samples];
-            for row in counts.chunks_exact(n_samples).take(n_genes) {
-                for (acc, v) in sums.iter_mut().zip(row.iter()) {
-                    *acc += v.to_f64().unwrap_or(f64::NAN);
-                }
-            }
-            sums
-        }
+        None => column_sums(counts, n_samples),
     };
 
     // edgeR carries a zero library size through to a NaN factor. Every method
@@ -953,7 +944,7 @@ pub fn calc_norm_factors<T: EdgeFloat>(
         )));
     }
 
-    let lib = resolve_lib_size(counts, n_genes, n_samples, lib_size)?;
+    let lib = resolve_lib_size(counts, n_samples, lib_size)?;
     let (x, n_kept) = to_column_major_nonzero(counts, n_genes, n_samples)?;
 
     // edgeR degrades rather than failing: nothing to normalise against.
@@ -1673,7 +1664,7 @@ mod tests {
     #[test]
     fn test_reference_column_is_the_one_nearest_the_mean_f75() {
         let (x, g, s) = read_csv("test_data_part1.csv");
-        let lib = resolve_lib_size(&x, g, s, None).unwrap();
+        let lib = resolve_lib_size(&x, s, None).unwrap();
         let (cm, n_kept) = to_column_major_nonzero(&x, g, s).unwrap();
         // R: f75 = 0.0561, 0.0734, 0.0558, 0.0607; which.min(abs(f75 - mean)) = 4.
         let chosen = resolve_ref_column(&cm, n_kept, s, &lib, NormMethod::Tmm).unwrap();

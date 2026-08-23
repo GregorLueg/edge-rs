@@ -11,6 +11,7 @@
 //! normalisation factors, offsets and dispersions, is `f64` per the crate
 //! numeric policy.
 
+use crate::core::expression::column_sums;
 use crate::prelude::*;
 
 ////////////////////
@@ -113,12 +114,7 @@ impl<T: EdgeFloat> DgeList<T> {
             });
         }
 
-        let mut lib_size = vec![0.0_f64; n_samples];
-        for row in counts.chunks_exact(n_samples) {
-            for (acc, v) in lib_size.iter_mut().zip(row.iter()) {
-                *acc += v.to_f64().unwrap_or(f64::NAN);
-            }
-        }
+        let lib_size = column_sums(&counts, n_samples);
 
         Ok(Self {
             counts,

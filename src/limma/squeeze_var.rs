@@ -61,7 +61,7 @@ use crate::numeric::dist::{beta_cdf, beta_ppf, beta_sf, chisq_sf, f_ppf, f_sf, g
 use crate::numeric::gamma::{ln_gamma, logmdigamma, trigamma, trigamma_inverse};
 use crate::numeric::interpolate::{interp_linear_extrap, natural_spline_basis};
 use crate::numeric::optimise::{OPTIMIZE_TOL, brent_fmin, brentq};
-use crate::numeric::stats::{p_adjust_bh, quantile_type7, rank_average, trimmed_mean};
+use crate::numeric::stats::{median, p_adjust_bh, quantile_type7, rank_average, trimmed_mean};
 use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span};
 
 /// Fewer genes than this and limma refuses to fit anything, returning the input
@@ -241,37 +241,6 @@ pub struct SqueezeVarParams {
     /// limma's own rule: legacy exactly when every positive degrees of freedom
     /// is the same, which is where the two families agree best.
     pub legacy: Option<bool>,
-}
-
-impl SqueezeVarParams {
-    /// Builds a parameter set.
-    ///
-    /// ### Params
-    ///
-    /// * `robust` - Whether to Winsorise the moment estimates
-    /// * `winsor_tail_p` - Lower and upper Winsorising proportions, each in
-    ///   `[0, 0.5)`
-    /// * `span` - Lowess span for the trended fit, or `None` for the default of
-    ///   whichever fit runs
-    /// * `legacy` - Fit family, or `None` to let the degrees of freedom decide
-    ///
-    /// ### Returns
-    ///
-    /// The parameter set. Nothing is validated here; [`squeeze_var`] checks the
-    /// values against the data it is given.
-    pub fn new(
-        robust: bool,
-        winsor_tail_p: (f64, f64),
-        span: Option<f64>,
-        legacy: Option<bool>,
-    ) -> Self {
-        Self {
-            robust,
-            winsor_tail_p,
-            span,
-            legacy,
-        }
-    }
 }
 
 impl Default for SqueezeVarParams {
@@ -1320,22 +1289,7 @@ fn shrink_df2(
     };
 
     let order = stable_order(log_tail_p);
-    // Flatten the leading run to the smallest running mean before the cummax,
-    // so the most extreme genes share a prior rather than each taking its own.
-    let mut running = 0.0;
-    let (mut best, mut imin) = (f64::INFINITY, 0);
-    for (k, &idx) in order.iter().enumerate() {
-        running += df2_shrunk[idx];
-        let avg = running / (k + 1) as f64;
-        if avg < best {
-            best = avg;
-            imin = k;
-        }
-    }
-    for &idx in &order[..=imin] {
-        df2_shrunk[idx] = best;
-    }
-    cummax_in_order(&mut df2_shrunk, &order);
+    flatten_then_cummax(&mut df2_shrunk, &order);
 
     Ok(df2_shrunk)
 }
@@ -1648,26 +1602,7 @@ fn unequal_df1_inner(
     // through the rest, so a more extreme gene never keeps more prior support
     // than a less extreme one.
     let order = stable_order(&right_p);
-    let mut ordered: Vec<f64> = order.iter().map(|&i| df2_shrunk[i]).collect();
-    let mut running = 0.0;
-    let mut best = f64::INFINITY;
-    let mut best_k = 0;
-    for (k, &v) in ordered.iter().enumerate() {
-        running += v;
-        let mean_so_far = running / (k + 1) as f64;
-        if mean_so_far < best {
-            best = mean_so_far;
-            best_k = k;
-        }
-    }
-    for slot in ordered.iter_mut().take(best_k + 1) {
-        *slot = best;
-    }
-    let mut climbing = f64::NEG_INFINITY;
-    for (k, &i) in order.iter().enumerate() {
-        climbing = climbing.max(ordered[k]);
-        df2_shrunk[i] = climbing;
-    }
+    flatten_then_cummax(&mut df2_shrunk, &order);
 
     Ok(UnequalDf1Fit {
         scale,
@@ -1775,10 +1710,6 @@ fn f_cdf(x: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
         beta_cdf(df1 * x / (df2 + df1 * x), 0.5 * df1, 0.5 * df2)
     }
 }
-
-////////////////////////////
-// Brent's fmin, R's own  //
-////////////////////////////
 
 //////////////////////////
 // Winsorised moments   //
@@ -2502,29 +2433,6 @@ fn subset_recycled(v: &[f64], ok: &[bool]) -> Vec<f64> {
     }
 }
 
-/// Sample median, averaging the two central values for an even count.
-///
-/// ### Params
-///
-/// * `x` - Values, non-empty
-///
-/// ### Returns
-///
-/// The median, or `NaN` for an empty slice.
-fn median(x: &[f64]) -> f64 {
-    if x.is_empty() {
-        return f64::NAN;
-    }
-    let mut sorted = x.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let n = sorted.len();
-    if n.is_multiple_of(2) {
-        0.5 * (sorted[n / 2 - 1] + sorted[n / 2])
-    } else {
-        sorted[n / 2]
-    }
-}
-
 /// Arithmetic mean.
 ///
 /// ### Params
@@ -2582,6 +2490,34 @@ fn cummax_in_order(v: &mut [f64], order: &[usize]) {
         running = running.max(v[i]);
         v[i] = running;
     }
+}
+
+/// Flattens the leading run to its smallest running mean, then takes a
+/// [`cummax_in_order`] through the rest.
+///
+/// limma's per-gene prior monotonicity trick: without the flatten, the most
+/// extreme gene could keep more prior support than a less extreme one, since a
+/// bare cummax only enforces monotonicity from that point onward.
+///
+/// ### Params
+///
+/// * `v` - Values, modified in place
+/// * `order` - Permutation to walk, e.g. by ascending tail probability
+fn flatten_then_cummax(v: &mut [f64], order: &[usize]) {
+    let mut running = 0.0;
+    let (mut best, mut imin) = (f64::INFINITY, 0);
+    for (k, &idx) in order.iter().enumerate() {
+        running += v[idx];
+        let avg = running / (k + 1) as f64;
+        if avg < best {
+            best = avg;
+            imin = k;
+        }
+    }
+    for &idx in &order[..=imin] {
+        v[idx] = best;
+    }
+    cummax_in_order(v, order);
 }
 
 /// Sorts knots ascending and averages the ordinates at duplicate abscissae.
@@ -3218,7 +3154,12 @@ mod tests {
             &fixture_b(),
             &vec![4.0; 40],
             None,
-            Some(SqueezeVarParams::new(true, (0.2, 0.25), None, None)),
+            Some(SqueezeVarParams {
+                robust: true,
+                winsor_tail_p: (0.2, 0.25),
+                span: None,
+                legacy: None,
+            }),
         )
         .unwrap();
         assert_relative_eq!(out.var_prior[0], B_ROBUST_WIDE_SCALE, max_relative = 1e-12);
@@ -3239,7 +3180,12 @@ mod tests {
             &fixture_b(),
             &vec![4.0; 40],
             None,
-            Some(SqueezeVarParams::new(true, (0.005, 0.005), None, None)),
+            Some(SqueezeVarParams {
+                robust: true,
+                winsor_tail_p: (0.005, 0.005),
+                span: None,
+                legacy: None,
+            }),
         )
         .unwrap();
         assert_relative_eq!(out.var_prior[0], B_TINY_WINSOR_SCALE, max_relative = 1e-12);
@@ -3609,7 +3555,12 @@ mod tests {
                         &fixture_b(),
                         &vec![4.0; 40],
                         None,
-                        Some(SqueezeVarParams::new(true, bad, None, None))
+                        Some(SqueezeVarParams {
+                            robust: true,
+                            winsor_tail_p: bad,
+                            span: None,
+                            legacy: None
+                        })
                     ),
                     Err(EdgeErrors::InvalidArgument(_))
                 ),
@@ -3627,7 +3578,12 @@ mod tests {
                         &fixture_b(),
                         &vec![4.0; 40],
                         None,
-                        Some(SqueezeVarParams::new(false, (0.05, 0.1), Some(bad), None))
+                        Some(SqueezeVarParams {
+                            robust: false,
+                            winsor_tail_p: (0.05, 0.1),
+                            span: Some(bad),
+                            legacy: None
+                        })
                     ),
                     Err(EdgeErrors::InvalidArgument(_))
                 ),

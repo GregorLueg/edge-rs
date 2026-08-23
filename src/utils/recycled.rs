@@ -61,18 +61,7 @@ impl<T: Copy> RecycledRow<'_, T> {
         }
     }
 
-    /// Whether this row is a single repeated value.
-    ///
-    /// ### Returns
-    ///
-    /// `true` for `Constant`. Hot loops branch on this once and then take a
-    /// specialised path, rather than calling [`RecycledRow::get`] per sample.
-    #[inline]
-    pub fn is_constant(&self) -> bool {
-        matches!(self, RecycledRow::Constant(_))
-    }
-
-    /// Iterates the row across `n_samples` samples.
+    /// Materialises the row as a dense vector.
     ///
     /// ### Params
     ///
@@ -81,15 +70,12 @@ impl<T: Copy> RecycledRow<'_, T> {
     ///
     /// ### Returns
     ///
-    /// An iterator over the row's values.
+    /// A dense `Vec` of the row's values.
     #[inline]
-    pub fn iter(&self, n_samples: usize) -> Box<dyn Iterator<Item = T> + '_> {
+    pub fn to_vec(&self, n_samples: usize) -> Vec<T> {
         match self {
-            RecycledRow::Constant(v) => {
-                let v = *v;
-                Box::new(std::iter::repeat_n(v, n_samples))
-            }
-            RecycledRow::Values(vals) => Box::new(vals.iter().copied()),
+            RecycledRow::Constant(v) => vec![*v; n_samples],
+            RecycledRow::Values(vals) => vals.to_vec(),
         }
     }
 }
@@ -235,6 +221,52 @@ impl<T: Copy> Recycled<T> {
         }
     }
 
+    /// Restricts this matrix to a subset of genes.
+    ///
+    /// `Scalar` and `BySample` pass through unchanged, since neither varies by
+    /// gene.
+    ///
+    /// ### Params
+    ///
+    /// * `kept` - Gene indices to keep, in order
+    /// * `n_samples` - Number of samples, needed to gather rows out of `Full`
+    ///
+    /// ### Returns
+    ///
+    /// A new [`Recycled`] holding only the kept genes.
+    pub fn subset(&self, kept: &[usize], n_samples: usize) -> Self {
+        match self {
+            Recycled::Scalar(v) => Recycled::Scalar(*v),
+            Recycled::BySample(v) => Recycled::BySample(v.clone()),
+            Recycled::ByGene(v) => Recycled::ByGene(kept.iter().map(|&g| v[g]).collect()),
+            Recycled::Full(v) => {
+                let mut out = Vec::with_capacity(kept.len() * n_samples);
+                for &gene in kept {
+                    out.extend_from_slice(&v[gene * n_samples..(gene + 1) * n_samples]);
+                }
+                Recycled::Full(out)
+            }
+        }
+    }
+
+    /// Applies a function to every stored value.
+    ///
+    /// ### Params
+    ///
+    /// * `f` - Function applied to each stored value
+    ///
+    /// ### Returns
+    ///
+    /// A new [`Recycled`] of the same shape with `f` applied.
+    pub fn map<U: Copy>(&self, f: impl Fn(T) -> U) -> Recycled<U> {
+        match self {
+            Recycled::Scalar(v) => Recycled::Scalar(f(*v)),
+            Recycled::ByGene(v) => Recycled::ByGene(v.iter().map(|&x| f(x)).collect()),
+            Recycled::BySample(v) => Recycled::BySample(v.iter().map(|&x| f(x)).collect()),
+            Recycled::Full(v) => Recycled::Full(v.iter().map(|&x| f(x)).collect()),
+        }
+    }
+
     /// Materialises the full row-major matrix.
     ///
     /// Only for tests and for interop with code that genuinely needs a dense
@@ -259,18 +291,6 @@ impl<T: Copy> Recycled<T> {
         }
         out
     }
-
-    /// Number of stored values, as opposed to the logical element count.
-    ///
-    /// ### Returns
-    ///
-    /// How many `T` this actually holds.
-    pub fn stored_len(&self) -> usize {
-        match self {
-            Recycled::Scalar(_) => 1,
-            Recycled::ByGene(v) | Recycled::BySample(v) | Recycled::Full(v) => v.len(),
-        }
-    }
 }
 
 ///////////
@@ -288,7 +308,6 @@ mod tests {
     fn test_scalar_expands_to_constant_matrix() {
         let r = Recycled::scalar(2.5_f64);
         assert_eq!(r.expand(N_GENES, N_SAMPLES), vec![2.5; N_GENES * N_SAMPLES]);
-        assert_eq!(r.stored_len(), 1);
     }
 
     #[test]
@@ -299,7 +318,6 @@ mod tests {
             expanded,
             vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]
         );
-        assert!(r.row(1, N_SAMPLES).is_constant());
     }
 
     #[test]
@@ -310,7 +328,6 @@ mod tests {
             expanded,
             vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
         );
-        assert!(!r.row(0, N_SAMPLES).is_constant());
     }
 
     #[test]
@@ -339,10 +356,43 @@ mod tests {
     }
 
     #[test]
-    fn test_row_iter_yields_n_samples() {
+    fn test_subset_selects_kept_genes() {
+        let kept = [0usize, 2];
+        assert_eq!(
+            Recycled::scalar(1.0_f64).subset(&kept, N_SAMPLES),
+            Recycled::scalar(1.0)
+        );
+        assert_eq!(
+            Recycled::by_sample(vec![1.0_f64, 2.0, 3.0, 4.0]).subset(&kept, N_SAMPLES),
+            Recycled::by_sample(vec![1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            Recycled::by_gene(vec![1.0_f64, 2.0, 3.0]).subset(&kept, N_SAMPLES),
+            Recycled::by_gene(vec![1.0, 3.0])
+        );
+        let full = Recycled::full((0..12).map(|i| i as f64).collect(), N_GENES, N_SAMPLES).unwrap();
+        assert_eq!(
+            full.subset(&kept, N_SAMPLES),
+            Recycled::Full(vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0])
+        );
+    }
+
+    #[test]
+    fn test_map_applies_to_every_stored_value() {
+        assert_eq!(
+            Recycled::scalar(2.0_f64).map(|v| v * 2.0),
+            Recycled::scalar(4.0)
+        );
+        assert_eq!(
+            Recycled::by_gene(vec![1.0_f64, 2.0, 3.0]).map(|v| v * 2.0),
+            Recycled::by_gene(vec![2.0, 4.0, 6.0])
+        );
+    }
+
+    #[test]
+    fn test_row_to_vec_yields_n_samples() {
         let r = Recycled::by_gene(vec![5.0_f64, 6.0, 7.0]);
-        let row: Vec<f64> = r.row(2, N_SAMPLES).iter(N_SAMPLES).collect();
-        assert_eq!(row, vec![7.0; N_SAMPLES]);
+        assert_eq!(r.row(2, N_SAMPLES).to_vec(N_SAMPLES), vec![7.0; N_SAMPLES]);
     }
 
     #[test]

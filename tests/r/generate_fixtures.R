@@ -387,10 +387,6 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
     ),
     paste0(tag, "_filter.csv")
   )
-  put(tag, "filter_n_default", sum(keep_default))
-  put(tag, "filter_n_group", sum(keep_group))
-  put(tag, "filter_n_design", sum(keep_design))
-  put(tag, "filter_n_after_norm", sum(keep_after_norm))
 
   # -- normalisation, on the unfiltered matrix so the sweep is independent of
   # the filter above.
@@ -411,7 +407,6 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
   ng <- nrow(cf)
   eff_lib <- yf$samples$lib.size * yf$samples$norm.factors
   off <- getOffset(yf)
-  put(tag, "n_kept", ng)
 
   write_int(cf, paste0(tag, "_kept_counts.csv"))
   write_num(
@@ -442,7 +437,6 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
   put(tag, "span", dd$span)
   put(tag, "prior_df", dd$prior.df[1])
   put(tag, "prior_df_len", length(dd$prior.df))
-  put(tag, "prior_n", dd$prior.n)
   write_num(
     cbind(
       ave_log_cpm = dd$AveLogCPM,
@@ -477,13 +471,11 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
       logCPM = lrt$table$logCPM,
       LR = lrt$table$LR,
       PValue = lrt$table$PValue,
-      logPValue = pchisq(lrt$table$LR, df = lrt$df.test, lower.tail = FALSE, log.p = TRUE),
-      FDR = p.adjust(lrt$table$PValue, "BH")
+      logPValue = pchisq(lrt$table$LR, df = lrt$df.test, lower.tail = FALSE, log.p = TRUE)
     ),
     paste0(tag, "_lrt.csv"),
-    c("logFC", "logCPM", "LR", "PValue", "logPValue", "FDR")
+    c("logFC", "logCPM", "LR", "PValue", "logPValue")
   )
-  put(tag, "lrt_df_test", lrt$df.test[1])
 
   # -- quasi-likelihood. The .default form is used rather than the DGEList one:
   # the DGEList method precomputes its own scalar dispersion from a hardcoded
@@ -515,12 +507,11 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
       PValue = qlt$table$PValue,
       logPValue = pf(qlt$table$F, qlt$df.test, qlt$df.total,
                      lower.tail = FALSE, log.p = TRUE),
-      FDR = p.adjust(qlt$table$PValue, "BH"),
       df_total = qlt$df.total
     ),
     paste0(tag, "_ql.csv"),
     c(paste0("coef", seq_len(ncoef)), "deviance", "s2_post", "s2_prior", "df_prior",
-      "df_residual_adj", "deviance_adj", "F", "PValue", "logPValue", "FDR", "df_total")
+      "df_residual_adj", "deviance_adj", "F", "PValue", "logPValue", "df_total")
   )
   put(tag, "qlf_df_test", qlt$df.test[1])
 
@@ -539,7 +530,6 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
       logFC = et$table$logFC,
       logCPM = et$table$logCPM,
       PValue = et$table$PValue,
-      FDR = p.adjust(et$table$PValue, "BH"),
       logFC_big5 = et_big5$table$logFC,
       PValue_big5 = et_big5$table$PValue,
       # The exact test has no log-scale output of its own, so the log is taken
@@ -551,10 +541,9 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
       logPValue_big5 = log(et_big5$table$PValue)
     ),
     paste0(tag, "_exact.csv"),
-    c("tagwise", "ave_log_cpm", "logFC", "logCPM", "PValue", "FDR",
+    c("tagwise", "ave_log_cpm", "logFC", "logCPM", "PValue",
       "logFC_big5", "PValue_big5", "logPValue", "logPValue_big5")
   )
-  put(tag, "exact_common_dispersion", de$common.dispersion)
 
   # -- topTags. FDR is BH over the whole table, so it does not move with n, and
   # the index column is one-based here.
@@ -607,56 +596,13 @@ pois <- run_core("pois", pois_counts, pois_des, pois_des, pois_grp, 2, c("ctl", 
 # Factorial extras: sweeps and contrasts #
 ##########################################
 
-# The trend method sweep only needs running once, and the factorial set is the
-# one with enough abundance range for the smoothers to differ meaningfully.
-trend_methods <- c("none", "movingave", "loess", "locfit", "locfit.mixed")
-trend_fits <- lapply(trend_methods, function(tm) estimateDisp(fac$yf, fac_des, trend.method = tm))
-names(trend_fits) <- trend_methods
-
-for (tm in trend_methods) {
-  d <- trend_fits[[tm]]
-  put("fac_trend", paste0("common_", tm), d$common.dispersion)
-  put("fac_trend", paste0("span_", tm), if (is.null(d$span)) NA_real_ else d$span)
-}
-
-# trend.method = "none" leaves no trended dispersion at all, so it contributes a
-# tagwise column only.
-write_num(
-  cbind(
-    do.call(cbind, lapply(trend_methods[-1], function(tm) trend_fits[[tm]]$trended.dispersion)),
-    do.call(cbind, lapply(trend_methods, function(tm) trend_fits[[tm]]$tagwise.dispersion))
-  ),
-  "fac_trend.csv",
-  c(paste0("trended_", trend_methods[-1]), paste0("tagwise_", trend_methods))
-)
-
 d_notag <- estimateDisp(fac$yf, fac_des, tagwise = FALSE)
 d_pdf10 <- estimateDisp(fac$yf, fac_des, prior.df = 10)
 put("fac_trend", "common_no_tagwise", d_notag$common.dispersion)
-put("fac_trend", "prior_n_pdf10", d_pdf10$prior.n)
 write_num(
   cbind(trended_no_tagwise = d_notag$trended.dispersion, tagwise_pdf10 = d_pdf10$tagwise.dispersion),
   "fac_trend_extra.csv",
   c("trended_no_tagwise", "tagwise_pdf10")
-)
-
-# The robust dispersion fit, through the converged-uniroot estimateDisp.
-invisible(uniroot_since())
-d_robust <- tightED(
-  y = fac$yf$counts, design = fac_des, offset = fac$off,
-  AveLogCPM = fac$dd$AveLogCPM, robust = TRUE
-)
-put("fac_trend", "uniroot_calls_robust_disp", uniroot_since())
-put("fac_trend", "common_robust", d_robust$common.dispersion)
-put("fac_trend", "prior_df_robust_len", length(d_robust$prior.df))
-write_num(
-  cbind(
-    prior_df = rep_len(d_robust$prior.df, fac$ng),
-    trended = d_robust$trended.dispersion,
-    tagwise = d_robust$tagwise.dispersion
-  ),
-  "fac_disp_robust.csv",
-  c("prior_df", "trended", "tagwise")
 )
 
 # Multi-coefficient and contrast tests. glmTreat reports no statistic column at
@@ -666,8 +612,6 @@ lrt_multi <- glmLRT(fac$fit, coef = 2:3)
 lrt_con1 <- glmLRT(fac$fit, contrast = fac_con[1, ])
 lrt_con2 <- glmLRT(fac$fit, contrast = fac_con[2, ])
 put("fac_glm", "lrt_multi_df_test", lrt_multi$df.test[1])
-put("fac_glm", "lrt_con1_df_test", lrt_con1$df.test[1])
-put("fac_glm", "lrt_con2_df_test", lrt_con2$df.test[1])
 
 write_num(
   cbind(
@@ -689,31 +633,14 @@ write_num(
 
 tr_int <- glmTreat(fac$fit, coef = 2, lfc = 1, null = "interval")
 tr_wc <- glmTreat(fac$fit, coef = 2, lfc = 1, null = "worst.case")
-tr_ql <- glmTreat(fac$ql, coef = 2, lfc = 1, null = "interval")
 write_num(
   cbind(
     interval_logFC = tr_int$table$logFC,
-    interval_unshrunk = tr_int$table$unshrunk.logFC,
     interval_PValue = tr_int$table$PValue,
-    worstcase_PValue = tr_wc$table$PValue,
-    ql_logFC = tr_ql$table$logFC,
-    ql_PValue = tr_ql$table$PValue
+    worstcase_PValue = tr_wc$table$PValue
   ),
   "fac_treat.csv",
-  c("interval_logFC", "interval_unshrunk", "interval_PValue",
-    "worstcase_PValue", "ql_logFC", "ql_PValue")
-)
-
-# The quasi-likelihood F test through a contrast rather than a coefficient.
-qlt_con <- glmQLFTest(fac$ql, contrast = fac_con[2, ])
-write_num(
-  cbind(
-    logFC = qlt_con$table$logFC,
-    F = qlt_con$table$F,
-    PValue = qlt_con$table$PValue
-  ),
-  "fac_qlf_contrast.csv",
-  c("logFC", "F", "PValue")
+  c("interval_logFC", "interval_PValue", "worstcase_PValue")
 )
 cat("factorial extras written\n")
 
@@ -946,19 +873,12 @@ if (requireNamespace("nebula", quietly = TRUE)) {
         "p_int", "p_grp", "p_cov2",
         "gene_id", "Subject", "Cell", "convergence", "algorithm")
     )
-    for (k in seq_along(c("ln", "lnhl", "hl"))) {
-      put(tag, paste0("n_algo_", c("ln", "lnhl", "hl")[k]), sum(algo == k, na.rm = TRUE))
-    }
     # R packs the covariance lower-triangular column-major; the Rust repacks it.
     write_num(as.matrix(res$covariance), paste0(tag, "_covariance.csv"),
               paste0("cov_", seq_len(ncol(res$covariance))))
 
-    put(tag, "n_genes_in", nrow(cnt))
     put(tag, "n_genes_out", nrow(res$summary))
     put(tag, "n_subjects", nsub)
-    put(tag, "cells_per_subject", cells_per)
-    put(tag, "n_ln", sum(grepl("LN", res$algorithm)))
-    put(tag, "n_hl_only", sum(res$algorithm == "NBGMM (HL)"))
 
     cat(sprintf("%s: %d/%d genes, %.1f cells/subject, algorithms {%s}\n",
                 tag, nrow(res$summary), nrow(cnt), cells_per,

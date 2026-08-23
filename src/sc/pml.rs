@@ -221,14 +221,23 @@ impl PmlData<'_> {
             )));
         }
         for s in 0..k {
-            if self.subject_start[s] > self.subject_start[s + 1] {
+            if self.subject_start[s] >= self.subject_start[s + 1] {
                 return Err(EdgeErrors::SubjectsNotContiguous { subject: s });
             }
         }
-        if let Some(&bad) = self.cell_index.iter().find(|&&c| c >= n_cells) {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "cell_index {bad} is out of range for {n_cells} cells."
-            )));
+        let mut previous: Option<usize> = None;
+        for &c in self.cell_index {
+            if c >= n_cells {
+                return Err(EdgeErrors::InvalidArgument(format!(
+                    "cell_index {c} is out of range for {n_cells} cells."
+                )));
+            }
+            if previous.is_some_and(|p| c <= p) {
+                return Err(EdgeErrors::InvalidArgument(
+                    "cell_index must be strictly increasing.".to_string(),
+                ));
+            }
+            previous = Some(c);
         }
         Ok(())
     }

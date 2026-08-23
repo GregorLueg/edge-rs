@@ -12,25 +12,12 @@
 use rayon::prelude::*;
 
 use crate::core::expression::check_dispersion;
+use crate::glm::{EMPTY_GENE_COEF, ETA_CLAMP, MIN_POSITIVE};
 use crate::prelude::*;
 
 ////////////
 // Consts //
 ////////////
-
-/// Bound on the linear predictor before exponentiating, as in the Levenberg fit.
-const ETA_CLAMP: f64 = 500.0;
-
-/// Floor applied to fitted means, which appear in denominators.
-const MIN_POSITIVE: f64 = 1e-300;
-
-/// Coefficient assigned to a gene with no counts or no library.
-///
-/// `log(0)` is negative infinity, which would poison every downstream sum.
-/// edgeR substitutes a large negative number, giving a fitted mean of about
-/// `2e-9` counts, indistinguishable from zero in practice and finite in
-/// arithmetic.
-const EMPTY_GENE_COEF: f64 = -20.0;
 
 /// Information below which a step is treated as undefined.
 const MIN_INFORMATION: f64 = 1e-300;

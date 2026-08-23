@@ -133,18 +133,6 @@ pub enum EdgeErrors {
         upper: f64,
     },
 
-    /// An interpolation was asked for a point outside the knot range, where the
-    /// spline is not defined.
-    #[error("Interpolation point {x} lies outside the knot range [{lower}, {upper}].")]
-    OutsideKnotRange {
-        /// Requested abscissa
-        x: f64,
-        /// Smallest knot
-        lower: f64,
-        /// Largest knot
-        upper: f64,
-    },
-
     // -- sparse --
     /// A compressed sparse structure violated its own invariants.
     #[error("Malformed sparse matrix: {0}")]
@@ -163,15 +151,6 @@ pub enum EdgeErrors {
     InvalidReferenceColumn(String),
 
     // -- GLM --
-    /// The negative binomial GLM did not converge for the given gene.
-    #[error("GLM fit failed to converge for gene {gene} after {iterations} iterations.")]
-    GlmNoConvergence {
-        /// Index of the gene that failed
-        gene: usize,
-        /// Iterations performed
-        iterations: usize,
-    },
-
     /// A dispersion outside `[0, inf)` was supplied to a negative binomial routine.
     #[error("Dispersion must be non-negative and finite; got {0}.")]
     InvalidDispersion(f64),

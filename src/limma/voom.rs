@@ -358,8 +358,7 @@ pub fn voom_lmfit<T: EdgeFloat>(
         detect_structural_zeros(counts, n_genes, n_samples, design, n_coef, &prep.lib_size)?;
     for (k, &g) in zeros.rows.iter().enumerate() {
         let mask = &zeros.observed[k * n_samples..(k + 1) * n_samples];
-        let row_w: Option<Vec<f64>> =
-            weights.map(|w| w.row(g, n_samples).iter(n_samples).collect());
+        let row_w: Option<Vec<f64>> = weights.map(|w| w.row(g, n_samples).to_vec(n_samples));
         let (sigma, df) = masked_fit(
             &prep.e[g * n_samples..(g + 1) * n_samples],
             mask,

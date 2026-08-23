@@ -462,7 +462,6 @@ pub fn rpkm<T: EdgeFloat>(
     log: bool,
     prior_count: f64,
 ) -> Result<Vec<f64>, EdgeErrors> {
-    check_counts(counts, n_genes, n_samples)?;
     check_gene_length(gene_length, n_genes, "gene_length")?;
 
     let mut out = cpm(
@@ -521,7 +520,6 @@ pub fn tpm<T: EdgeFloat>(
     n_samples: usize,
     effective_length: &[f64],
 ) -> Result<Vec<f64>, EdgeErrors> {
-    check_counts(counts, n_genes, n_samples)?;
     check_gene_length(effective_length, n_genes, "effective_length")?;
 
     let mut out = cpm(counts, n_genes, n_samples, None, None, false, 0.0)?;

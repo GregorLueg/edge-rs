@@ -15,8 +15,6 @@
 //! regime, so the difference of large logarithms is never evaluated where it
 //! would cancel.
 
-use crate::numeric::gamma::ln_gamma;
-
 ////////////
 // Consts //
 ////////////
@@ -90,61 +88,6 @@ pub fn unit_nb_deviance(y: f64, mu: f64, phi: f64) -> f64 {
     };
 
     out.max(0.0)
-}
-
-/// Residual deviance of one gene.
-///
-/// ### Params
-///
-/// * `y` - Observed counts for this gene, one per sample
-/// * `mu` - Fitted means, same length as `y`
-/// * `phi` - Dispersion for this gene
-/// * `weights` - Optional observation weights, same length as `y`
-///
-/// ### Returns
-///
-/// The weighted sum of unit deviances across samples.
-#[inline]
-pub fn gene_deviance(y: &[f64], mu: &[f64], phi: f64, weights: Option<&[f64]>) -> f64 {
-    match weights {
-        Some(w) => y
-            .iter()
-            .zip(mu.iter())
-            .zip(w.iter())
-            .map(|((&yi, &mi), &wi)| wi * unit_nb_deviance(yi, mi, phi))
-            .sum(),
-        None => y
-            .iter()
-            .zip(mu.iter())
-            .map(|(&yi, &mi)| unit_nb_deviance(yi, mi, phi))
-            .sum(),
-    }
-}
-
-/// Log-likelihood of one gene under a negative binomial model.
-///
-/// Used by the adjusted profile likelihood rather than by the fitter, which
-/// works with deviances directly.
-///
-/// ### Params
-///
-/// * `y` - Observed counts, one per sample
-/// * `mu` - Fitted means, same length as `y`
-/// * `phi` - Dispersion for this gene. Must be positive; the Poisson limit is
-///   not handled here because the profile likelihood never reaches it.
-///
-/// ### Returns
-///
-/// The log-likelihood summed across samples.
-pub fn gene_log_likelihood(y: &[f64], mu: &[f64], phi: f64) -> f64 {
-    let inv_phi = 1.0 / phi;
-    y.iter()
-        .zip(mu.iter())
-        .map(|(&yi, &mi)| {
-            ln_gamma(yi + inv_phi) - ln_gamma(inv_phi) - ln_gamma(yi + 1.0) + yi * (mi * phi).ln()
-                - (yi + inv_phi) * (1.0 + mi * phi).ln()
-        })
-        .sum()
 }
 
 ///////////
@@ -283,45 +226,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gene_deviance_sums_across_samples() {
-        let y = [0.0, 3.0, 12.0];
-        let mu = [10.0, 10.0, 10.0];
-        let expected: f64 = y
-            .iter()
-            .zip(mu.iter())
-            .map(|(&a, &b)| unit_nb_deviance(a, b, 0.1))
-            .sum();
-        assert_relative_eq!(
-            gene_deviance(&y, &mu, 0.1, None),
-            expected,
-            max_relative = 1e-14
-        );
-    }
-
-    #[test]
-    fn test_gene_deviance_applies_weights() {
-        let y = [0.0, 3.0, 12.0];
-        let mu = [10.0, 10.0, 10.0];
-        let w = [1.0, 2.0, 0.0];
-        let expected = unit_nb_deviance(0.0, 10.0, 0.1) + 2.0 * unit_nb_deviance(3.0, 10.0, 0.1);
-        assert_relative_eq!(
-            gene_deviance(&y, &mu, 0.1, Some(&w)),
-            expected,
-            max_relative = 1e-14
-        );
-    }
-
-    /// R: `sum(dnbinom(c(0,3,12), size=1/0.1, mu=10, log=TRUE))` gives
-    /// -13.2068986561.
-    #[test]
-    fn test_log_likelihood_matches_r_dnbinom() {
-        let y = [0.0, 3.0, 12.0];
-        let mu = [10.0, 10.0, 10.0];
-        assert_relative_eq!(
-            gene_log_likelihood(&y, &mu, 0.1),
-            -13.206_898_656_1,
-            max_relative = 1e-9
-        );
-    }
 }

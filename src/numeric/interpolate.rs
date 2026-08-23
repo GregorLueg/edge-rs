@@ -16,6 +16,7 @@
 
 use rayon::prelude::*;
 
+use crate::numeric::stats::quantile_type7;
 use crate::prelude::*;
 
 ////////////
@@ -563,7 +564,7 @@ pub fn natural_spline_basis(x: &[f64], df: usize) -> Result<(Vec<f64>, usize), E
     let mut knots = Vec::with_capacity(df);
     knots.push(lower);
     for j in 1..=n_internal {
-        knots.push(quantile_type7(&sorted, j as f64 / (n_internal + 1) as f64));
+        knots.push(quantile_type7(&sorted, j as f64 / (n_internal + 1) as f64)?);
     }
     knots.push(upper);
     knots.sort_by(f64::total_cmp);
@@ -628,63 +629,9 @@ fn truncated_power_term(x: f64, knot: f64, xi_last: f64, tail: f64) -> f64 {
     (truncated_cube(x, knot) - tail) / span
 }
 
-/// The type 7 sample quantile, R's default and numpy's.
-///
-/// ### Params
-///
-/// * `sorted` - Values in ascending order, non-empty
-/// * `p` - Probability in `[0, 1]`
-///
-/// ### Returns
-///
-/// The interpolated quantile.
-fn quantile_type7(sorted: &[f64], p: f64) -> f64 {
-    let n = sorted.len();
-    if n == 1 {
-        return sorted[0];
-    }
-    let h = (n - 1) as f64 * p;
-    let lo = h.floor();
-    let idx = (lo as usize).min(n - 2);
-    sorted[idx] + (h - lo) * (sorted[idx + 1] - sorted[idx])
-}
-
 //////////////////////////
 // Linear interpolation //
 //////////////////////////
-
-/// Piecewise-linear interpolation inside the knot range.
-///
-/// ### Params
-///
-/// * `x` - Abscissae to evaluate at, in any order
-/// * `xp` - Knot abscissae, strictly increasing
-/// * `fp` - Knot ordinates, same length as `xp`
-///
-/// ### Returns
-///
-/// One value per entry of `x`, or [`EdgeErrors::OutsideKnotRange`] if any query
-/// point lies outside `[xp[0], xp[last]]`. Use [`interp_linear_extrap`] when
-/// points outside the range are expected.
-pub fn interp_linear(x: &[f64], xp: &[f64], fp: &[f64]) -> Result<Vec<f64>, EdgeErrors> {
-    validate_interp_knots(xp, fp)?;
-    let lower = xp[0];
-    let upper = xp[xp.len() - 1];
-
-    x.iter()
-        .map(|&xi| {
-            if xi < lower || xi > upper {
-                Err(EdgeErrors::OutsideKnotRange {
-                    x: xi,
-                    lower,
-                    upper,
-                })
-            } else {
-                Ok(interp_one(xi, xp, fp))
-            }
-        })
-        .collect()
-}
 
 /// Piecewise-linear interpolation with constant extension outside the range.
 ///
@@ -1119,25 +1066,14 @@ mod tests {
     // -- linear interpolation --
 
     #[test]
-    fn test_interp_linear_inside_the_range() {
+    fn test_interp_linear_extrap_inside_the_range() {
         let xp = [0.0, 1.0, 2.0, 4.0];
         let fp = [0.0, 2.0, 3.0, -1.0];
         let q = [0.5, 1.0, 1.5, 3.0, 3.999];
-        let got = interp_linear(&q, &xp, &fp).unwrap();
+        let got = interp_linear_extrap(&q, &xp, &fp).unwrap();
         for (g, w) in got.iter().zip(&NP_INTERP_INSIDE) {
             assert_relative_eq!(*g, *w, epsilon = 1e-12);
         }
-    }
-
-    #[test]
-    fn test_interp_linear_extrap_agrees_inside_the_range() {
-        let xp = [0.0, 1.0, 2.0, 4.0];
-        let fp = [0.0, 2.0, 3.0, -1.0];
-        let q = [0.5, 1.0, 1.5, 3.0, 3.999];
-        assert_eq!(
-            interp_linear(&q, &xp, &fp).unwrap(),
-            interp_linear_extrap(&q, &xp, &fp).unwrap()
-        );
     }
 
     #[test]
@@ -1152,17 +1088,16 @@ mod tests {
     }
 
     #[test]
-    fn test_interp_linear_hits_the_knots_exactly() {
+    fn test_interp_linear_extrap_hits_the_knots_exactly() {
         let xp = [0.0, 1.0, 2.0, 4.0];
         let fp = [0.0, 2.0, 3.0, -1.0];
-        assert_eq!(interp_linear(&xp, &xp, &fp).unwrap(), fp.to_vec());
+        assert_eq!(interp_linear_extrap(&xp, &xp, &fp).unwrap(), fp.to_vec());
     }
 
     #[test]
-    fn test_interp_linear_empty_query_is_empty() {
+    fn test_interp_linear_extrap_empty_query_is_empty() {
         let xp = [0.0, 1.0];
         let fp = [0.0, 2.0];
-        assert!(interp_linear(&[], &xp, &fp).unwrap().is_empty());
         assert!(interp_linear_extrap(&[], &xp, &fp).unwrap().is_empty());
     }
 
@@ -1267,25 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interp_linear_rejects_points_outside_the_range() {
-        let xp = [0.0, 1.0, 2.0];
-        let fp = [0.0, 1.0, 4.0];
-        assert!(matches!(
-            interp_linear(&[0.5, 2.5], &xp, &fp).unwrap_err(),
-            EdgeErrors::OutsideKnotRange { .. }
-        ));
-        assert!(matches!(
-            interp_linear(&[-0.5], &xp, &fp).unwrap_err(),
-            EdgeErrors::OutsideKnotRange { .. }
-        ));
-    }
-
-    #[test]
     fn test_interp_linear_rejects_too_few_points() {
-        assert!(matches!(
-            interp_linear(&[0.5], &[0.0], &[1.0]).unwrap_err(),
-            EdgeErrors::InvalidArgument(_)
-        ));
         assert!(matches!(
             interp_linear_extrap(&[0.5], &[], &[]).unwrap_err(),
             EdgeErrors::InvalidArgument(_)

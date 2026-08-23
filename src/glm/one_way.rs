@@ -15,6 +15,7 @@ use faer::linalg::solvers::Solve;
 use rayon::prelude::*;
 
 use crate::core::expression::check_dispersion;
+use crate::glm::ETA_CLAMP;
 use crate::glm::one_group::{OneGroupParams, fit_one_gene, initial_coefficient};
 use crate::prelude::*;
 use crate::utils::design::design_as_factor;
@@ -22,9 +23,6 @@ use crate::utils::design::design_as_factor;
 ////////////
 // Consts //
 ////////////
-
-/// Bound on the linear predictor before exponentiating.
-const ETA_CLAMP: f64 = 500.0;
 
 /// Floor applied to group coefficients before they are used.
 ///

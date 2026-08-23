@@ -728,6 +728,51 @@ fn prepare_var_design(
     Ok((out, ngam))
 }
 
+/// Scales each design column by the per-observation square-root weight.
+///
+/// ### Params
+///
+/// * `design` - Column-major `n * p` design
+/// * `root_w` - Square-root weights, length `n`
+/// * `n` - Number of observations
+/// * `p` - Number of columns
+///
+/// ### Returns
+///
+/// The weighted design, column-major `n * p`.
+fn weight_columns(design: &[f64], root_w: &[f64], n: usize, p: usize) -> Vec<f64> {
+    let mut xw = vec![0.0; n * p];
+    for j in 0..p {
+        for i in 0..n {
+            xw[j * n + i] = root_w[i] * design[j * n + i];
+        }
+    }
+    xw
+}
+
+/// Reconstructs unweighted residuals `y - X b` from a pivoted QR's solve.
+///
+/// ### Params
+///
+/// * `qr` - The pivoted QR the coefficients were solved from
+/// * `y` - Response of length `n`
+/// * `design` - Column-major `n * p` design, unweighted
+/// * `coef` - Coefficients in pivot order, as returned by [`LinpackQr::solve_r`]
+/// * `n` - Number of observations
+///
+/// ### Returns
+///
+/// The residuals, length `n`.
+fn qr_residuals(qr: &LinpackQr, y: &[f64], design: &[f64], coef: &[f64], n: usize) -> Vec<f64> {
+    let mut residuals = y.to_vec();
+    for (m, &j) in qr.pivot.iter().enumerate() {
+        for i in 0..n {
+            residuals[i] -= design[j * n + i] * coef[m];
+        }
+    }
+    residuals
+}
+
 /// One weighted least squares fit, R's `lm.wfit`.
 struct WeightedFit {
     /// Unweighted residuals `y - X b`, one per observation.
@@ -757,12 +802,7 @@ struct WeightedFit {
 /// fit has no residual degrees of freedom, matching R's `mean(numeric(0))`.
 fn weighted_fit(x: &[f64], y: &[f64], w: &[f64], n: usize, p: usize) -> WeightedFit {
     let root_w: Vec<f64> = w.iter().map(|v| v.sqrt()).collect();
-    let mut xw = vec![0.0; n * p];
-    for j in 0..p {
-        for i in 0..n {
-            xw[j * n + i] = root_w[i] * x[j * n + i];
-        }
-    }
+    let xw = weight_columns(x, &root_w, n, p);
     let qr = LinpackQr::new(xw, n, p);
     let rank = qr.rank();
 
@@ -770,12 +810,7 @@ fn weighted_fit(x: &[f64], y: &[f64], w: &[f64], n: usize, p: usize) -> Weighted
     qr.qty(&mut effects);
     let coef = qr.solve_r(&effects);
 
-    let mut residuals = y.to_vec();
-    for (m, &j) in qr.pivot.iter().enumerate() {
-        for i in 0..n {
-            residuals[i] -= x[j * n + i] * coef[m];
-        }
-    }
+    let residuals = qr_residuals(&qr, y, x, &coef, n);
 
     let s2 = if n > rank {
         effects[rank..].iter().map(|v| v * v).sum::<f64>() / (n - rank) as f64
@@ -1039,6 +1074,32 @@ pub fn array_weights(
     }
 }
 
+/// The prior ridge `prior_n * Z2' Z2`, the starting information for all three
+/// array weight estimators.
+///
+/// ### Params
+///
+/// * `z2` - Column-major `n_samples * ngam` variance design
+/// * `n_samples` - Number of samples
+/// * `ngam` - Number of variance coefficients
+/// * `prior_n` - Prior gene count
+///
+/// ### Returns
+///
+/// The `ngam * ngam` ridge matrix, row-major.
+fn prior_ridge(z2: &[f64], n_samples: usize, ngam: usize, prior_n: f64) -> Vec<f64> {
+    let mut m = vec![0.0; ngam * ngam];
+    for b in 0..ngam {
+        for a in 0..ngam {
+            let dot: f64 = (0..n_samples)
+                .map(|i| z2[a * n_samples + i] * z2[b * n_samples + i])
+                .sum();
+            m[b * ngam + a] = prior_n * dot;
+        }
+    }
+    m
+}
+
 /// limma's `.arrayWeightsGeneByGene`.
 ///
 /// One Fisher scoring step per gene, with the weights refreshed after every
@@ -1077,15 +1138,7 @@ fn array_weights_gene_by_gene(
     let mut aw = vec![1.0; n_samples];
 
     // info2 starts at the prior ridge `prior_n * Z2' Z2`.
-    let mut info2 = vec![0.0; ngam * ngam];
-    for b in 0..ngam {
-        for a in 0..ngam {
-            let dot: f64 = (0..n_samples)
-                .map(|i| z2[a * n_samples + i] * z2[b * n_samples + i])
-                .sum();
-            info2[b * ngam + a] = prior_n * dot;
-        }
-    }
+    let mut info2 = prior_ridge(z2, n_samples, ngam, prior_n);
 
     let mut edge = vec![0.0; ngam];
     let mut block = vec![0.0; ngam * ngam];
@@ -1360,18 +1413,7 @@ fn array_weights_reml(
     };
 
     let p2 = p * (p + 1) / 2;
-    let ridge: Vec<f64> = {
-        let mut m = vec![0.0; ngam * ngam];
-        for b in 0..ngam {
-            for a in 0..ngam {
-                m[b * ngam + a] = prior_n
-                    * (0..n_samples)
-                        .map(|i| z2[a * n_samples + i] * z2[b * n_samples + i])
-                        .sum::<f64>();
-            }
-        }
-        m
-    };
+    let ridge: Vec<f64> = prior_ridge(z2, n_samples, ngam, prior_n);
 
     let mut gam = vec![0.0; ngam];
     let mut w: Vec<f64> = vec![1.0; n_samples];
@@ -1458,12 +1500,7 @@ fn reml_gene_pass(
     w: &[f64],
 ) -> (Vec<f64>, Vec<f64>, LinpackQr) {
     let root_w: Vec<f64> = w.iter().map(|v| v.sqrt()).collect();
-    let mut xw = vec![0.0; n_samples * p];
-    for j in 0..p {
-        for i in 0..n_samples {
-            xw[j * n_samples + i] = root_w[i] * design[j * n_samples + i];
-        }
-    }
+    let xw = weight_columns(design, &root_w, n_samples, p);
     let qr = LinpackQr::new(xw, n_samples, p);
     let rank = qr.rank();
     let df = (n_samples - rank) as f64;
@@ -1480,12 +1517,7 @@ fn reml_gene_pass(
                 let coef = qr.solve_r(&effects);
                 let variance = effects[rank..].iter().map(|v| v * v).sum::<f64>() / df;
                 s2.push(variance);
-                let mut residual = row.to_vec();
-                for (m, &j) in qr.pivot.iter().enumerate() {
-                    for i in 0..n_samples {
-                        residual[i] -= design[j * n_samples + i] * coef[m];
-                    }
-                }
+                let residual = qr_residuals(&qr, row, design, &coef, n_samples);
                 for i in 0..n_samples {
                     acc[i] += w[i] * residual[i] * residual[i] / variance;
                 }
@@ -1550,18 +1582,7 @@ fn array_weights_prior_reml(
     tol: f64,
 ) -> Result<Vec<f64>, EdgeErrors> {
     let p2 = p * (p + 1) / 2;
-    let ridge: Vec<f64> = {
-        let mut m = vec![0.0; ngam * ngam];
-        for b in 0..ngam {
-            for a in 0..ngam {
-                m[b * ngam + a] = prior_n
-                    * (0..n_samples)
-                        .map(|i| z2[a * n_samples + i] * z2[b * n_samples + i])
-                        .sum::<f64>();
-            }
-        }
-        m
-    };
+    let ridge: Vec<f64> = prior_ridge(z2, n_samples, ngam, prior_n);
 
     let mut gam = vec![0.0; ngam];
     let mut w = vec![1.0; n_samples];
@@ -1580,12 +1601,7 @@ fn array_weights_prior_reml(
                 {
                     let full_w: Vec<f64> = (0..n_samples).map(|j| w[j] * wrow[j]).collect();
                     let root_w: Vec<f64> = full_w.iter().map(|v| v.sqrt()).collect();
-                    let mut xw = vec![0.0; n_samples * p];
-                    for j in 0..p {
-                        for i in 0..n_samples {
-                            xw[j * n_samples + i] = root_w[i] * design[j * n_samples + i];
-                        }
-                    }
+                    let xw = weight_columns(design, &root_w, n_samples, p);
                     let qr = LinpackQr::new(xw, n_samples, p);
                     let rank = qr.rank();
                     let mut effects: Vec<f64> =
@@ -1598,15 +1614,13 @@ fn array_weights_prior_reml(
                     let (q2, hat) = residual_moments(&qr, n_samples, p);
                     let (corner, edge, block) =
                         reml_information(&q2, p2, &hat, z2, ngam, n_samples);
-                    sweep_intercept(&mut info2, corner, &edge, &block, ngam);
+                    let added = sweep_intercept(&mut info2, corner, &edge, &block, ngam);
 
-                    if s2 > MIN_RESIDUAL_VAR {
-                        let mut residual = row.to_vec();
-                        for (m, &j) in qr.pivot.iter().enumerate() {
-                            for i in 0..n_samples {
-                                residual[i] -= design[j * n_samples + i] * coef[m];
-                            }
-                        }
+                    // Skip the score contribution too when the information one
+                    // was skipped, so info2 and z never fall out of step - the
+                    // same rule array_weights_gene_by_gene applies.
+                    if added && s2 > MIN_RESIDUAL_VAR {
+                        let residual = qr_residuals(&qr, row, design, &coef, n_samples);
                         for i in 0..n_samples {
                             z[i] += full_w[i] * residual[i] * residual[i] / s2 - (1.0 - hat[i]);
                         }

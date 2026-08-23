@@ -13,6 +13,7 @@ use rayon::prelude::*;
 use crate::core::expression::check_dispersion;
 use crate::errors::EdgeErrors;
 use crate::glm::deviance::unit_nb_deviance;
+use crate::glm::{EMPTY_GENE_COEF, ETA_CLAMP, MIN_POSITIVE};
 use crate::utils::recycled::{Recycled, RecycledRow};
 use crate::utils::simd::EdgeSimd;
 use crate::utils::traits::EdgeFloat;
@@ -20,20 +21,6 @@ use crate::utils::traits::EdgeFloat;
 ////////////
 // Consts //
 ////////////
-
-/// Bound on the linear predictor before exponentiating.
-///
-/// `exp(710)` overflows a double. Clamping at 500 keeps the fitted mean finite
-/// through the wild excursions a rejected Levenberg step can produce, without
-/// touching any value a converged fit would reach. edgeR clamps at the same
-/// place.
-const ETA_CLAMP: f64 = 500.0;
-
-/// Floor applied to fitted means and working weights.
-///
-/// Both appear in denominators. This is small enough never to bind on real data
-/// and large enough to keep the reciprocal finite.
-const MIN_POSITIVE: f64 = 1e-300;
 
 /// Starting Levenberg damping factor.
 const INITIAL_DAMPING: f64 = 1e-3;
@@ -296,12 +283,6 @@ fn deviance_of(
         .sum()
 }
 
-/// Log-rate assigned to a gene with nothing to fit.
-///
-/// edgeR starts an all-zero gene at a very small mean rather than at negative
-/// infinity, so that the first step is finite.
-const EMPTY_GENE_LOG_RATE: f64 = -20.0;
-
 /// Least-squares projection of a per-sample target onto the design.
 ///
 /// Solves `design * beta = z` in the least-squares sense through the normal
@@ -414,7 +395,7 @@ pub(crate) fn initial_coefficients(
             let rate = if num > 0.0 && den > 0.0 {
                 (num / den).max(MIN_POSITIVE).ln()
             } else {
-                EMPTY_GENE_LOG_RATE
+                EMPTY_GENE_COEF
             };
             vec![rate; n_samples]
         }

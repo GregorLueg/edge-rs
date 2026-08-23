@@ -180,12 +180,7 @@ fn validate_weights(weights: Option<&[f64]>, n_rows: usize) -> Result<Vec<f64>, 
             got: w.len(),
         });
     }
-    if let Some(i) = w.iter().position(|v| *v < 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "prior weights must be non-negative; weights[{i}] is {}",
-            w[i]
-        )));
-    }
+    crate::limma::check_nonneg_weights(w)?;
     Ok(w.to_vec())
 }
 
@@ -667,22 +662,21 @@ pub fn locfit_by_col(
     let mut coef0 = vec![0.0; n_vertices * n_cols];
     let mut coef1 = vec![0.0; n_vertices * n_cols];
     let parallel = n_rows * n_cols >= PARALLEL_WORK_THRESHOLD;
+    let fit = |(v, (c0, c1)): (usize, (&mut [f64], &mut [f64]))| {
+        fit_vertex(&xs, y, n_cols, &weights, vertices[v], degree, c0, c1);
+    };
     if parallel {
         coef0
             .par_chunks_mut(n_cols)
             .zip(coef1.par_chunks_mut(n_cols))
             .enumerate()
-            .for_each(|(v, (c0, c1))| {
-                fit_vertex(&xs, y, n_cols, &weights, vertices[v], degree, c0, c1);
-            });
+            .for_each(fit);
     } else {
         coef0
             .chunks_mut(n_cols)
             .zip(coef1.chunks_mut(n_cols))
             .enumerate()
-            .for_each(|(v, (c0, c1))| {
-                fit_vertex(&xs, y, n_cols, &weights, vertices[v], degree, c0, c1);
-            });
+            .for_each(fit);
     }
 
     let mut fitted = vec![0.0; n_rows * n_cols];

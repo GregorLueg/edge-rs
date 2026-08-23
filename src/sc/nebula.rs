@@ -216,8 +216,12 @@ pub struct NebulaParams {
     pub mincp: usize,
     /// Estimate the overdispersions by restricted maximum likelihood.
     ///
-    /// nebula only honours this for `NBLMM`, which this port does not implement,
-    /// so it is here for completeness and defaults off.
+    /// R's `nebula` package only honours this for `NBLMM`, which this port does
+    /// not implement. Here it is threaded through unconditionally and does
+    /// change the fit on NBGMM, the only model implemented: [`opt_pml`] adds a
+    /// log-determinant term to the outer overdispersion objective whenever it is
+    /// set. That behaviour has not been validated against an R reference, since
+    /// R never exercises `reml` on this model. Defaults off.
     pub reml: bool,
     /// Absolute stopping tolerance handed to [`opt_pml`], nebula's `eps`.
     pub eps: f64,
@@ -241,28 +245,6 @@ impl Default for NebulaParams {
 }
 
 impl NebulaParams {
-    /// Builds a parameter set, leaving everything not named at its default.
-    ///
-    /// ### Params
-    ///
-    /// * `method` - NEBULA-LN or NEBULA-HL
-    /// * `cutoff_cell` - Refit trigger on cells per subject times `phi`
-    /// * `cpc` - Minimum mean count per cell
-    /// * `mincp` - Minimum number of expressed cells
-    ///
-    /// ### Returns
-    ///
-    /// The parameter set.
-    pub fn new(method: NebulaMethod, cutoff_cell: f64, cpc: f64, mincp: usize) -> Self {
-        Self {
-            method,
-            cutoff_cell,
-            cpc,
-            mincp,
-            ..Self::default()
-        }
-    }
-
     /// Checks the knobs the optimisers cannot recover from.
     ///
     /// ### Returns

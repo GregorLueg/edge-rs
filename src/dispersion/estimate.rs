@@ -586,32 +586,6 @@ fn expand_to_all_genes(
     out
 }
 
-/// Restricts a recycled matrix to a subset of genes.
-///
-/// ### Params
-///
-/// * `source` - The recycled matrix
-/// * `kept` - Indices of the retained genes
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// A recycled matrix over the retained genes only. The scalar and per-sample
-/// forms are unchanged, which is the common case and costs nothing.
-fn subset_recycled(source: &Recycled<f64>, kept: &[usize], n_samples: usize) -> Recycled<f64> {
-    match source {
-        Recycled::Scalar(v) => Recycled::Scalar(*v),
-        Recycled::BySample(v) => Recycled::BySample(v.clone()),
-        Recycled::ByGene(v) => Recycled::ByGene(kept.iter().map(|&g| v[g]).collect()),
-        Recycled::Full(v) => {
-            let mut out = Vec::with_capacity(kept.len() * n_samples);
-            for &gene in kept {
-                out.extend_from_slice(&v[gene * n_samples..(gene + 1) * n_samples]);
-            }
-            Recycled::Full(out)
-        }
-    }
-}
 
 /// Residual degrees of freedom per gene, reduced where the fit hit exact zeros.
 ///
@@ -748,21 +722,19 @@ pub fn estimate_disp<T: EdgeFloat>(
 
     // Genes with too few counts carry no information about the dispersion and
     // would only add noise to the trend.
-    let keep: Vec<bool> = counts
-        .chunks_exact(n_samples)
-        .map(|row| row.iter().map(|v| v.to_f64().unwrap_or(0.0)).sum::<f64>() >= params.min_row_sum)
-        .collect();
-    let kept: Vec<usize> = (0..n_genes).filter(|&g| keep[g]).collect();
-    if kept.is_empty() {
-        return Err(EdgeErrors::NoGenesAfterFiltering { n_genes });
-    }
+    let kept = crate::dispersion::filter_by_min_row_sum(
+        counts,
+        n_genes,
+        n_samples,
+        params.min_row_sum,
+    )?;
 
     let mut selected = Vec::with_capacity(kept.len() * n_samples);
     for &gene in &kept {
         selected.extend_from_slice(&counts[gene * n_samples..(gene + 1) * n_samples]);
     }
-    let selected_offset = subset_recycled(offset, &kept, n_samples);
-    let selected_weights = weights.map(|w| subset_recycled(w, &kept, n_samples));
+    let selected_offset = offset.subset(&kept, n_samples);
+    let selected_weights = weights.map(|w| w.subset(&kept, n_samples));
 
     // The grid is uniform in log2(dispersion / 0.1).
     let n_grid = params.grid_length;
@@ -1365,21 +1337,6 @@ mod tests {
         assert_relative_eq!(df[0], 4.0, max_relative = 1e-12);
         // Three zeros leave three samples and a rank-1 design, so 2 df.
         assert_relative_eq!(df[1], 2.0, max_relative = 1e-12);
-    }
-
-    #[test]
-    fn test_subset_recycled_leaves_shared_forms_alone() {
-        let kept = [0usize, 2];
-        assert!(matches!(
-            subset_recycled(&Recycled::scalar(1.0), &kept, 3),
-            Recycled::Scalar(_)
-        ));
-        assert!(matches!(
-            subset_recycled(&Recycled::by_sample(vec![1.0, 2.0, 3.0]), &kept, 3),
-            Recycled::BySample(_)
-        ));
-        let by_gene = subset_recycled(&Recycled::by_gene(vec![1.0, 2.0, 3.0]), &kept, 3);
-        assert_eq!(by_gene.expand(2, 1), vec![1.0, 3.0]);
     }
 
     #[test]

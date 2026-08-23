@@ -127,6 +127,31 @@ pub fn rank_average(x: &[f64]) -> Vec<f64> {
 // Quantiles //
 ///////////////
 
+/// Median of a slice.
+///
+/// ### Params
+///
+/// * `x` - Values, in any order. Copied and sorted internally with
+///   [`f64::total_cmp`], so a NaN sorts to the top rather than propagating
+///   through the comparison.
+///
+/// ### Returns
+///
+/// The median, or `NaN` for an empty slice.
+pub fn median(x: &[f64]) -> f64 {
+    if x.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = x.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    if n.is_multiple_of(2) {
+        0.5 * (sorted[n / 2 - 1] + sorted[n / 2])
+    } else {
+        sorted[n / 2]
+    }
+}
+
 /// Sample quantile by R's type 7 rule, the default of `quantile()`.
 ///
 /// Type 7 places the `k`-th order statistic at probability `(k - 1) / (n - 1)`

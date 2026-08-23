@@ -530,7 +530,7 @@ pub fn pois_kappa(mu: f64) -> f64 {
 /// ### Params
 ///
 /// * `mu` - Fitted mean
-/// * `phi` - Dispersion, expected in `(0, 0.736)`
+/// * `phi` - Dispersion, expected in `[0, 0.736)`
 ///
 /// ### Returns
 ///
@@ -572,7 +572,7 @@ fn nb_alpha_case1(mu: f64, phi: f64) -> f64 {
 /// ### Params
 ///
 /// * `mu` - Fitted mean
-/// * `phi` - Dispersion, expected in `(0, 0.736)`
+/// * `phi` - Dispersion, expected in `[0, 0.736)`
 ///
 /// ### Returns
 ///
@@ -799,13 +799,7 @@ fn nb_moments_large_phi(mu: f64, phi: f64) -> (f64, f64) {
 /// `2 E[d] / Var[d]` for `d` the unit deviance at `(mu, phi)`, or zero when
 /// `mu` is below [`MIN_MU`].
 pub fn nb_alpha(mu: f64, phi: f64) -> f64 {
-    if phi < PHI_CASE1_MAX {
-        nb_alpha_case1(mu, phi)
-    } else if phi < PHI_CASE2_MAX {
-        nb_alpha_case2(mu, phi)
-    } else {
-        nb_moments_large_phi(mu, phi).0
-    }
+    compute_weight(mu, phi, 1.0).0
 }
 
 /// Degrees of freedom of the negative binomial unit deviance.
@@ -824,13 +818,7 @@ pub fn nb_alpha(mu: f64, phi: f64) -> f64 {
 /// `2 E[d]^2 / Var[d]` for `d` the unit deviance at `(mu, phi)`, or zero when
 /// `mu` is below [`MIN_MU`].
 pub fn nb_kappa(mu: f64, phi: f64) -> f64 {
-    if phi < PHI_CASE1_MAX {
-        nb_kappa_case1(mu, phi)
-    } else if phi < PHI_CASE2_MAX {
-        nb_kappa_case2(mu, phi)
-    } else {
-        nb_moments_large_phi(mu, phi).1
-    }
+    compute_weight(mu, phi, 1.0).1
 }
 
 /// Both quasi-likelihood weights for one observation.

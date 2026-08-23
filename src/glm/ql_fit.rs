@@ -164,54 +164,6 @@ pub struct QlFit {
 // Helpers //
 /////////////
 
-/// Applies a map to every stored value of a recycled matrix.
-///
-/// The compressed forms stay compressed, so clamping a scalar dispersion still
-/// costs one value rather than `n_genes * n_samples`.
-///
-/// ### Params
-///
-/// * `source` - The recycled matrix
-/// * `f` - Map applied to each stored value
-///
-/// ### Returns
-///
-/// A recycled matrix of the same shape.
-fn map_recycled(source: &Recycled<f64>, f: impl Fn(f64) -> f64) -> Recycled<f64> {
-    match source {
-        Recycled::Scalar(v) => Recycled::Scalar(f(*v)),
-        Recycled::ByGene(v) => Recycled::ByGene(v.iter().map(|x| f(*x)).collect()),
-        Recycled::BySample(v) => Recycled::BySample(v.iter().map(|x| f(*x)).collect()),
-        Recycled::Full(v) => Recycled::Full(v.iter().map(|x| f(*x)).collect()),
-    }
-}
-
-/// Restricts a recycled matrix to a subset of genes.
-///
-/// ### Params
-///
-/// * `source` - The recycled matrix
-/// * `kept` - Gene indices to retain
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// A recycled matrix over the retained genes.
-fn subset_recycled(source: &Recycled<f64>, kept: &[usize], n_samples: usize) -> Recycled<f64> {
-    match source {
-        Recycled::Scalar(v) => Recycled::Scalar(*v),
-        Recycled::BySample(v) => Recycled::BySample(v.clone()),
-        Recycled::ByGene(v) => Recycled::ByGene(kept.iter().map(|&g| v[g]).collect()),
-        Recycled::Full(v) => {
-            let mut out = Vec::with_capacity(kept.len() * n_samples);
-            for &gene in kept {
-                out.extend_from_slice(&v[gene * n_samples..(gene + 1) * n_samples]);
-            }
-            Recycled::Full(out)
-        }
-    }
-}
-
 /// Estimates a negative binomial dispersion from the most abundant genes.
 ///
 /// edgeR does not use every gene. The quasi-likelihood weights need a dispersion
@@ -255,8 +207,8 @@ fn dispersion_from_top_genes<T: EdgeFloat>(
     for &gene in kept {
         selected.extend_from_slice(&counts[gene * n_samples..(gene + 1) * n_samples]);
     }
-    let selected_offset = subset_recycled(offset, kept, n_samples);
-    let selected_weights = weights.map(|w| subset_recycled(w, kept, n_samples));
+    let selected_offset = offset.subset(kept, n_samples);
+    let selected_weights = weights.map(|w| w.subset(kept, n_samples));
 
     // Subsetting is off here: this already is a subset, chosen by abundance
     // rather than stratified across it, and a second one would compound them.
@@ -315,7 +267,7 @@ fn resolve_dispersion<T: EdgeFloat>(
         let resolved = if params.legacy {
             d.clone()
         } else {
-            map_recycled(d, |v| v.min(MAX_DISPERSION))
+            d.map(|v| v.min(MAX_DISPERSION))
         };
         return Ok((resolved, None));
     }
@@ -465,7 +417,7 @@ pub fn glm_ql_fit<T: EdgeFloat>(
 
         // Refit with the negative binomial dispersion rescaled, so the two
         // dispersion layers do not describe the same variation twice.
-        let scaled = map_recycled(&dispersion, |v| v / average[0]);
+        let scaled = dispersion.map(|v| v / average[0]);
         let refit = glm_fit(
             counts,
             n_genes,

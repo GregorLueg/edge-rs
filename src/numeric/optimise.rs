@@ -3,12 +3,14 @@
 //! Between them these cover every `scipy.optimize` call in edgePython except
 //! the bounded quasi-Newton, which lives in [`crate::numeric::lbfgsb`]:
 //!
-//! * `minimize_scalar(method = 'bounded')` becomes [`brent_minimise_bounded`],
-//!   used by `disp_cox_reid` and the TMM-to-ChIP normalisation
 //! * `brentq` becomes [`brentq`], used by `disp_pearson`, `disp_deviance` and
 //!   limma's `fitFDist`
 //! * `minimize(method = 'Nelder-Mead')` becomes [`nelder_mead`], used by the
 //!   spline and power trend fitters
+//!
+//! [`brent_fmin`] is a separate, R-derived bounded minimiser (not a
+//! `scipy.optimize` port), used by `disp_cox_reid` and limma's `squeezeVar`
+//! where matching R's own `Brent_fmin` stopping point matters.
 //!
 //! The initial simplex in [`nelder_mead`] reproduces scipy's construction
 //! exactly, because a derivative-free search on a flat likelihood surface is
@@ -21,9 +23,6 @@ use crate::prelude::*;
 ////////////
 // Consts //
 ////////////
-
-/// Squared inverse of the golden ratio, the golden section step.
-const GOLDEN: f64 = 0.381_966_011_250_105_2;
 
 /// Default `tol` of R's `optimize`, `.Machine$double.eps^0.25`, which is exactly
 /// `2^-13`.
@@ -47,145 +46,6 @@ const NELDER_MEAD_STEP: f64 = 0.05;
 ///
 /// A relative step cannot move a zero, so scipy substitutes this constant.
 const NELDER_MEAD_ZERO_STEP: f64 = 0.000_25;
-
-////////////////////////////
-// Bounded scalar minimum //
-////////////////////////////
-
-/// Minimises a scalar function on a closed interval.
-///
-/// Brent's method: golden section search with parabolic interpolation accepted
-/// whenever it stays inside the bracket and improves on the previous step. This
-/// is the algorithm behind
-/// `scipy.optimize.minimize_scalar(method = 'bounded')`, down to the
-/// convergence test.
-///
-/// ### Params
-///
-/// * `f` - Objective, evaluated only inside `[lower, upper]`
-/// * `lower` - Lower end of the interval
-/// * `upper` - Upper end of the interval
-/// * `xatol` - Absolute tolerance on the location of the minimum
-/// * `max_iter` - Evaluation budget
-///
-/// ### Returns
-///
-/// The minimiser and its objective value, or [`EdgeErrors`] if the interval is
-/// inverted or the budget runs out.
-///
-/// ### References
-///
-/// Brent, Algorithms for Minimization without Derivatives, 1973, chapter 5
-pub fn brent_minimise_bounded<F>(
-    mut f: F,
-    lower: f64,
-    upper: f64,
-    xatol: f64,
-    max_iter: usize,
-) -> Result<(f64, f64), EdgeErrors>
-where
-    F: FnMut(f64) -> f64,
-{
-    // Written as an explicit ordering test so a NaN bound is rejected rather
-    // than slipping through a negated comparison.
-    if lower.partial_cmp(&upper) != Some(Ordering::Less) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "brent_minimise_bounded needs lower < upper, got [{lower}, {upper}]"
-        )));
-    }
-    if xatol <= 0.0 {
-        return Err(EdgeErrors::MustBePositive("xatol".to_string()));
-    }
-
-    let (mut a, mut b) = (lower, upper);
-    let mut x = a + GOLDEN * (b - a);
-    let (mut w, mut v) = (x, x);
-    let mut fx = f(x);
-    let (mut fw, mut fv) = (fx, fx);
-    let mut step_before_last: f64 = 0.0;
-    let mut last_step: f64 = 0.0;
-
-    for _ in 0..max_iter {
-        let midpoint = 0.5 * (a + b);
-        let tol1 = xatol * x.abs() + xatol / 3.0;
-        let tol2 = 2.0 * tol1;
-        if (x - midpoint).abs() <= tol2 - 0.5 * (b - a) {
-            return Ok((x, fx));
-        }
-
-        let mut golden_step = true;
-        if step_before_last.abs() > tol1 {
-            let r = (x - w) * (fx - fv);
-            let mut q = (x - v) * (fx - fw);
-            let mut p = (x - v) * q - (x - w) * r;
-            q = 2.0 * (q - r);
-            if q > 0.0 {
-                p = -p;
-            }
-            q = q.abs();
-            let prev = step_before_last;
-            step_before_last = last_step;
-
-            let acceptable = p.abs() < (0.5 * q * prev).abs() && p > q * (a - x) && p < q * (b - x);
-            if acceptable {
-                last_step = p / q;
-                let u = x + last_step;
-                // Never evaluate closer than tol2 to an endpoint.
-                if (u - a) < tol2 || (b - u) < tol2 {
-                    last_step = if x < midpoint { tol1 } else { -tol1 };
-                }
-                golden_step = false;
-            }
-        }
-
-        if golden_step {
-            step_before_last = if x >= midpoint { a - x } else { b - x };
-            last_step = GOLDEN * step_before_last;
-        }
-
-        let u = if last_step.abs() >= tol1 {
-            x + last_step
-        } else {
-            x + tol1.copysign(last_step)
-        };
-        let fu = f(u);
-
-        if fu <= fx {
-            if u < x {
-                b = x;
-            } else {
-                a = x;
-            }
-            v = w;
-            fv = fw;
-            w = x;
-            fw = fx;
-            x = u;
-            fx = fu;
-        } else {
-            if u < x {
-                a = u;
-            } else {
-                b = u;
-            }
-            if fu <= fw || w == x {
-                v = w;
-                fv = fw;
-                w = u;
-                fw = fu;
-            } else if fu <= fv || v == x || v == w {
-                v = u;
-                fv = fu;
-            }
-        }
-    }
-
-    Err(EdgeErrors::NoConvergence {
-        routine: "brent_minimise_bounded",
-        iterations: max_iter,
-        last_delta: (b - a).abs(),
-    })
-}
 
 //////////////////
 // Root finding //
@@ -318,14 +178,11 @@ where
 
 /// Minimises a scalar function on a closed interval, as R's `optimize` does.
 ///
-/// A line-by-line port of R's `Brent_fmin`. This is deliberately not
-/// [`brent_minimise_bounded`]: that one is scipy's
-/// `minimize_scalar(method = 'bounded')`, and although the algorithm is the
-/// same Brent search, its convergence test is `xatol * |x| + xatol / 3` where
-/// R's is `sqrt(eps) * |x| + tol / 3`. The two constants cannot be recovered
-/// from a single `xatol`, so the iterates diverge and, on a likelihood as flat
-/// as this one, so does the answer. Matching limma to more than its own `tol`
-/// requires stopping where limma stops.
+/// A line-by-line port of R's `Brent_fmin`, including its convergence test
+/// (`sqrt(eps) * |x| + tol / 3`). Matching limma to more than its own `tol`
+/// requires stopping exactly where limma stops, on a likelihood flat enough
+/// that a differently-tuned Brent search would land on a visibly different
+/// answer.
 ///
 /// ### Params
 ///
@@ -446,7 +303,8 @@ pub struct NelderMeadParams {
 }
 
 impl Default for NelderMeadParams {
-    /// scipy's defaults.
+    /// `xatol`/`fatol` match scipy's defaults. `max_iter` is a fixed fallback,
+    /// not scipy's rule (scipy defaults to `N * 200` for `N` parameters).
     fn default() -> Self {
         Self {
             xatol: 1e-4,
@@ -629,39 +487,6 @@ where
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-
-    #[test]
-    fn test_brent_minimise_finds_a_smooth_interior_minimum() {
-        // (x - 1.234)^2 + 3, minimum at 1.234.
-        let (x, fx) =
-            brent_minimise_bounded(|x| (x - 1.234).powi(2) + 3.0, -5.0, 5.0, 1e-10, 200).unwrap();
-        assert_relative_eq!(x, 1.234, max_relative = 1e-7);
-        assert_relative_eq!(fx, 3.0, max_relative = 1e-10);
-    }
-
-    /// scipy: `minimize_scalar(lambda x: (x-2)**2*np.exp(x), bounds=(0,5), method='bounded')`
-    /// gives x = 2.0 to the default tolerance.
-    #[test]
-    fn test_brent_minimise_matches_scipy_on_a_skewed_objective() {
-        let (x, _) =
-            brent_minimise_bounded(|x: f64| (x - 2.0).powi(2) * x.exp(), 0.0, 5.0, 1e-8, 200)
-                .unwrap();
-        assert_relative_eq!(x, 2.0, max_relative = 1e-6);
-    }
-
-    /// The minimum lies outside the interval, so the answer must be the endpoint.
-    #[test]
-    fn test_brent_minimise_returns_an_endpoint_when_the_minimum_is_outside() {
-        let (x, _) =
-            brent_minimise_bounded(|x: f64| (x - 10.0).powi(2), 0.0, 1.0, 1e-8, 200).unwrap();
-        assert_relative_eq!(x, 1.0, max_relative = 1e-4);
-    }
-
-    #[test]
-    fn test_brent_minimise_rejects_an_inverted_interval() {
-        let err = brent_minimise_bounded(|x: f64| x, 2.0, 1.0, 1e-8, 100).unwrap_err();
-        assert!(matches!(err, EdgeErrors::InvalidArgument(_)));
-    }
 
     #[test]
     fn test_brentq_finds_a_polynomial_root() {

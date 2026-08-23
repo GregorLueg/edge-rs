@@ -289,11 +289,7 @@ pub fn diff_splice<T: EdgeFloat>(
         }
     }
 
-    let gene_offset: Vec<f64> = input
-        .offset
-        .row(kept_exons[0], n_samples)
-        .iter(n_samples)
-        .collect();
+    let gene_offset: Vec<f64> = input.offset.row(kept_exons[0], n_samples).to_vec(n_samples);
     let gene_fit = glm_fit(
         &gene_counts,
         n_kept_genes,
@@ -321,14 +317,12 @@ pub fn diff_splice<T: EdgeFloat>(
         }
     }
 
-    let dispersion = subset_rows(input.dispersion, &kept_exons, n_samples);
+    let dispersion = input.dispersion.subset(&kept_exons, n_samples);
     let dispersion = match ql.and_then(|q| q.average_ql_dispersion) {
-        Some(average) => scale_recycled(&dispersion, 1.0 / average),
+        Some(average) => dispersion.map(|v| v / average),
         None => dispersion,
     };
-    let weights = input
-        .weights
-        .map(|w| subset_rows(w, &kept_exons, n_samples));
+    let weights = input.weights.map(|w| w.subset(&kept_exons, n_samples));
 
     let design0 = drop_column(&resolved.design, n_samples, n_coef, resolved.coef);
     let fit0 = glm_fit(
@@ -1160,50 +1154,6 @@ fn validate<T: EdgeFloat>(
         }
     }
     Ok(())
-}
-
-/// Takes a subset of rows from a recycled matrix, keeping it compressed.
-///
-/// ### Params
-///
-/// * `source` - The recycled matrix, logically `n_rows * n_samples`
-/// * `rows` - Row indices to keep, in the order wanted
-/// * `n_samples` - Number of samples, needed to slice the dense case
-///
-/// ### Returns
-///
-/// The same variant, restricted to `rows`. A `Scalar` or `BySample` does not
-/// vary by row and is returned untouched.
-fn subset_rows(source: &Recycled<f64>, rows: &[usize], n_samples: usize) -> Recycled<f64> {
-    match source {
-        Recycled::Scalar(v) => Recycled::Scalar(*v),
-        Recycled::BySample(v) => Recycled::BySample(v.clone()),
-        Recycled::ByGene(v) => Recycled::ByGene(rows.iter().map(|r| v[*r]).collect()),
-        Recycled::Full(v) => Recycled::Full(
-            rows.iter()
-                .flat_map(|r| v[r * n_samples..(r + 1) * n_samples].iter().copied())
-                .collect(),
-        ),
-    }
-}
-
-/// Multiplies every stored value of a recycled matrix by a factor.
-///
-/// ### Params
-///
-/// * `source` - The recycled matrix
-/// * `factor` - Multiplier
-///
-/// ### Returns
-///
-/// The same variant, scaled. The compressed forms stay compressed.
-fn scale_recycled(source: &Recycled<f64>, factor: f64) -> Recycled<f64> {
-    match source {
-        Recycled::Scalar(v) => Recycled::Scalar(v * factor),
-        Recycled::ByGene(v) => Recycled::ByGene(v.iter().map(|x| x * factor).collect()),
-        Recycled::BySample(v) => Recycled::BySample(v.iter().map(|x| x * factor).collect()),
-        Recycled::Full(v) => Recycled::Full(v.iter().map(|x| x * factor).collect()),
-    }
 }
 
 /// Drops one column from a row-major matrix.

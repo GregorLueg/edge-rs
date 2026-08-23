@@ -105,20 +105,6 @@ pub enum LbfgsbStatus {
     LineSearchFailed,
 }
 
-impl LbfgsbStatus {
-    /// Whether the stop was a genuine convergence rather than giving up.
-    ///
-    /// ### Returns
-    ///
-    /// `true` for the two tolerance statuses.
-    pub fn converged(&self) -> bool {
-        matches!(
-            self,
-            LbfgsbStatus::GradientTolerance | LbfgsbStatus::ObjectiveTolerance
-        )
-    }
-}
-
 //////////////////
 // LbfgsbResult //
 //////////////////

@@ -17,6 +17,7 @@
 
 use crate::errors::EdgeErrors;
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
+use crate::numeric::stats::median as numeric_median;
 
 ////////////
 // Consts //
@@ -276,17 +277,8 @@ fn unshrunk(phi_raw: Vec<f64>, df_residual: f64, dispersion: &[f64]) -> ShrinkRe
 ///
 /// The median, or `NaN` when nothing finite is present.
 fn median(values: &[f64]) -> f64 {
-    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
-    if finite.is_empty() {
-        return f64::NAN;
-    }
-    finite.sort_by(|a, b| a.total_cmp(b));
-    let mid = finite.len() / 2;
-    if finite.len().is_multiple_of(2) {
-        0.5 * (finite[mid - 1] + finite[mid])
-    } else {
-        finite[mid]
-    }
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    numeric_median(&finite)
 }
 
 ///////////
