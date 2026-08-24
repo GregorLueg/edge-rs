@@ -8,11 +8,18 @@
 //!
 //! Each operation exists at four widths: scalar, 128-bit, 256-bit and 512-bit.
 //! [`detect_simd_level`] caches what the machine supports and the trait impls
-//! dispatch on it. A tier does its own unrolled block loop, then single vectors
-//! at its own width, then hands the remainder down to the tier below. That
-//! ladder matters here because the hot caller is `linear_predictor`, which dots
-//! design rows of two to ten elements: a single-width kernel would drop those
-//! straight to scalar.
+//! dispatch on it. A tier vectorises what it can at its own width, then hands
+//! the remainder down to the tier below. That ladder matters here because the
+//! hot caller is `linear_predictor`, which dots design rows of two to ten
+//! elements: a single-width kernel would drop those straight to scalar.
+//!
+//! The reductions run one accumulator, not several. Multiple accumulators break
+//! the `fadd` dependency chain and pay from a few hundred elements up, but the
+//! block loop that drives them needs `lanes * accumulators` elements before it
+//! can fire at all, which at two to ten coefficients it never does. Dropping the
+//! four-accumulator version moved `glm_fit` by under three per cent either way
+//! at two and four coefficients and made it five per cent faster at eight, so it
+//! was buying code and nothing else.
 
 use std::sync::OnceLock;
 
@@ -20,15 +27,6 @@ use wide::{f32x4, f32x8, f64x2, f64x4};
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 use wide::{f32x16, f64x8};
-
-/// Number of independent accumulators in the reduction loops.
-///
-/// A single accumulator serialises on the FMA latency chain. Four independent
-/// ones keep the pipeline fed and is the point of diminishing returns on both
-/// Apple Silicon and x86: eight costs register pressure without buying
-/// throughput. This matches the constant `bixverse-rs` settled on. Four 512-bit
-/// accumulators still leave 28 of the 32 zmm registers free.
-const UNROLL: usize = 4;
 
 //////////////
 // Dispatch //
@@ -163,24 +161,10 @@ fn dot_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
 #[inline]
 fn dot_f64_sse(a: &[f64], b: &[f64]) -> f64 {
     const LANES: usize = 2;
-    const BLOCK: usize = LANES * UNROLL;
 
     let n = a.len().min(b.len());
-    let mut acc = [f64x2::ZERO; UNROLL];
-    let mut i = 0;
-
-    while i + BLOCK <= n {
-        for (u, acc_u) in acc.iter_mut().enumerate() {
-            let off = i + u * LANES;
-            *acc_u += f64x2::from(&a[off..off + LANES]) * f64x2::from(&b[off..off + LANES]);
-        }
-        i += BLOCK;
-    }
-
     let mut total = f64x2::ZERO;
-    for acc_u in acc.iter() {
-        total += *acc_u;
-    }
+    let mut i = 0;
 
     while i + LANES <= n {
         total += f64x2::from(&a[i..i + LANES]) * f64x2::from(&b[i..i + LANES]);
@@ -203,24 +187,10 @@ fn dot_f64_sse(a: &[f64], b: &[f64]) -> f64 {
 #[inline]
 fn dot_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
     const LANES: usize = 4;
-    const BLOCK: usize = LANES * UNROLL;
 
     let n = a.len().min(b.len());
-    let mut acc = [f64x4::ZERO; UNROLL];
-    let mut i = 0;
-
-    while i + BLOCK <= n {
-        for (u, acc_u) in acc.iter_mut().enumerate() {
-            let off = i + u * LANES;
-            *acc_u += f64x4::from(&a[off..off + LANES]) * f64x4::from(&b[off..off + LANES]);
-        }
-        i += BLOCK;
-    }
-
     let mut total = f64x4::ZERO;
-    for acc_u in acc.iter() {
-        total += *acc_u;
-    }
+    let mut i = 0;
 
     while i + LANES <= n {
         total += f64x4::from(&a[i..i + LANES]) * f64x4::from(&b[i..i + LANES]);
@@ -244,24 +214,10 @@ fn dot_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
 #[inline]
 fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
     const LANES: usize = 8;
-    const BLOCK: usize = LANES * UNROLL;
 
     let n = a.len().min(b.len());
-    let mut acc = [f64x8::ZERO; UNROLL];
-    let mut i = 0;
-
-    while i + BLOCK <= n {
-        for (u, acc_u) in acc.iter_mut().enumerate() {
-            let off = i + u * LANES;
-            *acc_u += f64x8::from(&a[off..off + LANES]) * f64x8::from(&b[off..off + LANES]);
-        }
-        i += BLOCK;
-    }
-
     let mut total = f64x8::ZERO;
-    for acc_u in acc.iter() {
-        total += *acc_u;
-    }
+    let mut i = 0;
 
     while i + LANES <= n {
         total += f64x8::from(&a[i..i + LANES]) * f64x8::from(&b[i..i + LANES]);
@@ -320,24 +276,10 @@ fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn dot_f32_sse(a: &[f32], b: &[f32]) -> f32 {
     const LANES: usize = 4;
-    const BLOCK: usize = LANES * UNROLL;
 
     let n = a.len().min(b.len());
-    let mut acc = [f32x4::ZERO; UNROLL];
-    let mut i = 0;
-
-    while i + BLOCK <= n {
-        for (u, acc_u) in acc.iter_mut().enumerate() {
-            let off = i + u * LANES;
-            *acc_u += f32x4::from(&a[off..off + LANES]) * f32x4::from(&b[off..off + LANES]);
-        }
-        i += BLOCK;
-    }
-
     let mut total = f32x4::ZERO;
-    for acc_u in acc.iter() {
-        total += *acc_u;
-    }
+    let mut i = 0;
 
     while i + LANES <= n {
         total += f32x4::from(&a[i..i + LANES]) * f32x4::from(&b[i..i + LANES]);
@@ -360,24 +302,10 @@ fn dot_f32_sse(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     const LANES: usize = 8;
-    const BLOCK: usize = LANES * UNROLL;
 
     let n = a.len().min(b.len());
-    let mut acc = [f32x8::ZERO; UNROLL];
-    let mut i = 0;
-
-    while i + BLOCK <= n {
-        for (u, acc_u) in acc.iter_mut().enumerate() {
-            let off = i + u * LANES;
-            *acc_u += f32x8::from(&a[off..off + LANES]) * f32x8::from(&b[off..off + LANES]);
-        }
-        i += BLOCK;
-    }
-
     let mut total = f32x8::ZERO;
-    for acc_u in acc.iter() {
-        total += *acc_u;
-    }
+    let mut i = 0;
 
     while i + LANES <= n {
         total += f32x8::from(&a[i..i + LANES]) * f32x8::from(&b[i..i + LANES]);
@@ -401,24 +329,10 @@ fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
     const LANES: usize = 16;
-    const BLOCK: usize = LANES * UNROLL;
 
     let n = a.len().min(b.len());
-    let mut acc = [f32x16::ZERO; UNROLL];
-    let mut i = 0;
-
-    while i + BLOCK <= n {
-        for (u, acc_u) in acc.iter_mut().enumerate() {
-            let off = i + u * LANES;
-            *acc_u += f32x16::from(&a[off..off + LANES]) * f32x16::from(&b[off..off + LANES]);
-        }
-        i += BLOCK;
-    }
-
     let mut total = f32x16::ZERO;
-    for acc_u in acc.iter() {
-        total += *acc_u;
-    }
+    let mut i = 0;
 
     while i + LANES <= n {
         total += f32x16::from(&a[i..i + LANES]) * f32x16::from(&b[i..i + LANES]);
@@ -691,8 +605,8 @@ mod tests {
     use approx::assert_relative_eq;
 
     /// Lengths chosen to straddle every rung of the ladder: below a vector, one
-    /// vector, one block, and blocks plus awkward remainders that force the
-    /// delegation down through 256, 128 and scalar.
+    /// vector, and vectors plus awkward remainders that force the delegation
+    /// down through 256, 128 and scalar.
     const SIZES: [usize; 16] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 45];
 
     fn ramp_f64(n: usize) -> Vec<f64> {

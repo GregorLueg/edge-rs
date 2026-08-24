@@ -2126,10 +2126,18 @@ mod tests {
         // L-BFGS and this crate with the Fortran L-BFGS-B, and on a gene with
         // six counts spread over 150 cells the two are not going to agree on a
         // point where both overdispersions have run to their box constraints.
-        // What has to agree is which constraints: the subject-level component
-        // at its floor and the cell-level one at its ceiling.
+        //
+        // The subject-level component is a hard attractor and does land exactly
+        // on its floor. The cell-level one does not: the marginal likelihood is
+        // flat in `phi` here, its gradient staying within a factor of eight of
+        // `STAGE_ONE_PGTOL` from `phi = 400` to the ceiling of 1000 for a total
+        // objective gain of 9.2e-5. One ulp in the starting intercept flips the
+        // fit between the ceiling and roughly 565, which is how the MSVC libm
+        // and glibc come out on opposite sides. Only the magnitude survives
+        // that, so only the magnitude is asserted; do not tighten this back to
+        // an exact 1e-3.
         assert_relative_eq!(fit.subject_overdispersion[8], 1e-4, max_relative = 1e-12);
-        assert_relative_eq!(fit.cell_overdispersion[8], 1e-3, max_relative = 1e-12);
+        assert!(fit.cell_overdispersion[8] < 2e-3);
         assert!(fit.coefficients[24..27].iter().all(|v| v.is_finite()));
         assert!(fit.se[24..27].iter().all(|v| v.is_finite()));
     }
