@@ -1,0 +1,16 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Test the package"]
+    branches: [ main ]
+    types: [ completed ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: GregorLueg/personal-actions/.github/workflows/rust-release.yml@v1
+    secrets: inherit

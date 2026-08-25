@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+.claude/worktrees/*
+
+# Point-in-time review output, not documentation.
+adversarial_review.md
