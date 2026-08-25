@@ -2,18 +2,18 @@
 
 Places where `edge-rs` deliberately does not reproduce its upstreams, and why.
 
-The port's reference is [`edgePython`](https://github.com/pachterlab/edgePython),
-itself a port of edgeR, limma and `nebula`. Where the Python disagrees with the R
-and C++ it came from, upstream wins: those packages are what users compare
-against, and their output is what the test suite gates on. Section A covers those
-cases.
+The port's reference is
+[`edgePython`](https://github.com/pachterlab/edgePython), itself a port of
+edgeR, limma and `nebula`. Where the Python disagrees with the R and C++ it came
+from, upstream wins: those packages are what users compare against, and their
+output is what the test suite gates on. Section A covers those cases.
 
 Every `edgepython/*.py` file and line below was read against **version 0.2.6,
-commit `1e572ae`**, dated 2026-06-16. That pin is the point: a line number with no
-commit behind it rots the moment upstream edits the file, and these are findings
-about one revision of a young package rather than standing judgements on it. Any
-of them may have been fixed since. Re-pin this paragraph if the entries are ever
-re-checked against a newer checkout.
+commit `1e572ae`**, dated 2026-06-16. That pin is the point: a line number with
+no commit behind it rots the moment upstream edits the file, and these are
+findings about one revision of a young package rather than standing judgements
+on it. Any of them may have been fixed since. Re-pin this paragraph if the
+entries are ever re-checked against a newer checkout.
 
 Section B is different and rarer: places where **edgeR or limma themselves are
 wrong**, verified by reproducing the fault in the installed package. There the R
