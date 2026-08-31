@@ -103,7 +103,13 @@ fn resolve_tested<T: EdgeFloat>(
                 ));
             }
             let first = coef[0];
-            let log_fc = project(&fit.coefficients, input.n_genes, input.n_coef, tested, first);
+            let log_fc = project(
+                &fit.coefficients,
+                input.n_genes,
+                input.n_coef,
+                tested,
+                first,
+            );
             coef.sort_unstable();
             Ok(Resolved {
                 design: input.design.to_vec(),

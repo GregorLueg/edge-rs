@@ -35,7 +35,9 @@ pub(crate) fn filter_by_min_row_sum<T: EdgeFloat>(
     let kept: Vec<usize> = counts
         .chunks_exact(n_samples)
         .enumerate()
-        .filter(|(_, row)| row.iter().map(|v| v.to_f64().unwrap_or(0.0)).sum::<f64>() >= min_row_sum)
+        .filter(|(_, row)| {
+            row.iter().map(|v| v.to_f64().unwrap_or(0.0)).sum::<f64>() >= min_row_sum
+        })
         .map(|(gene, _)| gene)
         .collect();
     if kept.is_empty() {

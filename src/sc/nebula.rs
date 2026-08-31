@@ -340,6 +340,10 @@ pub struct NebulaFit {
 
 /// Fits NEBULA's negative binomial gamma mixed model to every gene.
 ///
+/// Densifies nothing: the counts are compressed on entry and
+/// [`nebula_sparse`] does the work. Callers that already hold a gene-major
+/// sparse matrix should go straight there.
+///
 /// Cells must already be grouped by subject: `subject_id` is read as a run
 /// encoding, so a subject whose cells are split into two blocks is rejected
 /// rather than silently merged. Genes are the parallel axis, one rayon task per
@@ -380,8 +384,70 @@ pub fn nebula<T: EdgeFloat>(
     offset: Option<&[T]>,
     params: Option<NebulaParams>,
 ) -> Result<NebulaFit, EdgeErrors> {
+    if n_genes == 0 || n_cells == 0 {
+        return Err(EdgeErrors::EmptyCounts {
+            n_genes,
+            n_samples: n_cells,
+        });
+    }
+    if counts.len() != n_genes * n_cells {
+        return Err(EdgeErrors::LengthMismatch {
+            name: "counts",
+            expected: n_genes * n_cells,
+            got: counts.len(),
+        });
+    }
+
+    let sparse = build_csr(counts, n_genes, n_cells)?;
+    nebula_sparse(&sparse, subject_id, design, n_coef, offset, params)
+}
+
+/// Fits NEBULA's negative binomial gamma mixed model from a sparse matrix.
+///
+/// The entry point for a caller whose counts already live in compressed form,
+/// which for a single-cell store is all of them. A gene-major CSR is what the
+/// kernels read anyway, so nothing here copies the counts.
+///
+/// Cells must already be grouped by subject, exactly as in [`nebula`].
+///
+/// ### Params
+///
+/// * `counts` - Raw counts, [`SparseFormat::Csr`] over `(n_genes, n_cells)`.
+///   Stored values must be non-negative and finite; zeros may be stored or
+///   omitted
+/// * `subject_id` - Subject of each cell, with each subject's cells contiguous
+/// * `design` - Predictors, row-major `n_cells * n_coef`, including an intercept
+/// * `n_coef` - Number of design columns
+/// * `offset` - Strictly positive scaling factor per cell, or `None` for ones
+/// * `params` - Tuning knobs, or [`NebulaParams::default`]
+///
+/// ### Returns
+///
+/// The per-gene fits for the genes that passed the expression filter, or
+/// [`EdgeErrors`] as for [`nebula`], plus
+/// [`EdgeErrors::MalformedSparse`] if the matrix is not gene-major.
+///
+/// ### References
+///
+/// He et al., Communications Biology 4, 629, 2021
+pub fn nebula_sparse<T: EdgeFloat>(
+    counts: &CompressedSparse<f64>,
+    subject_id: &[usize],
+    design: &[T],
+    n_coef: usize,
+    offset: Option<&[T]>,
+    params: Option<NebulaParams>,
+) -> Result<NebulaFit, EdgeErrors> {
     let params = params.unwrap_or_default();
     params.validate()?;
+
+    if counts.format != SparseFormat::Csr {
+        return Err(EdgeErrors::MalformedSparse(
+            "nebula_sparse needs gene-major counts in CSR form.".to_string(),
+        ));
+    }
+    let n_genes = counts.nrows();
+    let n_cells = counts.ncols();
 
     if n_genes == 0 || n_cells == 0 {
         return Err(EdgeErrors::EmptyCounts {
@@ -397,12 +463,12 @@ pub fn nebula<T: EdgeFloat>(
     if n_coef == 0 {
         return Err(EdgeErrors::MustBePositive("n_coef".to_string()));
     }
-    if counts.len() != n_genes * n_cells {
-        return Err(EdgeErrors::LengthMismatch {
-            name: "counts",
-            expected: n_genes * n_cells,
-            got: counts.len(),
-        });
+    // The kernels drop everything that is not strictly positive, so a negative
+    // count would be silently ignored rather than rejected.
+    if let Some(bad) = counts.data.iter().find(|v| !(v.is_finite() && **v >= 0.0)) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "The counts hold {bad}, which is not a non-negative finite number."
+        )));
     }
     if design.len() != n_cells * n_coef {
         return Err(EdgeErrors::ShapeMismatch {
@@ -472,8 +538,8 @@ pub fn nebula<T: EdgeFloat>(
         .map(|(j, _)| j)
         .collect();
 
-    let sparse = build_csr(counts, n_genes, n_cells)?;
-    let totals = cumsum_y(&sparse, &fid)?;
+    let sparse = counts;
+    let totals = cumsum_y(sparse, &fid)?;
 
     let cells_per_subject = n_cells as f64 / n_subjects as f64;
     let method = if cells_per_subject < MIN_CELLS_PER_SUBJECT_LN {
@@ -513,7 +579,7 @@ pub fn nebula<T: EdgeFloat>(
     let outcomes: Vec<GeneOutcome> = kept
         .par_iter()
         .map(|&g| {
-            let counts = positive_indices(&sparse, g)?;
+            let counts = positive_indices(sparse, g)?;
             let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
             fit_gene(&shared, &counts, subject_totals)
         })
@@ -2293,6 +2359,85 @@ mod tests {
 
         assert_eq!(wide.coefficients, narrow.coefficients);
         assert_eq!(wide.se, narrow.se);
+    }
+
+    /// The sparse entry point is the dense one with the compression hoisted out.
+    ///
+    /// Bit-for-bit, not close: [`nebula`] builds exactly this matrix and then
+    /// calls [`nebula_sparse`], so any divergence would be a bug in the split
+    /// rather than a numerical difference.
+    #[test]
+    fn test_nebula_sparse_matches_the_dense_entry_point() {
+        let (counts, subject, design, offset) = fixture();
+        let dense = nebula(
+            &counts,
+            8,
+            150,
+            &subject,
+            &design,
+            3,
+            Some(&offset),
+            Some(golden_params()),
+        )
+        .expect("nebula failed");
+
+        // Built by hand rather than through `build_csr`, so the test would
+        // still catch the two paths drifting apart.
+        let mut data = Vec::new();
+        let mut indices = Vec::new();
+        let mut indptr = vec![0u32];
+        for gene in 0..8 {
+            for (cell, value) in counts[gene * 150..(gene + 1) * 150].iter().enumerate() {
+                if *value > 0.0 {
+                    data.push(*value);
+                    indices.push(cell as u32);
+                }
+            }
+            indptr.push(data.len() as u32);
+        }
+        let sparse =
+            CompressedSparse::from_parts(data, indices, indptr, SparseFormat::Csr, (8, 150))
+                .expect("malformed fixture");
+
+        let got = nebula_sparse(
+            &sparse,
+            &subject,
+            &design,
+            3,
+            Some(&offset),
+            Some(golden_params()),
+        )
+        .expect("nebula_sparse failed");
+
+        assert_eq!(got.gene_index, dense.gene_index);
+        assert_eq!(got.coefficients, dense.coefficients);
+        assert_eq!(got.covariance, dense.covariance);
+        assert_eq!(got.se, dense.se);
+        assert_eq!(got.subject_overdispersion, dense.subject_overdispersion);
+        assert_eq!(got.cell_overdispersion, dense.cell_overdispersion);
+        assert_eq!(got.convergence, dense.convergence);
+    }
+
+    /// A cell-major matrix is the wrong way round and has to say so.
+    #[test]
+    fn test_nebula_sparse_rejects_a_cell_major_matrix() {
+        let (counts, subject, design, offset) = fixture();
+        let sparse =
+            CompressedSparse::from_dense(&counts, 8, 150, SparseFormat::Csr, |v: &f64| *v == 0.0)
+                .expect("malformed fixture")
+                .transpose();
+
+        assert!(matches!(
+            nebula_sparse(
+                &sparse,
+                &subject,
+                &design,
+                3,
+                Some(&offset),
+                Some(golden_params()),
+            ),
+            Err(EdgeErrors::MalformedSparse(_))
+        ));
     }
 
     /// No offset is the same as an offset of ones.

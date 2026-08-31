@@ -31,7 +31,8 @@
 
 use crate::dispersion::cox_reid::{CoxReidParams, common_dispersion_cox_reid};
 use crate::dispersion::estimate::residual_df;
-use crate::glm::fit::{DEFAULT_PRIOR_COUNT, FitMethod, glm_fit};
+use crate::glm::fit::{DEFAULT_PRIOR_COUNT, FitMethod, GlmFit, glm_fit};
+use crate::glm::test::QlSummary;
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 use crate::prelude::*;
 use crate::ql::weights::{compute_adjust_vec, update_prior};
@@ -158,6 +159,64 @@ pub struct QlFit {
     pub average_ql_dispersion: Option<f64>,
     /// Top-abundance proportion used, when a dispersion was estimated.
     pub top_proportion: Option<f64>,
+}
+
+impl QlFit {
+    /// Borrows the GLM half of the fit.
+    ///
+    /// [`crate::glm::test::glm_ql_ftest`] wants a [`GlmFit`], and the right one
+    /// is the fit `glm_ql_fit` already performed rather than a fresh one.
+    /// Refitting at [`QlFit::dispersion`] would be wrong: that field holds the
+    /// *undivided* dispersion, while the fit itself ran at
+    /// `dispersion / average_ql_dispersion`. edgeR has no equivalent trap
+    /// because its `DGEGLM` is one object carrying both halves.
+    ///
+    /// ### Returns
+    ///
+    /// The same coefficients, fitted means and deviances, as a [`GlmFit`].
+    pub fn as_glm_fit(&self) -> GlmFit {
+        GlmFit {
+            coefficients: self.coefficients.clone(),
+            unshrunk_coefficients: self.unshrunk_coefficients.clone(),
+            fitted: self.fitted.clone(),
+            deviance: self.deviance.clone(),
+            df_residual: self.df_residual,
+            method: self.method,
+        }
+    }
+
+    /// Assembles the quasi-likelihood summary the tests read.
+    ///
+    /// Which degrees of freedom go where depends on the pipeline that ran, and
+    /// getting it wrong is silent. The current path has no `df.residual.zeros`,
+    /// and `None` there is also what switches the Poisson bound off, exactly as
+    /// edgeR does. The legacy path has no `df.residual.adj` and uses the
+    /// zero-adjusted degrees of freedom for both, with no average
+    /// quasi-dispersion to divide out.
+    ///
+    /// ### Returns
+    ///
+    /// The [`QlSummary`] borrowing this fit.
+    pub fn ql_summary(&self) -> QlSummary<'_> {
+        // One of the two is always present: `Extras` has no third variant.
+        let (df_residual_adj, df_residual_zeros, average_ql_dispersion) = match (
+            self.df_residual_adj.as_deref(),
+            self.df_residual_zeros.as_deref(),
+        ) {
+            (Some(adj), _) => (adj, None, self.average_ql_dispersion),
+            (None, Some(zeros)) => (zeros, Some(zeros), None),
+            (None, None) => unreachable!("glm_ql_fit always fills one of the two"),
+        };
+
+        QlSummary {
+            s2_post: &self.s2_post,
+            df_prior: &self.df_prior,
+            df_residual_adj,
+            df_residual_zeros,
+            fitted: &self.fitted,
+            average_ql_dispersion,
+        }
+    }
 }
 
 /////////////

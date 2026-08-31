@@ -150,12 +150,8 @@ pub fn common_dispersion_cox_reid<T: EdgeFloat>(
     }
 
     // Drop genes carrying no information about the dispersion.
-    let kept = crate::dispersion::filter_by_min_row_sum(
-        counts,
-        n_genes,
-        n_samples,
-        params.min_row_sum,
-    )?;
+    let kept =
+        crate::dispersion::filter_by_min_row_sum(counts, n_genes, n_samples, params.min_row_sum)?;
 
     // Subsample on large experiments, exactly as edgeR does.
     let chosen: Vec<usize> = match params.subset {
