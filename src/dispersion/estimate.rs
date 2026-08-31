@@ -586,7 +586,6 @@ fn expand_to_all_genes(
     out
 }
 
-
 /// Residual degrees of freedom per gene, reduced where the fit hit exact zeros.
 ///
 /// A gene with structural zeros has fewer effective observations than samples,
@@ -722,12 +721,8 @@ pub fn estimate_disp<T: EdgeFloat>(
 
     // Genes with too few counts carry no information about the dispersion and
     // would only add noise to the trend.
-    let kept = crate::dispersion::filter_by_min_row_sum(
-        counts,
-        n_genes,
-        n_samples,
-        params.min_row_sum,
-    )?;
+    let kept =
+        crate::dispersion::filter_by_min_row_sum(counts, n_genes, n_samples, params.min_row_sum)?;
 
     let mut selected = Vec::with_capacity(kept.len() * n_samples);
     for &gene in &kept {

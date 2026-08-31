@@ -24,9 +24,8 @@ mod common;
 
 use common::{Tol, assert_close, assert_close_scalar};
 
-use edge_rs::glm::fit::GlmFit;
-use edge_rs::glm::ql_fit::{QlFit, QlFitParams, glm_ql_fit};
-use edge_rs::glm::test::{GlmTestInput, QlSummary, Tested, glm_lrt, glm_ql_ftest};
+use edge_rs::glm::ql_fit::{QlFitParams, glm_ql_fit};
+use edge_rs::glm::test::{GlmTestInput, Tested, glm_lrt, glm_ql_ftest};
 use edge_rs::prelude::Recycled;
 
 ////////////////
@@ -117,33 +116,6 @@ struct Loaded {
     ave_log_cpm: Vec<f64>,
     /// Trended dispersion, which the legacy pipeline has to be handed.
     trended: Vec<f64>,
-}
-
-/// Borrows the GLM half of a quasi-likelihood fit.
-///
-/// `glm_ql_ftest` wants a [`GlmFit`], and the right one is the fit
-/// `glm_ql_fit` already performed, not a fresh one. Refitting at
-/// `QlFit::dispersion` would be wrong: that field holds the *undivided*
-/// dispersion, while the fit itself ran at
-/// `dispersion / average_ql_dispersion`. edgeR has no equivalent trap because
-/// its `DGEGLM` is one object carrying both halves.
-///
-/// ### Params
-///
-/// * `fit` - The quasi-likelihood fit
-///
-/// ### Returns
-///
-/// The same coefficients, fitted means and deviances, as a [`GlmFit`].
-fn as_glm_fit(fit: &QlFit) -> GlmFit {
-    GlmFit {
-        coefficients: fit.coefficients.clone(),
-        unshrunk_coefficients: fit.unshrunk_coefficients.clone(),
-        fitted: fit.fitted.clone(),
-        deviance: fit.deviance.clone(),
-        df_residual: fit.df_residual,
-        method: fit.method,
-    }
 }
 
 /// Loads one dataset.
@@ -345,19 +317,12 @@ fn test_glm_ql_ftest_matches_edger() {
         )
         .expect("glm_ql_fit failed");
 
-        // The summary has to be assembled by hand; there is no conversion, and
-        // `df_residual_zeros: None` is what selects the current pipeline and
-        // switches the Poisson bound off, exactly as edgeR does.
-        let base = as_glm_fit(&fit);
-
-        let ql = QlSummary {
-            s2_post: &fit.s2_post,
-            df_prior: &fit.df_prior,
-            df_residual_adj: fit.df_residual_adj.as_ref().expect("current pipeline"),
-            df_residual_zeros: None,
-            fitted: &fit.fitted,
-            average_ql_dispersion: fit.average_ql_dispersion,
-        };
+        let base = fit.as_glm_fit();
+        let ql = fit.ql_summary();
+        assert!(
+            ql.df_residual_zeros.is_none(),
+            "the current pipeline has no df.residual.zeros"
+        );
 
         let input = GlmTestInput {
             counts: &l.counts,
@@ -524,17 +489,12 @@ fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
     )
     .expect("glm_ql_fit failed");
 
-    let base = as_glm_fit(&fit);
-
-    let zeros = fit.df_residual_zeros.clone().expect("legacy pipeline");
-    let ql = QlSummary {
-        s2_post: &fit.s2_post,
-        df_prior: &fit.df_prior,
-        df_residual_adj: &zeros,
-        df_residual_zeros: Some(&zeros),
-        fitted: &fit.fitted,
-        average_ql_dispersion: None,
-    };
+    let base = fit.as_glm_fit();
+    let ql = fit.ql_summary();
+    assert!(
+        ql.df_residual_zeros.is_some(),
+        "the legacy pipeline carries df.residual.zeros"
+    );
     let input = GlmTestInput {
         counts: &l.counts,
         n_genes: l.n_genes,
@@ -598,15 +558,8 @@ fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
         None,
     )
     .expect("glm_ql_fit failed");
-    let base_current = as_glm_fit(&current);
-    let ql_current = QlSummary {
-        s2_post: &current.s2_post,
-        df_prior: &current.df_prior,
-        df_residual_adj: current.df_residual_adj.as_ref().expect("current pipeline"),
-        df_residual_zeros: None,
-        fitted: &current.fitted,
-        average_ql_dispersion: current.average_ql_dispersion,
-    };
+    let base_current = current.as_glm_fit();
+    let ql_current = current.ql_summary();
     let input_current = GlmTestInput {
         counts: &l.counts,
         n_genes: l.n_genes,
@@ -671,7 +624,7 @@ fn test_lrt_and_ftest_disagree_as_they_should() {
     )
     .expect("glm_ql_fit failed");
 
-    let base = as_glm_fit(&fit);
+    let base = fit.as_glm_fit();
 
     let input = GlmTestInput {
         counts: &l.counts,
@@ -684,14 +637,7 @@ fn test_lrt_and_ftest_disagree_as_they_should() {
         weights: None,
         log_cpm: Some(&l.ave_log_cpm),
     };
-    let ql = QlSummary {
-        s2_post: &fit.s2_post,
-        df_prior: &fit.df_prior,
-        df_residual_adj: fit.df_residual_adj.as_ref().expect("current pipeline"),
-        df_residual_zeros: None,
-        fitted: &fit.fitted,
-        average_ql_dispersion: fit.average_ql_dispersion,
-    };
+    let ql = fit.ql_summary();
 
     let with = glm_lrt(&input, &base, &Tested::Coef(vec![1]), Some(&ql)).expect("glm_lrt failed");
     let without = glm_lrt(&input, &base, &Tested::Coef(vec![1]), None).expect("glm_lrt failed");
