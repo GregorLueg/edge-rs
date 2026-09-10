@@ -13,9 +13,9 @@
 use crate::limma::lm_fit::LmFitResult;
 use crate::prelude::*;
 
-/////////////////
-// MArrayLm    //
-/////////////////
+//////////////
+// MArrayLm //
+//////////////
 
 /// A linear model fit, growing as the pipeline runs over it.
 ///
@@ -31,7 +31,6 @@ pub struct MArrayLm {
     /// Width of the coefficient axis: design columns, or contrasts once
     /// `contrasts_fit` has run.
     pub n_coef: usize,
-
     /// Coefficients, row-major `n_genes * n_coef`. `NaN` where not estimable.
     pub coefficients: Vec<f64>,
     /// Unscaled standard deviations, row-major `n_genes * n_coef`.
@@ -55,11 +54,9 @@ pub struct MArrayLm {
     /// `None` when the caller had none to give, which makes
     /// `EBayesTrend::Amean` an error rather than a silent no-trend fit.
     pub amean: Option<Vec<f64>>,
-
     /// Contrast matrix, column-major `original n_coef * n_coef`, once
     /// `contrasts_fit` has run.
     pub contrasts: Option<Vec<f64>>,
-
     /// Prior degrees of freedom. Length one, or `n_genes` for a robust fit.
     pub df_prior: Option<Vec<f64>>,
     /// Prior variance. Length one, or `n_genes` for a trended fit.

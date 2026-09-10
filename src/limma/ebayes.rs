@@ -109,211 +109,6 @@ impl Default for EBayesParams {
     }
 }
 
-/////////////////
-// Public API  //
-/////////////////
-
-/// Empirical Bayes moderation of a linear model fit.
-///
-/// Port of limma's `eBayes`. Shrinks each gene's residual variance towards a
-/// fitted prior, divides the coefficients by the moderated standard errors to
-/// get a t statistic with more degrees of freedom than the gene itself has, and
-/// adds the log-odds of differential expression. When the design is full rank
-/// it also computes the moderated F across coefficients.
-///
-/// The fit must have been through [`crate::limma::lm_fit::lm_fit`], and through
-/// [`crate::limma::contrasts::contrasts_fit`] first if the hypotheses of
-/// interest are contrasts rather than bare coefficients.
-///
-/// ### Params
-///
-/// * `fit` - The fit to moderate, consumed
-/// * `params` - Tuning knobs, or `None` for [`EBayesParams::default`]
-///
-/// ### Returns
-///
-/// The fit with `s2_post`, `t`, `df_total`, `p_value`, `lods` and the prior
-/// quantities filled in, plus `f_stat` and `f_p_value` when the design is full
-/// rank. [`EdgeErrors`] if no gene has residual degrees of freedom, no residual
-/// standard deviation is finite, `proportion` is outside `(0, 1)`, or
-/// `EBayesTrend::Amean` was asked for on a fit carrying no `amean`.
-///
-/// ### References
-///
-/// Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004
-pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayLm, EdgeErrors> {
-    let params = params.unwrap_or_default();
-    if !(params.proportion > 0.0 && params.proportion < 1.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "proportion must lie strictly inside (0, 1); got {}",
-            params.proportion
-        )));
-    }
-    if fit.df_residual.iter().fold(0.0_f64, |a, &b| a.max(b)) == 0.0 {
-        return Err(EdgeErrors::InvalidArgument(
-            "no residual degrees of freedom in the linear model fits".to_string(),
-        ));
-    }
-    if !fit.sigma.iter().any(|v| v.is_finite()) {
-        return Err(EdgeErrors::InvalidArgument(
-            "no finite residual standard deviations".to_string(),
-        ));
-    }
-
-    let n_genes = fit.n_genes;
-    let n_coef = fit.n_coef;
-
-    // -- the covariate the prior is trended against --
-    let covariate: Option<Vec<f64>> = match &params.trend {
-        EBayesTrend::None => None,
-        EBayesTrend::Amean => Some(fit.amean.clone().ok_or_else(|| {
-            EdgeErrors::InvalidArgument(
-                "trending the prior against the average expression needs `amean` on the fit; \
-                 `voom` returns it as `VoomResult::amean`"
-                    .to_string(),
-            )
-        })?),
-        EBayesTrend::Covariate(v) => {
-            if v.len() != n_genes {
-                return Err(EdgeErrors::LengthMismatch {
-                    name: "trend covariate",
-                    expected: n_genes,
-                    got: v.len(),
-                });
-            }
-            Some(v.clone())
-        }
-    };
-
-    // -- the variance prior --
-    let var: Vec<f64> = fit.sigma.iter().map(|s| s * s).collect();
-    let squeezed = squeeze_var(
-        &var,
-        &fit.df_residual,
-        covariate.as_deref(),
-        Some(SqueezeVarParams {
-            robust: params.robust,
-            winsor_tail_p: params.winsor_tail_p,
-            span: params.span,
-            legacy: params.legacy,
-        }),
-    )?;
-    let s2_post = squeezed.var_post;
-    let s2_prior = squeezed.var_prior;
-    let df_prior = squeezed.df_prior;
-
-    // -- moderated t, and the degrees of freedom it is read against --
-    //
-    // The pooled cap matters on small designs: without it a gene can be handed
-    // more degrees of freedom than the whole experiment has (`R/ebayes.R:62-64`).
-    let df_pooled: f64 = fit.df_residual.iter().filter(|v| v.is_finite()).sum();
-    let df_total: Vec<f64> = (0..n_genes)
-        .map(|g| (fit.df_residual[g] + recycled(&df_prior, g)).min(df_pooled))
-        .collect();
-
-    let mut t = vec![0.0; n_genes * n_coef];
-    let mut p_value = vec![0.0; n_genes * n_coef];
-    t.par_chunks_mut(n_coef)
-        .zip(p_value.par_chunks_mut(n_coef))
-        .enumerate()
-        .try_for_each(|(g, (t_row, p_row))| -> Result<(), EdgeErrors> {
-            let scale = s2_post[g].sqrt();
-            let df = df_total[g];
-            for j in 0..n_coef {
-                let k = g * n_coef + j;
-                let stat = fit.coefficients[k] / fit.stdev_unscaled[k] / scale;
-                t_row[j] = stat;
-                p_row[j] = if stat.is_finite() {
-                    2.0 * t_cdf(-stat.abs(), df)?
-                } else {
-                    f64::NAN
-                };
-            }
-            Ok(())
-        })?;
-
-    // -- prior coefficient variance for the B-statistic --
-    let median_prior = median(&s2_prior);
-    let limits = (
-        params.stdev_coef_lim.0.powi(2) / median_prior,
-        params.stdev_coef_lim.1.powi(2) / median_prior,
-    );
-    let mut var_prior = tmixture_matrix(
-        &t,
-        &fit.stdev_unscaled,
-        &df_total,
-        n_genes,
-        n_coef,
-        params.proportion,
-        limits,
-    )?;
-    // limma warns and substitutes; there is no warning channel here, and the
-    // substitution is the documented behaviour either way (`R/ebayes.R:71-74`).
-    // R writes `var.prior[is.na(var.prior)] <- 1 / s2.prior`, and a logical
-    // subassignment consumes the right-hand side from its start, so the nth
-    // failure takes the nth prior rather than the one for its own coefficient.
-    let mut failures = 0usize;
-    for v in var_prior.iter_mut() {
-        if v.is_nan() {
-            *v = 1.0 / recycled(&s2_prior, failures.min(s2_prior.len() - 1));
-            failures += 1;
-        }
-    }
-
-    let lods = log_odds(
-        &t,
-        &fit.stdev_unscaled,
-        &df_total,
-        &df_prior,
-        &var_prior,
-        n_genes,
-        n_coef,
-        params.proportion,
-    );
-
-    // -- moderated F, when every coefficient is estimable --
-    let (f_stat, f_p_value) = if is_full_rank(&fit.design, fit.n_samples, fit.pivot.len())? {
-        let df2: Vec<f64> = (0..n_genes)
-            .map(|g| fit.df_residual[g] + recycled(&df_prior, g))
-            .collect();
-        let (stat, df1) = moderated_f(&t, &fit.cov_coefficients, n_genes, n_coef)?;
-        let p = stat
-            .iter()
-            .zip(&df2)
-            .map(|(&s, &d)| {
-                if !s.is_finite() {
-                    Ok(f64::NAN)
-                } else if d.is_finite() {
-                    f_sf(s, df1, d)
-                } else {
-                    // `squeezeVar` returns an infinite prior whenever the
-                    // variances are close enough to constant that there is no
-                    // excess dispersion to explain, and limma passes that
-                    // straight to `pf`. R takes the chi-squared limit there,
-                    // which is what an F with an infinite denominator is.
-                    chisq_sf(s * df1, df1)
-                }
-            })
-            .collect::<Result<Vec<f64>, EdgeErrors>>()?;
-        (Some(stat), Some(p))
-    } else {
-        (None, None)
-    };
-
-    fit.df_prior = Some(df_prior);
-    fit.s2_prior = Some(s2_prior);
-    fit.var_prior = Some(var_prior);
-    fit.proportion = Some(params.proportion);
-    fit.s2_post = Some(s2_post);
-    fit.t = Some(t);
-    fit.df_total = Some(df_total);
-    fit.p_value = Some(p_value);
-    fit.lods = Some(lods);
-    fit.f_stat = f_stat;
-    fit.f_p_value = f_p_value;
-    Ok(fit)
-}
-
 /////////////
 // Kernels //
 /////////////
@@ -585,6 +380,205 @@ fn moderated_f(
     });
 
     Ok((out, r as f64))
+}
+
+//////////////
+// Frontend //
+//////////////
+
+/// Empirical Bayes moderation of a linear model fit.
+///
+/// Port of limma's `eBayes`. Shrinks each gene's residual variance towards a
+/// fitted prior, divides the coefficients by the moderated standard errors to
+/// get a t statistic with more degrees of freedom than the gene itself has, and
+/// adds the log-odds of differential expression. When the design is full rank
+/// it also computes the moderated F across coefficients.
+///
+/// The fit must have been through [`crate::limma::lm_fit::lm_fit`], and through
+/// [`crate::limma::contrasts::contrasts_fit`] first if the hypotheses of
+/// interest are contrasts rather than bare coefficients.
+///
+/// ### Params
+///
+/// * `fit` - The fit to moderate, consumed
+/// * `params` - Tuning knobs, or `None` for [`EBayesParams::default`]
+///
+/// ### Returns
+///
+/// The fit with `s2_post`, `t`, `df_total`, `p_value`, `lods` and the prior
+/// quantities filled in, plus `f_stat` and `f_p_value` when the design is full
+/// rank. [`EdgeErrors`] if no gene has residual degrees of freedom, no residual
+/// standard deviation is finite, `proportion` is outside `(0, 1)`, or
+/// `EBayesTrend::Amean` was asked for on a fit carrying no `amean`.
+///
+/// ### References
+///
+/// Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004
+pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayLm, EdgeErrors> {
+    let params = params.unwrap_or_default();
+    // -- checks --
+    if !(params.proportion > 0.0 && params.proportion < 1.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "proportion must lie strictly inside (0, 1); got {}",
+            params.proportion
+        )));
+    }
+    if fit.df_residual.iter().fold(0.0_f64, |a, &b| a.max(b)) == 0.0 {
+        return Err(EdgeErrors::InvalidArgument(
+            "no residual degrees of freedom in the linear model fits".to_string(),
+        ));
+    }
+    if !fit.sigma.iter().any(|v| v.is_finite()) {
+        return Err(EdgeErrors::InvalidArgument(
+            "no finite residual standard deviations".to_string(),
+        ));
+    }
+
+    let n_genes = fit.n_genes;
+    let n_coef = fit.n_coef;
+
+    // -- the covariate the prior is trended against --
+    let covariate: Option<Vec<f64>> = match &params.trend {
+        EBayesTrend::None => None,
+        EBayesTrend::Amean => Some(fit.amean.clone().ok_or_else(|| {
+            EdgeErrors::InvalidArgument(
+                "trending the prior against the average expression needs `amean` on the fit; \
+                 `voom` returns it as `VoomResult::amean`"
+                    .to_string(),
+            )
+        })?),
+        EBayesTrend::Covariate(v) => {
+            if v.len() != n_genes {
+                return Err(EdgeErrors::LengthMismatch {
+                    name: "trend covariate",
+                    expected: n_genes,
+                    got: v.len(),
+                });
+            }
+            Some(v.clone())
+        }
+    };
+
+    // -- the variance prior --
+    let var: Vec<f64> = fit.sigma.iter().map(|s| s * s).collect();
+    let squeezed = squeeze_var(
+        &var,
+        &fit.df_residual,
+        covariate.as_deref(),
+        Some(SqueezeVarParams {
+            robust: params.robust,
+            winsor_tail_p: params.winsor_tail_p,
+            span: params.span,
+            legacy: params.legacy,
+        }),
+    )?;
+    let s2_post = squeezed.var_post;
+    let s2_prior = squeezed.var_prior;
+    let df_prior = squeezed.df_prior;
+
+    // -- moderated t, and the degrees of freedom it is read against --
+    //
+    // The pooled cap matters on small designs: without it a gene can be handed
+    // more degrees of freedom than the whole experiment has, see
+    // `R/ebayes.R:62-64`.
+    let df_pooled: f64 = fit.df_residual.iter().filter(|v| v.is_finite()).sum();
+    let df_total: Vec<f64> = (0..n_genes)
+        .map(|g| (fit.df_residual[g] + recycled(&df_prior, g)).min(df_pooled))
+        .collect();
+
+    let mut t = vec![0.0; n_genes * n_coef];
+    let mut p_value = vec![0.0; n_genes * n_coef];
+    t.par_chunks_mut(n_coef)
+        .zip(p_value.par_chunks_mut(n_coef))
+        .enumerate()
+        .try_for_each(|(g, (t_row, p_row))| -> Result<(), EdgeErrors> {
+            let scale = s2_post[g].sqrt();
+            let df = df_total[g];
+            for j in 0..n_coef {
+                let k = g * n_coef + j;
+                let stat = fit.coefficients[k] / fit.stdev_unscaled[k] / scale;
+                t_row[j] = stat;
+                p_row[j] = if stat.is_finite() {
+                    2.0 * t_cdf(-stat.abs(), df)?
+                } else {
+                    f64::NAN
+                };
+            }
+            Ok(())
+        })?;
+
+    // -- prior coefficient variance for the B-statistic --
+    let median_prior = median(&s2_prior);
+    let limits = (
+        params.stdev_coef_lim.0.powi(2) / median_prior,
+        params.stdev_coef_lim.1.powi(2) / median_prior,
+    );
+    let mut var_prior = tmixture_matrix(
+        &t,
+        &fit.stdev_unscaled,
+        &df_total,
+        n_genes,
+        n_coef,
+        params.proportion,
+        limits,
+    )?;
+
+    let mut failures = 0usize;
+    for v in var_prior.iter_mut() {
+        if v.is_nan() {
+            *v = 1.0 / recycled(&s2_prior, failures.min(s2_prior.len() - 1));
+            failures += 1;
+        }
+    }
+
+    let lods = log_odds(
+        &t,
+        &fit.stdev_unscaled,
+        &df_total,
+        &df_prior,
+        &var_prior,
+        n_genes,
+        n_coef,
+        params.proportion,
+    );
+
+    // -- moderated F, when every coefficient is estimable --
+    let (f_stat, f_p_value) = if is_full_rank(&fit.design, fit.n_samples, fit.pivot.len())? {
+        let df2: Vec<f64> = (0..n_genes)
+            .map(|g| fit.df_residual[g] + recycled(&df_prior, g))
+            .collect();
+        let (stat, df1) = moderated_f(&t, &fit.cov_coefficients, n_genes, n_coef)?;
+        let p = stat
+            .iter()
+            .zip(&df2)
+            .map(|(&s, &d)| {
+                if !s.is_finite() {
+                    Ok(f64::NAN)
+                } else if d.is_finite() {
+                    f_sf(s, df1, d)
+                } else {
+                    chisq_sf(s * df1, df1)
+                }
+            })
+            .collect::<Result<Vec<f64>, EdgeErrors>>()?;
+        (Some(stat), Some(p))
+    } else {
+        (None, None)
+    };
+
+    fit.df_prior = Some(df_prior);
+    fit.s2_prior = Some(s2_prior);
+    fit.var_prior = Some(var_prior);
+    fit.proportion = Some(params.proportion);
+    fit.s2_post = Some(s2_post);
+    fit.t = Some(t);
+    fit.df_total = Some(df_total);
+    fit.p_value = Some(p_value);
+    fit.lods = Some(lods);
+    fit.f_stat = f_stat;
+    fit.f_p_value = f_p_value;
+
+    Ok(fit)
 }
 
 ///////////

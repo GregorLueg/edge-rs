@@ -9,12 +9,6 @@
 //!
 //! Sequential throughout. This is one sort and one scan over the genes, with
 //! nothing to fan out over.
-//!
-//! ### What is dropped
-//!
-//! Gene annotation and row names: the crate identifies genes by index, as
-//! `TopTags` already does. And every multiple testing adjustment except
-//! Benjamini-Hochberg, again as `results.rs` already does.
 
 use crate::limma::marray::MArrayLm;
 use crate::numeric::dist::t_ppf;
@@ -154,9 +148,112 @@ pub struct TopTableF {
     pub adj_p_value: Vec<f64>,
 }
 
-/////////////////
-// Public API  //
-/////////////////
+/////////////
+// Helpers //
+/////////////
+
+/// Checks the two cutoffs.
+///
+/// ### Params
+///
+/// * `params` - Tuning knobs
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`].
+fn check_cutoffs(params: &TopTableParams) -> Result<(), EdgeErrors> {
+    if !(params.p_value >= 0.0 && params.p_value <= 1.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "p_value must lie in [0, 1]; got {}",
+            params.p_value
+        )));
+    }
+    if !(params.lfc >= 0.0 && params.lfc.is_finite()) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "lfc must be finite and non-negative; got {}",
+            params.lfc
+        )));
+    }
+    if let Some(level) = params.confint
+        && !(level > 0.0 && level < 1.0)
+    {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "confint must lie strictly inside (0, 1); got {level}"
+        )));
+    }
+    Ok(())
+}
+
+/// The three per-coefficient matrices `eBayes` leaves on a fit.
+struct Moderated<'a> {
+    /// Moderated t, row-major `n_genes * n_coef`.
+    t: &'a [f64],
+    /// Two-sided p-values, same shape.
+    p: &'a [f64],
+    /// Log-odds, same shape.
+    lods: &'a [f64],
+}
+
+/// Pulls the moderated statistics off a fit, or explains that they are missing.
+///
+/// ### Params
+///
+/// * `fit` - The fit
+///
+/// ### Returns
+///
+/// The three matrices, or [`EdgeErrors::InvalidArgument`].
+fn moderated(fit: &MArrayLm) -> Result<Moderated<'_>, EdgeErrors> {
+    match (
+        fit.t.as_deref(),
+        fit.p_value.as_deref(),
+        fit.lods.as_deref(),
+    ) {
+        (Some(t), Some(p), Some(lods)) => Ok(Moderated { t, p, lods }),
+        _ => Err(EdgeErrors::InvalidArgument(
+            "the fit has no moderated statistics; run `ebayes` first".to_string(),
+        )),
+    }
+}
+
+/// Stable ordering of a key vector, missing values last.
+///
+/// R's `order` is a radix sort on doubles, so ties keep their input order in
+/// both directions, and `na.last = TRUE` sends `NA` to the end regardless of
+/// the direction. Both matter: a table where half the genes tie on a p-value of
+/// one would otherwise come back in an arbitrary order.
+///
+/// ### Params
+///
+/// * `keys` - Sort keys
+/// * `ascending` - Whether smaller comes first
+///
+/// ### Returns
+///
+/// Indices into `keys`, in sorted order.
+fn order_by(keys: &[f64], ascending: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (x, y) = (keys[a], keys[b]);
+        match (x.is_nan(), y.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => {
+                if ascending {
+                    x.total_cmp(&y)
+                } else {
+                    y.total_cmp(&x)
+                }
+            }
+        }
+    });
+    order
+}
+
+//////////////
+// Frontend //
+//////////////
 
 /// Ranks the genes for one coefficient.
 ///
@@ -391,109 +488,6 @@ pub fn top_table_f(
         adj_p_value: pick(&adj),
         index: kept,
     })
-}
-
-/////////////
-// Helpers //
-/////////////
-
-/// Checks the two cutoffs.
-///
-/// ### Params
-///
-/// * `params` - Tuning knobs
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`].
-fn check_cutoffs(params: &TopTableParams) -> Result<(), EdgeErrors> {
-    if !(params.p_value >= 0.0 && params.p_value <= 1.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "p_value must lie in [0, 1]; got {}",
-            params.p_value
-        )));
-    }
-    if !(params.lfc >= 0.0 && params.lfc.is_finite()) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "lfc must be finite and non-negative; got {}",
-            params.lfc
-        )));
-    }
-    if let Some(level) = params.confint
-        && !(level > 0.0 && level < 1.0)
-    {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "confint must lie strictly inside (0, 1); got {level}"
-        )));
-    }
-    Ok(())
-}
-
-/// The three per-coefficient matrices `eBayes` leaves on a fit.
-struct Moderated<'a> {
-    /// Moderated t, row-major `n_genes * n_coef`.
-    t: &'a [f64],
-    /// Two-sided p-values, same shape.
-    p: &'a [f64],
-    /// Log-odds, same shape.
-    lods: &'a [f64],
-}
-
-/// Pulls the moderated statistics off a fit, or explains that they are missing.
-///
-/// ### Params
-///
-/// * `fit` - The fit
-///
-/// ### Returns
-///
-/// The three matrices, or [`EdgeErrors::InvalidArgument`].
-fn moderated(fit: &MArrayLm) -> Result<Moderated<'_>, EdgeErrors> {
-    match (
-        fit.t.as_deref(),
-        fit.p_value.as_deref(),
-        fit.lods.as_deref(),
-    ) {
-        (Some(t), Some(p), Some(lods)) => Ok(Moderated { t, p, lods }),
-        _ => Err(EdgeErrors::InvalidArgument(
-            "the fit has no moderated statistics; run `ebayes` first".to_string(),
-        )),
-    }
-}
-
-/// Stable ordering of a key vector, missing values last.
-///
-/// R's `order` is a radix sort on doubles, so ties keep their input order in
-/// both directions, and `na.last = TRUE` sends `NA` to the end regardless of
-/// the direction. Both matter: a table where half the genes tie on a p-value of
-/// one would otherwise come back in an arbitrary order.
-///
-/// ### Params
-///
-/// * `keys` - Sort keys
-/// * `ascending` - Whether smaller comes first
-///
-/// ### Returns
-///
-/// Indices into `keys`, in sorted order.
-fn order_by(keys: &[f64], ascending: bool) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by(|&a, &b| {
-        let (x, y) = (keys[a], keys[b]);
-        match (x.is_nan(), y.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => {
-                if ascending {
-                    x.total_cmp(&y)
-                } else {
-                    y.total_cmp(&x)
-                }
-            }
-        }
-    });
-    order
 }
 
 ///////////

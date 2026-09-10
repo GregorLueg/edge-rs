@@ -32,10 +32,6 @@ use crate::utils::linalg::{cholesky_lower, cov2cor};
 ////////////
 
 /// Below this, the off-diagonal correlations count as zero.
-///
-/// limma computes an orthogonality flag twice, at `1e-12` (`R/contrasts.R:60`)
-/// and again at `1e-14` (`R/contrasts.R:103`). The first is overwritten before
-/// it is ever read, so `1e-14` is the one that decides which branch runs.
 const ORTHOGONAL_TOL: f64 = 1e-14;
 
 /// Standard deviation standing in for a non-estimable coefficient.
@@ -55,9 +51,162 @@ const NA_SENTINEL: f64 = 1e30;
 /// produces, far below the sentinel itself.
 const NA_DETECT: f64 = 1e20;
 
-/////////////////////
-// contrasts_fit   //
-/////////////////////
+/////////////
+// Kernels //
+/////////////
+
+/// Picks a subset of columns out of a row-major matrix.
+///
+/// ### Params
+///
+/// * `x` - Row-major `n_rows * n_cols`
+/// * `n_rows` - Number of rows
+/// * `n_cols` - Number of columns
+/// * `cols` - Column indices to keep, in the order wanted
+///
+/// ### Returns
+///
+/// Row-major `n_rows * cols.len()`.
+fn subset_columns(x: &[f64], n_rows: usize, n_cols: usize, cols: &[usize]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(n_rows * cols.len());
+    for row in x.chunks_exact(n_cols).take(n_rows) {
+        out.extend(cols.iter().map(|&j| row[j]));
+    }
+    out
+}
+
+/// Multiplies a row-major matrix by a column-major one.
+///
+/// `A B` with `A` row-major `n_rows * k` and `B` column-major `k * n_cols`,
+/// which is the layout the contrast matrix arrives in. Rayon over rows, since
+/// that is the gene axis.
+///
+/// ### Params
+///
+/// * `a` - Left operand, row-major `n_rows * k`
+/// * `n_rows` - Rows of `a`
+/// * `k` - Shared dimension
+/// * `b` - Right operand, column-major `k * n_cols`
+/// * `n_cols` - Columns of `b`
+///
+/// ### Returns
+///
+/// The product, row-major `n_rows * n_cols`.
+fn gemm(a: &[f64], n_rows: usize, k: usize, b: &[f64], n_cols: usize) -> Vec<f64> {
+    let mut out = vec![0.0; n_rows * n_cols];
+    out.par_chunks_mut(n_cols)
+        .zip(a.par_chunks_exact(k))
+        .for_each(|(dst, row)| {
+            for (c, slot) in dst.iter_mut().enumerate() {
+                let col = &b[c * k..(c + 1) * k];
+                *slot = row.iter().zip(col).map(|(x, y)| x * y).sum();
+            }
+        });
+    out
+}
+
+/// Forms `(L' C)' (L' C)` for a lower triangular `L`.
+///
+/// With `V = L L'` this is `C' V C`, the covariance in the contrast basis.
+/// limma writes it as `crossprod(chol(V) %*% C)` with an upper factor
+/// (`R/contrasts.R:107-108`); the transpose of that factor is `L`, so the two
+/// are the same product.
+///
+/// ### Params
+///
+/// * `chol` - Lower Cholesky factor of the covariance, row-major `n * n`
+/// * `contrasts` - Column-major `n * n_contrasts`
+/// * `n` - Order of the covariance
+/// * `n_contrasts` - Number of contrasts
+///
+/// ### Returns
+///
+/// The rotated covariance, row-major `n_contrasts * n_contrasts`.
+fn crossprod_whitened(chol: &[f64], contrasts: &[f64], n: usize, n_contrasts: usize) -> Vec<f64> {
+    // W[.,k] = L' C[.,k], so W[i,k] = sum_{r >= i} L[r,i] C[r,k].
+    let mut w = vec![0.0; n * n_contrasts];
+    for k in 0..n_contrasts {
+        let col = &contrasts[k * n..(k + 1) * n];
+        for i in 0..n {
+            let mut acc = 0.0;
+            for (r, &c) in col.iter().enumerate().skip(i) {
+                acc += chol[r * n + i] * c;
+            }
+            w[k * n + i] = acc;
+        }
+    }
+
+    let mut out = vec![0.0; n_contrasts * n_contrasts];
+    for a in 0..n_contrasts {
+        for b in a..n_contrasts {
+            let acc: f64 = (0..n).map(|i| w[a * n + i] * w[b * n + i]).sum();
+            out[a * n_contrasts + b] = acc;
+            out[b * n_contrasts + a] = acc;
+        }
+    }
+    out
+}
+
+/// Contrast standard errors when the coefficients are correlated.
+///
+/// For gene `i` the answer is the column norms of `R diag(u_i) C`, with `R` the
+/// Cholesky factor of the coefficient correlation matrix. limma runs this as an
+/// R loop over genes (`R/contrasts.R:118-123`); here it is a rayon fan-out with
+/// a per-thread scratch buffer, which is the shape every other genewise loop in
+/// the crate takes.
+///
+/// ### Params
+///
+/// * `stdev` - Unscaled standard deviations, row-major `n_genes * n`
+/// * `n_genes` - Number of genes
+/// * `n` - Number of coefficients
+/// * `contrasts` - Column-major `n * n_contrasts`
+/// * `n_contrasts` - Number of contrasts
+/// * `rchol` - Lower Cholesky factor of the correlation matrix, row-major `n`
+///
+/// ### Returns
+///
+/// The rotated standard deviations, row-major `n_genes * n_contrasts`.
+fn correlated_stdev(
+    stdev: &[f64],
+    n_genes: usize,
+    n: usize,
+    contrasts: &[f64],
+    n_contrasts: usize,
+    rchol: &[f64],
+) -> Vec<f64> {
+    let mut out = vec![0.0; n_genes * n_contrasts];
+    out.par_chunks_mut(n_contrasts)
+        .zip(stdev.par_chunks_exact(n))
+        .for_each_init(
+            || vec![0.0; n],
+            |scratch, (dst, u)| {
+                for (k, slot) in dst.iter_mut().enumerate() {
+                    let col = &contrasts[k * n..(k + 1) * n];
+                    // scratch = diag(u) C[., k], then take the norm of R times it.
+                    for (r, s) in scratch.iter_mut().enumerate() {
+                        *s = u[r] * col[r];
+                    }
+                    // R is upper triangular in limma's orientation, so row i of
+                    // `R x` is sum_{r >= i} rchol[r][i] * x[r].
+                    let mut acc = 0.0;
+                    for i in 0..n {
+                        let mut v = 0.0;
+                        for (r, &x) in scratch.iter().enumerate().skip(i) {
+                            v += rchol[r * n + i] * x;
+                        }
+                        acc += v * v;
+                    }
+                    *slot = acc.sqrt();
+                }
+            },
+        );
+    out
+}
+
+///////////////////
+// contrasts_fit //
+///////////////////
 
 /// Rotates a fit onto a set of contrasts.
 ///
@@ -254,213 +403,9 @@ pub fn contrasts_fit(
     Ok(fit)
 }
 
-/////////////
-// Kernels //
-/////////////
-
-/// Picks a subset of columns out of a row-major matrix.
-///
-/// ### Params
-///
-/// * `x` - Row-major `n_rows * n_cols`
-/// * `n_rows` - Number of rows
-/// * `n_cols` - Number of columns
-/// * `cols` - Column indices to keep, in the order wanted
-///
-/// ### Returns
-///
-/// Row-major `n_rows * cols.len()`.
-fn subset_columns(x: &[f64], n_rows: usize, n_cols: usize, cols: &[usize]) -> Vec<f64> {
-    let mut out = Vec::with_capacity(n_rows * cols.len());
-    for row in x.chunks_exact(n_cols).take(n_rows) {
-        out.extend(cols.iter().map(|&j| row[j]));
-    }
-    out
-}
-
-/// Multiplies a row-major matrix by a column-major one.
-///
-/// `A B` with `A` row-major `n_rows * k` and `B` column-major `k * n_cols`,
-/// which is the layout the contrast matrix arrives in. Rayon over rows, since
-/// that is the gene axis.
-///
-/// ### Params
-///
-/// * `a` - Left operand, row-major `n_rows * k`
-/// * `n_rows` - Rows of `a`
-/// * `k` - Shared dimension
-/// * `b` - Right operand, column-major `k * n_cols`
-/// * `n_cols` - Columns of `b`
-///
-/// ### Returns
-///
-/// The product, row-major `n_rows * n_cols`.
-fn gemm(a: &[f64], n_rows: usize, k: usize, b: &[f64], n_cols: usize) -> Vec<f64> {
-    let mut out = vec![0.0; n_rows * n_cols];
-    out.par_chunks_mut(n_cols)
-        .zip(a.par_chunks_exact(k))
-        .for_each(|(dst, row)| {
-            for (c, slot) in dst.iter_mut().enumerate() {
-                let col = &b[c * k..(c + 1) * k];
-                *slot = row.iter().zip(col).map(|(x, y)| x * y).sum();
-            }
-        });
-    out
-}
-
-/// Forms `(L' C)' (L' C)` for a lower triangular `L`.
-///
-/// With `V = L L'` this is `C' V C`, the covariance in the contrast basis.
-/// limma writes it as `crossprod(chol(V) %*% C)` with an upper factor
-/// (`R/contrasts.R:107-108`); the transpose of that factor is `L`, so the two
-/// are the same product.
-///
-/// ### Params
-///
-/// * `chol` - Lower Cholesky factor of the covariance, row-major `n * n`
-/// * `contrasts` - Column-major `n * n_contrasts`
-/// * `n` - Order of the covariance
-/// * `n_contrasts` - Number of contrasts
-///
-/// ### Returns
-///
-/// The rotated covariance, row-major `n_contrasts * n_contrasts`.
-fn crossprod_whitened(chol: &[f64], contrasts: &[f64], n: usize, n_contrasts: usize) -> Vec<f64> {
-    // W[.,k] = L' C[.,k], so W[i,k] = sum_{r >= i} L[r,i] C[r,k].
-    let mut w = vec![0.0; n * n_contrasts];
-    for k in 0..n_contrasts {
-        let col = &contrasts[k * n..(k + 1) * n];
-        for i in 0..n {
-            let mut acc = 0.0;
-            for (r, &c) in col.iter().enumerate().skip(i) {
-                acc += chol[r * n + i] * c;
-            }
-            w[k * n + i] = acc;
-        }
-    }
-
-    let mut out = vec![0.0; n_contrasts * n_contrasts];
-    for a in 0..n_contrasts {
-        for b in a..n_contrasts {
-            let acc: f64 = (0..n).map(|i| w[a * n + i] * w[b * n + i]).sum();
-            out[a * n_contrasts + b] = acc;
-            out[b * n_contrasts + a] = acc;
-        }
-    }
-    out
-}
-
-/// Contrast standard errors when the coefficients are correlated.
-///
-/// For gene `i` the answer is the column norms of `R diag(u_i) C`, with `R` the
-/// Cholesky factor of the coefficient correlation matrix. limma runs this as an
-/// R loop over genes (`R/contrasts.R:118-123`); here it is a rayon fan-out with
-/// a per-thread scratch buffer, which is the shape every other genewise loop in
-/// the crate takes.
-///
-/// ### Params
-///
-/// * `stdev` - Unscaled standard deviations, row-major `n_genes * n`
-/// * `n_genes` - Number of genes
-/// * `n` - Number of coefficients
-/// * `contrasts` - Column-major `n * n_contrasts`
-/// * `n_contrasts` - Number of contrasts
-/// * `rchol` - Lower Cholesky factor of the correlation matrix, row-major `n`
-///
-/// ### Returns
-///
-/// The rotated standard deviations, row-major `n_genes * n_contrasts`.
-fn correlated_stdev(
-    stdev: &[f64],
-    n_genes: usize,
-    n: usize,
-    contrasts: &[f64],
-    n_contrasts: usize,
-    rchol: &[f64],
-) -> Vec<f64> {
-    let mut out = vec![0.0; n_genes * n_contrasts];
-    out.par_chunks_mut(n_contrasts)
-        .zip(stdev.par_chunks_exact(n))
-        .for_each_init(
-            || vec![0.0; n],
-            |scratch, (dst, u)| {
-                for (k, slot) in dst.iter_mut().enumerate() {
-                    let col = &contrasts[k * n..(k + 1) * n];
-                    // scratch = diag(u) C[., k], then take the norm of R times it.
-                    for (r, s) in scratch.iter_mut().enumerate() {
-                        *s = u[r] * col[r];
-                    }
-                    // R is upper triangular in limma's orientation, so row i of
-                    // `R x` is sum_{r >= i} rchol[r][i] * x[r].
-                    let mut acc = 0.0;
-                    for i in 0..n {
-                        let mut v = 0.0;
-                        for (r, &x) in scratch.iter().enumerate().skip(i) {
-                            v += rchol[r * n + i] * x;
-                        }
-                        acc += v * v;
-                    }
-                    *slot = acc.sqrt();
-                }
-            },
-        );
-    out
-}
-
-///////////////////////
-// make_contrasts    //
-///////////////////////
-
-/// Builds a contrast matrix from linear expressions over the design columns.
-///
-/// The numerical half of limma's `makeContrasts`. Upstream is R
-/// metaprogramming: `substitute`, then an environment mapping every level name
-/// to an indicator vector, then `eval(parse(text = ...))`
-/// (`R/modelmatrix.R:46-114`). None of that ports, and none of it is
-/// arithmetic. What ports is the grammar people actually write in:
-/// `+ - * / ( )`, decimal literals, and the column names.
-///
-/// So `"grpB"`, `"grpB - grpA"` and `"grpB - 0.5 * batb2"` all work, and
-/// anything requiring an R evaluator does not. A level named `(Intercept)` is
-/// matched as `Intercept` too, which is the rename limma does at
-/// `R/modelmatrix.R:54`.
-///
-/// ### Params
-///
-/// * `levels` - Design column names, in design order
-/// * `contrasts` - One expression per contrast
-///
-/// ### Returns
-///
-/// The contrast matrix, column-major `levels.len() * contrasts.len()`, and the
-/// number of contrasts. [`EdgeErrors::InvalidArgument`] for an empty input, an
-/// unparseable expression, or a name that is not a level.
-pub fn make_contrasts(
-    levels: &[&str],
-    contrasts: &[&str],
-) -> Result<(Vec<f64>, usize), EdgeErrors> {
-    if levels.is_empty() {
-        return Err(EdgeErrors::InvalidArgument(
-            "make_contrasts needs at least one level".to_string(),
-        ));
-    }
-    if contrasts.is_empty() {
-        return Err(EdgeErrors::InvalidArgument(
-            "make_contrasts needs at least one contrast".to_string(),
-        ));
-    }
-
-    let n = levels.len();
-    let mut out = Vec::with_capacity(n * contrasts.len());
-    for expr in contrasts {
-        let mut column = vec![0.0; n];
-        let mut parser = Parser::new(expr, levels);
-        parser.expression(&mut column, 1.0)?;
-        parser.finish()?;
-        out.extend(column);
-    }
-    Ok((out, contrasts.len()))
-}
+////////////
+// Parser //
+////////////
 
 /// Recursive descent over the contrast grammar.
 ///
@@ -743,6 +688,61 @@ impl<'a> Parser<'a> {
         v[idx] = 1.0;
         Ok(Operand::Vector(v))
     }
+}
+
+////////////////////
+// make_contrasts //
+////////////////////
+
+/// Builds a contrast matrix from linear expressions over the design columns.
+///
+/// The numerical half of limma's `makeContrasts`. Upstream is R
+/// metaprogramming: `substitute`, then an environment mapping every level name
+/// to an indicator vector, then `eval(parse(text = ...))`
+/// (`R/modelmatrix.R:46-114`). None of that ports, and none of it is
+/// arithmetic. What ports is the grammar people actually write in:
+/// `+ - * / ( )`, decimal literals, and the column names.
+///
+/// So `"grpB"`, `"grpB - grpA"` and `"grpB - 0.5 * batb2"` all work, and
+/// anything requiring an R evaluator does not. A level named `(Intercept)` is
+/// matched as `Intercept` too, which is the rename limma does at
+/// `R/modelmatrix.R:54`.
+///
+/// ### Params
+///
+/// * `levels` - Design column names, in design order
+/// * `contrasts` - One expression per contrast
+///
+/// ### Returns
+///
+/// The contrast matrix, column-major `levels.len() * contrasts.len()`, and the
+/// number of contrasts. [`EdgeErrors::InvalidArgument`] for an empty input, an
+/// unparseable expression, or a name that is not a level.
+pub fn make_contrasts(
+    levels: &[&str],
+    contrasts: &[&str],
+) -> Result<(Vec<f64>, usize), EdgeErrors> {
+    if levels.is_empty() {
+        return Err(EdgeErrors::InvalidArgument(
+            "make_contrasts needs at least one level".to_string(),
+        ));
+    }
+    if contrasts.is_empty() {
+        return Err(EdgeErrors::InvalidArgument(
+            "make_contrasts needs at least one contrast".to_string(),
+        ));
+    }
+
+    let n = levels.len();
+    let mut out = Vec::with_capacity(n * contrasts.len());
+    for expr in contrasts {
+        let mut column = vec![0.0; n];
+        let mut parser = Parser::new(expr, levels);
+        parser.expression(&mut column, 1.0)?;
+        parser.finish()?;
+        out.extend(column);
+    }
+    Ok((out, contrasts.len()))
 }
 
 ///////////
