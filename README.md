@@ -10,9 +10,10 @@
 Negative binomial differential expression for bulk and single-cell RNA-seq. This
 is the edgeR numerical stack in Rust: normalisation, Cox-Reid dispersion
 estimation, the Levenberg-damped NB GLM, quasi-likelihood weights, the exact
-test and `diffSpliceDGE`. On top of that sit the limma routines edgeR leans on
-(`squeezeVar`, the F-distribution fits, lowess and locfit smoothing,
-`voomLmFit`) and NEBULA, a negative binomial gamma mixed model for single cell.
+test and `diffSpliceDGE`. On top of that sits the limma linear model stack
+(`squeezeVar`, the F-distribution fits, lowess and locfit smoothing, `voom`,
+`lmFit`, `contrasts.fit`, `eBayes`, `topTable`) and NEBULA, a negative binomial
+gamma mixed model for single cell.
 
 No R, no Python, no BLAS to hunt down. CPU only.
 
@@ -35,7 +36,9 @@ under the full feature set.
 
 ## Quick start
 
-The classic GLM chain: filter, normalise, estimate dispersions, fit, test, rank.
+### The GLM chain
+
+Filter, normalise, estimate dispersions, fit, test, rank.
 Counts are dense and gene-major throughout, `n_genes` rows of `n_samples`
 values, row-major, so one gene is a contiguous slice.
 
@@ -107,7 +110,54 @@ let top = top_tags(
 
 Swap `glm_fit` for `glm_ql_fit` and `glm_lrt` for `glm_ql_ftest` to get the
 quasi-likelihood pipeline instead. `exact_test` covers the pre-GLM two-group
-path, `voom_lmfit` the limma route, and `nebula` the single-cell one.
+path, and `nebula` the single-cell one. Counts already in CSR? Hand them to
+`nebula_sparse` and skip the densification.
+
+### limma-voom
+
+The other bulk route: transform the counts, fit a linear model against precision
+weights, moderate the variances, rank. `MArrayLm` is limma's `MArrayLM`, one
+object that each stage consumes and hands back with more on it.
+
+```rust
+use edge_rs::limma::contrasts::{contrasts_fit, make_contrasts};
+use edge_rs::limma::ebayes::{EBayesParams, EBayesTrend, ebayes};
+use edge_rs::limma::marray::MArrayLm;
+use edge_rs::limma::toptable::{TopTableParams, TopTableSort, top_table};
+use edge_rs::limma::voom::voom_lmfit;
+
+// Mean-variance trend, precision weights and the weighted least squares fit,
+// in one pass over the counts.
+let (voom, lm) = voom_lmfit(
+    &counts, n_genes, n_samples, &design, n_coef, None, None, None,
+)?;
+let fit = MArrayLm::from_lm_fit(lm, &design, n_coef, n_samples, Some(voom.amean))?;
+
+// Rotate onto the comparisons of interest. Names are the design columns.
+let (contrasts, n_contrasts) = make_contrasts(
+    &["Int", "grpB", "batb2"],
+    &["grpB", "grpB - 0.5 * batb2"],
+)?;
+let fit = contrasts_fit(fit, &contrasts, n_contrasts)?;
+
+// Moderate, trending the prior against average log-expression.
+let fit = ebayes(fit, Some(EBayesParams {
+    trend: EBayesTrend::Amean,
+    ..Default::default()
+}))?;
+
+// Rank the first contrast.
+let top = top_table(&fit, 0, Some(TopTableParams {
+    number: 10,
+    sort_by: TopTableSort::PValue,
+    ..Default::default()
+}))?;
+```
+
+`ebayes` also fills in the moderated F across contrasts whenever the design is
+full rank, and `top_table_f` ranks on it. Building the contrast matrix yourself
+rather than through `make_contrasts`? `contrasts_fit` wants it column-major,
+`n_coef` by `n_contrasts`.
 
 Fits and containers are generic over `EdgeFloat`, so single-cell counts can be
 held as `f32` and halve the memory. Likelihoods, Cox-Reid determinants, the
@@ -117,12 +167,18 @@ anything.
 
 ## What is not in here
 
-This is not a general limma port. Only the pieces `estimateDisp`, `glmQLFit` and
-`voomLmFit` actually reach for are implemented, so the voom chain stops at the
-moderated variances. There is no `eBayes` and no limma `topTable` (but might be
-implemented in the future...). On the single-cell side, NEBULA is `NBGMM` only:
-`PMM` needs Poisson-gamma kernels this crate does not have, and `NBLMM` has no
-golden to validate against.
+Still not a general limma port. The linear model chain is complete through
+`topTable`, but `treat` and `topTreat` are absent, and so is limma's
+`decideTests`: only the F statistic `eBayes` needs is ported, not the
+step-down classification around it. `voom_lmfit` takes no `block` or
+`correlation`, though `duplicate_correlation` and `array_weights` are both
+there to be called on their own. No `mrlm`, no `vooma`, no
+`voomWithQualityWeights`. `make_contrasts` reads a linear expression over the
+design column names rather than evaluating arbitrary R.
+
+No visualisations and no pathway enrichment. On the single-cell side, NEBULA is
+`NBGMM` only: `PMM` needs Poisson-gamma kernels this crate does not have, and
+`NBLMM` has no golden to validate against.
 
 ## Parity
 
