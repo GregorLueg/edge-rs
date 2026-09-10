@@ -87,9 +87,9 @@ const PRIOR_QUANTILE: f64 = 0.9;
 /// scale, so the effective floor on the returned value is also one.
 const PRIOR_FLOOR: f64 = 1.0;
 
-////////////////
-// Public API //
-////////////////
+//////////////
+// Frontend //
+//////////////
 
 /// Per-gene adjusted deviance, degrees of freedom and their ratio.
 ///

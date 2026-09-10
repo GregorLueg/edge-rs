@@ -169,6 +169,14 @@ pub struct VoomResult {
     /// Ordinates of the fitted mean-variance trend, one per
     /// [`VoomResult::trend_x`].
     pub trend_y: Vec<f64>,
+    /// Row means of [`VoomResult::e`], one per gene. limma's `Amean`.
+    ///
+    /// Plain means over every sample, **not** the masked means the trend uses.
+    /// `voomLmFit` keeps the two apart (`R/voomLmFit.R:193-195`): the masked
+    /// version corrects the trend abscissae for structural zeros, while
+    /// `fit$Amean`, which is what `eBayes(trend = TRUE)` reads, is the
+    /// uncorrected one at `R/voomLmFit.R:332`.
+    pub amean: Vec<f64>,
 }
 
 /////////////////
@@ -290,7 +298,7 @@ pub fn voom<T: EdgeFloat>(
     let trend = plain_trend(&sx, &sy, prep.span)?;
     let w = voom_weights(&fit.fitted, n_genes, n_samples, &prep.lib_adj, &trend);
 
-    Ok(finish(prep.e, w, trend, params.save_trend))
+    Ok(finish(prep.e, w, trend, params.save_trend, n_samples))
 }
 
 /// voom followed by the weighted linear model fit, as edgeR's `voomLmFit`.
@@ -438,7 +446,10 @@ pub fn voom_lmfit<T: EdgeFloat>(
         final_fit.df_residual[g] = df;
     }
 
-    Ok((finish(prep.e, w, trend, params.save_trend), final_fit))
+    Ok((
+        finish(prep.e, w, trend, params.save_trend, n_samples),
+        final_fit,
+    ))
 }
 
 /// voom with explicit normalisation factors and a fixed span.
@@ -988,17 +999,25 @@ fn voom_weights(
 /// ### Returns
 ///
 /// The result.
-fn finish(e: Vec<f64>, weights: Vec<f64>, trend: Trend, save_trend: bool) -> VoomResult {
+fn finish(
+    e: Vec<f64>,
+    weights: Vec<f64>,
+    trend: Trend,
+    save_trend: bool,
+    n_samples: usize,
+) -> VoomResult {
     let (trend_x, trend_y) = if save_trend {
         (trend.x, trend.y)
     } else {
         (Vec::new(), Vec::new())
     };
+    let amean = e.chunks_exact(n_samples).map(row_mean).collect();
     VoomResult {
         e,
         weights,
         trend_x,
         trend_y,
+        amean,
     }
 }
 
@@ -1014,11 +1033,13 @@ fn finish(e: Vec<f64>, weights: Vec<f64>, trend: Trend, save_trend: bool) -> Voo
 ///
 /// The expression matrix with every weight set to one and no trend.
 fn no_trend_result(e: Vec<f64>, n_genes: usize, n_samples: usize) -> VoomResult {
+    let amean = e.chunks_exact(n_samples).map(row_mean).collect();
     VoomResult {
         e,
         weights: vec![1.0; n_genes * n_samples],
         trend_x: Vec::new(),
         trend_y: Vec::new(),
+        amean,
     }
 }
 

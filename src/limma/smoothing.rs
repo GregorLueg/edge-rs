@@ -88,9 +88,9 @@ const LOESS_LOW_VALUE: f64 = 1e-10;
 /// genes by 21 grid points that `estimateDisp` produces is worth splitting.
 const PARALLEL_WORK_THRESHOLD: usize = 1 << 14;
 
-////////////////
-// Public API //
-////////////////
+//////////////
+// Frontend //
+//////////////
 
 /// What [`loess_by_col`] produces.
 #[derive(Clone, Debug)]

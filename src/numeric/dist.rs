@@ -274,6 +274,221 @@ fn gamma_cont_frac(a: f64, x: f64) -> f64 {
 }
 
 /////////////////////////////
+// Log incomplete beta     //
+/////////////////////////////
+
+/// Iteration budget for the incomplete beta continued fraction.
+const BETA_CF_MAX_ITER: usize = 300;
+
+/// Relative tolerance at which the continued fraction stops.
+const BETA_CF_EPS: f64 = 3e-16;
+
+/// Log of the smallest positive probability an `f64` can hold.
+///
+/// Below this, `exp(ln_p)` is zero and the AS 109 starting point is useless, so
+/// the small-`x` asymptote has to seed the search instead.
+const MIN_REPRESENTABLE_LN: f64 = -745.0;
+
+/// Shape above which the beta log-normaliser goes through Stirling.
+///
+/// `ln_beta` forms `lnGamma(a) + lnGamma(b) - lnGamma(a + b)`, and the first
+/// and last of those agree to many digits once `a` is large: at `a = 5e5` they
+/// are both about 6.0e6 and differ by 6.5, so the difference keeps barely nine
+/// digits. Above this the difference is built from a series instead, where
+/// nothing cancels. Below it the plain form loses at most `lnGamma(30) * eps`,
+/// which is 7e-15.
+const LN_BETA_STIRLING_MIN: f64 = 30.0;
+
+/// Stirling's correction, `lnGamma(z) - [(z - 1/2) ln z - z + ln(2 pi) / 2]`.
+///
+/// Asymptotic series, used only above [`LN_BETA_STIRLING_MIN`] where the first
+/// dropped term is past the last bit.
+///
+/// ### Params
+///
+/// * `z` - Argument, at least [`LN_BETA_STIRLING_MIN`]
+///
+/// ### Returns
+///
+/// The correction term.
+fn stirlerr(z: f64) -> f64 {
+    let z2 = z * z;
+    (1.0 / 12.0 - (1.0 / 360.0 - (1.0 / 1260.0 - 1.0 / (1680.0 * z2)) / z2) / z2) / z
+}
+
+/// Log of the beta function, stable for a large shape.
+///
+/// Symmetric in its arguments. For a large shape it evaluates
+/// `lnGamma(a + b) - lnGamma(a)` from Stirling's series, where the leading
+/// terms cancel analytically instead of numerically.
+///
+/// ### Params
+///
+/// * `a` - First shape, strictly positive
+/// * `b` - Second shape, strictly positive
+///
+/// ### Returns
+///
+/// `ln B(a, b)`.
+fn ln_beta_stable(a: f64, b: f64) -> f64 {
+    let (big, small) = if a >= b { (a, b) } else { (b, a) };
+    if big < LN_BETA_STIRLING_MIN {
+        return ln_beta(a, b);
+    }
+    // lnGamma(big + small) - lnGamma(big), with the (big - 1/2) ln(big) terms
+    // cancelled by hand.
+    let ratio = small * big.ln() + (big + small - 0.5) * (small / big).ln_1p() - small
+        + stirlerr(big + small)
+        - stirlerr(big);
+    ln_gamma(small) - ratio
+}
+
+/// Modified Lentz evaluation of the incomplete beta continued fraction.
+///
+/// Numerical Recipes' `betacf`, valid where `x < (a + 1) / (a + b + 2)`. The
+/// value is `O(1)`, so all the dynamic range lives in the prefactor its caller
+/// applies.
+///
+/// ### Params
+///
+/// * `a` - First shape, strictly positive
+/// * `b` - Second shape, strictly positive
+/// * `x` - Argument in `(0, 1)`, on the convergent side
+///
+/// ### Returns
+///
+/// The continued fraction value.
+///
+/// ### References
+///
+/// Press, Teukolsky, Vetterling & Flannery, Numerical Recipes, 3rd ed., 6.4
+fn beta_cf(a: f64, b: f64, x: f64) -> f64 {
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < LENTZ_TINY {
+        d = LENTZ_TINY;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+
+    for m in 1..=BETA_CF_MAX_ITER {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < LENTZ_TINY {
+            d = LENTZ_TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < LENTZ_TINY {
+            c = LENTZ_TINY;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < LENTZ_TINY {
+            d = LENTZ_TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < LENTZ_TINY {
+            c = LENTZ_TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+
+        if (del - 1.0).abs() < BETA_CF_EPS {
+            break;
+        }
+    }
+
+    h
+}
+
+/// Log of the regularised incomplete beta.
+///
+/// `ln I(x; a, b)` without ever forming `I` itself, so a tail of 1e-4000 comes
+/// back as roughly `-9210` rather than as `-inf`. This is R's
+/// `pbeta(log.p = TRUE)`, and it is what lets the unequal-degrees-of-freedom
+/// conversion in `tmixture.vector` survive a moderated t of 40 against a
+/// near-infinite `df.total`.
+///
+/// ### Params
+///
+/// * `x` - Argument in `[0, 1]`
+/// * `a` - First shape, strictly positive
+/// * `b` - Second shape, strictly positive
+///
+/// ### Returns
+///
+/// `ln I(x; a, b)`. `x = 0` gives `-inf` and `x = 1` gives `0`.
+fn ln_beta_reg(x: f64, a: f64, b: f64) -> f64 {
+    ln_beta_reg_pair(x, 1.0 - x, a, b)
+}
+
+/// Log of the regularised incomplete beta, given both `x` and `1 - x`.
+///
+/// The prefactor is `a ln x + b ln(1 - x)`, so when one of the two is close to
+/// one, forming its log from the *other* one is what keeps the result
+/// accurate. `a` here is half the degrees of freedom, which for a moderated t
+/// against an infinite prior runs into the millions: an absolute error of 1e-16
+/// in `ln x` comes out multiplied by that.
+///
+/// A caller that can compute the complement without cancellation should, and
+/// [`t_sf_log`] can: `1 - df / (df + x^2)` is `x^2 / (df + x^2)` exactly.
+///
+/// ### Params
+///
+/// * `x` - Argument in `[0, 1]`
+/// * `one_minus_x` - Its complement, computed independently where possible
+/// * `a` - First shape, strictly positive
+/// * `b` - Second shape, strictly positive
+///
+/// ### Returns
+///
+/// `ln I(x; a, b)`.
+fn ln_beta_reg_pair(x: f64, one_minus_x: f64, a: f64, b: f64) -> f64 {
+    if x <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if one_minus_x <= 0.0 {
+        return 0.0;
+    }
+
+    // `ln1p` of the complement beats `ln` of the value itself whenever the
+    // value is the one near one, and the two agree elsewhere.
+    let ln_x = if x > 0.5 {
+        (-one_minus_x).ln_1p()
+    } else {
+        x.ln()
+    };
+    let ln_1mx = if one_minus_x > 0.5 {
+        (-x).ln_1p()
+    } else {
+        one_minus_x.ln()
+    };
+
+    // The continued fraction converges quickly only on one side of this
+    // switchover; past it, evaluate the complement and take `ln(1 - .)`. The
+    // complement is then at least about a half, so the subtraction is safe.
+    if x < (a + 1.0) / (a + b + 2.0) {
+        let ln_pre = a * ln_x + b * ln_1mx - ln_beta_stable(a, b);
+        ln_pre + (beta_cf(a, b, x) / a).ln()
+    } else {
+        let ln_other =
+            b * ln_1mx + a * ln_x - ln_beta_stable(b, a) + (beta_cf(b, a, one_minus_x) / b).ln();
+        (-ln_other.exp()).ln_1p()
+    }
+}
+
+/////////////////////////////
 // Incomplete beta inverse //
 /////////////////////////////
 
@@ -312,14 +527,39 @@ fn inv_beta_reg_lower(a: f64, b: f64, p: f64) -> Result<f64, EdgeErrors> {
     if p <= 0.0 {
         return Ok(0.0);
     }
+    inv_ln_beta_reg_lower(a, b, p.ln())
+}
+
+/// Inverts the regularised incomplete beta from a log probability.
+///
+/// The body of [`inv_beta_reg_lower`], which already worked in
+/// `ln I(x; a, b) = ln p`; taking the target in logs simply lets it reach
+/// probabilities that cannot be represented at all. Everything below
+/// `ln p = -745` is only addressable this way.
+///
+/// ### Params
+///
+/// * `a` - First shape, strictly positive
+/// * `b` - Second shape, strictly positive
+/// * `ln_p` - Log of the target probability, at or below `ln(0.5)`
+///
+/// ### Returns
+///
+/// `x` with `ln I(x; a, b) = ln_p`, or [`EdgeErrors::NoConvergence`].
+fn inv_ln_beta_reg_lower(a: f64, b: f64, ln_p: f64) -> Result<f64, EdgeErrors> {
+    if ln_p == f64::NEG_INFINITY {
+        return Ok(0.0);
+    }
     let ln_b = ln_beta(a, b);
-    let ln_p = p.ln();
 
-    // g(t) = ln I(e^t; a, b) - ln p, increasing in t. -inf where I underflows,
-    // which still gives the right sign for the bracket.
-    let g = |t: f64| beta_reg(a, b, t.exp().min(1.0)).ln() - ln_p;
+    // g(t) = ln I(e^t; a, b) - ln p, increasing in t.
+    let g = |t: f64| ln_beta_reg(t.exp().min(1.0), a, b) - ln_p;
 
-    let start = inv_beta_reg(a, b, p);
+    let start = if ln_p > MIN_REPRESENTABLE_LN {
+        inv_beta_reg(a, b, ln_p.exp())
+    } else {
+        0.0
+    };
     let mut t = if start > 0.0 && start < 1.0 {
         start.ln()
     } else {
@@ -367,7 +607,7 @@ fn inv_beta_reg_lower(a: f64, b: f64, p: f64) -> Result<f64, EdgeErrors> {
             };
         }
         let x = t.exp();
-        let ln_i = beta_reg(a, b, x).ln();
+        let ln_i = ln_beta_reg(x, a, b);
         let residual = ln_i - ln_p;
         if residual < 0.0 {
             lo = t;
@@ -395,7 +635,7 @@ fn inv_beta_reg_lower(a: f64, b: f64, p: f64) -> Result<f64, EdgeErrors> {
     }
 
     Err(EdgeErrors::NoConvergence {
-        routine: "inv_beta_reg_lower",
+        routine: "inv_ln_beta_reg_lower",
         iterations: INV_BETA_MAX_ITER,
         last_delta: hi - lo,
     })
@@ -640,6 +880,86 @@ pub fn t_ppf(p: f64, df: f64) -> Result<f64, EdgeErrors> {
     let (y, one_minus_y) = inv_beta_reg_pair(0.5 * df, 0.5, 2.0 * tail)?;
     let t = (df * one_minus_y / y).sqrt();
     Ok(if upper { t } else { -t })
+}
+
+/// Log of Student's t survival function.
+///
+/// `ln P(T > x)`, formed from the log incomplete beta rather than as
+/// `t_sf(x).ln()`, so
+/// it keeps going where the probability itself has underflowed to zero. R's
+/// `pt(lower.tail = FALSE, log.p = TRUE)`.
+///
+/// `tmixture.vector` puts the top `proportion / 2` of genes by moderated t
+/// through here, and those are exactly the ones whose tail probability is too
+/// small to represent: an eBayes fit whose prior degrees of freedom came back
+/// infinite gives a `df.total` in the millions, where a t of 40 is already past
+/// 1e-350.
+///
+/// ### Params
+///
+/// * `x` - Quantile
+/// * `df` - Degrees of freedom, finite and strictly positive
+///
+/// ### Returns
+///
+/// `ln P(T > x)`, or [`EdgeErrors::InvalidArgument`] for a non-positive `df`.
+pub fn t_sf_log(x: f64, df: f64) -> Result<f64, EdgeErrors> {
+    check_positive("df", df)?;
+    if x.is_infinite() {
+        return Ok(if x > 0.0 { f64::NEG_INFINITY } else { 0.0 });
+    }
+    if x <= 0.0 {
+        // At or below the median the mass is at least a half, so the plain
+        // survival function has all the precision there is to have.
+        return Ok(t_sf(x, df)?.ln());
+    }
+    // Both halves formed directly: `1 - df / (df + x^2)` is `x^2 / (df + x^2)`,
+    // so neither is a subtraction of near-equal numbers.
+    let x2 = x * x;
+    let denom = df + x2;
+    Ok(-std::f64::consts::LN_2 + ln_beta_reg_pair(df / denom, x2 / denom, 0.5 * df, 0.5))
+}
+
+/// Student's t upper quantile from a log probability.
+///
+/// The inverse of [`t_sf_log`]: given `ln p`, returns the `t` with
+/// `P(T > t) = p`. R's `qt(lower.tail = FALSE, log.p = TRUE)`.
+///
+/// ### Params
+///
+/// * `log_p` - Log of the upper tail probability, at or below zero
+/// * `df` - Degrees of freedom, finite and strictly positive
+///
+/// ### Returns
+///
+/// `t` with `ln P(T > t) = log_p`. `log_p = 0` gives `-inf` and
+/// `log_p = -inf` gives `+inf`. [`EdgeErrors::InvalidArgument`] for a positive
+/// `log_p` or a non-positive `df`.
+pub fn t_isf_log(log_p: f64, df: f64) -> Result<f64, EdgeErrors> {
+    check_positive("df", df)?;
+    if log_p > 0.0 || log_p.is_nan() {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "log_p must be at most 0; got {log_p}"
+        )));
+    }
+    if log_p == 0.0 {
+        return Ok(f64::NEG_INFINITY);
+    }
+    if log_p == f64::NEG_INFINITY {
+        return Ok(f64::INFINITY);
+    }
+    if log_p > -std::f64::consts::LN_2 {
+        // Above the median, where the tail is the large side and there is
+        // nothing for the log scale to rescue. `1 - p` is representable and
+        // `t_ppf` resolves the other tail properly.
+        return t_ppf(1.0 - log_p.exp(), df);
+    }
+    // P(T > t) = I(df / (df + t^2); df/2, 1/2) / 2, so invert on the half.
+    let z = inv_ln_beta_reg_lower(0.5 * df, 0.5, log_p + std::f64::consts::LN_2)?;
+    if z <= 0.0 {
+        return Ok(f64::INFINITY);
+    }
+    Ok((df * (1.0 - z) / z).sqrt())
 }
 
 ///////
@@ -1065,6 +1385,12 @@ pub fn nbinom_cdf(k: f64, size: f64, prob: f64) -> Result<f64, EdgeErrors> {
 
 #[cfg(test)]
 mod tests {
+    // The reference values below are pasted verbatim from R's 17-digit output.
+    // The last digit or two is past what an f64 can hold, and keeping them
+    // exactly as printed is what makes them checkable against the `Rscript`
+    // line quoted above them.
+    #![allow(clippy::excessive_precision)]
+
     use super::*;
     use approx::assert_relative_eq;
 
@@ -1281,6 +1607,56 @@ mod tests {
             0.9842765778816955,
             max_relative = TOL
         );
+    }
+
+    /// `Rscript -e 'pt(x, df, lower.tail=FALSE, log.p=TRUE)'` for each pair.
+    ///
+    /// The last two are past what an `f64` probability can hold at all:
+    /// `exp(-803.97)` is about 1e-349 and `exp(-6732)` is not close.
+    const T_SF_LOG: [(f64, f64, f64); 8] = [
+        (2.5, 10.0, -4.1526038236684464),
+        (8.0, 5.0, -8.3083379118742755),
+        (50.0, 100.0, -166.10963191099665),
+        (300.0, 3.0, -17.013663984295441),
+        (0.5, 7.0, -1.1513690707642816),
+        (-2.5, 10.0, -0.015848346341060398),
+        (40.0, 1e6, -803.96832475034205),
+        (120.0, 1e5, -6732.1838846408191),
+    ];
+
+    #[test]
+    fn test_t_sf_log_matches_r() {
+        for &(x, df, want) in &T_SF_LOG {
+            // Worst observed is one ULP, on the smallest magnitude of the
+            // eight. The `df = 1e6` case is the one that pins the two accuracy
+            // fixes down: without the paired form it is out by 2.8e-13, and
+            // without the Stirling `ln_beta` by 2.6e-13.
+            let got = t_sf_log(x, df).unwrap();
+            assert_relative_eq!(got, want, max_relative = 1e-15);
+        }
+    }
+
+    #[test]
+    fn test_t_sf_log_reaches_past_underflow() {
+        // The plain survival function has nothing left to say here.
+        assert_eq!(t_sf(120.0, 1e5).unwrap(), 0.0);
+        assert!(t_sf_log(120.0, 1e5).unwrap() < -6000.0);
+    }
+
+    #[test]
+    fn test_t_isf_log_round_trips() {
+        for &(x, df, log_p) in &T_SF_LOG {
+            let back = t_isf_log(log_p, df).unwrap();
+            assert_relative_eq!(back, x, max_relative = 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_t_isf_log_edges() {
+        assert_eq!(t_isf_log(0.0, 5.0).unwrap(), f64::NEG_INFINITY);
+        assert_eq!(t_isf_log(f64::NEG_INFINITY, 5.0).unwrap(), f64::INFINITY);
+        assert!(t_isf_log(0.5, 5.0).is_err());
+        assert!(t_isf_log(-1.0, 0.0).is_err());
     }
 
     #[test]

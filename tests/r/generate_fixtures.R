@@ -767,6 +767,208 @@ run_voom <- function(tag, counts, des) {
 run_voom("fac", fac$yf$counts, fac_des)
 run_voom("unbal", unbal$yf$counts, unbal_des)
 
+##########
+# eBayes #
+##########
+
+# eBayes reaches squeezeVar through the non-exported .ebayes, so the converged
+# root-finder has to be injected one level deeper than for estimateDisp and
+# glmQLFit. Same reason as tightED/tightQL above, and the same deviation
+# (docs/UPSTREAM_DEVIATIONS.md, entry 12).
+tightEB0 <- shadow(limma:::.ebayes, "squeezeVar", tightS)
+tightEB <- shadow(limma::eBayes, ".ebayes", tightEB0)
+
+# One eBayes variant flattened into the layout the Rust tests read: the
+# coefficient-wide quantities first, then the per-gene ones.
+ebayes_frame <- function(eb, ncoef) {
+  cbind(eb$t, eb$p.value, eb$lods,
+        s2_post = eb$s2.post, df_total = eb$df.total)
+}
+
+ebayes_header <- function(ncoef) {
+  c(paste0("t", seq_len(ncoef)), paste0("p", seq_len(ncoef)),
+    paste0("lods", seq_len(ncoef)), "s2_post", "df_total")
+}
+
+
+# topTable variants. coef 2 is the group effect in both designs.
+#
+# The row names that reach topTable are the original gene labels, carried
+# through filterByExpr, so they run up to 1000 on a matrix of 890 rows. The crate
+# works on the filtered matrix and indexes from zero, so the index column is
+# written as the position within the filtered set, via match().
+#
+# confint is gated both on its own and combined with a threshold. The 3.65.2
+# snapshot in the reference checkout formed the margin of error after thinning
+# while indexing the unthinned vectors, which broke the second case; the fix
+# landed before the 3.66.0 release, so the installed package is correct and both
+# fixtures come straight from topTable.
+kept_index <- function(tt, eb) {
+  idx <- match(rownames(tt), rownames(eb$coefficients))
+  stopifnot(!anyNA(idx))
+  idx
+}
+
+toptable_frame <- function(tt, eb) {
+  cbind(index = kept_index(tt, eb), logFC = tt$logFC,
+        AveExpr = tt$AveExpr, t = tt$t, P.Value = tt$P.Value,
+        adj.P.Val = tt$adj.P.Val, B = tt$B)
+}
+
+TOPTABLE_HEADER <- c("index", "logFC", "AveExpr", "t", "P.Value",
+                     "adj.P.Val", "B")
+
+run_toptable <- function(tag, eb, coef, ncoef) {
+  for (sb in c("B", "P", "logFC", "none")) {
+    tt <- topTable(eb, coef = coef, number = Inf, sort.by = sb)
+    write_num(toptable_frame(tt, eb), paste0(tag, "_toptable_", sb, ".csv"),
+              TOPTABLE_HEADER)
+  }
+
+  tt <- topTable(eb, coef = coef, number = Inf, sort.by = "P",
+                 p.value = 0.05, lfc = 1)
+  write_num(toptable_frame(tt, eb), paste0(tag, "_toptable_filtered.csv"),
+            TOPTABLE_HEADER)
+  put(paste0(tag, "_toptable"), "n_filtered", nrow(tt))
+
+  tt <- topTable(eb, coef = coef, number = Inf, sort.by = "B", confint = TRUE)
+  write_num(
+    cbind(toptable_frame(tt, eb), CI.L = tt$CI.L, CI.R = tt$CI.R),
+    paste0(tag, "_toptable_confint.csv"),
+    c(TOPTABLE_HEADER, "CI.L", "CI.R")
+  )
+
+  # The same table, thinned. Checks that the interval still belongs to the row
+  # it sits on once a threshold has removed genes.
+  tt <- topTable(eb, coef = coef, number = Inf, sort.by = "B", lfc = 1,
+                 confint = TRUE)
+  write_num(
+    cbind(toptable_frame(tt, eb), CI.L = tt$CI.L, CI.R = tt$CI.R),
+    paste0(tag, "_toptable_confint_filtered.csv"),
+    c(TOPTABLE_HEADER, "CI.L", "CI.R")
+  )
+  put(paste0(tag, "_toptable"), "n_confint_filtered", nrow(tt))
+
+  ttf <- topTable(eb, coef = seq_len(ncoef), number = Inf, sort.by = "F")
+  write_num(
+    cbind(index = kept_index(ttf, eb),
+          as.matrix(ttf[, seq_len(ncoef)]),
+          AveExpr = ttf$AveExpr, F = ttf$F,
+          P.Value = ttf$P.Value, adj.P.Val = ttf$adj.P.Val),
+    paste0(tag, "_toptable_f.csv"),
+    c("index", paste0("Coef", seq_len(ncoef)), "AveExpr", "F",
+      "P.Value", "adj.P.Val")
+  )
+}
+
+# The moderated t/F stack on top of voomLmFit, which is the path a user takes.
+# Three prior variants are gated: the default single prior, the abundance trend
+# (trend = TRUE reads fit$Amean), and the robust fit. Then the same again after
+# contrasts.fit, since rotating first is the common case.
+run_ebayes <- function(tag, counts, des, con) {
+  ncoef <- ncol(des)
+  ncon <- nrow(con)
+  v <- voomLmFit(counts, des, block = NULL, sample.weights = FALSE)
+
+  invisible(uniroot_since())
+  eb <- tightEB(v)
+  eb_trend <- tightEB(v, trend = TRUE)
+  eb_robust <- tightEB(v, robust = TRUE)
+  put(paste0(tag, "_ebayes"), "uniroot_calls", uniroot_since())
+
+  write_num(ebayes_frame(eb, ncoef), paste0(tag, "_ebayes.csv"),
+            ebayes_header(ncoef))
+  write_num(ebayes_frame(eb_trend, ncoef), paste0(tag, "_ebayes_trend.csv"),
+            ebayes_header(ncoef))
+  write_num(ebayes_frame(eb_robust, ncoef), paste0(tag, "_ebayes_robust.csv"),
+            ebayes_header(ncoef))
+  write_num(cbind(F = eb$F, F_p = eb$F.p.value),
+            paste0(tag, "_ebayes_f.csv"), c("F", "F_p"))
+
+  put(paste0(tag, "_ebayes"), "df_prior", eb$df.prior[1])
+  put(paste0(tag, "_ebayes"), "s2_prior", eb$s2.prior[1])
+  put(paste0(tag, "_ebayes"), "proportion", eb$proportion)
+  put(paste0(tag, "_ebayes"), "n_var_prior", length(eb$var.prior))
+  for (j in seq_len(ncoef)) {
+    put(paste0(tag, "_ebayes"), paste0("var_prior", j), eb$var.prior[j])
+  }
+  put(paste0(tag, "_ebayes"), "trend_df_prior", eb_trend$df.prior[1])
+  put(paste0(tag, "_ebayes"), "robust_n_df_prior", length(eb_robust$df.prior))
+
+  # con is the transposed contrast matrix, ncon rows by ncoef columns, so it
+  # has to go back the other way for contrasts.fit.
+  cf <- contrasts.fit(v, t(con))
+  write_num(
+    cbind(cf$coefficients, cf$stdev.unscaled),
+    paste0(tag, "_contrasts_fit.csv"),
+    c(paste0("coef", seq_len(ncon)), paste0("stdev", seq_len(ncon)))
+  )
+  write_num(cf$cov.coefficients, paste0(tag, "_contrasts_cov.csv"),
+            paste0("v", seq_len(ncon)))
+
+  ebc <- tightEB(cf)
+  write_num(ebayes_frame(ebc, ncon), paste0(tag, "_ebayes_contrasts.csv"),
+            ebayes_header(ncon))
+  write_num(cbind(F = ebc$F, F_p = ebc$F.p.value),
+            paste0(tag, "_ebayes_contrasts_f.csv"), c("F", "F_p"))
+  for (j in seq_len(ncon)) {
+    put(paste0(tag, "_ebayes_con"), paste0("var_prior", j), ebc$var.prior[j])
+  }
+  put(paste0(tag, "_ebayes_con"), "df_prior", ebc$df.prior[1])
+
+  run_toptable(tag, eb, 2L, ncoef)
+
+  cat(sprintf("%s ebayes: df.prior %.6g, %d contrasts\n", tag,
+              eb$df.prior[1], ncon))
+}
+
+run_ebayes("fac", fac$yf$counts, fac_des, read_num("fac_contrasts.csv"))
+run_ebayes("unbal", unbal$yf$counts, unbal_des, read_num("unbal_contrasts.csv"))
+
+# limma-trend: log-CPM straight into lmFit, with the mean-variance relationship
+# absorbed by the prior rather than by observation weights. Faster than voom and
+# what limma's own guide recommends when the library sizes are not too variable.
+#
+# Both variants are written. robust = TRUE is the one that matters here: it is
+# what makes the trended prior tolerant of outlier genes, and trend + robust
+# together is a combination no other fixture exercises.
+run_trend <- function(tag, counts, eff_lib, des) {
+  ncoef <- ncol(des)
+  y <- cpm(counts, lib.size = eff_lib, log = TRUE, prior.count = 2)
+  fit <- lmFit(y, des)
+
+  invisible(uniroot_since())
+  eb <- tightEB(fit, trend = TRUE)
+  ebr <- tightEB(fit, trend = TRUE, robust = TRUE)
+  put(paste0(tag, "_limma_trend"), "uniroot_calls", uniroot_since())
+
+  write_num(cbind(sigma = fit$sigma, df_residual = fit$df.residual,
+                  amean = fit$Amean),
+            paste0(tag, "_limma_trend_lmfit.csv"),
+            c("sigma", "df_residual", "amean"))
+  write_num(ebayes_frame(eb, ncoef), paste0(tag, "_limma_trend_ebayes.csv"),
+            ebayes_header(ncoef))
+  write_num(ebayes_frame(ebr, ncoef), paste0(tag, "_limma_trend_ebayes_robust.csv"),
+            ebayes_header(ncoef))
+  write_num(cbind(F = eb$F, F_p = eb$F.p.value),
+            paste0(tag, "_limma_trend_ebayes_f.csv"), c("F", "F_p"))
+
+  put(paste0(tag, "_limma_trend"), "n_df_prior", length(eb$df.prior))
+  put(paste0(tag, "_limma_trend"), "n_s2_prior", length(eb$s2.prior))
+  put(paste0(tag, "_limma_trend"), "robust_n_df_prior", length(ebr$df.prior))
+  for (j in seq_len(ncoef)) {
+    put(paste0(tag, "_limma_trend"), paste0("var_prior", j), eb$var.prior[j])
+  }
+
+  cat(sprintf("%s trend: df.prior length %d, robust %d\n", tag,
+              length(eb$df.prior), length(ebr$df.prior)))
+}
+
+eff_lib_of <- function(y) y$samples$lib.size * y$samples$norm.factors
+
+run_trend("fac", fac$yf$counts, eff_lib_of(fac$yf), fac_des)
+run_trend("unbal", unbal$yf$counts, eff_lib_of(unbal$yf), unbal_des)
+
 ###############
 # Single cell #
 ###############

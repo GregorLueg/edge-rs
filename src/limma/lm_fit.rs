@@ -47,6 +47,9 @@ use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
 use crate::utils::design::non_estimable;
+use crate::utils::linalg::{
+    cholesky_lower, cross_inverse, forward_substitute, invert_upper_triangular,
+};
 use crate::utils::recycled::{Recycled, RecycledRow};
 
 /// Relative tolerance for declaring a design column linearly dependent.
@@ -104,6 +107,26 @@ pub struct LmFitResult {
     /// nothing, evaluated at every sample including the dropped ones. A gene
     /// with no usable observation at all is `NaN` throughout.
     pub fitted: Vec<f64>,
+    /// Unscaled covariance of the estimable coefficients, row-major
+    /// `rank * rank`.
+    ///
+    /// `(X' V^-1 X)^-1` for the design as a whole, in the order the accepted
+    /// columns appear in [`LmFitResult::pivot`]. One matrix for every gene, not
+    /// one per gene: see the note on [`lm_fit`] about what limma does under
+    /// probe weights.
+    pub cov_coefficients: Vec<f64>,
+    /// Design column indices, accepted ones first, then the rejected ones.
+    ///
+    /// Length `n_coef`, zero-based. `pivot[..rank]` names the estimable columns
+    /// in the order [`LmFitResult::cov_coefficients`] uses. R's `qr()$pivot`,
+    /// less the one-based offset.
+    pub pivot: Vec<usize>,
+    /// Rank of the design, shared by every fully observed gene.
+    ///
+    /// A gene that lost observations can have a lower rank of its own; that
+    /// shows up as extra `NaN` coefficients and a smaller
+    /// [`LmFitResult::df_residual`], not here.
+    pub rank: usize,
 }
 
 ////////////////////////
@@ -147,61 +170,6 @@ fn fill_correlation(
                 0.0
             };
         }
-    }
-}
-
-/// Lower Cholesky factor of a symmetric positive definite matrix, in place.
-///
-/// Only the lower triangle of `a` is written; the upper triangle is left as it
-/// was and must not be read afterwards.
-///
-/// ### Params
-///
-/// * `a` - The matrix, row-major with row stride `stride`, overwritten by its
-///   lower Cholesky factor
-/// * `n` - Order of the matrix
-/// * `stride` - Row stride of `a`
-///
-/// ### Returns
-///
-/// `false` if a pivot is not strictly positive, meaning the matrix is not
-/// positive definite.
-fn cholesky_lower(a: &mut [f64], n: usize, stride: usize) -> bool {
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[i * stride + j];
-            for k in 0..j {
-                sum -= a[i * stride + k] * a[j * stride + k];
-            }
-            if i == j {
-                // Rejects NaN as well as a non-positive pivot.
-                if sum <= 0.0 || sum.is_nan() {
-                    return false;
-                }
-                a[i * stride + i] = sum.sqrt();
-            } else {
-                a[i * stride + j] = sum / a[j * stride + j];
-            }
-        }
-    }
-    true
-}
-
-/// Solves `L x = b` in place for lower triangular `L`.
-///
-/// ### Params
-///
-/// * `l` - Lower triangular factor, row-major with row stride `stride`
-/// * `stride` - Row stride of `l`
-/// * `n` - Order of the system
-/// * `b` - Right-hand side, overwritten by the solution
-fn forward_substitute(l: &[f64], stride: usize, n: usize, b: &mut [f64]) {
-    for i in 0..n {
-        let mut sum = b[i];
-        for k in 0..i {
-            sum -= l[i * stride + k] * b[k];
-        }
-        b[i] = sum / l[i * stride + i];
     }
 }
 
@@ -272,6 +240,109 @@ impl Scratch {
             },
         }
     }
+}
+
+/// Householder QR that accepts design columns left to right and rejects any
+/// whose residual norm has collapsed.
+///
+/// This is what LINPACK's `dqrdc2` does for R's `lm.fit`, and hence for limma:
+/// a rejected column is set aside rather than cycled to the end, so the
+/// accepted columns keep their original order and `est` is an increasing
+/// subset. Both the per-gene fit and the shared design factorisation go through
+/// here, so the rank they report cannot drift apart.
+///
+/// ### Params
+///
+/// * `a` - Whitened design, column-major with column stride `stride`,
+///   overwritten by the transformed columns
+/// * `z` - Whitened response to carry along, overwritten by `Q' z`. `None` when
+///   only the factorisation itself is wanted.
+/// * `hh` - Scratch for the reflectors, column-major with stride `stride`
+/// * `tau` - Scratch for the reflector scales, length `n_coef`
+/// * `col_norm` - Original norm of each column, read only when `pivot` is set
+/// * `r` - Destination for the upper triangular factor, row-major `n_coef`
+/// * `est` - Destination for the accepted column indices, cleared on entry
+/// * `m` - Number of observations in play
+/// * `stride` - Column stride of `a` and `hh`
+/// * `n_coef` - Number of design columns
+/// * `pivot` - Whether to apply the rank test. A design known to be full rank
+///   on all its samples stays full rank after whitening, so a fully observed
+///   gene can skip it.
+///
+/// ### Returns
+///
+/// The rank achieved, which is `est.len()`.
+#[allow(clippy::too_many_arguments)]
+fn rank_revealing_qr(
+    a: &mut [f64],
+    mut z: Option<&mut [f64]>,
+    hh: &mut [f64],
+    tau: &mut [f64],
+    col_norm: &[f64],
+    r: &mut [f64],
+    est: &mut Vec<usize>,
+    m: usize,
+    stride: usize,
+    n_coef: usize,
+    pivot: bool,
+) -> usize {
+    est.clear();
+    let mut rank = 0usize;
+    for j in 0..n_coef {
+        if rank == m {
+            break;
+        }
+        let col = &a[j * stride..j * stride + m];
+        let norm = col[rank..].iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm == 0.0 || (pivot && norm <= RANK_TOL * col_norm[j]) {
+            continue;
+        }
+
+        // Record the column of R above and on the diagonal before the column is
+        // consumed by its own reflector.
+        for i in 0..rank {
+            r[i * n_coef + rank] = a[j * stride + i];
+        }
+        let head = a[j * stride + rank];
+        let alpha = if head >= 0.0 { -norm } else { norm };
+        r[rank * n_coef + rank] = alpha;
+
+        // u = x - alpha e_1, so u'u = 2 * norm * (norm + |head|) > 0.
+        let base = rank * stride;
+        for i in rank..m {
+            hh[base + i] = a[j * stride + i];
+        }
+        hh[base + rank] = head - alpha;
+        tau[rank] = 1.0 / (norm * (norm + head.abs()));
+
+        // Apply the reflector to every column still to come, and to the
+        // response. Columns already passed over are never revisited.
+        for jj in (j + 1)..n_coef {
+            let cbase = jj * stride;
+            let mut dot = 0.0;
+            for i in rank..m {
+                dot += hh[base + i] * a[cbase + i];
+            }
+            let factor = dot * tau[rank];
+            for i in rank..m {
+                a[cbase + i] -= factor * hh[base + i];
+            }
+        }
+        if let Some(z) = z.as_deref_mut() {
+            let mut dot = 0.0;
+            for i in rank..m {
+                dot += hh[base + i] * z[i];
+            }
+            let factor = dot * tau[rank];
+            for i in rank..m {
+                z[i] -= factor * hh[base + i];
+            }
+        }
+
+        est.push(j);
+        rank += 1;
+    }
+    rank
 }
 
 ///////////////////
@@ -410,60 +481,19 @@ fn fit_gene(
     }
 
     // -- rank-revealing Householder QR, columns accepted left to right --
-    est.clear();
-    let mut rank = 0usize;
-    for j in 0..n_coef {
-        if rank == m {
-            break;
-        }
-        let col = &a[j * n_samples..j * n_samples + m];
-        let norm = col[rank..].iter().map(|v| v * v).sum::<f64>().sqrt();
-        if norm == 0.0 || (pivot && norm <= RANK_TOL * col_norm[j]) {
-            continue;
-        }
-
-        // Record the column of R above and on the diagonal before the column is
-        // consumed by its own reflector.
-        for i in 0..rank {
-            r[i * n_coef + rank] = a[j * n_samples + i];
-        }
-        let head = a[j * n_samples + rank];
-        let alpha = if head >= 0.0 { -norm } else { norm };
-        r[rank * n_coef + rank] = alpha;
-
-        // u = x - alpha e_1, so u'u = 2 * norm * (norm + |head|) > 0.
-        let base = rank * n_samples;
-        for i in rank..m {
-            hh[base + i] = a[j * n_samples + i];
-        }
-        hh[base + rank] = head - alpha;
-        tau[rank] = 1.0 / (norm * (norm + head.abs()));
-
-        // Apply the reflector to every column still to come, and to the
-        // response. Columns already passed over are never revisited.
-        for jj in (j + 1)..n_coef {
-            let cbase = jj * n_samples;
-            let mut dot = 0.0;
-            for i in rank..m {
-                dot += hh[base + i] * a[cbase + i];
-            }
-            let factor = dot * tau[rank];
-            for i in rank..m {
-                a[cbase + i] -= factor * hh[base + i];
-            }
-        }
-        let mut dot = 0.0;
-        for i in rank..m {
-            dot += hh[base + i] * z[i];
-        }
-        let factor = dot * tau[rank];
-        for i in rank..m {
-            z[i] -= factor * hh[base + i];
-        }
-
-        est.push(j);
-        rank += 1;
-    }
+    let rank = rank_revealing_qr(
+        a,
+        Some(z.as_mut_slice()),
+        hh,
+        tau,
+        col_norm,
+        r,
+        est,
+        m,
+        n_samples,
+        n_coef,
+        pivot,
+    );
 
     // -- residual scale --
     let df = m - rank;
@@ -494,17 +524,7 @@ fn fit_gene(
     // diag((R'R)^-1) = diag(R^-1 R^-T), and R^-1 is upper triangular, so entry
     // i is the sum of squares of row i of R^-1. Forming the inverse of a tiny
     // triangular matrix is cheaper than a solve per coefficient.
-    for i in (0..rank).rev() {
-        let inv_diag = 1.0 / r[i * n_coef + i];
-        r_inv[i * n_coef + i] = inv_diag;
-        for j in (i + 1)..rank {
-            let mut sum = 0.0;
-            for t in (i + 1)..=j {
-                sum += r[i * n_coef + t] * r_inv[t * n_coef + j];
-            }
-            r_inv[i * n_coef + j] = -sum * inv_diag;
-        }
-    }
+    invert_upper_triangular(r, r_inv, rank, n_coef);
 
     out.stdev.fill(f64::NAN);
     for (t, &j) in est.iter().enumerate() {
@@ -521,6 +541,101 @@ fn fit_gene(
         }
         *slot = acc;
     }
+}
+
+////////////////////////////
+// Shared design factor   //
+////////////////////////////
+
+/// Factors the design once for the whole fit, giving the unscaled covariance.
+///
+/// **This deliberately ignores per-gene weights.** limma computes
+/// `cov.coefficients` from `qr(design)` on the shared design even when it is
+/// about to fit every gene separately under probe weights
+/// (`R/lmfit.R:180-182`, and `R/lmfit.R:359` for the blocked form, where only
+/// the correlation whitening is applied). It is an approximation, limma knows
+/// it is one, and `contrasts.fit` consumes it regardless: the comment at
+/// `R/contrasts.R:5-6` says so. Reproducing it is the whole point, because the
+/// contrast standard errors downstream have to match.
+///
+/// A weight row shared by every gene is a different matter. limma folds those
+/// in, since `lm.wfit` on the shared design is then exact for all genes
+/// (`R/lmfit.R:147`, `R/lmfit.R:316-318`), and it only takes that path when no
+/// response is missing either.
+///
+/// ### Params
+///
+/// * `design` - Row-major design, `n_samples * n_coef`
+/// * `n_samples` - Number of samples
+/// * `n_coef` - Number of coefficients
+/// * `shared_weights` - One weight per sample when every gene shares the same
+///   row and no response is missing, otherwise `None`
+/// * `gls` - Optional block correlation, whose Cholesky factor whitens the
+///   design exactly as it whitens each gene
+///
+/// ### Returns
+///
+/// The unscaled covariance of the estimable columns (row-major `rank * rank`),
+/// the pivot with accepted columns first, and the rank.
+fn design_factorisation(
+    design: &[f64],
+    n_samples: usize,
+    n_coef: usize,
+    shared_weights: Option<&[f64]>,
+    gls: Option<&BlockCorrelation<'_>>,
+) -> (Vec<f64>, Vec<usize>, usize) {
+    let mut a = vec![0.0; n_samples * n_coef];
+    for sample in 0..n_samples {
+        let scale = match shared_weights {
+            Some(w) => w[sample].sqrt(),
+            None => 1.0,
+        };
+        let row = &design[sample * n_coef..(sample + 1) * n_coef];
+        for (j, &x) in row.iter().enumerate() {
+            a[j * n_samples + sample] = scale * x;
+        }
+    }
+
+    if let Some(g) = gls {
+        for j in 0..n_coef {
+            forward_substitute(
+                &g.chol,
+                n_samples,
+                n_samples,
+                &mut a[j * n_samples..(j + 1) * n_samples],
+            );
+        }
+    }
+
+    let col_norm: Vec<f64> = (0..n_coef)
+        .map(|j| {
+            a[j * n_samples..(j + 1) * n_samples]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt()
+        })
+        .collect();
+
+    let mut hh = vec![0.0; n_samples * n_coef];
+    let mut tau = vec![0.0; n_coef];
+    let mut r = vec![0.0; n_coef * n_coef];
+    let mut est = Vec::with_capacity(n_coef);
+    let rank = rank_revealing_qr(
+        &mut a, None, &mut hh, &mut tau, &col_norm, &mut r, &mut est, n_samples, n_samples, n_coef,
+        true,
+    );
+
+    let mut r_inv = vec![0.0; n_coef * n_coef];
+    invert_upper_triangular(&r, &mut r_inv, rank, n_coef);
+    let cov = cross_inverse(&r_inv, rank, n_coef);
+
+    // Accepted columns first, then the rejected ones in their original order,
+    // which is what `dqrdc2` leaves behind and what `contrasts.fit` indexes.
+    let mut pivot = est.clone();
+    pivot.extend((0..n_coef).filter(|j| !est.contains(j)));
+
+    (cov, pivot, rank)
 }
 
 /////////////
@@ -557,9 +672,15 @@ fn fit_gene(
 /// ### Returns
 ///
 /// Coefficients, unscaled standard deviations, residual standard deviations,
-/// residual degrees of freedom and fitted values, or [`EdgeErrors`] if the
+/// residual degrees of freedom, fitted values, and the shared design
+/// factorisation `eBayes` and `contrasts.fit` need. [`EdgeErrors`] if the
 /// shapes disagree, the correlation is out of range, or the implied correlation
 /// matrix is not positive definite.
+///
+/// [`LmFitResult::cov_coefficients`] comes from the design as a whole rather
+/// than from each gene's own weighted fit. That is limma's choice, not a
+/// shortcut taken here, and `design_factorisation` in this module documents
+/// why.
 ///
 /// ### References
 ///
@@ -649,6 +770,28 @@ pub fn lm_fit(
     // gene that keeps all its observations, and those genes skip the rank test.
     let design_full_rank = non_estimable(design, n_samples, n_coef)?.is_none();
 
+    // limma folds weights into the shared factorisation only when one row
+    // serves every gene and no response is missing, which is exactly when
+    // `lm.wfit` on the shared design is exact for all of them
+    // (`R/lmfit.R:142`). Probe weights, or any missing value, and it falls back
+    // to the bare design.
+    let shared_weights: Option<Vec<f64>> = if y.par_iter().all(|v| v.is_finite()) {
+        match weights {
+            Some(Recycled::Scalar(w)) => Some(vec![*w; n_samples]),
+            Some(Recycled::BySample(v)) => Some(v.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let (cov_coefficients, pivot, rank) = design_factorisation(
+        design,
+        n_samples,
+        n_coef,
+        shared_weights.as_deref(),
+        gls.as_ref(),
+    );
+
     let mut coefficients = vec![0.0; n_genes * n_coef];
     let mut stdev_unscaled = vec![0.0; n_genes * n_coef];
     let mut sigma = vec![0.0; n_genes];
@@ -693,6 +836,9 @@ pub fn lm_fit(
         sigma,
         df_residual,
         fitted,
+        cov_coefficients,
+        pivot,
+        rank,
     })
 }
 
@@ -1285,6 +1431,103 @@ mod tests {
         assert_close(&fit.sigma, &A_SIGMA);
         assert_close(&fit.df_residual, &[3.0; 8]);
         assert_close(&fit.fitted, &A_FITTED);
+    }
+
+    /// `Rscript -e 'X <- matrix(c(1,0,1,0,1,1,1,1,1,1),5,2,byrow=TRUE);
+    /// Q <- qr(X); chol2inv(Q$qr, size=Q$rank)'`
+    const A_COV: [f64; 4] = [0.49999999999999994, -0.5, -0.5, 0.83333333333333337];
+
+    /// Same design under `lm.wfit(X, y, c(1,2,3,4,5)/8)`.
+    const A_COV_WEIGHTED: [f64; 4] = [
+        2.6666666666666656,
+        -2.6666666666666661,
+        -2.6666666666666661,
+        3.333333333333333,
+    ];
+
+    #[test]
+    fn test_cov_coefficients_match_the_shared_design_qr() {
+        let fit = lm_fit(
+            &fixture_y(),
+            N_GENES,
+            N_SAMPLES,
+            &design_two(),
+            2,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fit.rank, 2);
+        assert_eq!(fit.pivot, vec![0, 1]);
+        assert_close(&fit.cov_coefficients, &A_COV);
+        // The unscaled standard deviations are the square roots of its
+        // diagonal whenever no gene lost an observation.
+        for gene in 0..N_GENES {
+            assert_relative_eq!(
+                fit.stdev_unscaled[gene * 2],
+                A_COV[0].sqrt(),
+                epsilon = 1e-12
+            );
+        }
+    }
+
+    #[test]
+    fn test_cov_coefficients_fold_in_a_shared_weight_row() {
+        let w = Recycled::by_sample(vec![0.125, 0.25, 0.375, 0.5, 0.625]);
+        let fit = lm_fit(
+            &fixture_y(),
+            N_GENES,
+            N_SAMPLES,
+            &design_two(),
+            2,
+            Some(&w),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fit.rank, 2);
+        assert_close(&fit.cov_coefficients, &A_COV_WEIGHTED);
+    }
+
+    #[test]
+    fn test_cov_coefficients_ignore_per_gene_weights() {
+        // limma takes `cov.coefficients` from the bare design once probe
+        // weights are in play, so this must match the unweighted answer rather
+        // than anything derived from the weights.
+        let w = Recycled::full(fixture_weights(), N_GENES, N_SAMPLES).unwrap();
+        let fit = lm_fit(
+            &fixture_y(),
+            N_GENES,
+            N_SAMPLES,
+            &design_two(),
+            2,
+            Some(&w),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_close(&fit.cov_coefficients, &A_COV);
+    }
+
+    #[test]
+    fn test_aliased_design_reports_rank_and_pivot() {
+        let fit = lm_fit(
+            &fixture_y(),
+            N_GENES,
+            N_SAMPLES,
+            &design_aliased(),
+            3,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // R rejects the third column: `qr(X)$rank` is 2 and `$pivot` is 1 2 3.
+        assert_eq!(fit.rank, 2);
+        assert_eq!(fit.pivot, vec![0, 1, 2]);
+        assert_eq!(fit.cov_coefficients.len(), 4);
+        assert_close(&fit.cov_coefficients, &A_COV);
     }
 
     #[test]
