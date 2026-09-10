@@ -307,10 +307,6 @@ pub fn top_table(
     let b = column(stats.lods);
     let adj = p_adjust_bh(&p_value);
 
-    // Formed over every gene, then thinned alongside everything else, so the
-    // interval stays attached to its own gene. limma computed this after
-    // thinning while indexing the unthinned vectors until mid-2025, which broke
-    // exactly that; the fix is in 3.66.0 and this matches it.
     let margin = match params.confint {
         None => None,
         Some(level) => {
@@ -407,10 +403,6 @@ pub fn top_table(
 /// subsetting columns leaves it untouched. `coefs` selects which coefficients
 /// are tabulated, not which hypothesis is tested. To test a subset, rotate onto
 /// it with `contrasts_fit` and moderate again.
-///
-/// The fold change threshold works differently here: a row survives when **any**
-/// of its coefficients exceeds `lfc`, and the comparison is strict
-/// (`R/toptable.R:111`), where [`top_table`] uses `>=`.
 ///
 /// ### Params
 ///
