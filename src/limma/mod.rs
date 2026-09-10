@@ -1,15 +1,21 @@
-//! The limma routines edgeR depends on.
+//! The limma routines edgeR depends on, and the linear model stack on top.
 //!
-//! Not a general limma port: only the pieces `estimateDisp`, `glmQLFit` and
-//! `voomLmFit` actually reach for.
+//! Not a general limma port. It covers what `estimateDisp`, `glmQLFit` and
+//! `voomLmFit` reach for, plus the chain that turns a fit into a table:
+//! `lmFit` -> `contrasts.fit` -> `eBayes` -> `topTable`, carried through by
+//! [`marray::MArrayLm`].
 
 use crate::prelude::*;
 
 pub mod array_weights;
+pub mod contrasts;
+pub mod ebayes;
 pub mod lm_fit;
 pub mod lowess;
+pub mod marray;
 pub mod smoothing;
 pub mod squeeze_var;
+pub mod toptable;
 pub mod voom;
 
 /// Checks that prior weights are non-negative.

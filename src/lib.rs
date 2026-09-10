@@ -2,9 +2,9 @@
 //!
 //! A Rust port of the edgeR numerical stack (normalisation, Cox-Reid dispersion
 //! estimation, the Levenberg-damped negative binomial GLM, quasi-likelihood
-//! weights, the exact test), the parts of limma edgeR leans on (`squeezeVar`,
-//! the F-distribution fits, voom), and NEBULA, a negative binomial gamma mixed
-//! model for single cell.
+//! weights, the exact test), the limma linear model stack (`squeezeVar`, the
+//! F-distribution fits, voom, `lmFit`, `contrasts.fit`, `eBayes`, `topTable`),
+//! and NEBULA, a negative binomial gamma mixed model for single cell.
 //!
 //! The bulk stack follows edgePython, itself a port of edgeR and limma, with
 //! the R winning wherever the two disagree. NEBULA is ported from the `nebula`

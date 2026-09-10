@@ -2,6 +2,7 @@
 //! every other module indexes through.
 
 pub mod design;
+pub mod linalg;
 pub mod recycled;
 pub mod simd;
 pub mod sparse;

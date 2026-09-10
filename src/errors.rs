@@ -75,6 +75,17 @@ pub enum EdgeErrors {
         rank: usize,
     },
 
+    /// A contrast put weight on a coefficient the design cannot estimate.
+    #[error(
+        "Contrast {contrast} puts weight on coefficient {coef}, which is aliased and so has no estimate."
+    )]
+    NotEstimableContrast {
+        /// Index of the offending contrast
+        contrast: usize,
+        /// Index of the non-estimable coefficient it touches
+        coef: usize,
+    },
+
     /// A contrast or coefficient index pointed outside the design.
     #[error("Coefficient index {index} is out of range for a design with {n_coef} coefficients.")]
     CoefOutOfRange {
@@ -92,6 +103,10 @@ pub enum EdgeErrors {
     /// A linear solve produced a non-finite result.
     #[error("Linear solve failed: {0}")]
     SolveFailed(String),
+
+    /// A symmetric eigendecomposition did not converge.
+    #[error("Eigendecomposition failed: {0}")]
+    EigenFailed(String),
 
     // -- numeric support --
     /// A scalar optimiser or root finder did not converge inside its iteration budget.

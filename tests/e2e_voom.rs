@@ -200,6 +200,12 @@ fn test_voom_lmfit_matches_edger() {
             &format!("{}/lmfit_sigma", d.tag),
         );
         assert_close(
+            &voom.amean,
+            want_fit.column("amean"),
+            TOL_E,
+            &format!("{}/lmfit_amean", d.tag),
+        );
+        assert_close(
             &fit.df_residual,
             want_fit.column("df_residual"),
             Tol::rel(0.0),
