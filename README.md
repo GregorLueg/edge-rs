@@ -154,6 +154,13 @@ let top = top_table(&fit, 0, Some(TopTableParams {
 }))?;
 ```
 
+Prefer limma-trend? Skip `voom_lmfit`: put log-CPM from `cpm(.., log = true, ..)`
+straight into `lm_fit`, hand `MArrayLm::from_lm_fit` the row means as `amean`,
+and moderate with `EBayesTrend::Amean`. Cheaper, and what limma recommends when
+the library sizes are not too variable. `robust: true` goes with either route
+and Winsorises the prior so a handful of outlier genes cannot drag the prior
+degrees of freedom down.
+
 `ebayes` also fills in the moderated F across contrasts whenever the design is
 full rank, and `top_table_f` ranks on it. Building the contrast matrix yourself
 rather than through `make_contrasts`? `contrasts_fit` wants it column-major,

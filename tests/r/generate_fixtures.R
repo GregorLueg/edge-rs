@@ -925,6 +925,50 @@ run_ebayes <- function(tag, counts, des, con) {
 run_ebayes("fac", fac$yf$counts, fac_des, read_num("fac_contrasts.csv"))
 run_ebayes("unbal", unbal$yf$counts, unbal_des, read_num("unbal_contrasts.csv"))
 
+# limma-trend: log-CPM straight into lmFit, with the mean-variance relationship
+# absorbed by the prior rather than by observation weights. Faster than voom and
+# what limma's own guide recommends when the library sizes are not too variable.
+#
+# Both variants are written. robust = TRUE is the one that matters here: it is
+# what makes the trended prior tolerant of outlier genes, and trend + robust
+# together is a combination no other fixture exercises.
+run_trend <- function(tag, counts, eff_lib, des) {
+  ncoef <- ncol(des)
+  y <- cpm(counts, lib.size = eff_lib, log = TRUE, prior.count = 2)
+  fit <- lmFit(y, des)
+
+  invisible(uniroot_since())
+  eb <- tightEB(fit, trend = TRUE)
+  ebr <- tightEB(fit, trend = TRUE, robust = TRUE)
+  put(paste0(tag, "_limma_trend"), "uniroot_calls", uniroot_since())
+
+  write_num(cbind(sigma = fit$sigma, df_residual = fit$df.residual,
+                  amean = fit$Amean),
+            paste0(tag, "_limma_trend_lmfit.csv"),
+            c("sigma", "df_residual", "amean"))
+  write_num(ebayes_frame(eb, ncoef), paste0(tag, "_limma_trend_ebayes.csv"),
+            ebayes_header(ncoef))
+  write_num(ebayes_frame(ebr, ncoef), paste0(tag, "_limma_trend_ebayes_robust.csv"),
+            ebayes_header(ncoef))
+  write_num(cbind(F = eb$F, F_p = eb$F.p.value),
+            paste0(tag, "_limma_trend_ebayes_f.csv"), c("F", "F_p"))
+
+  put(paste0(tag, "_limma_trend"), "n_df_prior", length(eb$df.prior))
+  put(paste0(tag, "_limma_trend"), "n_s2_prior", length(eb$s2.prior))
+  put(paste0(tag, "_limma_trend"), "robust_n_df_prior", length(ebr$df.prior))
+  for (j in seq_len(ncoef)) {
+    put(paste0(tag, "_limma_trend"), paste0("var_prior", j), eb$var.prior[j])
+  }
+
+  cat(sprintf("%s trend: df.prior length %d, robust %d\n", tag,
+              length(eb$df.prior), length(ebr$df.prior)))
+}
+
+eff_lib_of <- function(y) y$samples$lib.size * y$samples$norm.factors
+
+run_trend("fac", fac$yf$counts, eff_lib_of(fac$yf), fac_des)
+run_trend("unbal", unbal$yf$counts, eff_lib_of(unbal$yf), unbal_des)
+
 ###############
 # Single cell #
 ###############

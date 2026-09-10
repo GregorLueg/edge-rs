@@ -712,3 +712,207 @@ fn test_top_table_f_matches_limma() {
         );
     }
 }
+
+//////////////////
+// limma-trend  //
+//////////////////
+
+// The other bulk route: log-CPM straight into `lm_fit`, with the mean-variance
+// relationship absorbed by a trended prior rather than by voom's observation
+// weights. limma recommends it over voom when the library sizes are not too
+// variable, and it is cheaper: no trend fit, no per-observation weights, one
+// least squares pass instead of two.
+//
+// `robust = TRUE` is the part worth gating hard. It is what makes the trended
+// prior tolerant of outlier genes, and combined with `trend` it reaches
+// `fitFDistUnequalDF1`'s robust branch, which nothing else in the suite does.
+
+/// Residual standard deviations from the unweighted fit on log-CPM. Needs
+/// `1.5e-14`.
+///
+/// The whole limma-trend path runs tighter than voom by two to four decades:
+/// its worst moderated t is `1.4e-10` against voom's `2.8e-9`, and most
+/// quantities land at `1e-13` or better. There is no `fitFDistUnequalDF1` in
+/// the way. The residual degrees of freedom are constant here, so `squeezeVar`
+/// takes the legacy branch and its moment matching, rather than the profile
+/// likelihood `optimize` only resolves to its default `tol`. The shared
+/// tolerances above are inherited unchanged and are loose for this path.
+const TOL_TREND_SIGMA: Tol = Tol::rel(5e-14);
+
+/// Builds the effective library sizes, `lib.size * norm.factors`.
+///
+/// Both are already in the `<tag>_kept_samples.csv` fixture, so this does not
+/// re-run TMM.
+///
+/// ### Params
+///
+/// * `tag` - Fixture prefix
+///
+/// ### Returns
+///
+/// One effective library size per sample.
+fn effective_lib(tag: &str) -> Vec<f64> {
+    let s = common::table(&format!("{tag}_kept_samples.csv"));
+    s.column("lib_size")
+        .iter()
+        .zip(s.column("norm_factors"))
+        .map(|(a, b)| a * b)
+        .collect()
+}
+
+/// Runs the limma-trend pipeline up to the moderated fit.
+///
+/// ### Params
+///
+/// * `d` - Dataset description
+/// * `robust` - Whether to Winsorise the prior's moments
+///
+/// ### Returns
+///
+/// The loaded dataset and the moderated fit.
+fn limma_trend(d: &Dataset, robust: bool) -> (Loaded, MArrayLm) {
+    use edge_rs::core::expression::cpm;
+    use edge_rs::limma::lm_fit::lm_fit;
+
+    let l = load(d);
+    let eff = effective_lib(d.tag);
+    let y = cpm(
+        &l.counts,
+        l.n_genes,
+        l.n_samples,
+        Some(&eff),
+        None,
+        true,
+        2.0,
+    )
+    .expect("cpm failed");
+
+    // limma takes `Amean` from `getEAWP`, which is the row means of the
+    // expression matrix. Nothing computes it for us outside voom.
+    let amean: Vec<f64> = y
+        .chunks_exact(l.n_samples)
+        .map(|r| r.iter().sum::<f64>() / l.n_samples as f64)
+        .collect();
+
+    let lm = lm_fit(
+        &y,
+        l.n_genes,
+        l.n_samples,
+        &l.design,
+        l.n_coef,
+        None,
+        None,
+        None,
+    )
+    .expect("lm_fit failed");
+    let fit = MArrayLm::from_lm_fit(lm, &l.design, l.n_coef, l.n_samples, Some(amean))
+        .expect("from_lm_fit failed");
+
+    let out = ebayes(
+        fit,
+        Some(EBayesParams {
+            trend: EBayesTrend::Amean,
+            robust,
+            ..Default::default()
+        }),
+    )
+    .expect("ebayes failed");
+    (l, out)
+}
+
+#[test]
+fn test_limma_trend_lm_fit_matches_limma() {
+    for d in &DATASETS {
+        let (_, fit) = limma_trend(d, false);
+        let want = common::table(&format!("{}_limma_trend_lmfit.csv", d.tag));
+        assert_close(
+            &fit.sigma,
+            want.column("sigma"),
+            TOL_TREND_SIGMA,
+            &format!("{}/trend_sigma", d.tag),
+        );
+        assert_close(
+            &fit.df_residual,
+            want.column("df_residual"),
+            Tol::rel(0.0),
+            &format!("{}/trend_df_residual", d.tag),
+        );
+        assert_close(
+            fit.amean.as_ref().unwrap(),
+            want.column("amean"),
+            TOL_CONTRAST,
+            &format!("{}/trend_amean", d.tag),
+        );
+    }
+}
+
+#[test]
+fn test_limma_trend_matches_limma() {
+    for d in &DATASETS {
+        let (_, fit) = limma_trend(d, false);
+        let want = common::table(&format!("{}_limma_trend_ebayes.csv", d.tag));
+        assert_ebayes(&fit, &want, &format!("{}/limma_trend", d.tag));
+
+        let scenario = format!("{}_limma_trend", d.tag);
+        let scalars = common::scalars();
+        // A trended prior varies by gene; its degrees of freedom do not, until
+        // the robust fit makes them.
+        assert_eq!(
+            fit.df_prior.as_ref().unwrap().len(),
+            scalars.get_usize(&scenario, "n_df_prior"),
+            "{}: df_prior length",
+            d.tag
+        );
+        assert_eq!(
+            fit.s2_prior.as_ref().unwrap().len(),
+            scalars.get_usize(&scenario, "n_s2_prior"),
+            "{}: s2_prior length",
+            d.tag
+        );
+        for (j, &v) in fit.var_prior.as_ref().unwrap().iter().enumerate() {
+            assert_close_scalar(
+                v,
+                scalars.get(&scenario, &format!("var_prior{}", j + 1)),
+                TOL_VAR_PRIOR,
+                &format!("{}/trend_var_prior{}", d.tag, j + 1),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_robust_limma_trend_matches_limma() {
+    for d in &DATASETS {
+        let (_, fit) = limma_trend(d, true);
+        let want = common::table(&format!("{}_limma_trend_ebayes_robust.csv", d.tag));
+        assert_ebayes(&fit, &want, &format!("{}/limma_trend_robust", d.tag));
+
+        // Winsorising turns the prior degrees of freedom into a per-gene vector.
+        assert_eq!(
+            fit.df_prior.as_ref().unwrap().len(),
+            common::scalars().get_usize(&format!("{}_limma_trend", d.tag), "robust_n_df_prior"),
+            "{}: robust df_prior length",
+            d.tag
+        );
+    }
+}
+
+#[test]
+fn test_limma_trend_moderated_f_matches_limma() {
+    for d in &DATASETS {
+        let (_, fit) = limma_trend(d, false);
+        let want = common::table(&format!("{}_limma_trend_ebayes_f.csv", d.tag));
+        assert_close(
+            fit.f_stat.as_ref().unwrap(),
+            want.column("F"),
+            TOL_F,
+            &format!("{}/trend_F", d.tag),
+        );
+        assert_close(
+            fit.f_p_value.as_ref().unwrap(),
+            want.column("F_p"),
+            TOL_P,
+            &format!("{}/trend_F_p_value", d.tag),
+        );
+    }
+}
