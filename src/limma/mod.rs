@@ -13,6 +13,7 @@ pub mod ebayes;
 pub mod lm_fit;
 pub mod lowess;
 pub mod marray;
+pub mod remove_batch_effect;
 pub mod smoothing;
 pub mod squeeze_var;
 pub mod toptable;
