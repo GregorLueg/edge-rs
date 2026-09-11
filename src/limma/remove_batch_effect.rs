@@ -1,10 +1,10 @@
 //! limma's `removeBatchEffect`: regress batch out of a log-expression matrix.
 //!
-//! Batch factors get sum-to-zero contrasts, so the corrected values stay centred
-//! on the grand mean rather than on the first batch. The batch columns are fitted
-//! jointly with the design of interest through [`lm_fit`], and only the batch
-//! part of the fit is subtracted: the design protects the biology from being
-//! absorbed into the batch coefficients.
+//! Batch factors get sum-to-zero contrasts, so the corrected values stay
+//! centred on the grand mean rather than on the first batch. The batch columns
+//! are fitted jointly with the design of interest through [`lm_fit`], and only
+//! the batch part of the fit is subtracted: the design protects the biology
+//! from being absorbed into the batch coefficients.
 //!
 //! Meant for plotting and unsupervised work. For testing, put batch into the
 //! design instead, as limma's own documentation says.
