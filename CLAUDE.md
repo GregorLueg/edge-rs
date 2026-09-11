@@ -87,7 +87,7 @@ Layered bottom-up; `src/lib.rs` carries the crate-level policy in its header.
 - `core/`: `DgeList`, `filterByExpr`, `cpm`/`aveLogCPM`, TMM and friends.
 - `glm/`, `dispersion/`, `ql/`, `exact/`: the edgeR stack proper.
 - `limma/`: only what `estimateDisp`, `glmQLFit` and `voomLmFit` actually reach
-  for. Not a general limma port.
+  for, plus `removeBatchEffect`. Not a general limma port.
 - `sc/`: NEBULA. Driver (`nebula.rs`), kernels (`ptmg.rs`, `pml.rs`), Wald
   tests, dispersion shrinkage.
 - `splicing.rs`, `results.rs` (`topTags`, `decideTests`), `errors.rs`.

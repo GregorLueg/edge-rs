@@ -111,7 +111,7 @@ fn check_len(name: &'static str, len: usize, n_samples: usize) -> Result<(), Edg
 
 /// Removes batch effects and covariates from a log-expression matrix.
 ///
-/// Port of limma's `removeBatchEffect` without `group` and `weights`. Builds
+/// Port of limma's `removeBatchEffect` without `group`. Builds
 /// `X_batch = cbind(contr.sum(batch), contr.sum(batch2), covariates)`, fits
 /// `cbind(design, X_batch)` per gene with [`lm_fit`] and returns
 /// `x - beta_batch %*% t(X_batch)`. Coefficients the fit cannot estimate count
@@ -133,6 +133,8 @@ fn check_len(name: &'static str, len: usize, n_samples: usize) -> Result<(), Edg
 ///   with `n_cov`
 /// * `design` - Optional design of interest, row-major `n_samples * n_coef`, with
 ///   `n_coef`. `None` is an intercept only.
+/// * `weights` - Optional observation weights, forwarded to [`lm_fit`] as limma's
+///   `...` does
 ///
 /// ### Returns
 ///
@@ -142,6 +144,7 @@ fn check_len(name: &'static str, len: usize, n_samples: usize) -> Result<(), Edg
 /// ### References
 ///
 /// Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004
+#[allow(clippy::too_many_arguments)]
 pub fn remove_batch_effect<T: EdgeFloat>(
     x: &[T],
     n_genes: usize,
@@ -150,11 +153,13 @@ pub fn remove_batch_effect<T: EdgeFloat>(
     batch2: Option<&[usize]>,
     covariates: Option<(&[f64], usize)>,
     design: Option<(&[f64], usize)>,
+    weights: Option<&Recycled<f64>>,
 ) -> Result<Vec<f64>, EdgeErrors> {
     if x.len() != n_genes * n_samples {
-        return Err(EdgeErrors::ShapeMismatch {
-            expected: (n_genes, n_samples),
-            got: (x.len(), 1),
+        return Err(EdgeErrors::LengthMismatch {
+            name: "x",
+            expected: n_genes * n_samples,
+            got: x.len(),
         });
     }
     let y: Vec<f64> = x.iter().map(|v| v.to_f64().unwrap_or(f64::NAN)).collect();
@@ -189,7 +194,7 @@ pub fn remove_batch_effect<T: EdgeFloat>(
 
     let n_full = n_coef + n_batch;
     let full = cbind(design, n_coef, &x_batch, n_batch, n_samples);
-    let fit = lm_fit(&y, n_genes, n_samples, &full, n_full, None, None, None)?;
+    let fit = lm_fit(&y, n_genes, n_samples, &full, n_full, weights, None, None)?;
 
     let mut out = y;
     out.par_chunks_mut(n_samples)
@@ -316,6 +321,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_matches(&got, &expected);
@@ -382,6 +388,7 @@ mod tests {
             None,
             None,
             Some((&DESIGN, 2)),
+            None,
         )
         .unwrap();
         assert_matches(&got, &expected);
@@ -448,6 +455,7 @@ mod tests {
             Some(&BATCH2),
             None,
             Some((&DESIGN, 2)),
+            None,
         )
         .unwrap();
         assert_matches(&got, &expected);
@@ -514,6 +522,7 @@ mod tests {
             None,
             Some((&COV, 1)),
             Some((&DESIGN, 2)),
+            None,
         )
         .unwrap();
         assert_matches(&got, &expected);
@@ -534,6 +543,7 @@ mod tests {
             None,
             None,
             Some((&design, 2)),
+            None,
         )
         .unwrap();
         assert_matches(&got, &y);
@@ -601,6 +611,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_matches(&got, &expected);
@@ -609,20 +620,31 @@ mod tests {
     #[test]
     fn test_remove_batch_effect_nothing_to_remove_returns_input() {
         let y = fixture_y();
-        let got = remove_batch_effect(&y, N_GENES, N_SAMPLES, None, None, None, None).unwrap();
+        let got =
+            remove_batch_effect(&y, N_GENES, N_SAMPLES, None, None, None, None, None).unwrap();
         assert_matches(&got, &y);
     }
 
     #[test]
     fn test_remove_batch_effect_f32_input() {
         let y32: Vec<f32> = fixture_y().iter().map(|v| *v as f32).collect();
-        let got32 =
-            remove_batch_effect(&y32, N_GENES, N_SAMPLES, Some(&BATCH), None, None, None).unwrap();
+        let got32 = remove_batch_effect(
+            &y32,
+            N_GENES,
+            N_SAMPLES,
+            Some(&BATCH),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let got64 = remove_batch_effect(
             &fixture_y(),
             N_GENES,
             N_SAMPLES,
             Some(&BATCH),
+            None,
             None,
             None,
             None,
@@ -643,6 +665,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(matches!(res, Err(EdgeErrors::InvalidArgument(_))));
     }
@@ -658,10 +681,222 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(matches!(
             res,
             Err(EdgeErrors::LengthMismatch { name: "batch", .. })
         ));
+    }
+
+    #[test]
+    fn test_remove_batch_effect_nan_input() {
+        // y[1, 3:4] <- NA; removeBatchEffect(y, batch = c(0, 0, 1, 1, 2, 2))
+        let expected = [
+            0.039062500000000000,
+            0.148437500000000000,
+            f64::NAN,
+            f64::NAN,
+            0.039062500000000000,
+            0.148437500000000000,
+            0.276041666666666630,
+            0.026041666666666657,
+            0.096354166666666657,
+            0.205729166666666657,
+            0.096354166666666685,
+            0.205729166666666685,
+        ];
+        let mut y = fixture_y();
+        y[2] = f64::NAN;
+        y[3] = f64::NAN;
+        let got = remove_batch_effect(&y, N_GENES, N_SAMPLES, Some(&BATCH), None, None, None, None)
+            .unwrap();
+        for (g, e) in got[..12].iter().zip(&expected) {
+            if e.is_nan() {
+                assert!(g.is_nan());
+            } else {
+                assert_relative_eq!(*g, *e, epsilon = TOL);
+            }
+        }
+    }
+
+    #[test]
+    fn test_remove_batch_effect_two_covariates() {
+        // cv <- cbind(c(1, 3, 2, 5, 4, 7) / 8, c(4, 1, 3, 0, 2, 5) / 8)
+        // removeBatchEffect(y, batch, covariates = cv, design)
+        let expected = [
+            0.135416666666666657,
+            0.171875000000000000,
+            0.171874999999999972,
+            0.171874999999999972,
+            0.135416666666666657,
+            0.135416666666666685,
+            0.312500000000000056,
+            -0.010416666666666685,
+            -0.010416666666666824,
+            -0.010416666666666907,
+            0.312500000000000111,
+            0.312500000000000111,
+            0.220052083333333287,
+            0.196614583333333343,
+            0.196614583333333315,
+            0.196614583333333370,
+            0.220052083333333426,
+            0.220052083333333287,
+            0.157552083333333287,
+            0.134114583333333315,
+            0.134114583333333315,
+            0.134114583333333315,
+            0.157552083333333398,
+            0.157552083333333343,
+            0.035156249999999944,
+            0.371093749999999944,
+            0.371093750000000056,
+            0.371093750000000056,
+            0.035156249999999972,
+            0.035156250000000056,
+            -0.027343750000000056,
+            0.308593750000000000,
+            0.308593750000000111,
+            0.308593750000000111,
+            -0.027343750000000083,
+            -0.027343750000000056,
+            0.359375000000000000,
+            0.036458333333333322,
+            0.036458333333333176,
+            0.036458333333333148,
+            0.359375000000000167,
+            0.359375000000000167,
+            0.296875000000000056,
+            -0.026041666666666678,
+            -0.026041666666666768,
+            -0.026041666666666852,
+            0.296875000000000111,
+            0.296875000000000111,
+        ];
+        let cov = [
+            0.125, 0.5, 0.375, 0.125, 0.25, 0.375, 0.625, 0.0, 0.5, 0.25, 0.875, 0.625,
+        ];
+        let got = remove_batch_effect(
+            &fixture_y(),
+            N_GENES,
+            N_SAMPLES,
+            Some(&BATCH),
+            None,
+            Some((&cov, 2)),
+            Some((&DESIGN, 2)),
+            None,
+        )
+        .unwrap();
+        assert_matches(&got, &expected);
+    }
+
+    #[test]
+    fn test_remove_batch_effect_covariates_and_design_length_errors() {
+        let res = remove_batch_effect(
+            &fixture_y(),
+            N_GENES,
+            N_SAMPLES,
+            None,
+            None,
+            Some((&COV, 2)),
+            None,
+            None,
+        );
+        assert!(matches!(
+            res,
+            Err(EdgeErrors::LengthMismatch {
+                name: "covariates",
+                ..
+            })
+        ));
+
+        // The design is only checked once there is something to remove.
+        let res = remove_batch_effect(
+            &fixture_y(),
+            N_GENES,
+            N_SAMPLES,
+            Some(&BATCH),
+            None,
+            None,
+            Some((&DESIGN, 3)),
+            None,
+        );
+        assert!(matches!(
+            res,
+            Err(EdgeErrors::LengthMismatch { name: "design", .. })
+        ));
+    }
+
+    #[test]
+    fn test_remove_batch_effect_weights() {
+        // w <- matrix(1 + ((0:47 * 5) %% 7) / 4, 8, 6, byrow = TRUE)
+        // removeBatchEffect(y, batch, design, weights = w)
+        let expected = [
+            0.093894675925925930,
+            0.203269675925925930,
+            0.157696759259259189,
+            0.267071759259259189,
+            0.045283564814814867,
+            0.154658564814814881,
+            0.279839409722222265,
+            0.029839409722222252,
+            -0.018012152777777873,
+            0.091362847222222127,
+            0.206922743055555636,
+            0.316297743055555636,
+            0.167601495726495797,
+            0.276976495726495797,
+            0.201255341880341887,
+            0.310630341880341887,
+            0.271768162393162316,
+            0.021768162393162316,
+            0.092708333333333323,
+            0.202083333333333337,
+            0.158333333333333326,
+            0.267708333333333326,
+            0.202083333333333337,
+            -0.047916666666666649,
+            0.161401098901098883,
+            0.270776098901098883,
+            0.377918956043956089,
+            0.127918956043956089,
+            0.085679945054945028,
+            0.195054945054945028,
+            0.086921296296296302,
+            0.196296296296296302,
+            0.307407407407407407,
+            0.057407407407407407,
+            0.043171296296296291,
+            0.152546296296296291,
+            0.326388888888888840,
+            0.076388888888888867,
+            0.003472222222222154,
+            0.112847222222222154,
+            0.279513888888888951,
+            0.388888888888888951,
+            0.255353009259259300,
+            0.005353009259259283,
+            -0.040219907407407413,
+            0.069155092592592587,
+            0.206741898148148140,
+            0.316116898148148140,
+        ];
+        let w = (0..N_GENES * N_SAMPLES)
+            .map(|i| 1.0 + ((i * 5) % 7) as f64 / 4.0)
+            .collect();
+        let w = Recycled::full(w, N_GENES, N_SAMPLES).unwrap();
+        let got = remove_batch_effect(
+            &fixture_y(),
+            N_GENES,
+            N_SAMPLES,
+            Some(&BATCH),
+            None,
+            None,
+            Some((&DESIGN, 2)),
+            Some(&w),
+        )
+        .unwrap();
+        assert_matches(&got, &expected);
     }
 }

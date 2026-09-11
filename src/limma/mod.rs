@@ -3,7 +3,7 @@
 //! Not a general limma port. It covers what `estimateDisp`, `glmQLFit` and
 //! `voomLmFit` reach for, plus the chain that turns a fit into a table:
 //! `lmFit` -> `contrasts.fit` -> `eBayes` -> `topTable`, carried through by
-//! [`marray::MArrayLm`].
+//! [`marray::MArrayLm`], and `removeBatchEffect` on top of `lmFit`.
 
 use crate::prelude::*;
 
