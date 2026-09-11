@@ -12,8 +12,8 @@ is the edgeR numerical stack in Rust: normalisation, Cox-Reid dispersion
 estimation, the Levenberg-damped NB GLM, quasi-likelihood weights, the exact
 test and `diffSpliceDGE`. On top of that sits the limma linear model stack
 (`squeezeVar`, the F-distribution fits, lowess and locfit smoothing, `voom`,
-`lmFit`, `contrasts.fit`, `eBayes`, `topTable`) and NEBULA, a negative binomial
-gamma mixed model for single cell.
+`lmFit`, `contrasts.fit`, `eBayes`, `topTable`, `removeBatchEffect`) and
+NEBULA, a negative binomial gamma mixed model for single cell.
 
 No R, no Python, no BLAS to hunt down. CPU only.
 
@@ -160,6 +160,11 @@ and moderate with `EBayesTrend::Amean`. Cheaper, and what limma recommends when
 the library sizes are not too variable. `robust: true` goes with either route
 and Winsorises the prior so a handful of outlier genes cannot drag the prior
 degrees of freedom down.
+
+Batch effects messing up a PCA or heatmap? `remove_batch_effect` is limma's
+`removeBatchEffect`: up to two batch factors plus numeric covariates, with the
+design protecting the biology and precision weights if you have them. It's for
+plotting only. For testing, put the batch in the design.
 
 `ebayes` also fills in the moderated F across contrasts whenever the design is
 full rank, and `top_table_f` ranks on it. Building the contrast matrix yourself

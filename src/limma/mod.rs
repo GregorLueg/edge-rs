@@ -3,7 +3,7 @@
 //! Not a general limma port. It covers what `estimateDisp`, `glmQLFit` and
 //! `voomLmFit` reach for, plus the chain that turns a fit into a table:
 //! `lmFit` -> `contrasts.fit` -> `eBayes` -> `topTable`, carried through by
-//! [`marray::MArrayLm`].
+//! [`marray::MArrayLm`], and `removeBatchEffect` on top of `lmFit`.
 
 use crate::prelude::*;
 
@@ -13,6 +13,7 @@ pub mod ebayes;
 pub mod lm_fit;
 pub mod lowess;
 pub mod marray;
+pub mod remove_batch_effect;
 pub mod smoothing;
 pub mod squeeze_var;
 pub mod toptable;

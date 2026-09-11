@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.0.4
+
+* `remove_batch_effect` added.
+
 ## v0.0.3
 
 * Ported in eBayes, contrasts.fit, MArrayLm to also enable the limma-voom
