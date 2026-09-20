@@ -199,4 +199,14 @@ pub enum EdgeErrors {
         /// Number of subjects supplied
         got: usize,
     },
+
+    // -- GPU --
+    /// The CubeCL runtime or a device limit rejected the work.
+    ///
+    /// Carries the runtime's own message. A busted device limit does not fail
+    /// loudly on wgpu, so this is raised from the validated dispatch geometry
+    /// rather than from the launch itself.
+    #[cfg(feature = "gpu")]
+    #[error("GPU error: {0}")]
+    Gpu(String),
 }

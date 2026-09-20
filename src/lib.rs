@@ -38,6 +38,8 @@ pub mod dispersion;
 pub mod errors;
 pub mod exact;
 pub mod glm;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod limma;
 pub mod numeric;
 pub mod prelude;
