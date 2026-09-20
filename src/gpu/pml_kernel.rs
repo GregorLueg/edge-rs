@@ -138,15 +138,14 @@ const SLOT_VW: u32 = 6;
 /// Slot index of `dw / vw`.
 const SLOT_DWVW: u32 = 7;
 
-/// Register capacity for designs of four columns or fewer.
+/// Largest design width the kernel is compiled for.
 ///
 /// The `n_beta`-sized and `n_beta`-squared working arrays are registers, so
-/// their capacity is a compile-time constant, and the quadratic blocks bound
-/// it. The narrow tier keeps the common NEBULA design, an intercept plus two or
-/// three covariates, clear of spilling.
-pub const SMALL_BETA_CAP: usize = 4;
-
-/// Register capacity for wider designs, and the largest the kernel accepts.
+/// their capacity is a compile-time constant. The dispatch compiles one shader
+/// per width rather than rounding up to a tier: register pressure is what bounds
+/// occupancy here, and at the common `n_beta` of three a padded capacity of four
+/// wastes seven registers on the quadratic block alone. Measured, dropping three
+/// such arrays moved the kernel 18 per cent.
 pub const MAX_BETA_CAP: usize = 8;
 
 ////////////
@@ -250,12 +249,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let mut damp_beta = Array::<F>::new(nb_cap as usize);
     let mut db = Array::<F>::new(nb_cap as usize);
     let mut db_block = Array::<F>::new(nb_cap as usize);
-    let mut a_sum = Array::<F>::new(nb_cap as usize);
     let mut a_bar = Array::<F>::new(nb_cap as usize);
-    let mut tmp = Array::<F>::new(nb_cap as usize);
-    let mut perm = Array::<u32>::new(nb_cap as usize);
     let mut vb2 = Array::<F>::new((nb_cap * nb_cap) as usize);
-    let mut factor = Array::<F>::new((nb_cap * nb_cap) as usize);
 
     let mut j = 0u32;
     while j < nb {
@@ -332,20 +327,20 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 
             let begin = subject_start[s as usize];
             let end = subject_start[(s + 1u32) as usize];
-            let ptr_block = ptr;
-
-            // -- First pass: the residual gradient, and the uncentred curvature
-            //    moments this subject's Schur block needs. --
+            // -- One pass: the residual gradient, and the weighted
+            //    within-subject covariance by Welford's online update. The
+            //    centred form needs the centre, and computing the centre first
+            //    would mean a second pass over the block and a second `exp` per
+            //    cell; the online update carries the centre along instead and
+            //    is cancellation-free for the same reason the two-pass form is.
             let mut resid = zero;
             let mut resid_block = zero;
             let mut p_sum = zero;
-            let mut p_block = zero;
             j = 0u32;
             while j < nb {
-                a_sum[j as usize] = zero;
+                a_bar[j as usize] = zero;
                 j += 1u32;
             }
-
             let mut r = begin;
             let mut since_flush = 0u32;
             while r < end {
@@ -373,21 +368,43 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 // two sums of order `1e4`. See the module doc.
                 let d = y - phi_g;
                 resid_block += d;
-                p_block += phi_c;
                 j = 0u32;
                 while j < nb {
-                    let x = design[(r * nb + j) as usize];
-                    db_block[j as usize] += x * d;
-                    a_sum[j as usize] += x * phi_c;
+                    db_block[j as usize] += design[(r * nb + j) as usize] * d;
                     j += 1u32;
                 }
+
+                // Welford, weighted: the deltas are taken against the running
+                // centre, then the centre moves.
+                let p_next = p_sum + phi_c;
+                if p_next > zero {
+                    let scale = gamma * phi_c * p_sum / p_next;
+                    let mut a = 0u32;
+                    while a < nb {
+                        let da = design[(r * nb + a) as usize] - a_bar[a as usize];
+                        let mut b = a;
+                        while b < nb {
+                            let db_delta = design[(r * nb + b) as usize] - a_bar[b as usize];
+                            vb2[(a * nb + b) as usize] += scale * da * db_delta;
+                            b += 1u32;
+                        }
+                        a += 1u32;
+                    }
+                    let step_frac = phi_c / p_next;
+                    j = 0u32;
+                    while j < nb {
+                        let centre = a_bar[j as usize];
+                        a_bar[j as usize] =
+                            centre + step_frac * (design[(r * nb + j) as usize] - centre);
+                        j += 1u32;
+                    }
+                }
+                p_sum = p_next;
 
                 since_flush += 1u32;
                 if since_flush == SUM_BLOCK {
                     resid += resid_block;
-                    p_sum += p_block;
                     resid_block = zero;
-                    p_block = zero;
                     j = 0u32;
                     while j < nb {
                         db[j as usize] += db_block[j as usize];
@@ -399,7 +416,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 r += 1u32;
             }
             resid += resid_block;
-            p_sum += p_block;
             j = 0u32;
             while j < nb {
                 db[j as usize] += db_block[j as usize];
@@ -412,58 +428,14 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             let vw_s = gamma * p_sum + lambda * w_s;
             subject_scratch[((SLOT_VW * k + s) * n_genes + g) as usize] = vw_s;
 
-            // A subject with no curvature at all contributes nothing; guarding
-            // here keeps the centre finite rather than letting it reach the
-            // output as a NaN.
-            let live = p_sum > zero;
             j = 0u32;
             while j < nb {
-                vwb_scratch[((s * nb + j) * n_genes + g) as usize] = gamma * a_sum[j as usize];
-                a_bar[j as usize] = if live {
-                    a_sum[j as usize] / p_sum
-                } else {
-                    zero
-                };
+                vwb_scratch[((s * nb + j) * n_genes + g) as usize] =
+                    gamma * a_bar[j as usize] * p_sum;
                 j += 1u32;
             }
 
-            // -- Second pass: the centred within-subject covariance. The centre
-            //    has to be known first, which is why this cannot be fused into
-            //    the pass above. --
             let shrink = lambda * w_s / vw_s;
-            ptr = ptr_block;
-            r = begin;
-            while r < end {
-                let mut eta = log_offset[r as usize];
-                j = 0u32;
-                while j < nb {
-                    eta += design[(r * nb + j) as usize] * beta[j as usize];
-                    j += 1u32;
-                }
-                let extb = F::exp(eta + log_w_s);
-                let mut y = zero;
-                if ptr < ptr_hi {
-                    if cells[ptr as usize] == r {
-                        y = counts[ptr as usize];
-                        ptr += 1u32;
-                    }
-                }
-                let phi_c = (gamma + y) / (one + gamma / extb) / (extb + gamma);
-
-                let mut a = 0u32;
-                while a < nb {
-                    let ca = design[(r * nb + a) as usize] - a_bar[a as usize];
-                    let mut b = a;
-                    while b < nb {
-                        let cb = design[(r * nb + b) as usize] - a_bar[b as usize];
-                        vb2[(a * nb + b) as usize] += gamma * phi_c * ca * cb;
-                        b += 1u32;
-                    }
-                    a += 1u32;
-                }
-                r += 1u32;
-            }
-
             // What the centring leaves over, which the prior's share of the
             // subject curvature keeps from cancelling.
             let mut a = 0u32;
@@ -471,7 +443,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let mut b = a;
                 while b < nb {
                     vb2[(a * nb + b) as usize] +=
-                        gamma * a_bar[a as usize] * a_sum[b as usize] * shrink;
+                        gamma * a_bar[a as usize] * a_bar[b as usize] * p_sum * shrink;
                     b += 1u32;
                 }
                 a += 1u32;
@@ -522,12 +494,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 j += 1u32;
             }
 
-            i = 0u32;
-            while i < nb * nb {
-                factor[i as usize] = vb2[i as usize];
-                i += 1u32;
-            }
-            ldlt_solve::<F>(&mut factor, &mut step_beta, &mut perm, &mut tmp, nb);
+            // The solve destroys its matrix. That is safe here: this sweep is
+            // not the final one, so `vb2` is rebuilt before it is read out.
+            ldlt_solve::<F>(&mut vb2, &mut step_beta, nb, nb_cap);
 
             s = 0u32;
             while s < k {
@@ -887,19 +856,14 @@ fn evaluate_pass<F: Float>(
 ///
 /// * `a` - Row-major `n * n` symmetric matrix, overwritten by the factor
 /// * `b` - Right-hand side, overwritten by the solution
-/// * `perm` - Scratch for the transposition record
-/// * `tmp` - Scratch row
 /// * `n` - System size
+/// * `n_cap` - Comptime capacity of the internal scratch
 #[cube]
-fn ldlt_solve<F: Float>(
-    a: &mut Array<F>,
-    b: &mut Array<F>,
-    perm: &mut Array<u32>,
-    tmp: &mut Array<F>,
-    n: u32,
-) {
+fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] n_cap: u32) {
     let zero = F::new(0.0_f32);
     let tiny = F::new(f32::MIN_POSITIVE);
+    let mut perm = Array::<u32>::new(n_cap as usize);
+    let mut tmp = Array::<F>::new(n_cap as usize);
 
     let mut step = 0u32;
     while step < n {
@@ -1113,10 +1077,15 @@ where
         };
     }
 
-    if nb <= SMALL_BETA_CAP {
-        dispatch!(SMALL_BETA_CAP as u32);
-    } else {
-        dispatch!(MAX_BETA_CAP as u32);
+    match nb {
+        1 => dispatch!(1),
+        2 => dispatch!(2),
+        3 => dispatch!(3),
+        4 => dispatch!(4),
+        5 => dispatch!(5),
+        6 => dispatch!(6),
+        7 => dispatch!(7),
+        _ => dispatch!(8),
     }
 
     Ok(())

@@ -26,6 +26,7 @@
 
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
+use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
 use crate::gpu::pml_kernel::{PmlGpuTensors, SUBJECT_SLOTS, launch_opt_pml};
@@ -164,20 +165,52 @@ pub fn opt_pml_batch<R: Runtime>(
     }
 
     // -- Shared inputs --
-    let design_f32: Vec<f32> = design.iter().map(|&v| v as f32).collect();
-    let offset_f32: Vec<f32> = log_offset.iter().map(|&v| v as f32).collect();
+    // The narrowing to f32 is over `n_cells * nb` and `nnz`, both of which run
+    // to tens of millions on a real batch. Left sequential it is a serial third
+    // of the time the caller spends in here, next to a kernel that is not.
+    let design_f32: Vec<f32> = design.par_iter().map(|&v| v as f32).collect();
+    let offset_f32: Vec<f32> = log_offset.par_iter().map(|&v| v as f32).collect();
     let start_u32: Vec<u32> = subject_start.iter().map(|&v| v as u32).collect();
 
     // -- Concatenated sparse counts --
-    let nnz: usize = genes.iter().map(|g| g.counts.len()).sum();
-    let mut counts_f32 = Vec::with_capacity(nnz);
-    let mut cells_u32 = Vec::with_capacity(nnz);
     let mut gene_ptr = Vec::with_capacity(n_genes + 1);
     gene_ptr.push(0u32);
+    let mut running = 0usize;
     for gene in genes {
-        counts_f32.extend(gene.counts.iter().map(|&v| v as f32));
-        cells_u32.extend(gene.cell_index.iter().map(|&c| c as u32));
-        gene_ptr.push(counts_f32.len() as u32);
+        running += gene.counts.len();
+        gene_ptr.push(running as u32);
+    }
+    let nnz = running;
+
+    let mut counts_f32 = vec![0.0f32; nnz];
+    let mut cells_u32 = vec![0u32; nnz];
+    {
+        // Split once into the per-gene runs `gene_ptr` already describes, then
+        // fill them in parallel; the runs are disjoint so nothing is shared.
+        let mut count_runs: Vec<&mut [f32]> = Vec::with_capacity(n_genes);
+        let mut cell_runs: Vec<&mut [u32]> = Vec::with_capacity(n_genes);
+        let mut count_rest = counts_f32.as_mut_slice();
+        let mut cell_rest = cells_u32.as_mut_slice();
+        for gene in genes {
+            let (a, b) = count_rest.split_at_mut(gene.counts.len());
+            count_runs.push(a);
+            count_rest = b;
+            let (c, d) = cell_rest.split_at_mut(gene.cell_index.len());
+            cell_runs.push(c);
+            cell_rest = d;
+        }
+        count_runs
+            .into_par_iter()
+            .zip(cell_runs)
+            .zip(genes)
+            .for_each(|((count_run, cell_run), gene)| {
+                for (out, &v) in count_run.iter_mut().zip(gene.counts) {
+                    *out = v as f32;
+                }
+                for (out, &c) in cell_run.iter_mut().zip(gene.cell_index) {
+                    *out = c as u32;
+                }
+            });
     }
 
     // -- Gene-minor per-gene inputs --
