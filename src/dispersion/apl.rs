@@ -264,7 +264,6 @@ fn fit_one_way_gene(
 /// * `dispersion` - Dispersion row
 /// * `offset` - Offset row
 /// * `weights` - Optional weight row
-/// * `params` - Iteration budget and tolerance for the coefficient fit
 fn fit_general_gene(
     scratch: &mut GeneScratch,
     design: &[f64],
@@ -273,7 +272,6 @@ fn fit_general_gene(
     dispersion: RecycledRow<'_, f64>,
     offset: RecycledRow<'_, f64>,
     weights: Option<RecycledRow<'_, f64>>,
-    params: &LevenbergParams,
 ) {
     scratch.levenberg.y.copy_from_slice(&scratch.y);
 
@@ -281,6 +279,12 @@ fn fit_general_gene(
     // very similar coefficients, so this saves most of the iterations after the
     // first grid point.
     //
+    // The budget is `glmFit`'s rather than `mglmLevenberg`'s, because that is the
+    // route `adjustedProfileLik` takes to the fitter.
+    let params = LevenbergParams {
+        max_iter: GLM_FIT_MAX_ITER,
+        ..Default::default()
+    };
     crate::glm::levenberg::fit_one_gene(
         &mut scratch.levenberg,
         &mut scratch.beta,
@@ -290,7 +294,7 @@ fn fit_general_gene(
         dispersion,
         offset,
         weights,
-        params,
+        &params,
     );
     scratch.mu.copy_from_slice(&scratch.levenberg.mu);
 }
@@ -336,9 +340,6 @@ pub struct AplWorkspace<'a> {
     weights: Option<RecycledRow<'a, f64>>,
     /// Whether a gene has been loaded since construction.
     started: bool,
-    /// Iteration budget and tolerance for the coefficient fit at each
-    /// dispersion.
-    levenberg: LevenbergParams,
 }
 
 impl<'a> AplWorkspace<'a> {
@@ -425,34 +426,7 @@ impl<'a> AplWorkspace<'a> {
             offset: RecycledRow::Constant(0.0),
             weights: None,
             started: false,
-            // The budget is `glmFit`'s rather than `mglmLevenberg`'s, because
-            // that is the route `adjustedProfileLik` takes to the fitter.
-            levenberg: LevenbergParams {
-                max_iter: GLM_FIT_MAX_ITER,
-                ..Default::default()
-            },
         }
-    }
-
-    /// Replaces the coefficient fit's iteration budget and tolerance.
-    ///
-    /// The default is `adjustedProfileLik`'s, which is edgeR's tolerance of
-    /// `1e-6` on the relative deviance. That is loose enough that a warm start
-    /// and a cold start stop at measurably different coefficients, and a search
-    /// walking a flat likelihood can be steered by the difference. Tighten it
-    /// when the dispersion the search returns has to be reproducible
-    /// independently of how it was reached.
-    ///
-    /// ### Params
-    ///
-    /// * `params` - Iteration budget, tolerance and starting method
-    ///
-    /// ### Returns
-    ///
-    /// The workspace, for chaining off [`AplWorkspace::new`].
-    pub fn with_levenberg_params(mut self, params: LevenbergParams) -> Self {
-        self.levenberg = params;
-        self
     }
 
     /// Loads a gene and cold-starts its coefficients.
@@ -510,7 +484,7 @@ impl<'a> AplWorkspace<'a> {
                 self.weights,
                 self.n_samples,
                 self.n_coef,
-                self.levenberg.start_method,
+                LevenbergParams::default().start_method,
                 &mut self.scratch.beta,
             );
         }
@@ -578,7 +552,6 @@ impl<'a> AplWorkspace<'a> {
                 disp_row,
                 self.offset,
                 self.weights,
-                &self.levenberg,
             );
         }
 
