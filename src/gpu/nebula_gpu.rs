@@ -120,6 +120,53 @@ pub fn opt_pml_batch<R: Runtime>(
     max_backtrack: u32,
     client: &ComputeClient<R>,
 ) -> Result<GpuPmlBatch, EdgeErrors> {
+    let mut resident = ResidentBatch::upload(design, log_offset, subject_start, genes, client)?;
+    resident.solve(genes, eps, noise_scale, max_iter, max_backtrack, client)
+}
+
+/// A batch whose gene-independent buffers stay on the device between solves.
+///
+/// The counts and their cell indices are by far the largest upload, running to
+/// hundreds of megabytes on a real batch, and NEBULA's stage two calls the
+/// solver on the order of a hundred times per gene with only the two variance
+/// components changed. Uploading once and solving many times is what makes that
+/// affordable: measured at 16384 genes and 20000 cells, a single solve spends
+/// 1.5 of its 4.0 seconds on staging, and every solve after the first pays none
+/// of it.
+pub struct ResidentBatch<R: Runtime> {
+    /// The device buffers, including the ones re-written per solve.
+    tensors: PmlGpuTensors<R, f32>,
+    /// Genes in the batch.
+    n_genes: usize,
+    /// Subjects.
+    k: usize,
+    /// Design columns.
+    nb: usize,
+}
+
+impl<R: Runtime> ResidentBatch<R> {
+    /// Uploads everything that does not change between solves.
+    ///
+    /// ### Params
+    ///
+    /// * `design` - Shared design, row-major `n_cells * nb`
+    /// * `log_offset` - Shared log offset per cell
+    /// * `subject_start` - Shared subject boundaries, length `k + 1`
+    /// * `genes` - One entry per gene; only the counts, their cell indices and
+    ///   the subject totals are read here
+    /// * `client` - CubeCL compute client
+    ///
+    /// ### Returns
+    ///
+    /// The resident batch, or [`EdgeErrors`] if the inputs disagree in shape or
+    /// a device limit rejects the allocation.
+    pub fn upload(
+        design: &[f64],
+        log_offset: &[f64],
+        subject_start: &[usize],
+        genes: &[GpuGene<'_>],
+        client: &ComputeClient<R>,
+    ) -> Result<Self, EdgeErrors> {
     let n_genes = genes.len();
     if n_genes == 0 {
         return Err(EdgeErrors::MustBePositive("n_genes".to_string()));
@@ -220,35 +267,8 @@ pub fn opt_pml_batch<R: Runtime>(
             subject_total[s * n_genes + g] = t as f32;
         }
     }
-    let mut beta_init = vec![0.0f32; nb * n_genes];
-    for (g, gene) in genes.iter().enumerate() {
-        for (j, &b) in gene.beta_init.iter().enumerate() {
-            beta_init[j * n_genes + g] = b as f32;
-        }
-    }
-
-    // The gamma prior, resolved in f64 exactly as `opt_pml` does. `e^s - 1`
-    // cancels for the small `s` most genes sit on, so this cannot be left to
-    // the device.
-    let mut gene_params = vec![0.0f32; 3 * n_genes];
-    for (g, gene) in genes.iter().enumerate() {
-        let exps = gene.sigma.exp();
-        if !(exps.is_finite() && exps > 1.0) {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "PmlVariance::subject must be finite and strictly positive; gene {g} has {}.",
-                gene.sigma
-            )));
-        }
-        if !(gene.gamma.is_finite() && gene.gamma > 0.0) {
-            return Err(EdgeErrors::InvalidDispersion(gene.gamma));
-        }
-        gene_params[g] = (1.0 / (exps - 1.0)) as f32;
-        gene_params[n_genes + g] = (1.0 / (exps.sqrt() * (exps - 1.0))) as f32;
-        gene_params[2 * n_genes + g] = gene.gamma as f32;
-    }
-
     let err = |e: CubeclUtilsErrors| EdgeErrors::Gpu(e.to_string());
-    let mut tensors = PmlGpuTensors::<R, f32> {
+    let tensors = PmlGpuTensors::<R, f32> {
         design: GpuTensor::from_slice(&design_f32, vec![n_cells * nb], client).map_err(err)?,
         log_offset: GpuTensor::from_slice(&offset_f32, vec![n_cells], client).map_err(err)?,
         subject_start: GpuTensor::from_slice(&start_u32, vec![k + 1], client).map_err(err)?,
@@ -257,10 +277,13 @@ pub fn opt_pml_batch<R: Runtime>(
         gene_ptr: GpuTensor::from_slice(&gene_ptr, vec![n_genes + 1], client).map_err(err)?,
         subject_total: GpuTensor::from_slice(&subject_total, vec![k * n_genes], client)
             .map_err(err)?,
-        gene_params: GpuTensor::from_slice(&gene_params, vec![3 * n_genes], client).map_err(err)?,
-        beta_init: GpuTensor::from_slice(&beta_init, vec![nb * n_genes], client).map_err(err)?,
-        tolerance: GpuTensor::from_slice(&[eps as f32, noise_scale as f32], vec![2], client)
+        // Placeholders: `solve` writes all three, and they are small enough
+        // that replacing them per solve costs nothing worth measuring.
+        gene_params: GpuTensor::from_slice(&vec![0.0f32; 3 * n_genes], vec![3 * n_genes], client)
             .map_err(err)?,
+        beta_init: GpuTensor::from_slice(&vec![0.0f32; nb * n_genes], vec![nb * n_genes], client)
+            .map_err(err)?,
+        tolerance: GpuTensor::from_slice(&[0.0f32, 0.0f32], vec![2], client).map_err(err)?,
         subject_scratch: GpuTensor::from_slice(
             &vec![0.0f32; SUBJECT_SLOTS as usize * k * n_genes],
             vec![SUBJECT_SLOTS as usize * k * n_genes],
@@ -287,45 +310,137 @@ pub fn opt_pml_batch<R: Runtime>(
             .map_err(err)?,
     };
 
-    launch_opt_pml::<R, f32>(
-        &mut tensors,
-        n_genes,
-        k,
-        nb,
-        max_iter,
-        max_backtrack,
-        client,
-    )?;
-
-    let beta_dev = tensors.out_beta.read(client).map_err(err)?;
-    let info_dev = tensors.out_information.read(client).map_err(err)?;
-    let scalars = tensors.out_scalars.read(client).map_err(err)?;
-    let counts_dev = tensors.out_counts.read(client).map_err(err)?;
-
-    let mut beta = vec![0.0f64; n_genes * nb];
-    for g in 0..n_genes {
-        for j in 0..nb {
-            beta[g * nb + j] = beta_dev[j * n_genes + g] as f64;
-        }
-    }
-    let mut information = vec![0.0f64; n_genes * nb * nb];
-    for g in 0..n_genes {
-        for i in 0..nb * nb {
-            information[g * nb * nb + i] = info_dev[i * n_genes + g] as f64;
-        }
+        Ok(Self {
+            tensors,
+            n_genes,
+            k,
+            nb,
+        })
     }
 
-    Ok(GpuPmlBatch {
-        beta,
-        information,
-        log_likelihood: (0..n_genes).map(|g| scalars[g] as f64).collect(),
-        log_det: (0..n_genes)
-            .map(|g| scalars[2 * n_genes + g] as f64)
-            .collect(),
-        iterations: (0..n_genes).map(|g| counts_dev[g]).collect(),
-        backtracks: (0..n_genes)
-            .map(|g| counts_dev[n_genes + g])
-            .collect(),
-        n_coef: nb,
-    })
+    /// Fits the resident batch at the given variance components.
+    ///
+    /// Only the per-gene scalars are re-uploaded; the counts, the design and
+    /// the offsets stay where they are.
+    ///
+    /// ### Params
+    ///
+    /// * `genes` - One entry per gene; only `beta_init`, `sigma` and `gamma`
+    ///   are read here, and they must be in the same gene order as the upload
+    /// * `eps` - nebula's absolute stopping tolerance
+    /// * `noise_scale` - Resolution floor on the objective, relative to its
+    ///   magnitude
+    /// * `max_iter` - Newton budget
+    /// * `max_backtrack` - Backtracking budget within one step
+    /// * `client` - CubeCL compute client
+    ///
+    /// ### Returns
+    ///
+    /// The fits, or [`EdgeErrors`] if a variance component is out of range.
+    pub fn solve(
+        &mut self,
+        genes: &[GpuGene<'_>],
+        eps: f64,
+        noise_scale: f64,
+        max_iter: u32,
+        max_backtrack: u32,
+        client: &ComputeClient<R>,
+    ) -> Result<GpuPmlBatch, EdgeErrors> {
+        let (n_genes, k, nb) = (self.n_genes, self.k, self.nb);
+        if genes.len() != n_genes {
+            return Err(EdgeErrors::LengthMismatch {
+                name: "genes",
+                expected: n_genes,
+                got: genes.len(),
+            });
+        }
+        let err = |e: CubeclUtilsErrors| EdgeErrors::Gpu(e.to_string());
+
+        let mut beta_init = vec![0.0f32; nb * n_genes];
+        for (g, gene) in genes.iter().enumerate() {
+            if gene.beta_init.len() != nb {
+                return Err(EdgeErrors::LengthMismatch {
+                    name: "beta_init",
+                    expected: nb,
+                    got: gene.beta_init.len(),
+                });
+            }
+            for (j, &b) in gene.beta_init.iter().enumerate() {
+                beta_init[j * n_genes + g] = b as f32;
+            }
+        }
+
+        // The gamma prior, resolved in f64 exactly as `opt_pml` does. `e^s - 1`
+        // cancels for the small `s` most genes sit on, so this cannot be left
+        // to the device.
+        let mut gene_params = vec![0.0f32; 3 * n_genes];
+        for (g, gene) in genes.iter().enumerate() {
+            let exps = gene.sigma.exp();
+            if !(exps.is_finite() && exps > 1.0) {
+                return Err(EdgeErrors::InvalidArgument(format!(
+                    "PmlVariance::subject must be finite and strictly positive; gene {g} has {}.",
+                    gene.sigma
+                )));
+            }
+            if !(gene.gamma.is_finite() && gene.gamma > 0.0) {
+                return Err(EdgeErrors::InvalidDispersion(gene.gamma));
+            }
+            gene_params[g] = (1.0 / (exps - 1.0)) as f32;
+            gene_params[n_genes + g] = (1.0 / (exps.sqrt() * (exps - 1.0))) as f32;
+            gene_params[2 * n_genes + g] = gene.gamma as f32;
+        }
+
+        self.tensors.beta_init =
+            GpuTensor::from_slice(&beta_init, vec![nb * n_genes], client).map_err(err)?;
+        self.tensors.gene_params =
+            GpuTensor::from_slice(&gene_params, vec![3 * n_genes], client).map_err(err)?;
+        self.tensors.tolerance =
+            GpuTensor::from_slice(&[eps as f32, noise_scale as f32], vec![2], client)
+                .map_err(err)?;
+
+        launch_opt_pml::<R, f32>(
+            &mut self.tensors,
+            n_genes,
+            k,
+            nb,
+            max_iter,
+            max_backtrack,
+            client,
+        )?;
+
+        let beta_dev = self.tensors.out_beta.clone().read(client).map_err(err)?;
+        let info_dev = self
+            .tensors
+            .out_information
+            .clone()
+            .read(client)
+            .map_err(err)?;
+        let scalars = self.tensors.out_scalars.clone().read(client).map_err(err)?;
+        let counts_dev = self.tensors.out_counts.clone().read(client).map_err(err)?;
+
+        let mut beta = vec![0.0f64; n_genes * nb];
+        for g in 0..n_genes {
+            for j in 0..nb {
+                beta[g * nb + j] = beta_dev[j * n_genes + g] as f64;
+            }
+        }
+        let mut information = vec![0.0f64; n_genes * nb * nb];
+        for g in 0..n_genes {
+            for i in 0..nb * nb {
+                information[g * nb * nb + i] = info_dev[i * n_genes + g] as f64;
+            }
+        }
+
+        Ok(GpuPmlBatch {
+            beta,
+            information,
+            log_likelihood: (0..n_genes).map(|g| scalars[g] as f64).collect(),
+            log_det: (0..n_genes)
+                .map(|g| scalars[2 * n_genes + g] as f64)
+                .collect(),
+            iterations: (0..n_genes).map(|g| counts_dev[g]).collect(),
+            backtracks: (0..n_genes).map(|g| counts_dev[n_genes + g]).collect(),
+            n_coef: nb,
+        })
+    }
 }

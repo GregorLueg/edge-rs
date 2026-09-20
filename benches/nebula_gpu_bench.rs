@@ -27,7 +27,7 @@ use rand::rngs::SmallRng;
 use rand_distr::{Distribution, Gamma, LogNormal, Poisson};
 use rayon::prelude::*;
 
-use edge_rs::gpu::nebula_gpu::{GpuGene, opt_pml_batch};
+use edge_rs::gpu::nebula_gpu::{GpuGene, ResidentBatch, opt_pml_batch};
 use edge_rs::gpu::pml_kernel::F32_NOISE_SCALE;
 use edge_rs::sc::pml::{PmlData, PmlParams, PmlVariance, opt_pml};
 
@@ -40,6 +40,14 @@ use edge_rs::sc::pml::{PmlData, PmlParams, PmlVariance, opt_pml};
 /// The first is a small batch where the GPU cannot fill the device; the last is
 /// the regime a real single-cell run is in, where the per-gene work dominates.
 const SWEEP: [(usize, usize); 4] = [(256, 20_000), (1024, 20_000), (4096, 20_000), (1024, 80_000)];
+
+/// Solves run against one resident upload, to show what stage two would see.
+///
+/// NEBULA's stage two calls `opt_pml` once per Nelder-Mead evaluation and once
+/// per polish stencil point, on the order of a hundred times per gene, with
+/// only the two variance components changed. Eight is enough to separate the
+/// upload from the solve without making the bench tedious.
+const RESIDENT_SOLVES: usize = 8;
 
 /// Subjects in every shape. Twenty donors is a typical NEBULA design.
 const SUBJECTS: usize = 20;
@@ -295,6 +303,30 @@ fn run_gpu_capped(
     (0..n_genes).map(|g| fit.beta[g * COEF]).sum()
 }
 
+/// Builds the per-gene views the GPU entry points take.
+///
+/// ### Params
+///
+/// * `batch` - The generated problem
+/// * `n_genes` - Number of genes
+/// * `beta_init` - Starting fixed effects, shared by every gene
+///
+/// ### Returns
+///
+/// One [`GpuGene`] per gene, borrowed against `batch`.
+fn gpu_genes<'a>(batch: &'a Batch, n_genes: usize, beta_init: &'a [f64]) -> Vec<GpuGene<'a>> {
+    (0..n_genes)
+        .map(|g| GpuGene {
+            counts: &batch.counts[g],
+            cell_index: &batch.cells[g],
+            subject_total: &batch.subject_totals[g],
+            beta_init,
+            sigma: TRUE_SIGMA,
+            gamma: 1.0 / TRUE_PHI_INV,
+        })
+        .collect()
+}
+
 fn main() {
     let device = WgpuDevice::default();
     let client = WgpuRuntime::client(&device);
@@ -310,6 +342,7 @@ fn main() {
     );
     println!("    genes    cells        cpu        gpu   speedup");
 
+    let beta_init = vec![0.0; COEF];
     for (n_genes, n_cells) in shapes {
         let batch = make_batch(n_genes, n_cells);
 
@@ -338,6 +371,61 @@ fn main() {
         println!(
             "           of which staging, launch and read-back {fixed:.3} s; kernel {:.3} s",
             gpu_time - fixed
+        );
+
+        // Amortised: one upload, several solves, against the same number of
+        // CPU passes. This is the shape stage two would run in.
+        let mut resident = ResidentBatch::upload(
+            &batch.design,
+            &batch.log_offset,
+            &batch.subject_start,
+            &gpu_genes(&batch, n_genes, &beta_init),
+            &client,
+        )
+        .expect("upload");
+        let genes = gpu_genes(&batch, n_genes, &beta_init);
+        let params = PmlParams {
+            ord: 1,
+            ..PmlParams::default()
+        };
+        black_box(
+            resident
+                .solve(
+                    &genes,
+                    params.eps,
+                    f64::from(F32_NOISE_SCALE),
+                    params.max_iter as u32,
+                    params.max_backtrack as u32,
+                    &client,
+                )
+                .expect("solve"),
+        );
+
+        let t = Instant::now();
+        for _ in 0..RESIDENT_SOLVES {
+            black_box(
+                resident
+                    .solve(
+                        &genes,
+                        params.eps,
+                        f64::from(F32_NOISE_SCALE),
+                        params.max_iter as u32,
+                        params.max_backtrack as u32,
+                        &client,
+                    )
+                    .expect("solve"),
+            );
+        }
+        let resident_time = t.elapsed().as_secs_f64();
+
+        let t = Instant::now();
+        for _ in 0..RESIDENT_SOLVES {
+            black_box(run_cpu(&batch, n_genes));
+        }
+        let cpu_many = t.elapsed().as_secs_f64();
+        println!(
+            "           {RESIDENT_SOLVES} solves on one upload: cpu {cpu_many:.3} s, gpu {resident_time:.3} s, {:.2}x",
+            cpu_many / resident_time
         );
         // The two sums are not expected to match bit for bit; printing them
         // guards against a kernel that returns zeros and looks fast.
