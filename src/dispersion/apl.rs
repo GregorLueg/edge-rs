@@ -51,8 +51,8 @@ struct GeneScratch {
     mu: Vec<f64>,
     /// Information matrix, row-major.
     information: Vec<f64>,
-    /// Coefficients, reused as a warm start across grid points and reset by
-    /// [`apl_grid`] at the start of each gene.
+    /// Coefficients, reused as a warm start across dispersions and reset by
+    /// [`AplWorkspace::begin_gene`] at the start of each gene.
     beta: Vec<f64>,
     /// Scratch for the general Levenberg path.
     levenberg: Scratch,
@@ -264,6 +264,7 @@ fn fit_one_way_gene(
 /// * `dispersion` - Dispersion row
 /// * `offset` - Offset row
 /// * `weights` - Optional weight row
+/// * `params` - Iteration budget and tolerance for the coefficient fit
 fn fit_general_gene(
     scratch: &mut GeneScratch,
     design: &[f64],
@@ -272,6 +273,7 @@ fn fit_general_gene(
     dispersion: RecycledRow<'_, f64>,
     offset: RecycledRow<'_, f64>,
     weights: Option<RecycledRow<'_, f64>>,
+    params: &LevenbergParams,
 ) {
     scratch.levenberg.y.copy_from_slice(&scratch.y);
 
@@ -279,12 +281,6 @@ fn fit_general_gene(
     // very similar coefficients, so this saves most of the iterations after the
     // first grid point.
     //
-    // The budget is `glmFit`'s rather than `mglmLevenberg`'s, because that is the
-    // route `adjustedProfileLik` takes to the fitter.
-    let params = LevenbergParams {
-        max_iter: GLM_FIT_MAX_ITER,
-        ..Default::default()
-    };
     crate::glm::levenberg::fit_one_gene(
         &mut scratch.levenberg,
         &mut scratch.beta,
@@ -294,9 +290,310 @@ fn fit_general_gene(
         dispersion,
         offset,
         weights,
-        &params,
+        params,
     );
     scratch.mu.copy_from_slice(&scratch.levenberg.mu);
+}
+
+//////////////////
+// AplWorkspace //
+//////////////////
+
+/// Reusable state for evaluating the adjusted profile likelihood of one gene at
+/// many dispersions.
+///
+/// [`apl_grid`] refits the coefficients at every grid point and carries the
+/// previous point's answer into the next, which is what keeps a 20-point sweep
+/// far cheaper than 20 independent fits. A caller driving its own search over
+/// the dispersion, an optimiser rather than a grid, cannot use that through
+/// [`apl_at`]: each call allocates its own buffers, re-derives the design's
+/// factor structure and cold-starts the coefficients again.
+///
+/// This type exposes the same machinery point by point. Build it once per
+/// design, call [`AplWorkspace::begin_gene`] when the gene changes, then
+/// [`AplWorkspace::eval`] for every dispersion the search asks about. Each
+/// evaluation starts from the last one's coefficients, so the saving grows with
+/// the number of points the search visits.
+///
+/// The buffers are sized at construction and never reallocated, so one
+/// workspace per worker thread is the intended pattern.
+pub struct AplWorkspace<'a> {
+    /// Row-major design, `n_samples * n_coef`.
+    design: &'a [f64],
+    /// Number of samples.
+    n_samples: usize,
+    /// Number of coefficients.
+    n_coef: usize,
+    /// Sample indices per group, used only on the one-way path.
+    members: Vec<Vec<usize>>,
+    /// Whether the design is a one-way layout, which has the closed-form fit.
+    one_way: bool,
+    /// Counts, fitted means, information matrix and coefficients.
+    scratch: GeneScratch,
+    /// Offset row of the gene currently loaded.
+    offset: RecycledRow<'a, f64>,
+    /// Weight row of the gene currently loaded.
+    weights: Option<RecycledRow<'a, f64>>,
+    /// Whether a gene has been loaded since construction.
+    started: bool,
+    /// Iteration budget and tolerance for the coefficient fit at each
+    /// dispersion.
+    levenberg: LevenbergParams,
+}
+
+impl<'a> AplWorkspace<'a> {
+    /// Allocates a workspace for one design.
+    ///
+    /// The design's factor structure is derived once here rather than per
+    /// evaluation, which is the other half of what [`apl_at`] repeats.
+    ///
+    /// ### Params
+    ///
+    /// * `design` - Design matrix, row-major `n_samples * n_coef`
+    /// * `n_samples` - Number of samples
+    /// * `n_coef` - Number of coefficients
+    ///
+    /// ### Returns
+    ///
+    /// The workspace, or [`EdgeErrors`] if the shapes disagree.
+    pub fn new(design: &'a [f64], n_samples: usize, n_coef: usize) -> Result<Self, EdgeErrors> {
+        if n_samples == 0 {
+            return Err(EdgeErrors::EmptyCounts {
+                n_genes: 1,
+                n_samples,
+            });
+        }
+        if n_coef == 0 {
+            return Err(EdgeErrors::MustBePositive("n_coef".to_string()));
+        }
+        if design.len() != n_samples * n_coef {
+            return Err(EdgeErrors::LengthMismatch {
+                name: "design",
+                expected: n_samples * n_coef,
+                got: design.len(),
+            });
+        }
+
+        let (labels, n_groups) = design_as_factor(design, n_samples, n_coef)?;
+
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); n_groups];
+        for (sample, &label) in labels.iter().enumerate() {
+            members[label].push(sample);
+        }
+
+        Ok(Self::from_parts(
+            design,
+            n_samples,
+            n_coef,
+            members,
+            n_groups == n_coef,
+        ))
+    }
+
+    /// Builds a workspace from a design whose factor structure is already known.
+    ///
+    /// [`apl_grid`] derives that structure once for the whole matrix and then
+    /// hands each worker its own workspace, so re-deriving it per worker would
+    /// be pure repetition.
+    ///
+    /// ### Params
+    ///
+    /// * `design` - Design matrix, row-major `n_samples * n_coef`
+    /// * `n_samples` - Number of samples
+    /// * `n_coef` - Number of coefficients
+    /// * `members` - Sample indices per group of the design read as a factor
+    /// * `one_way` - Whether that factor has exactly `n_coef` groups, the case
+    ///   the closed-form one-way fit applies to
+    ///
+    /// ### Returns
+    ///
+    /// The workspace, with no gene loaded.
+    fn from_parts(
+        design: &'a [f64],
+        n_samples: usize,
+        n_coef: usize,
+        members: Vec<Vec<usize>>,
+        one_way: bool,
+    ) -> Self {
+        Self {
+            design,
+            n_samples,
+            n_coef,
+            members,
+            one_way,
+            scratch: GeneScratch::new(n_samples, n_coef),
+            offset: RecycledRow::Constant(0.0),
+            weights: None,
+            started: false,
+            // The budget is `glmFit`'s rather than `mglmLevenberg`'s, because
+            // that is the route `adjustedProfileLik` takes to the fitter.
+            levenberg: LevenbergParams {
+                max_iter: GLM_FIT_MAX_ITER,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Replaces the coefficient fit's iteration budget and tolerance.
+    ///
+    /// The default is `adjustedProfileLik`'s, which is edgeR's tolerance of
+    /// `1e-6` on the relative deviance. That is loose enough that a warm start
+    /// and a cold start stop at measurably different coefficients, and a search
+    /// walking a flat likelihood can be steered by the difference. Tighten it
+    /// when the dispersion the search returns has to be reproducible
+    /// independently of how it was reached.
+    ///
+    /// ### Params
+    ///
+    /// * `params` - Iteration budget, tolerance and starting method
+    ///
+    /// ### Returns
+    ///
+    /// The workspace, for chaining off [`AplWorkspace::new`].
+    pub fn with_levenberg_params(mut self, params: LevenbergParams) -> Self {
+        self.levenberg = params;
+        self
+    }
+
+    /// Loads a gene and cold-starts its coefficients.
+    ///
+    /// The coefficients are deliberately carried from one [`AplWorkspace::eval`]
+    /// to the next, so a new gene has to clear them: neighbouring dispersions
+    /// are close together, neighbouring genes need not be, and over a wide
+    /// abundance range the previous gene's answer is far enough out that the fit
+    /// lands on the wrong optimum. This matches `estimateDisp`, which clears its
+    /// warm start once per gene.
+    ///
+    /// ### Params
+    ///
+    /// * `counts` - This gene's counts, one per sample
+    /// * `offset` - Log-scale offset row for this gene
+    /// * `weights` - Optional observation weight row for this gene
+    /// * `dispersion` - Dispersion the search will evaluate first, used only to
+    ///   build the starting coefficients
+    ///
+    /// ### Returns
+    ///
+    /// Nothing, or [`EdgeErrors`] if `counts` is the wrong length or the
+    /// dispersion is negative.
+    pub fn begin_gene<T: EdgeFloat>(
+        &mut self,
+        counts: &[T],
+        offset: RecycledRow<'a, f64>,
+        weights: Option<RecycledRow<'a, f64>>,
+        dispersion: f64,
+    ) -> Result<(), EdgeErrors> {
+        if counts.len() != self.n_samples {
+            return Err(EdgeErrors::LengthMismatch {
+                name: "counts",
+                expected: self.n_samples,
+                got: counts.len(),
+            });
+        }
+        if dispersion < 0.0 || !dispersion.is_finite() {
+            return Err(EdgeErrors::InvalidDispersion(dispersion));
+        }
+
+        for (slot, value) in self.scratch.y.iter_mut().zip(counts) {
+            *slot = value.to_f64().unwrap_or(0.0);
+        }
+        self.offset = offset;
+        self.weights = weights;
+        self.started = true;
+
+        if !self.one_way {
+            initial_coefficients(
+                &self.scratch.y,
+                self.design,
+                self.offset,
+                RecycledRow::Constant(dispersion),
+                self.weights,
+                self.n_samples,
+                self.n_coef,
+                self.levenberg.start_method,
+                &mut self.scratch.beta,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Adjusted profile likelihood of the loaded gene at one dispersion.
+    ///
+    /// ### Params
+    ///
+    /// * `dispersion` - Dispersion to evaluate at
+    ///
+    /// ### Returns
+    ///
+    /// The adjusted profile log-likelihood, or [`EdgeErrors`] if no gene has
+    /// been loaded or the dispersion is negative.
+    pub fn eval(&mut self, dispersion: f64) -> Result<f64, EdgeErrors> {
+        if !self.started {
+            return Err(EdgeErrors::AplWorkspaceNotStarted);
+        }
+        if dispersion < 0.0 || !dispersion.is_finite() {
+            return Err(EdgeErrors::InvalidDispersion(dispersion));
+        }
+        Ok(self.eval_unchecked(dispersion))
+    }
+
+    /// Coefficients of the loaded gene at the dispersion last evaluated.
+    ///
+    /// ### Returns
+    ///
+    /// The coefficients on the natural-log scale, one per design column. All
+    /// zeros before the first [`AplWorkspace::eval`].
+    pub fn coefficients(&self) -> &[f64] {
+        &self.scratch.beta
+    }
+
+    /// The evaluation itself, with the checks already done.
+    ///
+    /// ### Params
+    ///
+    /// * `dispersion` - Dispersion to evaluate at
+    ///
+    /// ### Returns
+    ///
+    /// The adjusted profile log-likelihood.
+    fn eval_unchecked(&mut self, dispersion: f64) -> f64 {
+        let disp_row = RecycledRow::Constant(dispersion);
+
+        if self.one_way {
+            fit_one_way_gene(
+                &mut self.scratch,
+                &self.members,
+                disp_row,
+                self.offset,
+                self.weights,
+                self.n_samples,
+            );
+        } else {
+            fit_general_gene(
+                &mut self.scratch,
+                self.design,
+                self.n_samples,
+                self.n_coef,
+                disp_row,
+                self.offset,
+                self.weights,
+                &self.levenberg,
+            );
+        }
+
+        let ll = log_likelihood(&self.scratch.y, &self.scratch.mu, dispersion, self.weights);
+        assemble_information(
+            &self.scratch.mu,
+            self.design,
+            self.n_coef,
+            dispersion,
+            self.weights,
+            &mut self.scratch.information,
+        );
+
+        ll + cox_reid_adjustment(&mut self.scratch.information, self.n_coef)
+    }
 }
 
 ///////////////
@@ -376,9 +673,9 @@ pub fn apl_grid<T: EdgeFloat>(
 
     let n_grid = grid.len();
     let (labels, n_groups) = design_as_factor(design, n_samples, n_coef)?;
-    let one_way = n_groups == n_coef;
 
-    // Sample indices per group, used only on the one-way path.
+    // Sample indices per group, used only on the one-way path. Derived once and
+    // handed to every worker, since it depends on the design alone.
     let mut members: Vec<Vec<usize>> = vec![Vec::new(); n_groups];
     for (sample, &label) in labels.iter().enumerate() {
         members[label].push(sample);
@@ -387,62 +684,30 @@ pub fn apl_grid<T: EdgeFloat>(
     let mut out = vec![0.0; n_genes * n_grid];
 
     out.par_chunks_mut(n_grid).enumerate().for_each_init(
-        || GeneScratch::new(n_samples, n_coef),
-        |scratch, (gene, row)| {
-            let offset_row = offset.row(gene, n_samples);
-            let weight_row = weights.map(|w| w.row(gene, n_samples));
-
+        || {
+            AplWorkspace::from_parts(
+                design,
+                n_samples,
+                n_coef,
+                members.clone(),
+                n_groups == n_coef,
+            )
+        },
+        |workspace, (gene, row)| {
             let start = gene * n_samples;
-            for (slot, value) in scratch.y.iter_mut().zip(&counts[start..start + n_samples]) {
-                *slot = value.to_f64().unwrap_or(0.0);
-            }
-
-            // Cold-start this gene. The scratch is shared by every gene a worker
-            // handles, and `beta` is deliberately carried from one grid point to
-            // the next, so without this the first grid point would start from
-            // whatever the previous *gene* converged to. Neighbouring grid points
-            // are close together; neighbouring genes need not be, and over a wide
-            // abundance range that start is far enough out that the fit lands on
-            // the wrong optimum. This matches `estimateDisp`, which clears its
-            // warm start once per gene and hands the rest of the grid the
-            // previous point's answer.
-            if !one_way {
-                initial_coefficients(
-                    &scratch.y,
-                    design,
-                    offset_row,
-                    RecycledRow::Constant(grid[0]),
-                    weight_row,
-                    n_samples,
-                    n_coef,
-                    LevenbergParams::default().start_method,
-                    &mut scratch.beta,
-                );
-            }
+            // Every argument was validated above, so the only failure this could
+            // report is one the caller has already been protected from.
+            workspace
+                .begin_gene(
+                    &counts[start..start + n_samples],
+                    offset.row(gene, n_samples),
+                    weights.map(|w| w.row(gene, n_samples)),
+                    grid[0],
+                )
+                .expect("apl_grid validated its shapes and its grid before dispatching");
 
             for (g, &dispersion) in grid.iter().enumerate() {
-                let disp_row = RecycledRow::Constant(dispersion);
-
-                if one_way {
-                    fit_one_way_gene(
-                        scratch, &members, disp_row, offset_row, weight_row, n_samples,
-                    );
-                } else {
-                    fit_general_gene(
-                        scratch, design, n_samples, n_coef, disp_row, offset_row, weight_row,
-                    );
-                }
-
-                let ll = log_likelihood(&scratch.y, &scratch.mu, dispersion, weight_row);
-                assemble_information(
-                    &scratch.mu,
-                    design,
-                    n_coef,
-                    dispersion,
-                    weight_row,
-                    &mut scratch.information,
-                );
-                row[g] = ll + cox_reid_adjustment(&mut scratch.information, n_coef);
+                row[g] = workspace.eval_unchecked(dispersion);
             }
         },
     );
@@ -655,5 +920,109 @@ mod tests {
         let (counts, design, offset) = fixture();
         let err = apl_grid(&counts, 4, 6, &design, 2, &[0.1], &offset, None).unwrap_err();
         assert!(matches!(err, EdgeErrors::LengthMismatch { .. }));
+    }
+
+    /// The workspace must walk a grid to the same values `apl_grid` reports,
+    /// since it is the same warm start driven by hand.
+    #[test]
+    fn test_workspace_reproduces_the_grid() {
+        let (counts, design, offset) = fixture();
+        let grid = [0.01, 0.05, 0.1, 0.3, 1.0];
+        let batched = apl_grid(&counts, 3, 6, &design, 2, &grid, &offset, None).unwrap();
+
+        let mut workspace = AplWorkspace::new(&design, 6, 2).unwrap();
+        for gene in 0..3 {
+            workspace
+                .begin_gene(
+                    &counts[gene * 6..(gene + 1) * 6],
+                    offset.row(gene, 6),
+                    None,
+                    grid[0],
+                )
+                .unwrap();
+            for (g, &d) in grid.iter().enumerate() {
+                let got = workspace.eval(d).unwrap();
+                assert_relative_eq!(got, batched[gene * grid.len() + g], max_relative = 1e-12);
+            }
+        }
+    }
+
+    /// The one-way path has no coefficients to carry, so the workspace has to
+    /// agree there too.
+    #[test]
+    fn test_workspace_reproduces_the_grid_on_the_one_way_path() {
+        let (counts, design, offset) = fixture();
+        let grid = [0.05, 0.2];
+        let batched = apl_grid(&counts, 3, 6, &design, 2, &grid, &offset, None).unwrap();
+
+        let mut workspace = AplWorkspace::new(&design, 6, 2).unwrap();
+        assert!(workspace.one_way);
+        for gene in 0..3 {
+            workspace
+                .begin_gene(
+                    &counts[gene * 6..(gene + 1) * 6],
+                    offset.row(gene, 6),
+                    None,
+                    grid[0],
+                )
+                .unwrap();
+            for (g, &d) in grid.iter().enumerate() {
+                assert_relative_eq!(
+                    workspace.eval(d).unwrap(),
+                    batched[gene * grid.len() + g],
+                    max_relative = 1e-12
+                );
+            }
+        }
+    }
+
+    /// Sums one gene's adjusted profile likelihood across a grid, driving the
+    /// workspace the way an optimiser would.
+    fn walk<'a>(
+        workspace: &mut AplWorkspace<'a>,
+        counts: &'a [f64],
+        offset: &'a Recycled<f64>,
+        grid: &[f64],
+        gene: usize,
+    ) -> f64 {
+        workspace
+            .begin_gene(
+                &counts[gene * 6..(gene + 1) * 6],
+                offset.row(gene, 6),
+                None,
+                grid[0],
+            )
+            .unwrap();
+        grid.iter().map(|&d| workspace.eval(d).unwrap()).sum()
+    }
+
+    /// A gene's fit must not depend on what the workspace saw before it.
+    #[test]
+    fn test_workspace_cold_starts_each_gene() {
+        let (counts, _, offset) = fixture();
+        // A continuous column forces the general path, where the warm start lives.
+        let continuous: Vec<f64> = (0..6).flat_map(|s| [1.0, (s as f64) * 0.37]).collect();
+        let grid = [0.02, 0.15];
+
+        let mut forwards = AplWorkspace::new(&continuous, 6, 2).unwrap();
+        let mut backwards = AplWorkspace::new(&continuous, 6, 2).unwrap();
+
+        // Gene 2 reached through the other two, and on its own.
+        let _ = walk(&mut forwards, &counts, &offset, &grid, 0);
+        let _ = walk(&mut forwards, &counts, &offset, &grid, 1);
+        let through = walk(&mut forwards, &counts, &offset, &grid, 2);
+        let alone = walk(&mut backwards, &counts, &offset, &grid, 2);
+
+        assert_relative_eq!(through, alone, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn test_workspace_rejects_an_evaluation_before_a_gene() {
+        let (_, design, _) = fixture();
+        let mut workspace = AplWorkspace::new(&design, 6, 2).unwrap();
+        assert!(matches!(
+            workspace.eval(0.1).unwrap_err(),
+            EdgeErrors::AplWorkspaceNotStarted
+        ));
     }
 }
