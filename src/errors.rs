@@ -170,6 +170,10 @@ pub enum EdgeErrors {
     #[error("Dispersion must be non-negative and finite; got {0}.")]
     InvalidDispersion(f64),
 
+    /// An adjusted profile likelihood was asked for before a gene was loaded.
+    #[error("No gene has been loaded into the workspace; call `begin_gene` first.")]
+    AplWorkspaceNotStarted,
+
     // -- single cell / NEBULA --
     /// Cells were not grouped contiguously by subject, which every inner loop assumes.
     #[error(

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.0.5
+
+* `AplWorkspace` added: the adjusted profile likelihood point by point, with the
+  coefficients carried from one dispersion to the next. Callers running their
+  own search over the dispersion, rather than a grid, no longer pay a cold
+  restart per evaluation the way repeated `apl_at` calls do. `apl_grid` now runs
+  on top of it.
+
 ## v0.0.4
 
 * `remove_batch_effect` added.
