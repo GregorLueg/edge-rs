@@ -41,8 +41,10 @@
 //!   `gamma M_ij - gamma^2 A_i A_j / (gamma P + lambda w)` rearranges exactly to
 //!   `gamma [ C_ij + (A_i A_j / P) lambda w / (gamma P + lambda w) ]`, where
 //!   `C_ij = sum p (x_i - A_i/P)(x_j - A_j/P)` is a weighted within-subject
-//!   covariance. Neither term cancels. It costs a second pass over each subject
-//!   block, because the centre has to be known before the centred sum.
+//!   covariance. Neither term cancels. The centred sum needs the centre, which
+//!   would mean a second pass over each subject block and a second `exp` per
+//!   cell, so it is accumulated by Welford's weighted online update instead:
+//!   one pass, and stable for the same reason the two-pass form is.
 //!
 //! What is left is the ordinary `f32` rounding of one `exp` and one `ln` per
 //! cell, which nothing can undo, plus the error growth of a long naive sum. The
