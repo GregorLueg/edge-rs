@@ -930,7 +930,36 @@ fn evaluate_pass<F: Float>(
         let mut lin_lane = zero;
         let mut phil_lane = zero;
         let mut weighted_lane = zero;
+        // Four of the lane's cells per trip, every load ahead of its use: the
+        // sweep waits on memory, not arithmetic, and four loads in flight hide
+        // most of that wait. The logarithms are taken on products of two, which
+        // halves them; each term is at least `gamma` and a product of two stays
+        // far inside the `f32` range for any count a fit can reach.
         let mut r = begin + lane;
+        while r + 3u32 * PLANE < end {
+            let r1 = r + PLANE;
+            let r2 = r1 + PLANE;
+            let r3 = r2 + PLANE;
+            let mut eta0 = log_offset[r as usize];
+            let mut eta1 = log_offset[r1 as usize];
+            let mut eta2 = log_offset[r2 as usize];
+            let mut eta3 = log_offset[r3 as usize];
+            let mut j = 0u32;
+            while j < nb {
+                let b = beta[j as usize];
+                eta0 += design[(r * nb + j) as usize] * b;
+                eta1 += design[(r1 * nb + j) as usize] * b;
+                eta2 += design[(r2 * nb + j) as usize] * b;
+                eta3 += design[(r3 * nb + j) as usize] * b;
+                j += 1u32;
+            }
+            let t0 = F::exp(eta0 + log_w_s) + gamma;
+            let t1 = F::exp(eta1 + log_w_s) + gamma;
+            let t2 = F::exp(eta2 + log_w_s) + gamma;
+            let t3 = F::exp(eta3 + log_w_s) + gamma;
+            phil_lane += F::ln(t0 * t1) + F::ln(t2 * t3);
+            r += 4u32 * PLANE;
+        }
         while r < end {
             let mut eta = log_offset[r as usize];
             let mut j = 0u32;
