@@ -164,6 +164,15 @@ const SLOT_VW: u32 = 6;
 /// Slot index of `dw / vw`.
 const SLOT_DWVW: u32 = 7;
 
+/// Rows of the packed output ahead of the fitted point: the log-likelihood,
+/// the previous one, the log-determinant, the final improvement, the Newton
+/// steps taken and the backtracks used.
+///
+/// Everything a request brings back sits in one buffer so the host pays one
+/// read-back per launch; each read is a round trip to the device whatever its
+/// size. The two counts ride along as floats, which is exact at their size.
+pub const OUT_HEADER: u32 = 6;
+
 /// Largest design width the kernel is compiled for.
 ///
 /// The `n_beta`-sized and `n_beta`-squared working arrays are registers, so
@@ -212,11 +221,9 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `subject_scratch` - Per-subject working store,
 ///   `[(slot * k + s) * n_req + q]`, [`SUBJECT_SLOTS`] slots
 /// * `vwb_scratch` - Cross block of the information, `[(s * nb + j) * n_req + q]`
-/// * `out_beta` - Fitted fixed effects, `[j * n_req + q]`
-/// * `out_information` - Schur complement, `[(i * nb + j) * n_req + q]`
-/// * `out_scalars` - Four per request: the log-likelihood, the previous one,
-///   the log-determinant, and the final improvement
-/// * `out_counts` - Two per request: Newton steps taken, then backtracks used
+/// * `out` - Everything a request brings back, `[row * n_req + q]`: the
+///   [`OUT_HEADER`] rows, then `nb` fitted fixed effects, the `nb * nb` Schur
+///   complement and the `k` fitted random effects on the log scale
 /// * `n_genes` - Genes resident on the device
 /// * `n_req` - Requests in the launch
 /// * `k` - Subjects
@@ -247,10 +254,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     tolerance: &Tensor<F>,
     subject_scratch: &mut Tensor<F>,
     vwb_scratch: &mut Tensor<F>,
-    out_beta: &mut Tensor<F>,
-    out_information: &mut Tensor<F>,
-    out_scalars: &mut Tensor<F>,
-    out_counts: &mut Tensor<u32>,
+    out: &mut Tensor<F>,
     n_genes: u32,
     n_req: u32,
     k: u32,
@@ -779,22 +783,30 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         s += 1u32;
     }
 
+    out[q as usize] = ll;
+    out[(n_req + q) as usize] = ll_prev;
+    out[(2u32 * n_req + q) as usize] = log_det;
+    out[(3u32 * n_req + q) as usize] = likdif;
+    out[(4u32 * n_req + q) as usize] = F::cast_from(step);
+    out[(5u32 * n_req + q) as usize] = F::cast_from(backtracks);
+    // The rows are indexed rather than counted: a counter started from the
+    // comptime header is itself comptime and cannot be advanced.
     j = 0u32;
     while j < nb {
-        out_beta[(j * n_req + q) as usize] = beta[j as usize];
+        out[((OUT_HEADER + j) * n_req + q) as usize] = beta[j as usize];
         j += 1u32;
     }
     let mut idx = 0u32;
     while idx < nb * nb {
-        out_information[(idx * n_req + q) as usize] = vb2[idx as usize];
+        out[((OUT_HEADER + nb + idx) * n_req + q) as usize] = vb2[idx as usize];
         idx += 1u32;
     }
-    out_scalars[q as usize] = ll;
-    out_scalars[(n_req + q) as usize] = ll_prev;
-    out_scalars[(2u32 * n_req + q) as usize] = log_det;
-    out_scalars[(3u32 * n_req + q) as usize] = likdif;
-    out_counts[q as usize] = step;
-    out_counts[(n_req + q) as usize] = backtracks;
+    s = 0u32;
+    while s < k {
+        out[((OUT_HEADER + nb + nb * nb + s) * n_req + q) as usize] =
+            subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize];
+        s += 1u32;
+    }
 }
 
 /////////////////
@@ -1219,10 +1231,7 @@ where
                     tensors.tolerance.clone().into_tensor_arg(),
                     tensors.subject_scratch.clone().into_tensor_arg(),
                     tensors.vwb_scratch.clone().into_tensor_arg(),
-                    tensors.out_beta.clone().into_tensor_arg(),
-                    tensors.out_information.clone().into_tensor_arg(),
-                    tensors.out_scalars.clone().into_tensor_arg(),
-                    tensors.out_counts.clone().into_tensor_arg(),
+                    tensors.out.clone().into_tensor_arg(),
                     n_genes as u32,
                     n_req as u32,
                     k as u32,
@@ -1288,13 +1297,8 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     pub subject_scratch: GpuTensor<R, F>,
     /// Cross block of the information, `[(s * nb + j) * n_req + q]`.
     pub vwb_scratch: GpuTensor<R, F>,
-    /// Fitted fixed effects, `[j * n_req + q]`.
-    pub out_beta: GpuTensor<R, F>,
-    /// Schur complement, `[(i * nb + j) * n_req + q]`.
-    pub out_information: GpuTensor<R, F>,
-    /// Log-likelihood, previous log-likelihood, log-determinant and final
-    /// improvement, `[i * n_req + q]`.
-    pub out_scalars: GpuTensor<R, F>,
-    /// Newton steps taken and backtracks used, `[i * n_req + q]`.
-    pub out_counts: GpuTensor<R, u32>,
+    /// Everything a request brings back, `[row * n_req + q]`: [`OUT_HEADER`]
+    /// rows, then `nb` fixed effects, the `nb * nb` Schur complement and the `k`
+    /// random effects.
+    pub out: GpuTensor<R, F>,
 }

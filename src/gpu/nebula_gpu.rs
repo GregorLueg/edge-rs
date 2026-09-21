@@ -32,15 +32,7 @@ use cubecl_utils_rs::prelude::*;
 use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
-use crate::gpu::pml_kernel::{PmlGpuTensors, SUBJECT_SLOTS, launch_opt_pml};
-
-////////////
-// Consts //
-////////////
-
-/// Scalars the kernel writes per request: the log-likelihood, the previous
-/// one, the log-determinant and the final improvement.
-const OUT_SCALARS: usize = 4;
+use crate::gpu::pml_kernel::{OUT_HEADER, PmlGpuTensors, SUBJECT_SLOTS, launch_opt_pml};
 
 ///////////
 // Input //
@@ -465,6 +457,7 @@ impl<R: Runtime> ResidentBatch<R> {
             self.capacity = n_req;
         }
 
+        let header = OUT_HEADER as usize;
         let tensors = PmlGpuTensors::<R, f32> {
             design: self.design.clone(),
             log_offset: self.log_offset.clone(),
@@ -487,10 +480,8 @@ impl<R: Runtime> ResidentBatch<R> {
             .map_err(err)?,
             subject_scratch: self.subject_scratch.clone(),
             vwb_scratch: self.vwb_scratch.clone(),
-            out_beta: GpuTensor::empty(vec![nb * n_req], client).map_err(err)?,
-            out_information: GpuTensor::empty(vec![nb * nb * n_req], client).map_err(err)?,
-            out_scalars: GpuTensor::empty(vec![OUT_SCALARS * n_req], client).map_err(err)?,
-            out_counts: GpuTensor::empty(vec![2 * n_req], client).map_err(err)?,
+            out: GpuTensor::empty(vec![(header + nb + nb * nb + k) * n_req], client)
+                .map_err(err)?,
         };
 
         let staged = Instant::now();
@@ -509,44 +500,24 @@ impl<R: Runtime> ResidentBatch<R> {
         }
         let launched = Instant::now();
 
-        let scalars = tensors.out_scalars.read(client).map_err(err)?;
-        let counts = tensors.out_counts.read(client).map_err(err)?;
-        // The random effects are left in slot zero of the per-subject scratch,
-        // `[s * n_req + q]`, which is the one scratch read the host makes.
-        let (beta_dev, info_dev, scratch) = if params.full {
-            (
-                tensors.out_beta.read(client).map_err(err)?,
-                tensors.out_information.read(client).map_err(err)?,
-                tensors.subject_scratch.clone().read(client).map_err(err)?,
-            )
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
+        let out = tensors.out.read(client).map_err(err)?;
+        let rows = |first: usize, n: usize, q: usize| -> Vec<f64> {
+            if params.full {
+                (first..first + n).map(|r| out[r * n_req + q] as f64).collect()
+            } else {
+                Vec::new()
+            }
         };
-
         let replies = (0..n_req)
             .map(|q| PmlReply {
-                log_likelihood: scalars[q] as f64,
-                log_likelihood_prev: scalars[n_req + q] as f64,
-                log_det: scalars[2 * n_req + q] as f64,
-                iterations: counts[q],
-                backtracks: counts[n_req + q],
-                beta: if params.full {
-                    (0..nb).map(|j| beta_dev[j * n_req + q] as f64).collect()
-                } else {
-                    Vec::new()
-                },
-                log_w: if params.full {
-                    (0..k).map(|s| scratch[s * n_req + q] as f64).collect()
-                } else {
-                    Vec::new()
-                },
-                information: if params.full {
-                    (0..nb * nb)
-                        .map(|i| info_dev[i * n_req + q] as f64)
-                        .collect()
-                } else {
-                    Vec::new()
-                },
+                log_likelihood: out[q] as f64,
+                log_likelihood_prev: out[n_req + q] as f64,
+                log_det: out[2 * n_req + q] as f64,
+                iterations: out[4 * n_req + q] as u32,
+                backtracks: out[5 * n_req + q] as u32,
+                beta: rows(header, nb, q),
+                information: rows(header + nb, nb * nb, q),
+                log_w: rows(header + nb + nb * nb, k, q),
             })
             .collect();
         if let Some(t) = self.timing.as_mut() {
