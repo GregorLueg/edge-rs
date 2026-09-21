@@ -103,7 +103,18 @@ pub struct PmlReply {
     /// back in full.
     pub log_w: Vec<f64>,
     /// Schur complement, row-major `nb * nb`; empty unless read back in full.
+    ///
+    /// At the returned point when [`GpuSolveParams::information`] is set. Without
+    /// it this, [`Self::subject_curvature`] and [`Self::cross_block`] are the
+    /// last Newton step's, one converged step behind the returned point: not the
+    /// fit's information, but as good a Hessian for one more step from there.
     pub information: Vec<f64>,
+    /// Curvature of each random effect, nebula's `vw`, length `k`; empty unless
+    /// read back in full.
+    pub subject_curvature: Vec<f64>,
+    /// Cross block of the information, nebula's `vwb`, row-major `k * nb`; empty
+    /// unless read back in full.
+    pub cross_block: Vec<f64>,
 }
 
 /// What one launch of one request per gene brings back, laid out gene-major.
@@ -142,7 +153,7 @@ pub struct GpuSolveParams {
     pub full: bool,
     /// Whether the information and the log-determinant are wanted. They cost the
     /// device one more sweep over the cells, at the point the fit returns;
-    /// without it [`PmlReply::information`] is empty and
+    /// without it [`PmlReply::information`] is the last Newton step's and
     /// [`PmlReply::log_det`] is NaN.
     pub information: bool,
 }
@@ -548,8 +559,11 @@ impl<R: Runtime> ResidentBatch<R> {
             .map_err(err)?,
             subject_scratch: self.subject_scratch.clone(),
             vwb_scratch: self.vwb_scratch.clone(),
-            out: GpuTensor::empty(vec![(header + nb + nb * nb + k) * n_req], client)
-                .map_err(err)?,
+            out: GpuTensor::empty(
+                vec![(header + nb + nb * nb + 2 * k + k * nb) * n_req],
+                client,
+            )
+            .map_err(err)?,
         };
 
         launch_opt_pml::<R, f32>(
@@ -618,12 +632,10 @@ impl<R: Runtime> ResidentBatch<R> {
                 iterations: out[4 * n_req + q] as u32,
                 backtracks: out[5 * n_req + q] as u32,
                 beta: rows(header, nb, q),
-                information: if pending.information {
-                    rows(header + nb, nb * nb, q)
-                } else {
-                    Vec::new()
-                },
+                information: rows(header + nb, nb * nb, q),
                 log_w: rows(header + nb + nb * nb, k, q),
+                subject_curvature: rows(header + nb + nb * nb + k, k, q),
+                cross_block: rows(header + nb + nb * nb + 2 * k, k * nb, q),
             })
             .collect();
         if let Some(t) = self.timing.as_mut() {

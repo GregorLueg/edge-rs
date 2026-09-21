@@ -748,6 +748,19 @@ impl LogSum {
     }
 }
 
+/// The device's curvature at, or one converged step behind, the point
+/// [`newton_finish`] starts from.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeviceCurvature<'a> {
+    /// Curvature of each random effect, `vw`, length `n_subjects`.
+    pub(crate) subject: &'a [f64],
+    /// Cross block, `vwb`, row-major `n_subjects * n_beta`.
+    pub(crate) cross: &'a [f64],
+    /// Schur complement, row-major `n_beta * n_beta`.
+    pub(crate) schur: &'a [f64],
+}
+
 /// What [`newton_finish`] brings back: the three scalars the profile objective
 /// reads off an order-one inner fit.
 #[cfg(feature = "gpu")]
@@ -791,6 +804,12 @@ pub(crate) struct NewtonFinish {
 /// * `variance` - The two variance components, read as [`opt_pml`] reads them
 /// * `eps` - nebula's absolute stopping tolerance
 /// * `max_iter` - Newton budget
+/// * `curvature` - The device's curvature near the starting point. When given,
+///   the first step takes its gradient in `f64` and its Hessian from here, so
+///   its sweep skips the `n_beta^2` cross-products per cell. The Hessian only
+///   steers the step: `f32` curvature and an `f64` gradient land as close as an
+///   exact step from a point already converged to `f32`. Later steps, which a
+///   few per cent of fits need, assemble their own
 ///
 /// ### Returns
 ///
@@ -805,12 +824,18 @@ pub(crate) fn newton_finish(
     variance: &PmlVariance,
     eps: f64,
     max_iter: usize,
+    curvature: Option<DeviceCurvature<'_>>,
 ) -> Option<NewtonFinish> {
     let nb = data.n_beta();
     let k = data.n_subjects();
     let gamma = variance.cell;
     let exps = variance.subject.exp();
     if beta.len() != nb || log_w.len() != k || !(exps.is_finite() && exps > 1.0) {
+        return None;
+    }
+    if curvature.is_some_and(|c| {
+        c.subject.len() != k || c.cross.len() != k * nb || c.schur.len() != nb * nb
+    }) {
         return None;
     }
     let alpha = 1.0 / (exps - 1.0);
@@ -843,6 +868,8 @@ pub(crate) fn newton_finish(
     let mut tmp = vec![0.0; nb];
 
     for iterations in 1..=max_iter {
+        let borrowed = curvature.filter(|_| iterations == 1);
+        let assemble = borrowed.is_none();
         db.fill(0.0);
         vb.fill(0.0);
         let mut log_likelihood_prev = 0.0;
@@ -858,13 +885,17 @@ pub(crate) fn newton_finish(
 
             let mut fold = |row: &[f64], d: f64, p: f64| {
                 resid += d;
-                weight += p;
                 for a in 0..nb {
                     db[a] += row[a] * d;
-                    let pa = p * row[a];
-                    first[a] += pa;
-                    for b in a..nb {
-                        second[a * nb + b] += pa * row[b];
+                }
+                if assemble {
+                    weight += p;
+                    for a in 0..nb {
+                        let pa = p * row[a];
+                        first[a] += pa;
+                        for b in a..nb {
+                            second[a * nb + b] += pa * row[b];
+                        }
                     }
                 }
             };
@@ -903,25 +934,33 @@ pub(crate) fn newton_finish(
                 linear + log_w[s] * data.subject_total[s] - gamma * sum_log.finish() - weighted_log
                     + (alpha * log_w[s] - lambda * w_s);
             dw[s] = resid + (alpha - lambda * w_s);
-            vw[s] = gamma * weight + lambda * w_s;
-            for a in 0..nb {
-                vwb[s * nb + a] = gamma * first[a];
-                for b in a..nb {
-                    vb[a * nb + b] += gamma * second[a * nb + b];
+            if assemble {
+                vw[s] = gamma * weight + lambda * w_s;
+                for a in 0..nb {
+                    vwb[s * nb + a] = gamma * first[a];
+                    for b in a..nb {
+                        vb[a * nb + b] += gamma * second[a * nb + b];
+                    }
                 }
             }
         }
 
         // Schur complement and the step, as in `optimise`.
-        for a in 0..nb {
-            for b in a..nb {
-                let mut acc = 0.0;
-                for s in 0..k {
-                    acc += vwb[s * nb + a] * vwb[s * nb + b] / vw[s];
+        if let Some(device) = borrowed {
+            vw.copy_from_slice(device.subject);
+            vwb.copy_from_slice(device.cross);
+            factor.copy_from_slice(device.schur);
+        } else {
+            for a in 0..nb {
+                for b in a..nb {
+                    let mut acc = 0.0;
+                    for s in 0..k {
+                        acc += vwb[s * nb + a] * vwb[s * nb + b] / vw[s];
+                    }
+                    let v = vb[a * nb + b] - acc;
+                    factor[a * nb + b] = v;
+                    factor[b * nb + a] = v;
                 }
-                let v = vb[a * nb + b] - acc;
-                factor[a * nb + b] = v;
-                factor[b * nb + a] = v;
             }
         }
         for j in 0..nb {

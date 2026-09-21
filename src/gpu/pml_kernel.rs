@@ -224,7 +224,8 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `vwb_scratch` - Cross block of the information, `[(s * nb + j) * n_req + q]`
 /// * `out` - Everything a request brings back, `[row * n_req + q]`: the
 ///   [`OUT_HEADER`] rows, then `nb` fitted fixed effects, the `nb * nb` Schur
-///   complement and the `k` fitted random effects on the log scale
+///   complement, the `k` fitted random effects on the log scale, the `k`
+///   random-effect curvatures and the `k * nb` cross block
 /// * `n_genes` - Genes resident on the device
 /// * `n_req` - Requests in the launch
 /// * `k` - Subjects
@@ -597,8 +598,14 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 j += 1u32;
             }
 
-            // The solve destroys its matrix. That is safe here: this sweep is
-            // not the final one, so `vb2` is rebuilt before it is read out.
+            // The solve destroys its matrix, so the Schur complement goes out
+            // first. With a final assembly these rows are overwritten by the one
+            // at the returned point; without, they are what the host gets.
+            i = 0u32;
+            while i < nb * nb {
+                out[((OUT_HEADER + nb + i) * n_req + q) as usize] = vb2[i as usize];
+                i += 1u32;
+            }
             ldlt_solve::<F>(&mut vb2, &mut step_beta, nb, nb_cap);
 
             s = 0u32;
@@ -807,15 +814,27 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         out[((OUT_HEADER + j) * n_req + q) as usize] = beta[j as usize];
         j += 1u32;
     }
-    let mut idx = 0u32;
-    while idx < nb * nb {
-        out[((OUT_HEADER + nb + idx) * n_req + q) as usize] = vb2[idx as usize];
-        idx += 1u32;
+    if final_assembly != 0u32 {
+        let mut idx = 0u32;
+        while idx < nb * nb {
+            out[((OUT_HEADER + nb + idx) * n_req + q) as usize] = vb2[idx as usize];
+            idx += 1u32;
+        }
     }
+    // The random-effect block and the cross block ride along from the same
+    // assembly as the Schur complement, whichever that was.
     s = 0u32;
     while s < k {
         out[((OUT_HEADER + nb + nb * nb + s) * n_req + q) as usize] =
             subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize];
+        out[((OUT_HEADER + nb + nb * nb + k + s) * n_req + q) as usize] =
+            subject_scratch[((SLOT_VW * k + s) * n_req + q) as usize];
+        j = 0u32;
+        while j < nb {
+            out[((OUT_HEADER + nb + nb * nb + 2u32 * k + s * nb + j) * n_req + q) as usize] =
+                vwb_scratch[((s * nb + j) * n_req + q) as usize];
+            j += 1u32;
+        }
         s += 1u32;
     }
 }
@@ -1316,7 +1335,8 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     /// Cross block of the information, `[(s * nb + j) * n_req + q]`.
     pub vwb_scratch: GpuTensor<R, F>,
     /// Everything a request brings back, `[row * n_req + q]`: [`OUT_HEADER`]
-    /// rows, then `nb` fixed effects, the `nb * nb` Schur complement and the `k`
-    /// random effects.
+    /// rows, then `nb` fixed effects, the `nb * nb` Schur complement, the `k`
+    /// random effects, the `k` random-effect curvatures and the `k * nb` cross
+    /// block.
     pub out: GpuTensor<R, F>,
 }

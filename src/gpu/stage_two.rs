@@ -103,7 +103,7 @@ use crate::sc::nebula::{
     GeneOutcome, GenePlan, InnerFit, NebulaFit, NebulaParams, Shared, StageTwoSearch, finish_gene,
     gene_pml, nebula_sparse_with, plan_gene, variance_bounds, variance_objective,
 };
-use crate::sc::pml::{PmlParams, PmlVariance, newton_finish, opt_pml_from};
+use crate::sc::pml::{DeviceCurvature, PmlParams, PmlVariance, newton_finish, opt_pml_from};
 use crate::sc::ptmg::{GeneCounts, positive_indices};
 
 ////////////
@@ -727,6 +727,11 @@ fn finish_at_argmax(
             &PmlVariance { subject, cell },
             params.eps,
             params.max_iter,
+            Some(DeviceCurvature {
+                subject: &reply.subject_curvature,
+                cross: &reply.cross_block,
+                schur: &reply.information,
+            }),
         )
     {
         return Some((
