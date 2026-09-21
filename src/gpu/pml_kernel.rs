@@ -48,7 +48,7 @@
 //!
 //! What is left is the ordinary `f32` rounding of one `exp` and one `ln` per
 //! cell, which nothing can undo, plus the error growth of a long naive sum. The
-//! second is handled by [`SUM_BLOCK`]: summing in blocks is a pure change of
+//! second is handled by `SUM_BLOCK`: summing in blocks is a pure change of
 //! association with no algebraic identity for the optimiser to exploit, so
 //! unlike compensation it survives.
 //!

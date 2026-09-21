@@ -9,7 +9,7 @@
 //!
 //! * **Stage one** (L-BFGS-B on the marginal likelihood) stays on the CPU. It is
 //!   a few per cent of the time and has an exact gradient.
-//! * **Stage two** runs as one [`crate::sc::nebula::StageTwoSearch`] per gene,
+//! * **Stage two** runs as one `StageTwoSearch` per gene,
 //!   the same state machine the CPU path drives. Each round, every live search
 //!   asks for its next points and all of them go out as one device launch of
 //!   [`ResidentBatch::solve`]. The device finds each penalised fit's optimum;
