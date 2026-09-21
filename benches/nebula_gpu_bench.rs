@@ -396,6 +396,7 @@ fn main() {
             max_iter: params.max_iter as u32,
             max_backtrack: params.max_backtrack as u32,
             full: false,
+            information: true,
         };
         black_box(solve_per_gene(&mut resident, &genes, &solve_params, &client).expect("solve"));
 

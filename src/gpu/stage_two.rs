@@ -445,6 +445,8 @@ fn search_all<R: Runtime>(
         max_iter: inner.max_iter as u32,
         max_backtrack: inner.max_backtrack as u32,
         full: true,
+        // The host recomputes both in `f64`; see `finish_at_argmax`.
+        information: false,
     };
 
     // Two cohorts leapfrog: while the host finishes one cohort's fits in `f64`,

@@ -231,6 +231,10 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `nb` - Design width
 /// * `max_iter` - Newton budget
 /// * `max_backtrack` - Backtracking budget within one step
+/// * `final_assembly` - Non-zero to assemble once more at the point the fit
+///   returns, which is what makes the reported information and log-determinant
+///   belong to it. Zero skips that pass, a whole sweep over the cells, and
+///   leaves both rows of the output at the last Newton step's values
 /// * `nb_cap` - Comptime capacity of the `n_beta`-sized register arrays
 ///
 /// ### Grid mapping
@@ -263,6 +267,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     nb: u32,
     max_iter: u32,
     max_backtrack: u32,
+    final_assembly: u32,
     #[comptime] nb_cap: u32,
 ) {
     let q = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * PLANES_PER_CUBE + UNIT_POS_Y;
@@ -770,6 +775,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 settled = confirmed;
                 confirmed = true;
             }
+            if settled && final_assembly == 0u32 {
+                running = false;
+            }
         }
     }
 
@@ -1164,6 +1172,8 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
 /// * `nb` - Design width
 /// * `max_iter` - Newton budget
 /// * `max_backtrack` - Backtracking budget within one step
+/// * `final_assembly` - Whether to assemble once more at the returned point;
+///   see [`fn@opt_pml_gpu`]
 /// * `client` - CubeCL compute client
 ///
 /// ### Returns
@@ -1184,6 +1194,7 @@ pub fn launch_opt_pml<R, F>(
     nb: usize,
     max_iter: u32,
     max_backtrack: u32,
+    final_assembly: bool,
     client: &ComputeClient<R>,
 ) -> Result<(), EdgeErrors>
 where
@@ -1242,6 +1253,7 @@ where
                     nb as u32,
                     max_iter,
                     max_backtrack,
+                    u32::from(final_assembly),
                     $cap,
                 );
             }

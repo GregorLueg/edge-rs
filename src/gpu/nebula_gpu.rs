@@ -140,6 +140,11 @@ pub struct GpuSolveParams {
     /// Whether to read back the fitted point (coefficients and random effects)
     /// and the information as well as the scalars.
     pub full: bool,
+    /// Whether the information and the log-determinant are wanted. They cost the
+    /// device one more sweep over the cells, at the point the fit returns;
+    /// without it [`PmlReply::information`] is empty and
+    /// [`PmlReply::log_det`] is NaN.
+    pub information: bool,
 }
 
 /// Wall clock inside [`ResidentBatch::submit`] and [`ResidentBatch::collect`],
@@ -166,8 +171,10 @@ pub struct PendingSolve<'a> {
     out: Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ServerError>> + Send + 'a>>,
     /// Requests in the launch.
     n_req: usize,
-    /// Whether the fitted point and the information are wanted.
+    /// Whether the fitted point is wanted.
     full: bool,
+    /// Whether the information and the log-determinant were computed.
+    information: bool,
 }
 
 //////////////////
@@ -456,6 +463,7 @@ impl<R: Runtime> ResidentBatch<R> {
                 out: Box::pin(async { Ok(Vec::new()) }),
                 n_req,
                 full: params.full,
+                information: params.information,
             });
         }
         let (n_genes, k, nb) = (self.n_genes, self.k, self.nb);
@@ -552,6 +560,7 @@ impl<R: Runtime> ResidentBatch<R> {
             nb,
             params.max_iter,
             params.max_backtrack,
+            params.information,
             client,
         )?;
         // The read encodes its copy and submits the queue here, not when it is
@@ -564,6 +573,7 @@ impl<R: Runtime> ResidentBatch<R> {
             out,
             n_req,
             full: params.full,
+            information: params.information,
         })
     }
 
@@ -600,11 +610,19 @@ impl<R: Runtime> ResidentBatch<R> {
             .map(|q| PmlReply {
                 log_likelihood: out[q] as f64,
                 log_likelihood_prev: out[n_req + q] as f64,
-                log_det: out[2 * n_req + q] as f64,
+                log_det: if pending.information {
+                    out[2 * n_req + q] as f64
+                } else {
+                    f64::NAN
+                },
                 iterations: out[4 * n_req + q] as u32,
                 backtracks: out[5 * n_req + q] as u32,
                 beta: rows(header, nb, q),
-                information: rows(header + nb, nb * nb, q),
+                information: if pending.information {
+                    rows(header + nb, nb * nb, q)
+                } else {
+                    Vec::new()
+                },
                 log_w: rows(header + nb + nb * nb, k, q),
             })
             .collect();
@@ -665,6 +683,7 @@ pub fn opt_pml_batch<R: Runtime>(
             max_iter,
             max_backtrack,
             full: true,
+            information: true,
         },
         client,
     )
