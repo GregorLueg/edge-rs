@@ -70,6 +70,9 @@ pub struct PmlRequest {
     pub cell: f64,
     /// Starting fixed effects, length `nb`.
     pub beta_init: Vec<f64>,
+    /// Starting random effects on the log scale, length `k`, or empty to start
+    /// every subject at zero as nebula does.
+    pub log_w_init: Vec<f64>,
 }
 
 ////////////
@@ -344,11 +347,8 @@ impl<R: Runtime> ResidentBatch<R> {
                 .map_err(err)?,
             subject_mean: GpuTensor::from_slice(&subject_mean, vec![k * nb], client)
                 .map_err(err)?,
-            subject_scratch: GpuTensor::empty(
-                vec![SUBJECT_SLOTS as usize * k * capacity],
-                client,
-            )
-            .map_err(err)?,
+            subject_scratch: GpuTensor::empty(vec![SUBJECT_SLOTS as usize * k * capacity], client)
+                .map_err(err)?,
             vwb_scratch: GpuTensor::empty(vec![k * nb * capacity], client).map_err(err)?,
             capacity,
             n_genes,
@@ -416,6 +416,7 @@ impl<R: Runtime> ResidentBatch<R> {
         let mut request_gene = vec![0u32; n_req];
         let mut request_params = vec![0.0f32; 3 * n_req];
         let mut beta_init = vec![0.0f32; nb * n_req];
+        let mut log_w_init = vec![0.0f32; k * n_req];
         for (q, req) in requests.iter().enumerate() {
             if req.gene >= n_genes {
                 return Err(EdgeErrors::InvalidArgument(format!(
@@ -445,8 +446,18 @@ impl<R: Runtime> ResidentBatch<R> {
             request_params[q] = (1.0 / (exps - 1.0)) as f32;
             request_params[n_req + q] = (1.0 / (exps.sqrt() * (exps - 1.0))) as f32;
             request_params[2 * n_req + q] = req.cell as f32;
+            if !(req.log_w_init.is_empty() || req.log_w_init.len() == k) {
+                return Err(EdgeErrors::LengthMismatch {
+                    name: "log_w_init",
+                    expected: k,
+                    got: req.log_w_init.len(),
+                });
+            }
             for (j, &b) in req.beta_init.iter().enumerate() {
                 beta_init[j * n_req + q] = b as f32;
+            }
+            for (s, &w) in req.log_w_init.iter().enumerate() {
+                log_w_init[s * n_req + q] = w as f32;
             }
         }
 
@@ -467,11 +478,11 @@ impl<R: Runtime> ResidentBatch<R> {
             subject_ptr: self.subject_ptr.clone(),
             subject_total: self.subject_total.clone(),
             subject_mean: self.subject_mean.clone(),
-            request_gene: GpuTensor::from_slice(&request_gene, vec![n_req], client)
-                .map_err(err)?,
+            request_gene: GpuTensor::from_slice(&request_gene, vec![n_req], client).map_err(err)?,
             request_params: GpuTensor::from_slice(&request_params, vec![3 * n_req], client)
                 .map_err(err)?,
             beta_init: GpuTensor::from_slice(&beta_init, vec![nb * n_req], client).map_err(err)?,
+            log_w_init: GpuTensor::from_slice(&log_w_init, vec![k * n_req], client).map_err(err)?,
             tolerance: GpuTensor::from_slice(
                 &[params.eps as f32, params.noise_scale as f32],
                 vec![2],
@@ -503,7 +514,9 @@ impl<R: Runtime> ResidentBatch<R> {
         let out = tensors.out.read(client).map_err(err)?;
         let rows = |first: usize, n: usize, q: usize| -> Vec<f64> {
             if params.full {
-                (first..first + n).map(|r| out[r * n_req + q] as f64).collect()
+                (first..first + n)
+                    .map(|r| out[r * n_req + q] as f64)
+                    .collect()
             } else {
                 Vec::new()
             }
@@ -610,11 +623,15 @@ pub fn solve_per_gene<R: Runtime>(
             subject: gene.sigma,
             cell: gene.gamma,
             beta_init: gene.beta_init.to_vec(),
+            log_w_init: Vec::new(),
         })
         .collect();
     let replies = resident.solve(&requests, params, client)?;
     Ok(GpuPmlBatch {
-        beta: replies.iter().flat_map(|r| r.beta.iter().copied()).collect(),
+        beta: replies
+            .iter()
+            .flat_map(|r| r.beta.iter().copied())
+            .collect(),
         information: replies
             .iter()
             .flat_map(|r| r.information.iter().copied())

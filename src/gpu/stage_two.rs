@@ -30,8 +30,33 @@
 //! device resolves the variance to a few tenths of a per cent at best, worse
 //! with more cells. Searching on the device's values, measured on the R
 //! fixtures, drove half the genes' subject-level variance onto its lower bound.
-//! So the host finishes each fit: one Newton step in `f64` from the device's
-//! optimum, and what comes back is exactly the CPU path's inner fit.
+//! So the host finishes each fit: a full Newton step in `f64` from the device's
+//! optimum (`newton_finish` in [`crate::sc::pml`]), and the value that comes
+//! back is the CPU path's.
+//!
+//! The log-determinant is where this path parts from the CPU's. nebula reads it
+//! off the penultimate iterate, which on the CPU is an `f64` iterate a hair from
+//! the last. Here the penultimate iterate is the device's `f32` point, so the
+//! finish takes it at the stepped point instead, for one more division per
+//! cell. Measured on the R fixtures that moved the worst `sigma^2` disagreement
+//! with nebula on `sc_small` from `3.4e-2` relative to `1.7e-3`, and the median
+//! disagreement with the CPU path on the bench shapes from `2.4e-6` to `4e-7`.
+//!
+//! ### Where a fit starts
+//!
+//! nebula starts every inner fit cold, from the gene's mean count and zero
+//! random effects. Here only a gene's first fit does; every later one starts
+//! from the point that first fit converged to. The optimum does not depend on
+//! the start, and the search stays close enough to its own starting variance
+//! that the device's Newton count fell from five or six to two or three.
+//!
+//! The anchor is fixed on purpose. Starting each fit from the *previous* one's
+//! optimum saves a little more per fit and was slower overall: the device's
+//! `f32` location error then depends on the search's history instead of being a
+//! smooth function of the variance components, that reaches the objective at
+//! the simplex's `1e-7` tolerance, and the searches took 24 to 39 per cent more
+//! evaluations. With a fixed anchor they took as many as from cold, 73247
+//! against 73423 on one shape.
 //!
 //! ### Cost, measured
 //!
@@ -300,6 +325,10 @@ struct Live<'a> {
     pml: crate::sc::pml::PmlData<'a>,
     /// Distinct positive counts other than one and two, with multiplicities.
     tail: Vec<(f64, f64)>,
+    /// The device's fitted `(beta, log_w)` for the search's first finite
+    /// evaluation, which every later fit starts from. See the module doc for
+    /// why it is never updated.
+    warm: Option<(Vec<f64>, Vec<f64>)>,
 }
 
 /// Runs stage two for every gene that needs it, all searches in lockstep.
@@ -343,6 +372,7 @@ fn search_all<R: Runtime>(
             fixed_cell,
             pml: gene_pml(shared, counts, &totals[g * k..(g + 1) * k]),
             tail: count_histogram(&counts.counts),
+            warm: None,
         });
     }
     if live.is_empty() {
@@ -407,11 +437,16 @@ fn search_all<R: Runtime>(
             );
             for (p, x) in points.iter().enumerate() {
                 if let Some((subject, cell, beta_init)) = objective.request(x) {
+                    let (beta_init, log_w_init) = match &l.warm {
+                        Some((beta, log_w)) => (beta.clone(), log_w.clone()),
+                        None => (beta_init, Vec::new()),
+                    };
                     requests.push(PmlRequest {
                         gene: l.resident,
                         subject,
                         cell,
                         beta_init,
+                        log_w_init,
                     });
                     routes.push((i, p, subject, cell));
                 }
@@ -453,8 +488,11 @@ fn search_all<R: Runtime>(
             })
             .collect();
         let finished = Instant::now();
-        for (&(i, p, _, _), &(v, _)) in routes.iter().zip(&assembled) {
+        for ((&(i, p, _, _), &(v, _)), reply) in routes.iter().zip(&assembled).zip(&replies) {
             values[i][p] = v;
+            if v.is_finite() && live[i].warm.is_none() {
+                live[i].warm = Some((reply.beta.clone(), reply.log_w.clone()));
+            }
         }
         for (l, v) in live.iter_mut().zip(values) {
             if l.search.ask().is_some() {
@@ -491,8 +529,8 @@ fn search_all<R: Runtime>(
 /// searches onto the lower bound. Evaluating the `f64` value at the device's
 /// point fixed the value, but the log-determinant is not stationary at the
 /// optimum and still carried the device's location error at first order. So
-/// the `f64` fit is finished from the device's point instead: one Newton step
-/// from there, and what comes back is exactly what the CPU path computes.
+/// the `f64` fit is finished from the device's point instead: a Newton step
+/// from there, with the log-determinant taken at the stepped point.
 ///
 /// ### Params
 ///

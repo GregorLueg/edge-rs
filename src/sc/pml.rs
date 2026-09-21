@@ -757,8 +757,7 @@ pub(crate) struct NewtonFinish {
     pub(crate) log_likelihood: f64,
     /// Penalised log-likelihood at the starting point.
     pub(crate) log_likelihood_prev: f64,
-    /// Log-determinant of the random-effect block at the penultimate iterate,
-    /// which is nebula's convention.
+    /// Log-determinant of the random-effect block at the final iterate.
     pub(crate) log_det: f64,
     /// Newton steps taken.
     pub(crate) iterations: usize,
@@ -777,6 +776,12 @@ pub(crate) struct NewtonFinish {
 /// a count of zero, then a sparse sweep adding what the positive counts change.
 /// The sums therefore associate differently from [`opt_pml`] and agree with it
 /// to rounding, not to the bit.
+///
+/// The log-determinant is taken at the final iterate, where [`opt_pml`] follows
+/// nebula and reports the penultimate one. On the CPU the two iterates are both
+/// `f64` and a converged step apart. Here the penultimate iterate is the
+/// device's `f32` point, whose location error the log-determinant carries at
+/// first order, so the second pass accumulates the curvature weight as well.
 ///
 /// ### Params
 ///
@@ -932,6 +937,7 @@ pub(crate) fn newton_finish(
             new_beta[j] = beta[j] + step_beta[j];
         }
         let mut log_likelihood = 0.0;
+        let mut log_det = 0.0;
         for s in 0..k {
             let mut acc = 0.0;
             for j in 0..nb {
@@ -939,17 +945,23 @@ pub(crate) fn newton_finish(
             }
             let new_log_w_s = log_w[s] + (dw[s] - acc) / vw[s];
             new_log_w[s] = new_log_w_s;
+            let new_w_s = new_log_w_s.exp();
 
             let mut sum_log = LogSum::new();
             let mut linear = 0.0;
             let mut weighted_log = 0.0;
+            let mut weight = 0.0;
             for r in data.subject_start[s]..data.subject_start[s + 1] {
                 let row = &data.design[r * nb..(r + 1) * nb];
                 let mut eta = data.offset[r];
                 for j in 0..nb {
                     eta += row[j] * new_beta[j];
                 }
-                sum_log.push((eta + new_log_w_s).exp() + gamma);
+                let extb = (eta + new_log_w_s).exp();
+                let t = extb + gamma;
+                sum_log.push(t);
+                let inv = 1.0 / t;
+                weight += gamma * extb * inv * inv;
             }
             for i in run[s]..run[s + 1] {
                 let c = data.cell_index[i];
@@ -959,13 +971,18 @@ pub(crate) fn newton_finish(
                 for j in 0..nb {
                     eta += row[j] * new_beta[j];
                 }
+                let extb = (eta + new_log_w_s).exp();
+                let t = extb + gamma;
                 linear += eta * y;
-                weighted_log += y * ((eta + new_log_w_s).exp() + gamma).ln();
+                weighted_log += y * t.ln();
+                let inv = 1.0 / t;
+                weight += y * extb * inv * inv;
             }
             log_likelihood += linear + new_log_w_s * data.subject_total[s]
                 - gamma * sum_log.finish()
                 - weighted_log
-                + (alpha * new_log_w_s - lambda * new_log_w_s.exp());
+                + (alpha * new_log_w_s - lambda * new_w_s);
+            log_det += (gamma * weight + lambda * new_w_s).abs().ln();
         }
 
         let likdif = log_likelihood - log_likelihood_prev;
@@ -976,7 +993,7 @@ pub(crate) fn newton_finish(
             return Some(NewtonFinish {
                 log_likelihood,
                 log_likelihood_prev,
-                log_det: vw.iter().map(|v| v.abs().ln()).sum(),
+                log_det,
                 iterations,
             });
         }

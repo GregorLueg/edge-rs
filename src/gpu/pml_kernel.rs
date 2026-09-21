@@ -214,6 +214,7 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `request_params` - Three per request: the gamma prior's `alpha` and
 ///   `lambda`, then the cell-level size `gamma`
 /// * `beta_init` - Starting fixed effects, `[j * n_req + q]`
+/// * `log_w_init` - Starting random effects on the log scale, `[s * n_req + q]`
 /// * `tolerance` - Two elements: nebula's absolute stopping tolerance, then the
 ///   resolution floor relative to the objective ([`F32_NOISE_SCALE`]). A buffer
 ///   rather than scalar arguments because a runtime float scalar would need a
@@ -251,6 +252,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     request_gene: &Tensor<u32>,
     request_params: &Tensor<F>,
     beta_init: &Tensor<F>,
+    log_w_init: &Tensor<F>,
     tolerance: &Tensor<F>,
     subject_scratch: &mut Tensor<F>,
     vwb_scratch: &mut Tensor<F>,
@@ -310,7 +312,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     }
     let mut s = 0u32;
     while s < k {
-        subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize] = zero;
+        subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize] =
+            log_w_init[(s * n_req + q) as usize];
         s += 1u32;
     }
 
@@ -1228,6 +1231,7 @@ where
                     tensors.request_gene.clone().into_tensor_arg(),
                     tensors.request_params.clone().into_tensor_arg(),
                     tensors.beta_init.clone().into_tensor_arg(),
+                    tensors.log_w_init.clone().into_tensor_arg(),
                     tensors.tolerance.clone().into_tensor_arg(),
                     tensors.subject_scratch.clone().into_tensor_arg(),
                     tensors.vwb_scratch.clone().into_tensor_arg(),
@@ -1290,6 +1294,8 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     pub request_params: GpuTensor<R, F>,
     /// Starting fixed effects, `[j * n_req + q]`.
     pub beta_init: GpuTensor<R, F>,
+    /// Starting random effects on the log scale, `[s * n_req + q]`.
+    pub log_w_init: GpuTensor<R, F>,
     /// nebula's absolute stopping tolerance, then the relative resolution
     /// floor. Two elements.
     pub tolerance: GpuTensor<R, F>,
