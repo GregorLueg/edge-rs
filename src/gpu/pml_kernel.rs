@@ -474,10 +474,16 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                     other_centre[j as usize] = plane_shuffle_xor(centre[j as usize], mask);
                     j += 1u32;
                 }
-                i = 0u32;
-                while i < nb * nb {
-                    other_spread[i as usize] = plane_shuffle_xor(spread[i as usize], mask);
-                    i += 1u32;
+                // Only the upper triangle of the spread is ever written or read.
+                let mut a = 0u32;
+                while a < nb {
+                    let mut b = a;
+                    while b < nb {
+                        let idx = (a * nb + b) as usize;
+                        other_spread[idx] = plane_shuffle_xor(spread[idx], mask);
+                        b += 1u32;
+                    }
+                    a += 1u32;
                 }
                 let lower = (lane & mask) == 0u32;
                 let wa = if lower { weight } else { other_weight };
