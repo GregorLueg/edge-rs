@@ -25,13 +25,16 @@
 //!
 //! wgpu exposes no `f64`, so the device arithmetic is `f32`. The obvious
 //! defence is compensated summation, and on this backend it **does not work**.
-//! Kahan and full double-single accumulation both recover the rounding error of
-//! an addition through a `two_sum`, and under exact algebra that error is
-//! identically zero, so a compiler permitted to reassociate folds the whole
-//! thing away. Measured on wgpu/Metal: scaling the recovered low part by a
-//! thousand changed not one digit of any output, and routing it through a
-//! bit-level round-trip to make it opaque did not help either. Compensated
-//! summation here is a silent no-op that costs instructions.
+//! wgpu-hal compiles every Metal shader with fast-math left on (it builds
+//! `MTLCompileOptions` and sets only the language version and invariance,
+//! `wgpu-hal-29.0.4/src/metal/device.rs:227`), which licenses reassociation.
+//! Kahan and double-single both recover a rounding error through a `two_sum`
+//! whose exact-algebra value is zero, so the compiler folds them away. Measured:
+//! scaling the recovered low part by a thousand changed not one digit, and a
+//! bit-level round-trip, a multiply by a runtime one read from a buffer and a
+//! trip through global memory are all folded too. Integer fixed-point
+//! accumulation is exact and costs nothing measurable, but see below for why
+//! exact summation would not be enough.
 //!
 //! So the arithmetic has to be arranged so that nothing cancels, and three
 //! places needed it. All three are exact rewrites, not approximations.

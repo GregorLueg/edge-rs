@@ -821,24 +821,29 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
 
 /// The GPU path's gates, read off the NEEDS column of its own tolerance report.
 ///
-/// Stage two's penalised fits run in `f32` on the device, so the variance
-/// components land within about `1e-3` of where the CPU puts them, and the
-/// coefficients and standard errors stage three computes from them follow.
-/// Worst measured needs, across both fixtures, against R:
+/// Stage two's penalised fits run in `f32` on the device and are finished in
+/// `f64` on the host, so the variance components land within about `1e-4` of
+/// R, which is the floor for any inner-fit trajectory other than R's own: the
+/// CPU restarted from a point perturbed by `1e-4` needs the same. Worst
+/// measured needs, across both fixtures, against R:
 ///
-/// * coefficients `3.9e-3`, standard errors `2.4e-3`, cell-level
-///   overdispersion `2.2e-3`;
-/// * covariance entries `5.8e-3` above an absolute `1e-6`. Without the floor
+/// * coefficients `2.8e-4`, standard errors `9.7e-4`, cell-level
+///   overdispersion `3.0e-4`;
+/// * covariance entries `1.9e-3` above an absolute `1e-6`. Without the floor
 ///   one entry needs `3.6e-1`: it is `cov(intercept, cov2) = 6.9e-7` on a gene
 ///   whose diagonals are `1.8e-2` and `6.9e-3`, a correlation of `6e-5`, and a
 ///   relative error on it measures nothing;
-/// * subject-level overdispersion `6.6e-3` above an absolute `1e-3`, the floor
+/// * subject-level overdispersion within an absolute `1e-3`, the floor
 ///   the CPU's own mixed-path gate uses. Without it one gene needs `8.9e-1`: R
 ///   and the CPU put `sigma^2` at `1.0e-3`, just above its `1e-4` bound, and the
 ///   GPU puts it on the bound. Both say the gene has no subject effect.
 ///
 /// The mixed LN-then-HL path is held to the CPU's own gates, which the GPU meets
-/// as well as the CPU does (`8.0e-2` against the CPU's `7.9e-2`).
+/// as well as the CPU does (`7.9e-2`, as the CPU).
+///
+/// The gates sit well above those needs on purpose. The kernel's `f32` code is
+/// whatever the shader compiler makes of it, and two builds that differ only in
+/// dead code have measured up to five times apart on the hardest gene.
 #[cfg(feature = "gpu")]
 const GPU_TOLS: NebulaTols = NebulaTols {
     coef: Tol::new(1e-2, 1e-9),

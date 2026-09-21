@@ -21,23 +21,31 @@
 //!
 //! ### Why the host finishes every fit
 //!
-//! The search compares profile likelihoods to about `1e-6`. The penalised
-//! log-likelihood is of order `1e4` on a real gene, where one `f32` unit in the
-//! last place is already `1e-3`, so a single `f32` cannot carry the value the
-//! search needs, and the compensated summation that would carry it is folded
-//! away by the shader compiler (see [`crate::gpu::pml_kernel`]). Measured on
-//! the R fixtures, searching on the device's own values drove half the genes'
-//! subject-level variance onto its lower bound. The finish is one Newton step
-//! from the device's optimum, about a quarter of a cold fit, and what comes back
-//! is exactly the CPU path's inner fit.
+//! The search compares profile likelihoods finely: the objective moves about
+//! `6e-6` for a `1e-3` relative move in the subject-level variance. The device's
+//! own value cannot resolve that, and not for want of better summation. With
+//! the sum made exact, the `f32` rounding of one `exp` and one `ln` per cell
+//! still leaves the value off by `1.5e-3` to `2.7e-3` at 20000 cells and
+//! jittering by `2e-5` to `2e-4` between nearby variance components, so the
+//! device resolves the variance to a few tenths of a per cent at best, worse
+//! with more cells. Searching on the device's values, measured on the R
+//! fixtures, drove half the genes' subject-level variance onto its lower bound.
+//! So the host finishes each fit: one Newton step in `f64` from the device's
+//! optimum, and what comes back is exactly the CPU path's inner fit.
 //!
 //! ### Cost, measured
 //!
-//! That finish is the ceiling. At 4000 genes and 20000 cells on the forced-HL
-//! path, stage two spent 140 s in device solves and 79 s finishing on the host,
-//! and the run as a whole was level with the CPU (245 s against 243 s). At 500
-//! genes it was four and a half times slower, because the lockstep rounds carry
-//! too few requests to fill the device.
+//! Forced HL, 20000 cells, against a 10-thread CPU:
+//!
+//! | genes | CPU | GPU | stage one | device | host finish |
+//! |---|---|---|---|---|---|
+//! | 500 | 30.6 s | 23.1 s | | | |
+//! | 4000 | 236 s | 151 s | 25 s | 45 s | 80 s |
+//!
+//! The host finish is now the largest part and the ceiling: it costs about a
+//! third of the CPU's own stage two. With one thread per fit the device took
+//! 140 s at 4000 genes and the run only broke even; see the kernel's module doc
+//! for the mapping that fixed it.
 //!
 //! ### Why lockstep rounds
 //!
