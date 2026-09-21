@@ -282,6 +282,10 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let mut damp_beta = Array::<F>::new(nb_cap as usize);
     let mut db = Array::<F>::new(nb_cap as usize);
     let mut db_lane = Array::<F>::new(nb_cap as usize);
+    // The cell's design row. Every use below reads it from here: left in
+    // global memory the row is re-read once per use, which is quadratic in
+    // `nb` through the Welford cross-products.
+    let mut x = Array::<F>::new(nb_cap as usize);
     let mut centre = Array::<F>::new(nb_cap as usize);
     let mut other_centre = Array::<F>::new(nb_cap as usize);
     let mut spread = Array::<F>::new((nb_cap * nb_cap) as usize);
@@ -399,7 +403,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let mut eta = log_offset[r as usize];
                 j = 0u32;
                 while j < nb {
-                    eta += design[(r * nb + j) as usize] * beta[j as usize];
+                    x[j as usize] = design[(r * nb + j) as usize];
+                    eta += x[j as usize] * beta[j as usize];
                     j += 1u32;
                 }
                 let extb = F::exp(eta + log_w_s);
@@ -407,8 +412,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let d = zero - gamma * u;
                 let phi_c = gamma * u / (extb + gamma);
                 welford_step::<F>(
-                    design,
-                    r,
+                    &x,
                     nb,
                     d,
                     phi_c,
@@ -428,7 +432,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let mut eta = log_offset[c as usize];
                 j = 0u32;
                 while j < nb {
-                    eta += design[(c * nb + j) as usize] * beta[j as usize];
+                    x[j as usize] = design[(c * nb + j) as usize];
+                    eta += x[j as usize] * beta[j as usize];
                     j += 1u32;
                 }
                 let extb = F::exp(eta + log_w_s);
@@ -436,8 +441,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let d = y * (one - u);
                 let phi_c = y * u / (extb + gamma);
                 welford_step::<F>(
-                    design,
-                    c,
+                    &x,
                     nb,
                     d,
                     phi_c,
@@ -962,8 +966,7 @@ fn evaluate_pass<F: Float>(
 ///
 /// ### Params
 ///
-/// * `design` - Shared design, row-major
-/// * `cell` - The cell whose covariates the observation carries
+/// * `x` - The design row of the cell the observation belongs to
 /// * `nb` - Design width
 /// * `d` - Contribution to the residual
 /// * `w` - Curvature weight of the observation
@@ -975,8 +978,7 @@ fn evaluate_pass<F: Float>(
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn welford_step<F: Float>(
-    design: &Tensor<F>,
-    cell: u32,
+    x: &Array<F>,
     nb: u32,
     d: F,
     w: F,
@@ -990,7 +992,7 @@ fn welford_step<F: Float>(
     *resid += d;
     let mut j = 0u32;
     while j < nb {
-        db_lane[j as usize] += design[(cell * nb + j) as usize] * d;
+        db_lane[j as usize] += x[j as usize] * d;
         j += 1u32;
     }
     let before = *weight;
@@ -999,10 +1001,10 @@ fn welford_step<F: Float>(
         let scale = w * before / next;
         let mut a = 0u32;
         while a < nb {
-            let da = design[(cell * nb + a) as usize] - centre[a as usize];
+            let da = x[a as usize] - centre[a as usize];
             let mut b = a;
             while b < nb {
-                let dbv = design[(cell * nb + b) as usize] - centre[b as usize];
+                let dbv = x[b as usize] - centre[b as usize];
                 spread[(a * nb + b) as usize] += scale * da * dbv;
                 b += 1u32;
             }
@@ -1012,7 +1014,7 @@ fn welford_step<F: Float>(
         j = 0u32;
         while j < nb {
             let c = centre[j as usize];
-            centre[j as usize] = c + frac * (design[(cell * nb + j) as usize] - c);
+            centre[j as usize] = c + frac * (x[j as usize] - c);
             j += 1u32;
         }
     }
