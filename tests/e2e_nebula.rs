@@ -827,16 +827,17 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
 /// CPU restarted from a point perturbed by `1e-4` needs the same. Worst
 /// measured needs, across both fixtures, against R:
 ///
-/// * coefficients `2.8e-4`, standard errors `9.7e-4`, cell-level
-///   overdispersion `3.0e-4`;
-/// * covariance entries `1.9e-3` above an absolute `1e-6`. Without the floor
-///   one entry needs `3.6e-1`: it is `cov(intercept, cov2) = 6.9e-7` on a gene
-///   whose diagonals are `1.8e-2` and `6.9e-3`, a correlation of `6e-5`, and a
-///   relative error on it measures nothing;
+/// * coefficients `2.4e-4`, standard errors `2.4e-4`, cell-level
+///   overdispersion `1.5e-4`;
+/// * covariance entries `4.8e-4` above an absolute `1e-6`, `1.6e-3` without
+///   it. The floor is for entries like `cov(intercept, cov2) = 6.9e-7` on a gene
+///   whose diagonals are `1.8e-2` and `6.9e-3`: a correlation of `6e-5`, on
+///   which a relative error measures nothing, and which needed `3.6e-1` before
+///   the finish took its log-determinant at the stepped point;
 /// * subject-level overdispersion within an absolute `1e-3`, the floor
-///   the CPU's own mixed-path gate uses. Without it one gene needs `8.9e-1`: R
-///   and the CPU put `sigma^2` at `1.0e-3`, just above its `1e-4` bound, and the
-///   GPU puts it on the bound. Both say the gene has no subject effect.
+///   the CPU's own mixed-path gate uses; `1.7e-3` relative without it. The
+///   floor is for genes R and the CPU put just above the `1e-4` bound and the
+///   GPU may put on it. Both say the gene has no subject effect.
 ///
 /// The mixed LN-then-HL path is held to the CPU's own gates, which the GPU meets
 /// as well as the CPU does (`7.9e-2`, as the CPU).
