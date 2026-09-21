@@ -53,11 +53,15 @@
 //!   `C_ij = sum p (x_i - A_i/P)(x_j - A_j/P)` is a weighted within-subject
 //!   covariance. Neither term cancels. The centred sum needs the centre, which
 //!   would mean a second pass over each subject block and a second `exp` per
-//!   cell, so it is accumulated by Welford's weighted online update instead:
-//!   one pass, and stable for the same reason the two-pass form is.
-//!
-//! The Welford state is merged across the lanes of a plane by Chan's rule,
-//! each pair taken in lane order so both partners compute the same bits.
+//!   cell. So the moments are taken about an anchor known up front, the
+//!   subject's unweighted mean design row, and moved to the weighted centre
+//!   afterwards: `C_ij = S_ij - A_i A_j / P` with `S` and `A` about the anchor.
+//!   That subtraction is the square of the gap between two means of the same
+//!   cells against the spread, where about the origin it was the whole of the
+//!   intercept; columns constant within a subject come out exactly zero. A
+//!   Welford online update does the same job with no subtraction at all, but
+//!   costs two divisions and a branch per cell and a pairwise merge across the
+//!   plane, and measured 1.3x to 1.45x slower on the whole kernel.
 //!
 //! What is left is the `f32` rounding of one `exp` and one `ln` per cell, which
 //! nothing here can undo: it leaves the value of the objective off by about
@@ -196,6 +200,7 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `subject_ptr` - Start of each subject's run within each gene's block in
 ///   `counts`, `[gene * (k + 1) + s]`
 /// * `subject_total` - Count total per subject, `[s * n_genes + gene]`
+/// * `subject_mean` - Unweighted mean design row per subject, `[s * nb + j]`
 /// * `request_gene` - The gene each request is for
 /// * `request_params` - Three per request: the gamma prior's `alpha` and
 ///   `lambda`, then the cell-level size `gamma`
@@ -235,6 +240,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     cells: &Tensor<u32>,
     subject_ptr: &Tensor<u32>,
     subject_total: &Tensor<F>,
+    subject_mean: &Tensor<F>,
     request_gene: &Tensor<u32>,
     request_params: &Tensor<F>,
     beta_init: &Tensor<F>,
@@ -284,12 +290,13 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let mut db_lane = Array::<F>::new(nb_cap as usize);
     // The cell's design row. Every use below reads it from here: left in
     // global memory the row is re-read once per use, which is quadratic in
-    // `nb` through the Welford cross-products.
+    // `nb` through the cross-products.
     let mut x = Array::<F>::new(nb_cap as usize);
     let mut centre = Array::<F>::new(nb_cap as usize);
-    let mut other_centre = Array::<F>::new(nb_cap as usize);
+    let mut anchor = Array::<F>::new(nb_cap as usize);
+    let mut first = Array::<F>::new(nb_cap as usize);
+    let mut delta = Array::<F>::new(nb_cap as usize);
     let mut spread = Array::<F>::new((nb_cap * nb_cap) as usize);
-    let mut other_spread = Array::<F>::new((nb_cap * nb_cap) as usize);
     let mut vb2 = Array::<F>::new((nb_cap * nb_cap) as usize);
 
     let mut j = 0u32;
@@ -381,15 +388,15 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             // parts. Both stride across the lanes, so a plane's loads fall on
             // consecutive cells: a contiguous chunk per lane, which walked the
             // counts with one pointer, measured 2.4x slower for the scattered
-            // loads alone. The weighted Welford update is indifferent to order,
-            // so a count's curvature enters as one more observation at its
-            // cell's covariates.
+            // loads alone. The moments are order-free sums, so a count's
+            // curvature enters as one more observation at its cell's covariates.
             let mut resid = zero;
             let mut weight = zero;
             j = 0u32;
             while j < nb {
                 db_lane[j as usize] = zero;
-                centre[j as usize] = zero;
+                first[j as usize] = zero;
+                anchor[j as usize] = subject_mean[(s * nb + j) as usize];
                 j += 1u32;
             }
             i = 0u32;
@@ -411,16 +418,18 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let u = one / (one + gamma / extb);
                 let d = zero - gamma * u;
                 let phi_c = gamma * u / (extb + gamma);
-                welford_step::<F>(
+                moment_step::<F>(
                     &x,
+                    &anchor,
                     nb,
                     d,
                     phi_c,
                     &mut resid,
                     &mut db_lane,
                     &mut weight,
-                    &mut centre,
+                    &mut first,
                     &mut spread,
+                    &mut delta,
                 );
                 r += PLANE;
             }
@@ -440,117 +449,69 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let u = one / (one + gamma / extb);
                 let d = y * (one - u);
                 let phi_c = y * u / (extb + gamma);
-                welford_step::<F>(
+                moment_step::<F>(
                     &x,
+                    &anchor,
                     nb,
                     d,
                     phi_c,
                     &mut resid,
                     &mut db_lane,
                     &mut weight,
-                    &mut centre,
+                    &mut first,
                     &mut spread,
+                    &mut delta,
                 );
                 p += PLANE;
             }
 
-            // -- Across the plane. Plain sums reduce directly; the Welford state
-            //    merges pairwise by Chan's rule. --
+            // -- Across the plane. Every moment is taken about the same anchor in
+            //    every lane, so all of them are plain sums. --
             let resid_s = plane_sum(resid);
             j = 0u32;
             while j < nb {
                 db[j as usize] += plane_sum(db_lane[j as usize]);
                 j += 1u32;
             }
-
-            // Butterfly over the plane. Each pair merges as (lower lane, higher
-            // lane) whichever side it sits on, so both partners compute the same
-            // bits and every lane ends holding the identical total.
-            let mut mask = 1u32;
-            while mask < PLANE {
-                let other_weight = plane_shuffle_xor(weight, mask);
-                j = 0u32;
-                while j < nb {
-                    other_centre[j as usize] = plane_shuffle_xor(centre[j as usize], mask);
-                    j += 1u32;
+            weight = plane_sum(weight);
+            j = 0u32;
+            while j < nb {
+                first[j as usize] = plane_sum(first[j as usize]);
+                j += 1u32;
+            }
+            let mut a = 0u32;
+            while a < nb {
+                let mut b = a;
+                while b < nb {
+                    let idx = (a * nb + b) as usize;
+                    spread[idx] = plane_sum(spread[idx]);
+                    b += 1u32;
                 }
-                // Only the upper triangle of the spread is ever written or read.
-                let mut a = 0u32;
+                a += 1u32;
+            }
+
+            // Move the moments from the anchor to the weighted centre. The
+            // anchor is the subject's unweighted mean, so what is subtracted is
+            // the square of the gap between two means, small against the
+            // spread; about the origin it would be the whole of the intercept.
+            if weight > zero {
+                a = 0u32;
                 while a < nb {
+                    let shift = first[a as usize] / weight;
                     let mut b = a;
                     while b < nb {
-                        let idx = (a * nb + b) as usize;
-                        other_spread[idx] = plane_shuffle_xor(spread[idx], mask);
+                        spread[(a * nb + b) as usize] -= shift * first[b as usize];
                         b += 1u32;
                     }
+                    centre[a as usize] = anchor[a as usize] + shift;
                     a += 1u32;
                 }
-                let lower = (lane & mask) == 0u32;
-                let wa = if lower { weight } else { other_weight };
-                let wb = if lower { other_weight } else { weight };
-                let total = wa + wb;
-                if total > zero {
-                    let f = wb / total;
-                    let g = wa * wb / total;
-                    let mut a = 0u32;
-                    while a < nb {
-                        let ma = if lower {
-                            centre[a as usize]
-                        } else {
-                            other_centre[a as usize]
-                        };
-                        let mb = if lower {
-                            other_centre[a as usize]
-                        } else {
-                            centre[a as usize]
-                        };
-                        let da = mb - ma;
-                        let mut b = a;
-                        while b < nb {
-                            let mbb = if lower {
-                                other_centre[b as usize]
-                            } else {
-                                centre[b as usize]
-                            };
-                            let mab = if lower {
-                                centre[b as usize]
-                            } else {
-                                other_centre[b as usize]
-                            };
-                            let idx = (a * nb + b) as usize;
-                            let sa = if lower {
-                                spread[idx]
-                            } else {
-                                other_spread[idx]
-                            };
-                            let sb = if lower {
-                                other_spread[idx]
-                            } else {
-                                spread[idx]
-                            };
-                            spread[idx] = (sa + sb) + g * da * (mbb - mab);
-                            b += 1u32;
-                        }
-                        a += 1u32;
-                    }
-                    j = 0u32;
-                    while j < nb {
-                        let ma = if lower {
-                            centre[j as usize]
-                        } else {
-                            other_centre[j as usize]
-                        };
-                        let mb = if lower {
-                            other_centre[j as usize]
-                        } else {
-                            centre[j as usize]
-                        };
-                        centre[j as usize] = ma + f * (mb - ma);
-                        j += 1u32;
-                    }
+            } else {
+                j = 0u32;
+                while j < nb {
+                    centre[j as usize] = anchor[j as usize];
+                    j += 1u32;
                 }
-                weight = total;
-                mask *= 2u32;
             }
 
             let dw_s = resid_s + (alpha - lambda * w_s);
@@ -568,7 +529,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             // The centred covariance, then what the centring leaves over, which
             // the prior's share of the subject curvature keeps from cancelling.
             let shrink = lambda * w_s / vw_s;
-            let mut a = 0u32;
+            a = 0u32;
             while a < nb {
                 let mut b = a;
                 while b < nb {
@@ -966,65 +927,60 @@ fn evaluate_pass<F: Float>(
     acc + (alpha * sum_log_w - lambda * sum_w)
 }
 
-/// Folds one observation into a lane's residual and weighted Welford state.
+/// Folds one observation into a lane's residual and weighted moments.
 ///
 /// The per-cell body of the assembly, shared by the dense and the sparse pass.
+/// The moments are taken about a fixed anchor, so they are order-free sums with
+/// no division and no branch per cell.
 ///
 /// ### Params
 ///
 /// * `x` - The design row of the cell the observation belongs to
+/// * `anchor` - The point the moments are taken about
 /// * `nb` - Design width
 /// * `d` - Contribution to the residual
 /// * `w` - Curvature weight of the observation
 /// * `resid` - The lane's residual sum
 /// * `db_lane` - The lane's fixed-effect gradient
 /// * `weight` - The lane's total curvature weight
-/// * `centre` - The lane's weighted mean of the covariates
-/// * `spread` - The lane's weighted centred cross-products, upper triangle
+/// * `first` - The lane's weighted sum of `x - anchor`
+/// * `spread` - The lane's weighted cross-products of `x - anchor`, upper
+///   triangle
+/// * `delta` - Scratch for `x - anchor`
 #[cube]
 #[allow(clippy::too_many_arguments)]
-fn welford_step<F: Float>(
+fn moment_step<F: Float>(
     x: &Array<F>,
+    anchor: &Array<F>,
     nb: u32,
     d: F,
     w: F,
     resid: &mut F,
     db_lane: &mut Array<F>,
     weight: &mut F,
-    centre: &mut Array<F>,
+    first: &mut Array<F>,
     spread: &mut Array<F>,
+    delta: &mut Array<F>,
 ) {
-    let zero = F::new(0.0_f32);
     *resid += d;
+    *weight += w;
     let mut j = 0u32;
     while j < nb {
         db_lane[j as usize] += x[j as usize] * d;
+        delta[j as usize] = x[j as usize] - anchor[j as usize];
         j += 1u32;
     }
-    let before = *weight;
-    let next = before + w;
-    if next > zero {
-        let scale = w * before / next;
-        let mut a = 0u32;
-        while a < nb {
-            let da = x[a as usize] - centre[a as usize];
-            let mut b = a;
-            while b < nb {
-                let dbv = x[b as usize] - centre[b as usize];
-                spread[(a * nb + b) as usize] += scale * da * dbv;
-                b += 1u32;
-            }
-            a += 1u32;
+    let mut a = 0u32;
+    while a < nb {
+        let wa = w * delta[a as usize];
+        first[a as usize] += wa;
+        let mut b = a;
+        while b < nb {
+            spread[(a * nb + b) as usize] += wa * delta[b as usize];
+            b += 1u32;
         }
-        let frac = w / next;
-        j = 0u32;
-        while j < nb {
-            let c = centre[j as usize];
-            centre[j as usize] = c + frac * (x[j as usize] - c);
-            j += 1u32;
-        }
+        a += 1u32;
     }
-    *weight = next;
 }
 
 //////////////////
@@ -1256,6 +1212,7 @@ where
                     tensors.cells.clone().into_tensor_arg(),
                     tensors.subject_ptr.clone().into_tensor_arg(),
                     tensors.subject_total.clone().into_tensor_arg(),
+                    tensors.subject_mean.clone().into_tensor_arg(),
                     tensors.request_gene.clone().into_tensor_arg(),
                     tensors.request_params.clone().into_tensor_arg(),
                     tensors.beta_init.clone().into_tensor_arg(),
@@ -1316,6 +1273,8 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     pub subject_ptr: GpuTensor<R, u32>,
     /// Count total per subject, `[s * n_genes + gene]`.
     pub subject_total: GpuTensor<R, F>,
+    /// Unweighted mean design row per subject, `[s * nb + j]`.
+    pub subject_mean: GpuTensor<R, F>,
     /// The gene each request is for.
     pub request_gene: GpuTensor<R, u32>,
     /// `alpha`, `lambda` and `gamma` per request, `[i * n_req + q]`.
