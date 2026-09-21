@@ -8,8 +8,10 @@
 //! ### Layout
 //!
 //! The per-gene data is uploaded once and stays resident: the positive counts of
-//! every gene concatenated with a `gene_ptr` index (the same CSR the crate
-//! already holds them in), and the per-subject count totals gene-minor. The
+//! every gene concatenated, indexed by where each subject's run starts within
+//! each gene, and the per-subject count totals gene-minor. The subject index is
+//! what lets each lane of a plane find its own first count by a short binary
+//! search instead of walking the gene from the start. The
 //! shared design, offsets and subject boundaries stay in their natural order,
 //! because every thread walks them identically and the traffic is served once
 //! from cache.
@@ -162,8 +164,8 @@ pub struct ResidentBatch<R: Runtime> {
     counts: GpuTensor<R, f32>,
     /// Cell index of each count.
     cells: GpuTensor<R, u32>,
-    /// Start of each gene's block in `counts`.
-    gene_ptr: GpuTensor<R, u32>,
+    /// Start of each subject's run in each gene's counts, `[gene * (k + 1) + s]`.
+    subject_ptr: GpuTensor<R, u32>,
     /// Count total per subject, gene-minor.
     subject_total: GpuTensor<R, f32>,
     /// Per-subject scratch, sized for `capacity` requests.
@@ -287,6 +289,21 @@ impl<R: Runtime> ResidentBatch<R> {
                 });
         }
 
+        // Where each subject's run starts within each gene's counts, as an
+        // absolute index into the concatenated buffer. The counts are in cell
+        // order and so are the subjects, so one merge per gene does it.
+        let mut subject_ptr = vec![0u32; n_genes * (k + 1)];
+        for (g, gene) in genes.iter().enumerate() {
+            let base = gene_ptr[g] as usize;
+            let mut p = 0usize;
+            for s in 0..=k {
+                while p < gene.cell_index.len() && gene.cell_index[p] < subject_start[s] {
+                    p += 1;
+                }
+                subject_ptr[g * (k + 1) + s] = (base + p) as u32;
+            }
+        }
+
         let mut subject_total = vec![0.0f32; k * n_genes];
         for (g, gene) in genes.iter().enumerate() {
             for (s, &t) in gene.subject_total.iter().enumerate() {
@@ -302,7 +319,8 @@ impl<R: Runtime> ResidentBatch<R> {
             subject_start: GpuTensor::from_slice(&start_u32, vec![k + 1], client).map_err(err)?,
             counts: GpuTensor::from_slice(&counts_f32, vec![nnz.max(1)], client).map_err(err)?,
             cells: GpuTensor::from_slice(&cells_u32, vec![nnz.max(1)], client).map_err(err)?,
-            gene_ptr: GpuTensor::from_slice(&gene_ptr, vec![n_genes + 1], client).map_err(err)?,
+            subject_ptr: GpuTensor::from_slice(&subject_ptr, vec![n_genes * (k + 1)], client)
+                .map_err(err)?,
             subject_total: GpuTensor::from_slice(&subject_total, vec![k * n_genes], client)
                 .map_err(err)?,
             subject_scratch: GpuTensor::empty(
@@ -405,7 +423,7 @@ impl<R: Runtime> ResidentBatch<R> {
             subject_start: self.subject_start.clone(),
             counts: self.counts.clone(),
             cells: self.cells.clone(),
-            gene_ptr: self.gene_ptr.clone(),
+            subject_ptr: self.subject_ptr.clone(),
             subject_total: self.subject_total.clone(),
             request_gene: GpuTensor::from_slice(&request_gene, vec![n_req], client)
                 .map_err(err)?,

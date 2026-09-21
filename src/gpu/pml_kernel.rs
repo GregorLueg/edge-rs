@@ -1,4 +1,4 @@
-//! NEBULA's penalised maximum likelihood inner solver, one gene per thread.
+//! NEBULA's penalised maximum likelihood inner solver, one fit per plane.
 //!
 //! A port of [`crate::sc::pml`]'s Newton loop to CubeCL. The CPU module is the
 //! reference for every formula; this file changes where the work happens, what
@@ -7,12 +7,19 @@
 //!
 //! ### Mapping
 //!
-//! One thread owns one gene and runs the entire Newton loop, including the
-//! backtracking, without touching any other thread's memory. The loop-carried
-//! state is per gene, so no reduction is shared and no summation is
-//! reassociated between threads. The design, the log offsets and the subject
-//! boundaries are gene-independent, so all threads in a plane read the same
-//! cell at the same step and the traffic is served once from cache.
+//! One 32-lane plane owns one fit and every lane runs the whole Newton loop,
+//! backtracking included, on the same values. Only the passes over cells are
+//! split: each lane takes a contiguous chunk of every subject block, and the
+//! partial sums are recombined with plane reductions, so the quantities the
+//! Newton step and the stopping tests read are identical in every lane and the
+//! lanes never disagree about what to do next. No barrier, no shared memory.
+//!
+//! The first version put one fit on one thread. That made a launch cost one
+//! thread's serial walk over every cell whatever the batch size: measured at
+//! 20000 cells, 455 fits took 152 ms and 3644 took 202 ms, and stage two's
+//! lockstep rounds carry a few thousand fits at most. Spreading each fit over a
+//! plane measured 15x faster at 455 fits and 4.2x at 3644 on the likelihood
+//! pass.
 //!
 //! ### Precision: the part better summation cannot fix
 //!
@@ -46,11 +53,16 @@
 //!   cell, so it is accumulated by Welford's weighted online update instead:
 //!   one pass, and stable for the same reason the two-pass form is.
 //!
-//! What is left is the ordinary `f32` rounding of one `exp` and one `ln` per
-//! cell, which nothing can undo, plus the error growth of a long naive sum. The
-//! second is handled by `SUM_BLOCK`: summing in blocks is a pure change of
-//! association with no algebraic identity for the optimiser to exploit, so
-//! unlike compensation it survives.
+//! The Welford state is merged across the lanes of a plane by Chan's rule,
+//! each pair taken in lane order so both partners compute the same bits.
+//!
+//! What is left is the `f32` rounding of one `exp` and one `ln` per cell, which
+//! nothing here can undo: it leaves the value of the objective off by about
+//! `2e-3` at 20000 cells and jittering by `2e-5` to `2e-4` between nearby
+//! variance components, even with exact summation. That, not the summation, is
+//! why the host finishes every fit in `f64` (see [`crate::gpu::stage_two`]).
+//! Long sums run as a three-level tree (within a lane, across the plane, over
+//! the subjects), a change of association the compiler cannot fold.
 //!
 //! ### Consequence
 //!
@@ -77,7 +89,6 @@ use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 
 use crate::errors::EdgeErrors;
-use crate::gpu::GENE_WORKGROUP;
 
 ////////////
 // Consts //
@@ -90,14 +101,20 @@ const STEP_CUTOFF: f32 = 40.0;
 /// Largest gradient component still called a critical point, nebula's `convd`.
 const GRADIENT_TOLERANCE: f32 = 0.01;
 
-/// Cells summed into a block accumulator before it is flushed into the total.
+/// Lanes per request: one plane.
 ///
-/// Two-level summation, which turns the `n * eps` error growth of a naive sum
-/// into roughly `(n / SUM_BLOCK + SUM_BLOCK) * eps`. At a million cells that is
-/// the difference between a few per cent and a few parts in `1e6`. Unlike
-/// compensated summation it is only a change of association, so there is no
-/// algebraic identity for the shader compiler to fold away; see the module doc.
-const SUM_BLOCK: u32 = 256;
+/// Every reduction here is a plane reduction, which is only correct when a
+/// plane is exactly this wide; the dispatch refuses to run anywhere else rather
+/// than return wrong answers, which a plane straddling two requests would give
+/// silently.
+pub const PLANE: u32 = 32;
+
+/// Requests per workgroup, one plane each.
+///
+/// The planes share nothing, so this is purely an occupancy knob: two planes
+/// make a 64-thread workgroup, which is what the per-thread kernel measured
+/// best at and no worse than wider.
+const PLANES_PER_CUBE: u32 = 2;
 
 /// Default resolution floor on the objective, relative to its magnitude.
 ///
@@ -154,11 +171,17 @@ pub const MAX_BETA_CAP: usize = 8;
 // Kernel //
 ////////////
 
-/// Fits one gene per thread by penalised maximum likelihood.
+/// Fits one request per 32-lane plane by penalised maximum likelihood.
 ///
 /// Mirrors `optimise` in [`crate::sc::pml`] with the gamma penalty, NEBULA's
-/// NBGMM, at Laplace order one. Higher orders are left to the host, which still
-/// has the `f64` path for them.
+/// NBGMM, at Laplace order one. Higher orders are left to the host, which has
+/// the `f64` path for them.
+///
+/// Every lane of a plane runs the same control flow on the same request. The
+/// passes over cells are split across the lanes, each lane taking a contiguous
+/// chunk of every subject block, and recombined with plane reductions, so every
+/// quantity the Newton step and the backtracking search read is bit-identical
+/// in all 32 lanes and their decisions agree without a barrier.
 ///
 /// ### Params
 ///
@@ -167,24 +190,27 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `subject_start` - Shared subject boundaries, length `k + 1`
 /// * `counts` - Every gene's positive counts, concatenated
 /// * `cells` - Cell index of each entry of `counts`
-/// * `gene_ptr` - Start of each gene's block in `counts`, length `n_genes + 1`
-/// * `subject_total` - Count total per subject, `[s * n_genes + g]`
-/// * `gene_params` - Three per gene: the gamma prior's `alpha` and `lambda`,
-///   then the cell-level size `gamma`
-/// * `beta_init` - Starting fixed effects, `[j * n_genes + g]`
+/// * `subject_ptr` - Start of each subject's run within each gene's block in
+///   `counts`, `[gene * (k + 1) + s]`
+/// * `subject_total` - Count total per subject, `[s * n_genes + gene]`
+/// * `request_gene` - The gene each request is for
+/// * `request_params` - Three per request: the gamma prior's `alpha` and
+///   `lambda`, then the cell-level size `gamma`
+/// * `beta_init` - Starting fixed effects, `[j * n_req + q]`
 /// * `tolerance` - Two elements: nebula's absolute stopping tolerance, then the
 ///   resolution floor relative to the objective ([`F32_NOISE_SCALE`]). A buffer
 ///   rather than scalar arguments because a runtime float scalar would need a
 ///   `ScalarArgSettings` bound this module otherwise has no use for
 /// * `subject_scratch` - Per-subject working store,
-///   `[(slot * k + s) * n_genes + g]`, [`SUBJECT_SLOTS`] slots
-/// * `vwb_scratch` - Cross block of the information, `[(s * nb + j) * n_genes + g]`
-/// * `out_beta` - Fitted fixed effects, `[j * n_genes + g]`
-/// * `out_information` - Schur complement, `[(i * nb + j) * n_genes + g]`
-/// * `out_scalars` - Four per gene: the log-likelihood, the previous one, the
-///   log-determinant, and the final improvement
-/// * `out_counts` - Two per gene: Newton steps taken, then backtracks used
-/// * `n_genes` - Genes in the batch, which is the thread count
+///   `[(slot * k + s) * n_req + q]`, [`SUBJECT_SLOTS`] slots
+/// * `vwb_scratch` - Cross block of the information, `[(s * nb + j) * n_req + q]`
+/// * `out_beta` - Fitted fixed effects, `[j * n_req + q]`
+/// * `out_information` - Schur complement, `[(i * nb + j) * n_req + q]`
+/// * `out_scalars` - Four per request: the log-likelihood, the previous one,
+///   the log-determinant, and the final improvement
+/// * `out_counts` - Two per request: Newton steps taken, then backtracks used
+/// * `n_genes` - Genes resident on the device
+/// * `n_req` - Requests in the launch
 /// * `k` - Subjects
 /// * `nb` - Design width
 /// * `max_iter` - Newton budget
@@ -193,8 +219,9 @@ pub const MAX_BETA_CAP: usize = 8;
 ///
 /// ### Grid mapping
 ///
-/// * `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` -> block of [`GENE_WORKGROUP`] genes
-/// * `UNIT_POS_X` -> gene within the block
+/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * PLANES_PER_CUBE + UNIT_POS_Y`
+///   -> request
+/// * `UNIT_POS_X` -> lane within the request's plane
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn opt_pml_gpu<F: Float + CubeElement>(
@@ -203,7 +230,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     subject_start: &Tensor<u32>,
     counts: &Tensor<F>,
     cells: &Tensor<u32>,
-    gene_ptr: &Tensor<u32>,
+    subject_ptr: &Tensor<u32>,
     subject_total: &Tensor<F>,
     request_gene: &Tensor<u32>,
     request_params: &Tensor<F>,
@@ -223,10 +250,11 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     max_backtrack: u32,
     #[comptime] nb_cap: u32,
 ) {
-    let q = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * GENE_WORKGROUP + UNIT_POS_X;
+    let q = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * PLANES_PER_CUBE + UNIT_POS_Y;
     if q >= n_req {
         terminate!();
     }
+    let lane = UNIT_POS_X;
     let gene = request_gene[q as usize];
 
     let zero = F::new(0.0_f32);
@@ -245,16 +273,16 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let lambda = request_params[(n_req + q) as usize];
     let gamma = request_params[(2u32 * n_req + q) as usize];
 
-    let ptr_lo = gene_ptr[gene as usize];
-    let ptr_hi = gene_ptr[(gene + 1u32) as usize];
-
     let mut beta = Array::<F>::new(nb_cap as usize);
     let mut new_beta = Array::<F>::new(nb_cap as usize);
     let mut step_beta = Array::<F>::new(nb_cap as usize);
     let mut damp_beta = Array::<F>::new(nb_cap as usize);
     let mut db = Array::<F>::new(nb_cap as usize);
-    let mut db_block = Array::<F>::new(nb_cap as usize);
-    let mut a_bar = Array::<F>::new(nb_cap as usize);
+    let mut db_lane = Array::<F>::new(nb_cap as usize);
+    let mut centre = Array::<F>::new(nb_cap as usize);
+    let mut other_centre = Array::<F>::new(nb_cap as usize);
+    let mut spread = Array::<F>::new((nb_cap * nb_cap) as usize);
+    let mut other_spread = Array::<F>::new((nb_cap * nb_cap) as usize);
     let mut vb2 = Array::<F>::new((nb_cap * nb_cap) as usize);
 
     let mut j = 0u32;
@@ -274,6 +302,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         subject_start,
         counts,
         cells,
+        subject_ptr,
         subject_total,
         subject_scratch,
         &beta,
@@ -281,13 +310,12 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         alpha,
         lambda,
         gamma,
-        ptr_lo,
-        ptr_hi,
         n_genes,
         n_req,
         k,
         q,
         gene,
+        lane,
         nb,
     );
 
@@ -309,7 +337,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         while j < nb {
             damp_beta[j as usize] = one;
             db[j as usize] = zero;
-            db_block[j as usize] = zero;
             j += 1u32;
         }
         s = 0u32;
@@ -327,7 +354,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         // Gradient and curvature, fused //
         ///////////////////////////////////
 
-        let mut ptr = ptr_lo;
         s = 0u32;
         while s < k {
             let log_w_s = subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize];
@@ -336,23 +362,36 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 
             let begin = subject_start[s as usize];
             let end = subject_start[(s + 1u32) as usize];
-            // -- One pass: the residual gradient, and the weighted
-            //    within-subject covariance by Welford's online update. The
-            //    centred form needs the centre, and computing the centre first
-            //    would mean a second pass over the block and a second `exp` per
-            //    cell; the online update carries the centre along instead and
-            //    is cancellation-free for the same reason the two-pass form is.
-            let mut resid = zero;
-            let mut resid_block = zero;
+            let sp_lo = subject_ptr[(gene * (k + 1u32) + s) as usize];
+            let sp_hi = subject_ptr[(gene * (k + 1u32) + s + 1u32) as usize];
 
-            let mut p_sum = zero;
+            // Every quantity here is linear in the count `y`: with
+            // `u = 1 / (1 + gamma / extb)` and `h = u / (extb + gamma)`, the
+            // gradient weight is `(gamma + y) u`, the residual is
+            // `-gamma u + y (1 - u)` and the curvature weight is `(gamma + y) h`.
+            // So each subject is a dense pass over every cell at `y = 0`, then a
+            // sparse pass over the subject's positive counts adding the `y`
+            // parts. Both stride across the lanes, so a plane's loads fall on
+            // consecutive cells: a contiguous chunk per lane, which walked the
+            // counts with one pointer, measured 2.4x slower for the scattered
+            // loads alone. The weighted Welford update is indifferent to order,
+            // so a count's curvature enters as one more observation at its
+            // cell's covariates.
+            let mut resid = zero;
+            let mut weight = zero;
             j = 0u32;
             while j < nb {
-                a_bar[j as usize] = zero;
+                db_lane[j as usize] = zero;
+                centre[j as usize] = zero;
                 j += 1u32;
             }
-            let mut r = begin;
-            let mut since_flush = 0u32;
+            i = 0u32;
+            while i < nb * nb {
+                spread[i as usize] = zero;
+                i += 1u32;
+            }
+
+            let mut r = begin + lane;
             while r < end {
                 let mut eta = log_offset[r as usize];
                 j = 0u32;
@@ -361,99 +400,167 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                     j += 1u32;
                 }
                 let extb = F::exp(eta + log_w_s);
+                let u = one / (one + gamma / extb);
+                let d = zero - gamma * u;
+                let phi_c = gamma * u / (extb + gamma);
+                welford_step::<F>(
+                    design,
+                    r,
+                    nb,
+                    d,
+                    phi_c,
+                    &mut resid,
+                    &mut db_lane,
+                    &mut weight,
+                    &mut centre,
+                    &mut spread,
+                );
+                r += PLANE;
+            }
 
-                let mut y = zero;
-                if ptr < ptr_hi {
-                    if cells[ptr as usize] == r {
-                        y = counts[ptr as usize];
-                        ptr += 1u32;
-                    }
-                }
-
-                // `phi` of the CPU's `gradient_only`, then of its `curvature`.
-                let phi_g = (gamma + y) / (one + gamma / extb);
-                let phi_c = phi_g / (extb + gamma);
-
-                // Residual form: the difference is taken per cell, not between
-                // two sums of order `1e4`. See the module doc.
-                let d = y - phi_g;
-                resid_block += d;
+            let mut p = sp_lo + lane;
+            while p < sp_hi {
+                let c = cells[p as usize];
+                let y = counts[p as usize];
+                let mut eta = log_offset[c as usize];
                 j = 0u32;
                 while j < nb {
-                    db_block[j as usize] += design[(r * nb + j) as usize] * d;
+                    eta += design[(c * nb + j) as usize] * beta[j as usize];
                     j += 1u32;
                 }
+                let extb = F::exp(eta + log_w_s);
+                let u = one / (one + gamma / extb);
+                let d = y * (one - u);
+                let phi_c = y * u / (extb + gamma);
+                welford_step::<F>(
+                    design,
+                    c,
+                    nb,
+                    d,
+                    phi_c,
+                    &mut resid,
+                    &mut db_lane,
+                    &mut weight,
+                    &mut centre,
+                    &mut spread,
+                );
+                p += PLANE;
+            }
 
-                // Welford, weighted: the deltas are taken against the running
-                // centre, then the centre moves.
-                let p_next = p_sum + phi_c;
-                if p_next > zero {
-                    let scale = gamma * phi_c * p_sum / p_next;
+            // -- Across the plane. Plain sums reduce directly; the Welford state
+            //    merges pairwise by Chan's rule. --
+            let resid_s = plane_sum(resid);
+            j = 0u32;
+            while j < nb {
+                db[j as usize] += plane_sum(db_lane[j as usize]);
+                j += 1u32;
+            }
+
+            // Butterfly over the plane. Each pair merges as (lower lane, higher
+            // lane) whichever side it sits on, so both partners compute the same
+            // bits and every lane ends holding the identical total.
+            let mut mask = 1u32;
+            while mask < PLANE {
+                let other_weight = plane_shuffle_xor(weight, mask);
+                j = 0u32;
+                while j < nb {
+                    other_centre[j as usize] = plane_shuffle_xor(centre[j as usize], mask);
+                    j += 1u32;
+                }
+                i = 0u32;
+                while i < nb * nb {
+                    other_spread[i as usize] = plane_shuffle_xor(spread[i as usize], mask);
+                    i += 1u32;
+                }
+                let lower = (lane & mask) == 0u32;
+                let wa = if lower { weight } else { other_weight };
+                let wb = if lower { other_weight } else { weight };
+                let total = wa + wb;
+                if total > zero {
+                    let f = wb / total;
+                    let g = wa * wb / total;
                     let mut a = 0u32;
                     while a < nb {
-                        let da = design[(r * nb + a) as usize] - a_bar[a as usize];
+                        let ma = if lower {
+                            centre[a as usize]
+                        } else {
+                            other_centre[a as usize]
+                        };
+                        let mb = if lower {
+                            other_centre[a as usize]
+                        } else {
+                            centre[a as usize]
+                        };
+                        let da = mb - ma;
                         let mut b = a;
                         while b < nb {
-                            let db_delta = design[(r * nb + b) as usize] - a_bar[b as usize];
-                            vb2[(a * nb + b) as usize] += scale * da * db_delta;
+                            let mbb = if lower {
+                                other_centre[b as usize]
+                            } else {
+                                centre[b as usize]
+                            };
+                            let mab = if lower {
+                                centre[b as usize]
+                            } else {
+                                other_centre[b as usize]
+                            };
+                            let idx = (a * nb + b) as usize;
+                            let sa = if lower {
+                                spread[idx]
+                            } else {
+                                other_spread[idx]
+                            };
+                            let sb = if lower {
+                                other_spread[idx]
+                            } else {
+                                spread[idx]
+                            };
+                            spread[idx] = (sa + sb) + g * da * (mbb - mab);
                             b += 1u32;
                         }
                         a += 1u32;
                     }
-                    let step_frac = phi_c / p_next;
                     j = 0u32;
                     while j < nb {
-                        let centre = a_bar[j as usize];
-                        a_bar[j as usize] =
-                            centre + step_frac * (design[(r * nb + j) as usize] - centre);
+                        let ma = if lower {
+                            centre[j as usize]
+                        } else {
+                            other_centre[j as usize]
+                        };
+                        let mb = if lower {
+                            other_centre[j as usize]
+                        } else {
+                            centre[j as usize]
+                        };
+                        centre[j as usize] = ma + f * (mb - ma);
                         j += 1u32;
                     }
                 }
-                p_sum = p_next;
-
-                since_flush += 1u32;
-                if since_flush == SUM_BLOCK {
-                    resid += resid_block;
-                    resid_block = zero;
-                    j = 0u32;
-                    while j < nb {
-                        db[j as usize] += db_block[j as usize];
-                        db_block[j as usize] = zero;
-                        j += 1u32;
-                    }
-                    since_flush = 0u32;
-                }
-                r += 1u32;
-            }
-            resid += resid_block;
-            j = 0u32;
-            while j < nb {
-                db[j as usize] += db_block[j as usize];
-                db_block[j as usize] = zero;
-                j += 1u32;
+                weight = total;
+                mask *= 2u32;
             }
 
-            let dw_s = resid + (alpha - lambda * w_s);
+            let dw_s = resid_s + (alpha - lambda * w_s);
             subject_scratch[((SLOT_DW * k + s) * n_req + q) as usize] = dw_s;
-            let vw_s = gamma * p_sum + lambda * w_s;
+            let vw_s = gamma * weight + lambda * w_s;
             subject_scratch[((SLOT_VW * k + s) * n_req + q) as usize] = vw_s;
 
             j = 0u32;
             while j < nb {
                 vwb_scratch[((s * nb + j) * n_req + q) as usize] =
-                    gamma * a_bar[j as usize] * p_sum;
+                    gamma * centre[j as usize] * weight;
                 j += 1u32;
             }
 
+            // The centred covariance, then what the centring leaves over, which
+            // the prior's share of the subject curvature keeps from cancelling.
             let shrink = lambda * w_s / vw_s;
-            // What the centring leaves over, which the prior's share of the
-            // subject curvature keeps from cancelling.
             let mut a = 0u32;
             while a < nb {
                 let mut b = a;
                 while b < nb {
-                    vb2[(a * nb + b) as usize] +=
-                        gamma * a_bar[a as usize] * a_bar[b as usize] * p_sum * shrink;
+                    vb2[(a * nb + b) as usize] += gamma * spread[(a * nb + b) as usize]
+                        + gamma * centre[a as usize] * centre[b as usize] * weight * shrink;
                     b += 1u32;
                 }
                 a += 1u32;
@@ -542,6 +649,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 subject_start,
                 counts,
                 cells,
+                subject_ptr,
                 subject_total,
                 subject_scratch,
                 &new_beta,
@@ -549,13 +657,12 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 alpha,
                 lambda,
                 gamma,
-                ptr_lo,
-                ptr_hi,
                 n_genes,
                 n_req,
                 k,
                 q,
                 gene,
+                lane,
                 nb,
             );
             likdif = ll - ll_prev;
@@ -636,6 +743,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                         subject_start,
                         counts,
                         cells,
+                        subject_ptr,
                         subject_total,
                         subject_scratch,
                         &new_beta,
@@ -643,13 +751,12 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                         alpha,
                         lambda,
                         gamma,
-                        ptr_lo,
-                        ptr_hi,
                         n_genes,
                         n_req,
                         k,
                         q,
                         gene,
+                        lane,
                         nb,
                     );
                     likdif = ll - ll_prev;
@@ -720,13 +827,15 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 // Cell passes //
 /////////////////
 
-/// The penalised log-likelihood at `(beta, log_w)`.
+/// The penalised log-likelihood at `(beta, log_w)`, reduced across the plane.
 ///
-/// Accumulates in the four stages the CPU's `Workspace::evaluate` uses and in
-/// the same per-stage order: the linear term over the positive counts, the
-/// subject term, `-gamma` times the sum of `log(extb + gamma)` over all cells,
-/// and the count-weighted sum of the same logs over the positive counts. Each
-/// runs through a block accumulator; see [`SUM_BLOCK`].
+/// Accumulates the four terms of the CPU's `Workspace::evaluate`: the linear
+/// term over the positive counts, the subject term, `-gamma` times the sum of
+/// `log(extb + gamma)` over all cells, and the count-weighted sum of the same
+/// logs over the positive counts. One pass per subject covers the first, third
+/// and fourth, each lane summing its own chunk, then the plane, then the
+/// subjects: a three-level tree, which is what keeps a long `f32` sum honest
+/// here without compensation.
 ///
 /// ### Params
 ///
@@ -735,6 +844,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 /// * `subject_start` - Shared subject boundaries
 /// * `counts` - Concatenated positive counts
 /// * `cells` - Cell index of each count
+/// * `subject_ptr` - Start of each subject's run in each gene's counts
 /// * `subject_total` - Count total per subject, gene-minor
 /// * `subject_scratch` - Per-subject store holding the random effects
 /// * `beta` - Fixed effects to evaluate at
@@ -742,18 +852,17 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 /// * `alpha` - Shape of the gamma prior
 /// * `lambda` - Rate of the gamma prior
 /// * `gamma` - Cell-level negative binomial size
-/// * `ptr_lo` - Start of this gene's block in `counts`
-/// * `ptr_hi` - End of this gene's block in `counts`
 /// * `n_genes` - Genes resident on the device, the stride of `subject_total`
 /// * `n_req` - Requests in the launch, the stride of `subject_scratch`
 /// * `k` - Subjects
-/// * `q` - This thread's request
+/// * `q` - This plane's request
 /// * `gene` - The gene the request is for
+/// * `lane` - This thread's lane within the plane
 /// * `nb` - Design width
 ///
 /// ### Returns
 ///
-/// The penalised log-likelihood.
+/// The penalised log-likelihood, identical in every lane.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn evaluate_pass<F: Float>(
@@ -762,6 +871,7 @@ fn evaluate_pass<F: Float>(
     subject_start: &Tensor<u32>,
     counts: &Tensor<F>,
     cells: &Tensor<u32>,
+    subject_ptr: &Tensor<u32>,
     subject_total: &Tensor<F>,
     subject_scratch: &Tensor<F>,
     beta: &Array<F>,
@@ -769,72 +879,42 @@ fn evaluate_pass<F: Float>(
     alpha: F,
     lambda: F,
     gamma: F,
-    ptr_lo: u32,
-    ptr_hi: u32,
     n_genes: u32,
     n_req: u32,
     k: u32,
     q: u32,
     gene: u32,
+    lane: u32,
     nb: u32,
 ) -> F {
     let zero = F::new(0.0_f32);
 
-    // Stage one: `sum y_i (offset_i + x_i beta)` over the positive counts, with
-    // no random effect. The CPU adds the random effect to the linear predictor
-    // only after this term.
-    let mut acc = zero;
-    let mut block = zero;
-    let mut since_flush = 0u32;
-    let mut p = ptr_lo;
-    while p < ptr_hi {
-        let c = cells[p as usize];
-        let mut eta = log_offset[c as usize];
-        let mut j = 0u32;
-        while j < nb {
-            eta += design[(c * nb + j) as usize] * beta[j as usize];
-            j += 1u32;
-        }
-        block += eta * counts[p as usize];
-        since_flush += 1u32;
-        if since_flush == SUM_BLOCK {
-            acc += block;
-            block = zero;
-            since_flush = 0u32;
-        }
-        p += 1u32;
-    }
-    acc += block;
-
-    // Stage two: the random effect against each subject's count total.
-    let mut s = 0u32;
-    while s < k {
-        let log_w_s = subject_scratch[((slot_log_w * k + s) * n_req + q) as usize];
-        acc += log_w_s * subject_total[(s * n_genes + gene) as usize];
-        s += 1u32;
-    }
-
-    // Stages three and four share the pass over cells: the unweighted sum of
-    // `log(extb + gamma)` and the count-weighted one, kept apart so each keeps
-    // the CPU's own order.
+    let mut linear = zero;
     let mut phil = zero;
-    let mut phil_block = zero;
     let mut weighted = zero;
-    let mut weighted_block = zero;
+    let mut subject_term = zero;
     let mut sum_log_w = zero;
     let mut sum_w = zero;
 
-    let mut ptr = ptr_lo;
-    since_flush = 0u32;
-    s = 0u32;
+    let mut s = 0u32;
     while s < k {
         let log_w_s = subject_scratch[((slot_log_w * k + s) * n_req + q) as usize];
         sum_log_w += log_w_s;
         sum_w += F::exp(log_w_s);
+        subject_term += log_w_s * subject_total[(s * n_genes + gene) as usize];
 
         let begin = subject_start[s as usize];
         let end = subject_start[(s + 1u32) as usize];
-        let mut r = begin;
+        let sp_lo = subject_ptr[(gene * (k + 1u32) + s) as usize];
+        let sp_hi = subject_ptr[(gene * (k + 1u32) + s + 1u32) as usize];
+
+        // Dense over every cell for `log(extb + gamma)`, then sparse over the
+        // positive counts for the two count-weighted terms; both strided across
+        // the lanes. See the assembly in `opt_pml_gpu` for why.
+        let mut lin_lane = zero;
+        let mut phil_lane = zero;
+        let mut weighted_lane = zero;
+        let mut r = begin + lane;
         while r < end {
             let mut eta = log_offset[r as usize];
             let mut j = 0u32;
@@ -842,34 +922,98 @@ fn evaluate_pass<F: Float>(
                 eta += design[(r * nb + j) as usize] * beta[j as usize];
                 j += 1u32;
             }
-            let value = F::ln(F::exp(eta + log_w_s) + gamma);
-            phil_block += value;
-
-            if ptr < ptr_hi {
-                if cells[ptr as usize] == r {
-                    weighted_block += counts[ptr as usize] * value;
-                    ptr += 1u32;
-                }
-            }
-
-            since_flush += 1u32;
-            if since_flush == SUM_BLOCK {
-                phil += phil_block;
-                weighted += weighted_block;
-                phil_block = zero;
-                weighted_block = zero;
-                since_flush = 0u32;
-            }
-            r += 1u32;
+            phil_lane += F::ln(F::exp(eta + log_w_s) + gamma);
+            r += PLANE;
         }
+        let mut p = sp_lo + lane;
+        while p < sp_hi {
+            let c = cells[p as usize];
+            let y = counts[p as usize];
+            let mut eta = log_offset[c as usize];
+            let mut j = 0u32;
+            while j < nb {
+                eta += design[(c * nb + j) as usize] * beta[j as usize];
+                j += 1u32;
+            }
+            // The linear term takes the predictor without the random effect,
+            // which the subject term adds back.
+            lin_lane += eta * y;
+            weighted_lane += y * F::ln(F::exp(eta + log_w_s) + gamma);
+            p += PLANE;
+        }
+        linear += plane_sum(lin_lane);
+        phil += plane_sum(phil_lane);
+        weighted += plane_sum(weighted_lane);
         s += 1u32;
     }
-    phil += phil_block;
-    weighted += weighted_block;
 
+    let mut acc = linear + subject_term;
     acc -= gamma * phil;
     acc -= weighted;
     acc + (alpha * sum_log_w - lambda * sum_w)
+}
+
+/// Folds one observation into a lane's residual and weighted Welford state.
+///
+/// The per-cell body of the assembly, shared by the dense and the sparse pass.
+///
+/// ### Params
+///
+/// * `design` - Shared design, row-major
+/// * `cell` - The cell whose covariates the observation carries
+/// * `nb` - Design width
+/// * `d` - Contribution to the residual
+/// * `w` - Curvature weight of the observation
+/// * `resid` - The lane's residual sum
+/// * `db_lane` - The lane's fixed-effect gradient
+/// * `weight` - The lane's total curvature weight
+/// * `centre` - The lane's weighted mean of the covariates
+/// * `spread` - The lane's weighted centred cross-products, upper triangle
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn welford_step<F: Float>(
+    design: &Tensor<F>,
+    cell: u32,
+    nb: u32,
+    d: F,
+    w: F,
+    resid: &mut F,
+    db_lane: &mut Array<F>,
+    weight: &mut F,
+    centre: &mut Array<F>,
+    spread: &mut Array<F>,
+) {
+    let zero = F::new(0.0_f32);
+    *resid += d;
+    let mut j = 0u32;
+    while j < nb {
+        db_lane[j as usize] += design[(cell * nb + j) as usize] * d;
+        j += 1u32;
+    }
+    let before = *weight;
+    let next = before + w;
+    if next > zero {
+        let scale = w * before / next;
+        let mut a = 0u32;
+        while a < nb {
+            let da = design[(cell * nb + a) as usize] - centre[a as usize];
+            let mut b = a;
+            while b < nb {
+                let dbv = design[(cell * nb + b) as usize] - centre[b as usize];
+                spread[(a * nb + b) as usize] += scale * da * dbv;
+                b += 1u32;
+            }
+            a += 1u32;
+        }
+        let frac = w / next;
+        j = 0u32;
+        while j < nb {
+            let c = centre[j as usize];
+            centre[j as usize] = c + frac * (design[(cell * nb + j) as usize] - c);
+            j += 1u32;
+        }
+    }
+    *weight = next;
 }
 
 //////////////////
@@ -1074,7 +1218,15 @@ where
     }
 
     let limits = GpuLimits::from_client(client);
-    let blocks = (n_req as u32).div_ceil(GENE_WORKGROUP);
+    // Every reduction is a plane reduction; on a plane of any other width they
+    // would mix requests and return wrong answers without an error.
+    if !plane_uniform(PLANE, &limits) {
+        return Err(EdgeErrors::Gpu(format!(
+            "The GPU NEBULA kernel needs a plane of exactly {PLANE} lanes; this device reports {} to {}.",
+            limits.plane_size_min, limits.plane_size_max
+        )));
+    }
+    let blocks = (n_req as u32).div_ceil(PLANES_PER_CUBE);
     let (gx, gy) = grid_2d(blocks, &limits).map_err(|e| EdgeErrors::Gpu(e.to_string()))?;
     let count = checked_cube_count("opt_pml_gpu", gx, gy, 1, &limits)
         .map_err(|e| EdgeErrors::Gpu(e.to_string()))?;
@@ -1085,13 +1237,13 @@ where
                 opt_pml_gpu::launch_unchecked::<F, R>(
                     client,
                     count,
-                    CubeDim::new_1d(GENE_WORKGROUP),
+                    CubeDim::new_2d(PLANE, PLANES_PER_CUBE),
                     tensors.design.clone().into_tensor_arg(),
                     tensors.log_offset.clone().into_tensor_arg(),
                     tensors.subject_start.clone().into_tensor_arg(),
                     tensors.counts.clone().into_tensor_arg(),
                     tensors.cells.clone().into_tensor_arg(),
-                    tensors.gene_ptr.clone().into_tensor_arg(),
+                    tensors.subject_ptr.clone().into_tensor_arg(),
                     tensors.subject_total.clone().into_tensor_arg(),
                     tensors.request_gene.clone().into_tensor_arg(),
                     tensors.request_params.clone().into_tensor_arg(),
@@ -1148,8 +1300,9 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     pub counts: GpuTensor<R, F>,
     /// Cell index of each entry of `counts`.
     pub cells: GpuTensor<R, u32>,
-    /// Start of each gene's block in `counts`, length `n_genes + 1`.
-    pub gene_ptr: GpuTensor<R, u32>,
+    /// Start of each subject's run within each gene's block in `counts`,
+    /// `[gene * (k + 1) + s]`.
+    pub subject_ptr: GpuTensor<R, u32>,
     /// Count total per subject, `[s * n_genes + gene]`.
     pub subject_total: GpuTensor<R, F>,
     /// The gene each request is for.
