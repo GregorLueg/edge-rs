@@ -685,6 +685,31 @@ pub(crate) fn opt_pml_from(
     )
 }
 
+/// Largest move in a cell's linear predictor for which [`newton_finish`]
+/// updates the stored `exp` by series instead of taking it again.
+///
+/// The second sweep of a step sits one converged Newton step from the first, so
+/// `exp(eta + z) = exp(eta) exp(z)` with `z` of order `1e-4`. To fifth order the
+/// truncation is `z^6 / 720`, `1.4e-21` relative at this bound and far under an
+/// ulp, for five multiply-adds against one `exp`.
+#[cfg(feature = "gpu")]
+const EXP_SERIES_MAX: f64 = 1e-3;
+
+/// `exp(z)` to fifth order, for `|z|` within [`EXP_SERIES_MAX`].
+///
+/// ### Params
+///
+/// * `z` - The exponent
+///
+/// ### Returns
+///
+/// `exp(z)`, to well under an ulp.
+#[cfg(feature = "gpu")]
+#[inline(always)]
+fn exp_series(z: f64) -> f64 {
+    1.0 + z * (1.0 + z * (0.5 + z * (1.0 / 6.0 + z * (1.0 / 24.0 + z * (1.0 / 120.0)))))
+}
+
 /// Terms multiplied together before [`LogSum`] takes one logarithm.
 ///
 /// Each term is `extb + gamma`, bounded below by the cell-level size and in
@@ -811,12 +836,16 @@ pub(crate) struct NewtonFinish {
 ///   exact step from a point already converged to `f32`. Later steps, which a
 ///   few per cent of fits need, assemble their own
 ///
+/// * `stored` - Scratch the first sweep leaves each cell's `exp` in for the
+///   second; resized here, so one per thread serves every call
+///
 /// ### Returns
 ///
 /// The finished scalars, or `None` when a full step worsens the objective or
 /// leaves it not finite, or the budget runs out. Those need the backtracking
 /// search and the convergence codes, so the caller wants [`opt_pml_from`].
 #[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn newton_finish(
     data: &PmlData<'_>,
     beta: &[f64],
@@ -825,8 +854,61 @@ pub(crate) fn newton_finish(
     eps: f64,
     max_iter: usize,
     curvature: Option<DeviceCurvature<'_>>,
+    stored: &mut Vec<f64>,
 ) -> Option<NewtonFinish> {
-    let nb = data.n_beta();
+    match data.n_beta() {
+        1 => newton_finish_width::<1>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        2 => newton_finish_width::<2>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        3 => newton_finish_width::<3>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        4 => newton_finish_width::<4>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        5 => newton_finish_width::<5>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        6 => newton_finish_width::<6>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        7 => newton_finish_width::<7>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        8 => newton_finish_width::<8>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        _ => newton_finish_width::<0>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+    }
+}
+
+/// [`newton_finish`] for one design width.
+///
+/// The sweeps spend their time in loops over the design columns, a handful of
+/// iterations each. With the width a run-time value those loops are never
+/// unrolled and every access is bounds-checked; with it a constant they
+/// disappear into straight-line code.
+///
+/// `NB` is the design width, or zero to read it from the data, which is the
+/// path for designs wider than the device kernel is compiled for.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn newton_finish_width<const NB: usize>(
+    data: &PmlData<'_>,
+    beta: &[f64],
+    log_w: &[f64],
+    variance: &PmlVariance,
+    eps: f64,
+    max_iter: usize,
+    curvature: Option<DeviceCurvature<'_>>,
+    stored: &mut Vec<f64>,
+) -> Option<NewtonFinish> {
+    let nb = if NB == 0 { data.n_beta() } else { NB };
     let k = data.n_subjects();
     let gamma = variance.cell;
     let exps = variance.subject.exp();
@@ -866,6 +948,8 @@ pub(crate) fn newton_finish(
     let mut step_beta = vec![0.0; nb];
     let mut perm = vec![0usize; nb];
     let mut tmp = vec![0.0; nb];
+    // Every entry is written by the first sweep before the second reads it.
+    stored.resize(data.n_cells(), 0.0);
 
     for iterations in 1..=max_iter {
         let borrowed = curvature.filter(|_| iterations == 1);
@@ -907,6 +991,7 @@ pub(crate) fn newton_finish(
                     eta += row[j] * beta[j];
                 }
                 let extb = (eta + log_w[s]).exp();
+                stored[r] = extb;
                 let t = extb + gamma;
                 sum_log.push(t);
                 let inv = 1.0 / t;
@@ -985,6 +1070,7 @@ pub(crate) fn newton_finish(
             let new_log_w_s = log_w[s] + (dw[s] - acc) / vw[s];
             new_log_w[s] = new_log_w_s;
             let new_w_s = new_log_w_s.exp();
+            let step_log_w_s = new_log_w_s - log_w[s];
 
             let mut sum_log = LogSum::new();
             let mut linear = 0.0;
@@ -992,11 +1078,19 @@ pub(crate) fn newton_finish(
             let mut weight = 0.0;
             for r in data.subject_start[s]..data.subject_start[s + 1] {
                 let row = &data.design[r * nb..(r + 1) * nb];
-                let mut eta = data.offset[r];
+                let mut z = step_log_w_s;
                 for j in 0..nb {
-                    eta += row[j] * new_beta[j];
+                    z += row[j] * step_beta[j];
                 }
-                let extb = (eta + new_log_w_s).exp();
+                let extb = if z.abs() < EXP_SERIES_MAX {
+                    stored[r] * exp_series(z)
+                } else {
+                    let mut eta = data.offset[r];
+                    for j in 0..nb {
+                        eta += row[j] * new_beta[j];
+                    }
+                    (eta + new_log_w_s).exp()
+                };
                 let t = extb + gamma;
                 sum_log.push(t);
                 let inv = 1.0 / t;

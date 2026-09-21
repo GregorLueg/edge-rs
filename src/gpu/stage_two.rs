@@ -485,7 +485,7 @@ fn search_all<R: Runtime>(
                 .routes
                 .par_iter()
                 .zip(replies.par_iter())
-                .map(|(&(i, _, subject, cell), reply)| {
+                .map_init(Vec::new, |stored, (&(i, _, subject, cell), reply)| {
                     let l = &live[i];
                     let (counts, plan) = &genes[l.index];
                     let objective = variance_objective(
@@ -497,7 +497,7 @@ fn search_all<R: Runtime>(
                         l.fixed_cell,
                     );
                     let Some((fit, steps)) =
-                        finish_at_argmax(&l.pml, reply, subject, cell, objective.params)
+                        finish_at_argmax(&l.pml, reply, subject, cell, objective.params, stored)
                     else {
                         return (f64::INFINITY, 0);
                     };
@@ -701,6 +701,7 @@ fn launch_cohort<'a, R: Runtime>(
 /// * `subject` - nebula's `sigma[0]`
 /// * `cell` - The cell-level negative binomial size
 /// * `params` - The inner fit's knobs, including its Laplace order
+/// * `stored` - Per-thread scratch for [`newton_finish`]
 ///
 /// ### Returns
 ///
@@ -712,6 +713,7 @@ fn finish_at_argmax(
     subject: f64,
     cell: f64,
     params: PmlParams,
+    stored: &mut Vec<f64>,
 ) -> Option<(InnerFit, usize)> {
     if !reply.beta.iter().chain(&reply.log_w).all(|v| v.is_finite()) {
         return None;
@@ -732,6 +734,7 @@ fn finish_at_argmax(
                 cross: &reply.cross_block,
                 schur: &reply.information,
             }),
+            stored,
         )
     {
         return Some((
