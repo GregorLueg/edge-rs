@@ -218,6 +218,10 @@ pub struct ResidentBatch<R: Runtime> {
     subject_total: GpuTensor<R, f32>,
     /// Unweighted mean design row per subject, `[s * nb + j]`.
     subject_mean: GpuTensor<R, f32>,
+    /// Design columns that vary within some subject, the live ones first.
+    varying: GpuTensor<R, u32>,
+    /// How many entries of `varying` are live.
+    n_varying: usize,
     /// Per-subject scratch, sized for `capacity` requests.
     subject_scratch: GpuTensor<R, f32>,
     /// Cross-block scratch, sized for `capacity` requests.
@@ -363,15 +367,32 @@ impl<R: Runtime> ResidentBatch<R> {
             }
         }
 
-        // The anchor the kernel takes each subject's curvature moments about.
+        // The anchor the kernel takes each subject's curvature moments about. A
+        // column constant within a subject is anchored on its value, not on a
+        // mean that may round an ulp away from it, so its deviation is exactly
+        // zero; a column constant within every subject is left out of the
+        // moments altogether.
         let mut subject_mean = vec![0.0f32; k * nb];
+        let mut varies = vec![false; nb];
         for s in 0..k {
             let (lo, hi) = (subject_start[s], subject_start[s + 1]);
+            if lo == hi {
+                continue;
+            }
             for j in 0..nb {
-                let total: f64 = (lo..hi).map(|c| design[c * nb + j]).sum();
-                subject_mean[s * nb + j] = (total / (hi - lo).max(1) as f64) as f32;
+                let head = design[lo * nb + j];
+                if (lo..hi).all(|c| design[c * nb + j] == head) {
+                    subject_mean[s * nb + j] = head as f32;
+                } else {
+                    varies[j] = true;
+                    let total: f64 = (lo..hi).map(|c| design[c * nb + j]).sum();
+                    subject_mean[s * nb + j] = (total / (hi - lo) as f64) as f32;
+                }
             }
         }
+        let mut varying: Vec<u32> = (0..nb as u32).filter(|&j| varies[j as usize]).collect();
+        let n_varying = varying.len();
+        varying.resize(nb, 0);
 
         let err = |e: CubeclUtilsErrors| EdgeErrors::Gpu(e.to_string());
         let capacity = n_genes;
@@ -387,6 +408,8 @@ impl<R: Runtime> ResidentBatch<R> {
                 .map_err(err)?,
             subject_mean: GpuTensor::from_slice(&subject_mean, vec![k * nb], client)
                 .map_err(err)?,
+            varying: GpuTensor::from_slice(&varying, vec![nb], client).map_err(err)?,
+            n_varying,
             subject_scratch: GpuTensor::empty(vec![SUBJECT_SLOTS as usize * k * capacity], client)
                 .map_err(err)?,
             vwb_scratch: GpuTensor::empty(vec![k * nb * capacity], client).map_err(err)?,
@@ -546,6 +569,7 @@ impl<R: Runtime> ResidentBatch<R> {
             subject_ptr: self.subject_ptr.clone(),
             subject_total: self.subject_total.clone(),
             subject_mean: self.subject_mean.clone(),
+            varying: self.varying.clone(),
             request_gene: GpuTensor::from_slice(&request_gene, vec![n_req], client).map_err(err)?,
             request_params: GpuTensor::from_slice(&request_params, vec![3 * n_req], client)
                 .map_err(err)?,
@@ -575,6 +599,7 @@ impl<R: Runtime> ResidentBatch<R> {
             params.max_iter,
             params.max_backtrack,
             params.information,
+            self.n_varying,
             client,
         )?;
         // The read encodes its copy and submits the queue here, not when it is

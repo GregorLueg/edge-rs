@@ -210,6 +210,11 @@ pub const MAX_BETA_CAP: usize = 8;
 ///   `counts`, `[gene * (k + 1) + s]`
 /// * `subject_total` - Count total per subject, `[s * n_genes + gene]`
 /// * `subject_mean` - Unweighted mean design row per subject, `[s * nb + j]`
+/// * `varying` - The design columns that vary within some subject, first
+///   `n_varying` entries of `nb`. The others are constant within every subject,
+///   so their deviation from the anchor is exactly zero and they drop out of
+///   the curvature moments: an intercept and donor-level covariates cost the
+///   sweep nothing
 /// * `request_gene` - The gene each request is for
 /// * `request_params` - Three per request: the gamma prior's `alpha` and
 ///   `lambda`, then the cell-level size `gamma`
@@ -236,6 +241,7 @@ pub const MAX_BETA_CAP: usize = 8;
 ///   returns, which is what makes the reported information and log-determinant
 ///   belong to it. Zero skips that pass, a whole sweep over the cells, and
 ///   leaves both rows of the output at the last Newton step's values
+/// * `n_varying` - How many entries of `varying` are live
 /// * `nb_cap` - Comptime capacity of the `n_beta`-sized register arrays
 ///
 /// ### Grid mapping
@@ -254,6 +260,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     subject_ptr: &Tensor<u32>,
     subject_total: &Tensor<F>,
     subject_mean: &Tensor<F>,
+    varying: &Tensor<u32>,
     request_gene: &Tensor<u32>,
     request_params: &Tensor<F>,
     beta_init: &Tensor<F>,
@@ -269,6 +276,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     max_iter: u32,
     max_backtrack: u32,
     final_assembly: u32,
+    n_varying: u32,
     #[comptime] nb_cap: u32,
 ) {
     let q = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * PLANES_PER_CUBE + UNIT_POS_Y;
@@ -308,6 +316,12 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let mut anchor = Array::<F>::new(nb_cap as usize);
     let mut first = Array::<F>::new(nb_cap as usize);
     let mut delta = Array::<F>::new(nb_cap as usize);
+    let mut vary = Array::<u32>::new(nb_cap as usize);
+    let mut v = 0u32;
+    while v < n_varying {
+        vary[v as usize] = varying[v as usize];
+        v += 1u32;
+    }
     let mut spread = Array::<F>::new((nb_cap * nb_cap) as usize);
     let mut vb2 = Array::<F>::new((nb_cap * nb_cap) as usize);
 
@@ -434,6 +448,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 moment_step::<F>(
                     &x,
                     &anchor,
+                    &vary,
+                    n_varying,
                     nb,
                     d,
                     phi_c,
@@ -465,6 +481,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 moment_step::<F>(
                     &x,
                     &anchor,
+                    &vary,
+                    n_varying,
                     nb,
                     d,
                     phi_c,
@@ -487,43 +505,41 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 j += 1u32;
             }
             weight = plane_sum(weight);
-            j = 0u32;
-            while j < nb {
-                first[j as usize] = plane_sum(first[j as usize]);
-                j += 1u32;
-            }
-            let mut a = 0u32;
-            while a < nb {
-                let mut b = a;
-                while b < nb {
-                    let idx = (a * nb + b) as usize;
+            let mut va = 0u32;
+            while va < n_varying {
+                let a = vary[va as usize];
+                first[a as usize] = plane_sum(first[a as usize]);
+                let mut vb = va;
+                while vb < n_varying {
+                    let idx = (a * nb + vary[vb as usize]) as usize;
                     spread[idx] = plane_sum(spread[idx]);
-                    b += 1u32;
+                    vb += 1u32;
                 }
-                a += 1u32;
+                va += 1u32;
             }
 
             // Move the moments from the anchor to the weighted centre. The
             // anchor is the subject's unweighted mean, so what is subtracted is
             // the square of the gap between two means, small against the
             // spread; about the origin it would be the whole of the intercept.
+            j = 0u32;
+            while j < nb {
+                centre[j as usize] = anchor[j as usize];
+                j += 1u32;
+            }
             if weight > zero {
-                a = 0u32;
-                while a < nb {
+                va = 0u32;
+                while va < n_varying {
+                    let a = vary[va as usize];
                     let shift = first[a as usize] / weight;
-                    let mut b = a;
-                    while b < nb {
+                    let mut vb = va;
+                    while vb < n_varying {
+                        let b = vary[vb as usize];
                         spread[(a * nb + b) as usize] -= shift * first[b as usize];
-                        b += 1u32;
+                        vb += 1u32;
                     }
                     centre[a as usize] = anchor[a as usize] + shift;
-                    a += 1u32;
-                }
-            } else {
-                j = 0u32;
-                while j < nb {
-                    centre[j as usize] = anchor[j as usize];
-                    j += 1u32;
+                    va += 1u32;
                 }
             }
 
@@ -542,7 +558,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             // The centred covariance, then what the centring leaves over, which
             // the prior's share of the subject curvature keeps from cancelling.
             let shrink = lambda * w_s / vw_s;
-            a = 0u32;
+            let mut a = 0u32;
             while a < nb {
                 let mut b = a;
                 while b < nb {
@@ -1008,6 +1024,8 @@ fn evaluate_pass<F: Float>(
 ///
 /// * `x` - The design row of the cell the observation belongs to
 /// * `anchor` - The point the moments are taken about
+/// * `vary` - The columns that vary within some subject, in increasing order
+/// * `n_varying` - How many of them there are
 /// * `nb` - Design width
 /// * `d` - Contribution to the residual
 /// * `w` - Curvature weight of the observation
@@ -1017,12 +1035,14 @@ fn evaluate_pass<F: Float>(
 /// * `first` - The lane's weighted sum of `x - anchor`
 /// * `spread` - The lane's weighted cross-products of `x - anchor`, upper
 ///   triangle
-/// * `delta` - Scratch for `x - anchor`
+/// * `delta` - Scratch for `x - anchor` over the varying columns
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn moment_step<F: Float>(
     x: &Array<F>,
     anchor: &Array<F>,
+    vary: &Array<u32>,
+    n_varying: u32,
     nb: u32,
     d: F,
     w: F,
@@ -1038,19 +1058,26 @@ fn moment_step<F: Float>(
     let mut j = 0u32;
     while j < nb {
         db_lane[j as usize] += x[j as usize] * d;
-        delta[j as usize] = x[j as usize] - anchor[j as usize];
         j += 1u32;
     }
-    let mut a = 0u32;
-    while a < nb {
-        let wa = w * delta[a as usize];
+    let mut va = 0u32;
+    while va < n_varying {
+        let a = vary[va as usize];
+        delta[va as usize] = x[a as usize] - anchor[a as usize];
+        va += 1u32;
+    }
+    va = 0u32;
+    while va < n_varying {
+        let a = vary[va as usize];
+        let wa = w * delta[va as usize];
         first[a as usize] += wa;
-        let mut b = a;
-        while b < nb {
-            spread[(a * nb + b) as usize] += wa * delta[b as usize];
-            b += 1u32;
+        let mut vb = va;
+        while vb < n_varying {
+            let b = vary[vb as usize];
+            spread[(a * nb + b) as usize] += wa * delta[vb as usize];
+            vb += 1u32;
         }
-        a += 1u32;
+        va += 1u32;
     }
 }
 
@@ -1222,6 +1249,7 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
 /// * `max_backtrack` - Backtracking budget within one step
 /// * `final_assembly` - Whether to assemble once more at the returned point;
 ///   see [`fn@opt_pml_gpu`]
+/// * `n_varying` - How many entries of [`PmlGpuTensors::varying`] are live
 /// * `client` - CubeCL compute client
 ///
 /// ### Returns
@@ -1243,6 +1271,7 @@ pub fn launch_opt_pml<R, F>(
     max_iter: u32,
     max_backtrack: u32,
     final_assembly: bool,
+    n_varying: usize,
     client: &ComputeClient<R>,
 ) -> Result<(), EdgeErrors>
 where
@@ -1287,6 +1316,7 @@ where
                     tensors.subject_ptr.clone().into_tensor_arg(),
                     tensors.subject_total.clone().into_tensor_arg(),
                     tensors.subject_mean.clone().into_tensor_arg(),
+                    tensors.varying.clone().into_tensor_arg(),
                     tensors.request_gene.clone().into_tensor_arg(),
                     tensors.request_params.clone().into_tensor_arg(),
                     tensors.beta_init.clone().into_tensor_arg(),
@@ -1302,6 +1332,7 @@ where
                     max_iter,
                     max_backtrack,
                     u32::from(final_assembly),
+                    n_varying as u32,
                     $cap,
                 );
             }
@@ -1348,6 +1379,9 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     pub subject_total: GpuTensor<R, F>,
     /// Unweighted mean design row per subject, `[s * nb + j]`.
     pub subject_mean: GpuTensor<R, F>,
+    /// Design columns that vary within some subject, length `nb`, the live ones
+    /// first and in increasing order.
+    pub varying: GpuTensor<R, u32>,
     /// The gene each request is for.
     pub request_gene: GpuTensor<R, u32>,
     /// `alpha`, `lambda` and `gamma` per request, `[i * n_req + q]`.
