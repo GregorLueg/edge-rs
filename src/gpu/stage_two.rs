@@ -12,7 +12,7 @@
 //! * **Stage two** runs as one `StageTwoSearch` per gene,
 //!   the same state machine the CPU path drives. Each round, every live search
 //!   asks for its next points and all of them go out as one device launch of
-//!   [`ResidentBatch::solve`]. The device finds each penalised fit's optimum;
+//!   [`ResidentBatch::submit`]. The device finds each penalised fit's optimum;
 //!   the host then finishes that fit in `f64` from the device's point and
 //!   assembles the profile objective. Nelder-Mead, the polish least squares and
 //!   the objective never leave the host.
@@ -80,6 +80,12 @@
 //! requests, so the total device work is the total number of evaluations, not
 //! the slowest gene's count times the gene count. A polish stencil goes out as
 //! all of its points in one round.
+//!
+//! The rounds are not strictly lockstep. The device sits idle while the host
+//! finishes a round in `f64` and the host while the device fits, so where it
+//! pays the searches run as two cohorts that leapfrog: one on the device while
+//! the other is being finished. Where it pays is decided at run time; see
+//! `PROBE_ROUNDS`. The cohorts never change what a search is told, only when.
 
 use std::time::{Duration, Instant};
 
@@ -88,7 +94,7 @@ use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
 use crate::gpu::nebula_gpu::{
-    GpuGene, GpuSolveParams, PmlReply, PmlRequest, ResidentBatch, SolveTiming,
+    GpuGene, GpuSolveParams, PendingSolve, PmlReply, PmlRequest, ResidentBatch, SolveTiming,
 };
 use crate::gpu::pml_kernel::F32_NOISE_SCALE;
 use crate::numeric::gamma::ln_gamma;
@@ -106,6 +112,35 @@ use crate::sc::ptmg::{GeneCounts, positive_indices};
 
 /// Environment variable that switches on the per-phase timing report.
 const TIMING_ENV: &str = "EDGE_RS_GPU_TIMING";
+
+/// Launches kept in flight at once, each carrying its own share of the searches.
+///
+/// Two is what it takes for the device to run one cohort while the host
+/// finishes the other in `f64`. The two costs are of the same order on every
+/// shape measured, so a third cohort would only queue behind the second.
+const COHORTS: usize = 2;
+
+/// Rounds, after the first, run as one cohort to decide whether to split.
+///
+/// A launch costs the device about the same for 250 fits as for 500: measured
+/// 75 ms either way at eight coefficients and 20000 cells, because what a
+/// launch costs is one fit's serial walk over the cells and the device has
+/// lanes to spare. Splitting the searches in two therefore doubles the device's
+/// launches, and a search then advances once per two launches instead of once
+/// per launch plus finish. That wins exactly when a round's `f64` finish takes
+/// longer than its launch, which depends on the design width, the cell count
+/// and the machine: measured 1.25x and 1.16x end to end at three coefficients
+/// with 20000 and 100000 cells, and nothing at eight, where the launch is the
+/// longer of the two. So the two are timed rather than assumed.
+const PROBE_ROUNDS: usize = 8;
+
+/// Running searches below which the cohorts merge into one.
+///
+/// A launch of a few dozen fits costs the device its fixed latency, about 19 ms
+/// at 20000 cells, whatever it carries, and the host finishes it in a
+/// millisecond or two. There is nothing left to overlap then, and two cohorts
+/// would make every straggler wait out the other cohort's launch as well.
+const MERGE_BELOW: usize = 64;
 
 /// Bins of the Newton-step histograms; the last one collects everything above.
 const STEP_BINS: usize = 12;
@@ -167,10 +202,10 @@ impl Timing {
         );
         if let Some(t) = solve {
             eprintln!(
-                "  solve: staging {:.2} s, device {:.2} s, read-back {:.2} s",
+                "  solve: staging {:.2} s, blocked on the device {:.2} s, scatter {:.2} s",
                 secs(t.staging),
-                secs(t.device),
-                secs(t.read_back),
+                secs(t.blocked),
+                secs(t.scatter),
             );
         }
         eprintln!(
@@ -412,104 +447,117 @@ fn search_all<R: Runtime>(
         full: true,
     };
 
-    loop {
-        // -- Gather: every live search's points, as device requests. Points
-        //    outside the domain are infinite without a fit. --
-        let started = Instant::now();
-        let mut requests = Vec::new();
-        let mut routes: Vec<(usize, usize, f64, f64)> = Vec::new();
-        let mut values: Vec<Vec<f64>> = vec![Vec::new(); live.len()];
-        let mut any = false;
-        for (i, l) in live.iter().enumerate() {
-            let Some(points) = l.search.ask() else {
-                continue;
-            };
-            any = true;
-            values[i] = vec![f64::INFINITY; points.len()];
-            let (counts, plan) = &genes[l.index];
-            let objective = variance_objective(
-                shared,
-                &l.pml,
-                &plan.beta_start,
-                counts,
-                l.search.order(),
-                l.fixed_cell,
-            );
-            for (p, x) in points.iter().enumerate() {
-                if let Some((subject, cell, beta_init)) = objective.request(x) {
-                    let (beta_init, log_w_init) = match &l.warm {
-                        Some((beta, log_w)) => (beta.clone(), log_w.clone()),
-                        None => (beta_init, Vec::new()),
+    // Two cohorts leapfrog: while the host finishes one cohort's fits in `f64`,
+    // the device is already running the other's. Whether that pays is read off
+    // the first rounds, which run as one cohort; see `PROBE_ROUNDS`.
+    let mut split = false;
+    let mut probed = 0usize;
+    let mut probe_blocked = Duration::ZERO;
+    let mut probe_finish = Duration::ZERO;
+    let mut in_flight = vec![false; live.len()];
+    let mut flights: [Option<Flight<'_>>; COHORTS] = std::array::from_fn(|_| None);
+    for (cohort, flight) in flights.iter_mut().enumerate() {
+        *flight = launch_cohort(
+            shared,
+            genes,
+            &live,
+            &mut in_flight,
+            cohort,
+            split,
+            &mut resident,
+            &solve_params,
+            client,
+            timing.as_deref_mut(),
+        )?;
+    }
+    let mut cohort = 0;
+    while flights.iter().any(Option::is_some) || live.iter().any(|l| l.search.ask().is_some()) {
+        if let Some(flight) = flights[cohort].take() {
+            let started = Instant::now();
+            let replies = resident.collect(flight.pending)?;
+            let solved = Instant::now();
+
+            // -- Scatter: assemble the profile objective in f64, in parallel,
+            //    then hand each search its values. --
+            let assembled: Vec<(f64, usize)> = flight
+                .routes
+                .par_iter()
+                .zip(replies.par_iter())
+                .map(|(&(i, _, subject, cell), reply)| {
+                    let l = &live[i];
+                    let (counts, plan) = &genes[l.index];
+                    let objective = variance_objective(
+                        shared,
+                        &l.pml,
+                        &plan.beta_start,
+                        counts,
+                        l.search.order(),
+                        l.fixed_cell,
+                    );
+                    let Some((fit, steps)) =
+                        finish_at_argmax(&l.pml, reply, subject, cell, objective.params)
+                    else {
+                        return (f64::INFINITY, 0);
                     };
-                    requests.push(PmlRequest {
-                        gene: l.resident,
-                        subject,
-                        cell,
-                        beta_init,
-                        log_w_init,
-                    });
-                    routes.push((i, p, subject, cell));
+                    (
+                        objective.assemble(subject, cell, &fit, histogram_tail(&l.tail, cell)),
+                        steps,
+                    )
+                })
+                .collect();
+            let finished = Instant::now();
+            // The first round is left out: it starts cold and is not what the
+            // rest look like.
+            if probed <= PROBE_ROUNDS {
+                if probed > 0 {
+                    probe_blocked += solved - started;
+                    probe_finish += finished - solved;
+                }
+                split = probed == PROBE_ROUNDS && probe_finish > probe_blocked;
+                probed += 1;
+            }
+
+            let mut values = flight.values;
+            for ((&(i, p, _, _), &(v, _)), reply) in
+                flight.routes.iter().zip(&assembled).zip(&replies)
+            {
+                let slot = values
+                    .binary_search_by_key(&i, |(index, _)| *index)
+                    .expect("every route belongs to a search of its own flight");
+                values[slot].1[p] = v;
+                if v.is_finite() && live[i].warm.is_none() {
+                    live[i].warm = Some((reply.beta.clone(), reply.log_w.clone()));
+                }
+            }
+            for (i, v) in values {
+                live[i].search.tell(&v);
+                in_flight[i] = false;
+            }
+            if let Some(t) = timing.as_deref_mut() {
+                t.solve += solved - started;
+                t.finish += finished - solved;
+                t.tell += finished.elapsed();
+                for (reply, &(_, steps)) in replies.iter().zip(&assembled) {
+                    t.device_steps[(reply.iterations as usize).min(STEP_BINS - 1)] += 1;
+                    t.finish_steps[steps.min(STEP_BINS - 1)] += 1;
                 }
             }
         }
-        if !any {
-            break;
-        }
-
-        let gathered = Instant::now();
-        let replies = resident.solve(&requests, &solve_params, client)?;
-        let solved = Instant::now();
-
-        // -- Scatter: assemble the profile objective in f64, in parallel, then
-        //    hand each search its values. --
-        let assembled: Vec<(f64, usize)> = routes
-            .par_iter()
-            .zip(replies.par_iter())
-            .map(|(&(i, _, subject, cell), reply)| {
-                let l = &live[i];
-                let (counts, plan) = &genes[l.index];
-                let objective = variance_objective(
-                    shared,
-                    &l.pml,
-                    &plan.beta_start,
-                    counts,
-                    l.search.order(),
-                    l.fixed_cell,
-                );
-                let Some((fit, steps)) =
-                    finish_at_argmax(&l.pml, reply, subject, cell, objective.params)
-                else {
-                    return (f64::INFINITY, 0);
-                };
-                (
-                    objective.assemble(subject, cell, &fit, histogram_tail(&l.tail, cell)),
-                    steps,
-                )
-            })
-            .collect();
-        let finished = Instant::now();
-        for ((&(i, p, _, _), &(v, _)), reply) in routes.iter().zip(&assembled).zip(&replies) {
-            values[i][p] = v;
-            if v.is_finite() && live[i].warm.is_none() {
-                live[i].warm = Some((reply.beta.clone(), reply.log_w.clone()));
-            }
-        }
-        for (l, v) in live.iter_mut().zip(values) {
-            if l.search.ask().is_some() {
-                l.search.tell(&v);
-            }
-        }
-        if let Some(t) = timing.as_deref_mut() {
-            t.gather += gathered - started;
-            t.solve += solved - gathered;
-            t.finish += finished - solved;
-            t.tell += finished.elapsed();
-            t.requests.push(requests.len());
-            for (reply, &(_, steps)) in replies.iter().zip(&assembled) {
-                t.device_steps[(reply.iterations as usize).min(STEP_BINS - 1)] += 1;
-                t.finish_steps[steps.min(STEP_BINS - 1)] += 1;
-            }
-        }
+        // Tried even when nothing of this cohort's came back: once the cohorts
+        // merge, the searches the other one hands over have nowhere else to go.
+        flights[cohort] = launch_cohort(
+            shared,
+            genes,
+            &live,
+            &mut in_flight,
+            cohort,
+            split,
+            &mut resident,
+            &solve_params,
+            client,
+            timing.as_deref_mut(),
+        )?;
+        cohort = (cohort + 1) % COHORTS;
     }
 
     let solve_timing = resident.timing();
@@ -517,6 +565,118 @@ fn search_all<R: Runtime>(
         refits[l.index] = Some(l.search.result());
     }
     Ok((refits, solve_timing))
+}
+
+/// One cohort's launch in flight.
+struct Flight<'a> {
+    /// The device work.
+    pending: PendingSolve<'a>,
+    /// Per request: the search, the point within its batch, and the two variance
+    /// components it was asked at.
+    routes: Vec<(usize, usize, f64, f64)>,
+    /// Per search in the flight, in increasing search order: its values, infinite
+    /// until a fit fills them in.
+    values: Vec<(usize, Vec<f64>)>,
+}
+
+/// Gathers a cohort's next points and launches them.
+///
+/// A search belongs to the cohort of its index while `split` is set and at
+/// least [`MERGE_BELOW`] searches are running, and to cohort zero otherwise.
+/// Points outside the domain are infinite without a fit.
+///
+/// ### Params
+///
+/// * `shared` - The inputs common to every gene
+/// * `genes` - Every kept gene's counts and plan
+/// * `live` - Every search
+/// * `in_flight` - Which searches are waiting on a launch; updated
+/// * `cohort` - The cohort to launch
+/// * `split` - Whether the searches are split across the cohorts at all
+/// * `resident` - The resident genes
+/// * `solve_params` - Knobs shared by every request
+/// * `client` - CubeCL compute client
+/// * `timing` - Where to book the phases, when the report is on
+///
+/// ### Returns
+///
+/// The flight, or `None` when no search of the cohort is asking.
+#[allow(clippy::too_many_arguments)]
+fn launch_cohort<'a, R: Runtime>(
+    shared: &Shared<'_>,
+    genes: &[(GeneCounts, GenePlan)],
+    live: &[Live<'_>],
+    in_flight: &mut [bool],
+    cohort: usize,
+    split: bool,
+    resident: &mut ResidentBatch<R>,
+    solve_params: &GpuSolveParams,
+    client: &'a ComputeClient<R>,
+    timing: Option<&mut Timing>,
+) -> Result<Option<Flight<'a>>, EdgeErrors> {
+    let started = Instant::now();
+    let running = live.iter().filter(|l| l.search.ask().is_some()).count();
+    let merged = !split || running < MERGE_BELOW;
+
+    let mut requests = Vec::new();
+    let mut routes = Vec::new();
+    let mut values = Vec::new();
+    for (i, l) in live.iter().enumerate() {
+        let mine = if merged {
+            cohort == 0
+        } else {
+            i % COHORTS == cohort
+        };
+        if in_flight[i] || !mine {
+            continue;
+        }
+        let Some(points) = l.search.ask() else {
+            continue;
+        };
+        in_flight[i] = true;
+        values.push((i, vec![f64::INFINITY; points.len()]));
+        let (counts, plan) = &genes[l.index];
+        let objective = variance_objective(
+            shared,
+            &l.pml,
+            &plan.beta_start,
+            counts,
+            l.search.order(),
+            l.fixed_cell,
+        );
+        for (p, x) in points.iter().enumerate() {
+            if let Some((subject, cell, beta_init)) = objective.request(x) {
+                let (beta_init, log_w_init) = match &l.warm {
+                    Some((beta, log_w)) => (beta.clone(), log_w.clone()),
+                    None => (beta_init, Vec::new()),
+                };
+                requests.push(PmlRequest {
+                    gene: l.resident,
+                    subject,
+                    cell,
+                    beta_init,
+                    log_w_init,
+                });
+                routes.push((i, p, subject, cell));
+            }
+        }
+    }
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    let gathered = Instant::now();
+    let pending = resident.submit(&requests, solve_params, client)?;
+    if let Some(t) = timing {
+        t.gather += gathered - started;
+        t.solve += gathered.elapsed();
+        t.requests.push(requests.len());
+    }
+    Ok(Some(Flight {
+        pending,
+        routes,
+        values,
+    }))
 }
 
 /// The four scalars the objective reads: the CPU's fit, started from the

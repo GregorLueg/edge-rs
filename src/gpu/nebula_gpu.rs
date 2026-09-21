@@ -27,7 +27,12 @@
 
 use std::time::{Duration, Instant};
 
+use std::future::Future;
+use std::pin::Pin;
+
+use cubecl::bytes::Bytes;
 use cubecl::prelude::*;
+use cubecl::server::ServerError;
 use cubecl_utils_rs::prelude::*;
 use rayon::prelude::*;
 
@@ -137,15 +142,32 @@ pub struct GpuSolveParams {
     pub full: bool,
 }
 
-/// Wall clock inside [`ResidentBatch::solve`], accumulated over launches.
+/// Wall clock inside [`ResidentBatch::submit`] and [`ResidentBatch::collect`],
+/// accumulated over launches.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SolveTiming {
-    /// Request staging on the host and its upload.
+    /// Request staging on the host, its upload and the launch.
     pub staging: Duration,
-    /// Launch to the end of the device queue.
-    pub device: Duration,
-    /// Read-back and the scatter into replies.
-    pub read_back: Duration,
+    /// Blocked in [`ResidentBatch::collect`] on the device and the copy back.
+    pub blocked: Duration,
+    /// The scatter into replies.
+    pub scatter: Duration,
+}
+
+/// A launch in flight: what [`ResidentBatch::submit`] hands back and
+/// [`ResidentBatch::collect`] redeems.
+///
+/// The read-back is already queued behind the kernel, so a later launch does
+/// not hold this one's results up and the host can finish one batch while the
+/// device runs the next.
+pub struct PendingSolve<'a> {
+    /// The packed output on its way back. The read borrows the client it was
+    /// queued on.
+    out: Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ServerError>> + Send + 'a>>,
+    /// Requests in the launch.
+    n_req: usize,
+    /// Whether the fitted point and the information are wanted.
+    full: bool,
 }
 
 //////////////////
@@ -358,10 +380,7 @@ impl<R: Runtime> ResidentBatch<R> {
         })
     }
 
-    /// Switches on per-phase timing of every later [`Self::solve`].
-    ///
-    /// A timed solve waits for the device queue to drain before it reads back,
-    /// so the launch and the copy are told apart; an untimed one does not.
+    /// Switches on per-phase timing of every later launch.
     pub fn time_solves(&mut self) {
         self.timing = Some(SolveTiming::default());
     }
@@ -386,8 +405,8 @@ impl<R: Runtime> ResidentBatch<R> {
 
     /// Runs a batch of penalised fits against the resident genes.
     ///
-    /// Only the per-request scalars and starting points are uploaded; the
-    /// counts, the design and the offsets stay where they are.
+    /// [`Self::submit`] then [`Self::collect`], for a caller with nothing to do
+    /// in between.
     ///
     /// ### Params
     ///
@@ -405,9 +424,39 @@ impl<R: Runtime> ResidentBatch<R> {
         params: &GpuSolveParams,
         client: &ComputeClient<R>,
     ) -> Result<Vec<PmlReply>, EdgeErrors> {
+        let pending = self.submit(requests, params, client)?;
+        self.collect(pending)
+    }
+
+    /// Launches a batch of penalised fits and queues its read-back.
+    ///
+    /// Only the per-request scalars and starting points are uploaded; the
+    /// counts, the design and the offsets stay where they are. Returns as soon
+    /// as the work is queued. Launches run in submission order on the device,
+    /// so several may be in flight against the one scratch.
+    ///
+    /// ### Params
+    ///
+    /// * `requests` - The fits to run; any gene may appear more than once
+    /// * `params` - Knobs shared by every request
+    /// * `client` - CubeCL compute client
+    ///
+    /// ### Returns
+    ///
+    /// The launch in flight, or [`EdgeErrors`] if a request is out of range.
+    pub fn submit<'a>(
+        &mut self,
+        requests: &[PmlRequest],
+        params: &GpuSolveParams,
+        client: &'a ComputeClient<R>,
+    ) -> Result<PendingSolve<'a>, EdgeErrors> {
         let n_req = requests.len();
         if n_req == 0 {
-            return Ok(Vec::new());
+            return Ok(PendingSolve {
+                out: Box::pin(async { Ok(Vec::new()) }),
+                n_req,
+                full: params.full,
+            });
         }
         let (n_genes, k, nb) = (self.n_genes, self.k, self.nb);
         let err = |e: CubeclUtilsErrors| EdgeErrors::Gpu(e.to_string());
@@ -495,7 +544,6 @@ impl<R: Runtime> ResidentBatch<R> {
                 .map_err(err)?,
         };
 
-        let staged = Instant::now();
         launch_opt_pml::<R, f32>(
             &tensors,
             n_genes,
@@ -506,14 +554,41 @@ impl<R: Runtime> ResidentBatch<R> {
             params.max_backtrack,
             client,
         )?;
-        if self.timing.is_some() {
-            cubecl::future::block_on(client.sync()).map_err(|e| EdgeErrors::Gpu(e.to_string()))?;
+        // The read encodes its copy and submits the queue here, not when it is
+        // awaited, which is what lets the next launch go in behind it.
+        let out = Box::pin(client.read_async(vec![tensors.out.handle().clone()]));
+        if let Some(t) = self.timing.as_mut() {
+            t.staging += started.elapsed();
         }
-        let launched = Instant::now();
+        Ok(PendingSolve {
+            out,
+            n_req,
+            full: params.full,
+        })
+    }
 
-        let out = tensors.out.read(client).map_err(err)?;
+    /// Waits for a launch and scatters its output into replies.
+    ///
+    /// ### Params
+    ///
+    /// * `pending` - The launch, from [`Self::submit`]
+    ///
+    /// ### Returns
+    ///
+    /// One reply per request, in request order.
+    pub fn collect(&mut self, pending: PendingSolve<'_>) -> Result<Vec<PmlReply>, EdgeErrors> {
+        let (n_req, k, nb) = (pending.n_req, self.k, self.nb);
+        let header = OUT_HEADER as usize;
+        let started = Instant::now();
+        let bytes =
+            cubecl::future::block_on(pending.out).map_err(|e| EdgeErrors::Gpu(e.to_string()))?;
+        let waited = Instant::now();
+        let Some(bytes) = bytes.first() else {
+            return Ok(Vec::new());
+        };
+        let out = f32::from_bytes(bytes);
         let rows = |first: usize, n: usize, q: usize| -> Vec<f64> {
-            if params.full {
+            if pending.full {
                 (first..first + n)
                     .map(|r| out[r * n_req + q] as f64)
                     .collect()
@@ -534,9 +609,8 @@ impl<R: Runtime> ResidentBatch<R> {
             })
             .collect();
         if let Some(t) = self.timing.as_mut() {
-            t.staging += staged - started;
-            t.device += launched - staged;
-            t.read_back += launched.elapsed();
+            t.blocked += waited - started;
+            t.scatter += waited.elapsed();
         }
         Ok(replies)
     }
