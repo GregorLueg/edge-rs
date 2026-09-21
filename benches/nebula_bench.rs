@@ -30,7 +30,9 @@
 //! ```
 //!
 //! `NEBULA_BENCH_GENES`, `NEBULA_BENCH_CELLS`, `NEBULA_BENCH_SUBJECTS` and
-//! `NEBULA_BENCH_COEF` change the shape. `NEBULA_BENCH_ONLY=ptmg,pml` runs a
+//! `NEBULA_BENCH_COEF` change the shape. `NEBULA_BENCH_INTERCEPT_SHIFT` moves
+//! every gene's baseline on the log scale, which sets the density, and
+//! `NEBULA_BENCH_IMBALANCE` is the ratio of the largest subject to the smallest. `NEBULA_BENCH_ONLY=ptmg,pml` runs a
 //! comma-separated subset of the cells. `NEBULA_BENCH_SWEEP=1` adds a cell-count
 //! sweep of the two inner kernels, which is the scaling a GPU port cares about.
 
@@ -43,7 +45,7 @@ use rand::rngs::SmallRng;
 use rand_distr::{Distribution, Gamma, LogNormal, Poisson};
 
 use edge_rs::prelude::*;
-use edge_rs::sc::nebula::{NebulaMethod, NebulaParams, nebula_sparse};
+use edge_rs::sc::nebula::{NebulaFit, NebulaMethod, NebulaParams, nebula_sparse};
 use edge_rs::sc::pml::{PmlData, PmlParams, PmlVariance, opt_pml};
 use edge_rs::sc::ptmg::{GeneData, ptmg_value_and_gradient};
 
@@ -118,24 +120,36 @@ struct Problem {
 /// * `n_cells` - Number of cells, split as evenly as possible across subjects
 /// * `n_subjects` - Number of subjects
 /// * `n_coef` - Design width, at least two: intercept plus a group column
+/// * `intercept_shift` - Added to every gene's log baseline; negative is sparser
+/// * `imbalance` - Largest subject over smallest, sizes geometric in between;
+///   one is balanced
 ///
 /// ### Returns
 ///
 /// The assembled [`Problem`].
-fn make_problem(n_genes: usize, n_cells: usize, n_subjects: usize, n_coef: usize) -> Problem {
+fn make_problem(
+    n_genes: usize,
+    n_cells: usize,
+    n_subjects: usize,
+    n_coef: usize,
+    intercept_shift: f64,
+    imbalance: f64,
+) -> Problem {
     assert!(n_coef >= 2, "the design needs an intercept and a group");
     let mut rng = SmallRng::seed_from_u64(SEED);
 
     // Cells blocked by subject, sizes uneven so the ragged-block path is live.
     let mut subject_id = Vec::with_capacity(n_cells);
-    let base = n_cells / n_subjects;
+    let share: Vec<f64> = (0..n_subjects)
+        .map(|s| imbalance.powf(s as f64 / (n_subjects - 1).max(1) as f64))
+        .collect();
+    let share_total: f64 = share.iter().sum();
     let mut assigned = 0;
-    for s in 0..n_subjects {
-        let extra = if s < n_cells % n_subjects { 1 } else { 0 };
+    for (s, &part) in share.iter().enumerate() {
         let size = if s + 1 == n_subjects {
             n_cells - assigned
         } else {
-            base + extra
+            ((n_cells as f64 * part / share_total).round() as usize).max(1)
         };
         subject_id.extend(std::iter::repeat_n(s, size));
         assigned += size;
@@ -166,7 +180,7 @@ fn make_problem(n_genes: usize, n_cells: usize, n_subjects: usize, n_coef: usize
 
     let mut beta = vec![0.0; n_coef];
     for _ in 0..n_genes {
-        beta[0] = rng.random_range(-2.0..1.5);
+        beta[0] = rng.random_range(-2.0..1.5) + intercept_shift;
         for b in beta.iter_mut().skip(1) {
             *b = rng.random_range(-0.5..0.5);
         }
@@ -331,6 +345,23 @@ fn env_usize(key: &str, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
+/// Reads an `f64` from the environment, falling back to a default.
+///
+/// ### Params
+///
+/// * `key` - Environment variable name
+/// * `fallback` - Value to use when unset or unparseable
+///
+/// ### Returns
+///
+/// The resolved value.
+fn env_f64(key: &str, fallback: f64) -> f64 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(fallback)
+}
+
 /// Whether a named cell should run, given `NEBULA_BENCH_ONLY`.
 ///
 /// ### Params
@@ -356,13 +387,22 @@ fn main() {
     let n_cells = env_usize("NEBULA_BENCH_CELLS", DEFAULT_CELLS);
     let n_subjects = env_usize("NEBULA_BENCH_SUBJECTS", DEFAULT_SUBJECTS);
     let n_coef = env_usize("NEBULA_BENCH_COEF", DEFAULT_COEF);
+    let intercept_shift = env_f64("NEBULA_BENCH_INTERCEPT_SHIFT", 0.0);
+    let imbalance = env_f64("NEBULA_BENCH_IMBALANCE", 1.0);
 
     println!(
-        "\nNEBULA bench: {n_genes} genes, {n_cells} cells, {n_subjects} subjects, {n_coef} coefficients"
+        "\nNEBULA bench: {n_genes} genes, {n_cells} cells, {n_subjects} subjects, {n_coef} coefficients, intercept shift {intercept_shift}, imbalance {imbalance}"
     );
 
     let build = Instant::now();
-    let problem = make_problem(n_genes, n_cells, n_subjects, n_coef);
+    let problem = make_problem(
+        n_genes,
+        n_cells,
+        n_subjects,
+        n_coef,
+        intercept_shift,
+        imbalance,
+    );
     let nnz = problem.counts.data.len();
     println!(
         "generated in {:.1} s, {} nnz, {:.1}% dense\n",
@@ -376,6 +416,9 @@ fn main() {
         let gene = one_gene(&problem, g);
         inner_kernels(&problem, &gene, "");
     }
+
+    let mut cpu_ln = None;
+    let mut cpu_hl = None;
 
     if selected("ln") {
         let t = Instant::now();
@@ -392,8 +435,9 @@ fn main() {
             "ln (end to end)",
             t.elapsed(),
             1,
-            &format!("{} genes kept", fit.gene_index.len()),
+            &format!("{} genes kept, {}", fit.gene_index.len(), checksum(&fit)),
         );
+        cpu_ln = Some(fit);
     }
 
     if selected("hl") {
@@ -415,17 +459,20 @@ fn main() {
             "hl (end to end)",
             t.elapsed(),
             1,
-            &format!("{} genes kept", fit.gene_index.len()),
+            &format!("{} genes kept, {}", fit.gene_index.len(), checksum(&fit)),
         );
+        cpu_hl = Some(fit);
     }
 
     #[cfg(feature = "gpu")]
-    gpu_cells(&problem);
+    gpu_cells(&problem, cpu_ln.as_ref(), cpu_hl.as_ref());
+    #[cfg(not(feature = "gpu"))]
+    let _ = (cpu_ln, cpu_hl);
 
     if env::var("NEBULA_BENCH_SWEEP").is_ok() {
         println!("\ncell-count sweep of the inner kernels:");
         for &cells in SWEEP_CELLS.iter() {
-            let p = make_problem(8, cells, n_subjects, n_coef);
+            let p = make_problem(8, cells, n_subjects, n_coef, intercept_shift, imbalance);
             let g = median_gene(&p);
             let gene = one_gene(&p, g);
             inner_kernels(&p, &gene, &format!("n_cells = {cells}"));
@@ -503,6 +550,59 @@ fn inner_kernels(problem: &Problem, gene: &OneGene, note: &str) {
     }
 }
 
+/// Sums of the fitted quantities, to tell two runs of one path apart.
+///
+/// ### Params
+///
+/// * `fit` - The fit
+///
+/// ### Returns
+///
+/// The sums of the coefficients and of the two overdispersions, formatted.
+fn checksum(fit: &NebulaFit) -> String {
+    format!(
+        "sums beta {:.9} sigma2 {:.9} phi {:.9}",
+        fit.coefficients.iter().sum::<f64>(),
+        fit.subject_overdispersion.iter().sum::<f64>(),
+        fit.cell_overdispersion.iter().sum::<f64>(),
+    )
+}
+
+/// Worst disagreement between two fits of the same problem.
+///
+/// ### Params
+///
+/// * `got` - The fit under test
+/// * `want` - The reference
+///
+/// ### Returns
+///
+/// The worst absolute difference on a coefficient, on `sigma^2` and on
+/// `phi^-1`, then the median absolute difference on `sigma^2`, formatted.
+#[cfg(feature = "gpu")]
+fn drift(got: &NebulaFit, want: &NebulaFit) -> String {
+    let worst = |a: &[f64], b: &[f64]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f64, f64::max)
+    };
+    let mut sigma: Vec<f64> = got
+        .subject_overdispersion
+        .iter()
+        .zip(&want.subject_overdispersion)
+        .map(|(x, y)| (x - y).abs())
+        .collect();
+    sigma.sort_by(f64::total_cmp);
+    format!(
+        "vs cpu: max |d beta| {:.2e}, max |d sigma2| {:.2e} (median {:.2e}), max |d phi| {:.2e}",
+        worst(&got.coefficients, &want.coefficients),
+        worst(&got.subject_overdispersion, &want.subject_overdispersion),
+        sigma[sigma.len() / 2],
+        worst(&got.cell_overdispersion, &want.cell_overdispersion),
+    )
+}
+
 /// The GPU path end to end, on both NEBULA variants, against the same problem.
 ///
 /// Stage two's penalised fits go to the device; stage one, the `f64` finish of
@@ -512,8 +612,10 @@ fn inner_kernels(problem: &Problem, gene: &OneGene, note: &str) {
 /// ### Params
 ///
 /// * `problem` - The generated problem
+/// * `cpu_ln` - The CPU NEBULA-LN fit, when that cell ran
+/// * `cpu_hl` - The CPU NEBULA-HL fit, when that cell ran
 #[cfg(feature = "gpu")]
-fn gpu_cells(problem: &Problem) {
+fn gpu_cells(problem: &Problem, cpu_ln: Option<&NebulaFit>, cpu_hl: Option<&NebulaFit>) {
     use cubecl::Runtime;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use edge_rs::gpu::stage_two::nebula_sparse_gpu;
@@ -521,7 +623,10 @@ fn gpu_cells(problem: &Problem) {
     let device = WgpuDevice::default();
     let client = WgpuRuntime::client(&device);
 
-    for (name, method) in [("gpu_ln", NebulaMethod::Ln), ("gpu_hl", NebulaMethod::Hl)] {
+    for (name, method, cpu) in [
+        ("gpu_ln", NebulaMethod::Ln, cpu_ln),
+        ("gpu_hl", NebulaMethod::Hl, cpu_hl),
+    ] {
         if !selected(name) {
             continue;
         }
@@ -544,7 +649,10 @@ fn gpu_cells(problem: &Problem) {
             &format!("{name} (end to end)"),
             t.elapsed(),
             1,
-            &format!("{} genes kept", fit.gene_index.len()),
+            &format!("{} genes kept, {}", fit.gene_index.len(), checksum(&fit)),
         );
+        if let Some(want) = cpu {
+            println!("{:<24} {}", "", drift(&fit, want));
+        }
     }
 }
