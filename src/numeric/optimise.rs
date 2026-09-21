@@ -47,6 +47,19 @@ const NELDER_MEAD_STEP: f64 = 0.05;
 /// A relative step cannot move a zero, so scipy substitutes this constant.
 const NELDER_MEAD_ZERO_STEP: f64 = 0.000_25;
 
+/// Simplex extent, in units of `f64::EPSILON` times the best vertex's largest
+/// coordinate, below which Nelder-Mead stops whatever the objective says.
+///
+/// Both of scipy's tolerances must pass, which a discontinuous objective can
+/// make impossible: NEBULA's profile likelihood jumps by a few `1e-7` wherever
+/// an inner Newton loop changes its step count, and a simplex that has shrunk
+/// onto such a jump to adjacent floating-point numbers then cycles through the
+/// same handful of points until the iteration cap. Measured on one gene in 500:
+/// vertices two ulp apart, a `4.5e-7` jump against an `fatol` of `1e-7`, and
+/// 1650 wasted evaluations. No move is left to a simplex this small, so
+/// stopping returns the same minimiser to the last few bits.
+const NELDER_MEAD_COLLAPSED_ULPS: f64 = 16.0;
+
 //////////////////
 // Root finding //
 //////////////////
@@ -626,7 +639,11 @@ impl NelderMeadStepper {
             .iter()
             .map(|&i| (self.values[i] - self.values[best]).abs())
             .fold(0.0_f64, f64::max);
-        if spread_x <= self.params.xatol && spread_f <= self.params.fatol {
+        let scale = self.simplex[best]
+            .iter()
+            .fold(f64::MIN_POSITIVE, |m, v| m.max(v.abs()));
+        let collapsed = spread_x <= NELDER_MEAD_COLLAPSED_ULPS * f64::EPSILON * scale;
+        if collapsed || (spread_x <= self.params.xatol && spread_f <= self.params.fatol) {
             self.converged = true;
             self.finish();
             return;
