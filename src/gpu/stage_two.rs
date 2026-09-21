@@ -11,16 +11,33 @@
 //!   a few per cent of the time and has an exact gradient.
 //! * **Stage two** runs as one [`crate::sc::nebula::StageTwoSearch`] per gene,
 //!   the same state machine the CPU path drives. Each round, every live search
-//!   asks for its next points, all of them go out as one device launch of
-//!   [`ResidentBatch::solve`], and the replies are assembled into the profile
-//!   objective on the host in `f64`. Nelder-Mead, the polish least squares and
-//!   the objective assembly never leave the host; only the penalised fits do.
+//!   asks for its next points and all of them go out as one device launch of
+//!   [`ResidentBatch::solve`]. The device finds each penalised fit's optimum;
+//!   the host then finishes that fit in `f64` from the device's point and
+//!   assembles the profile objective. Nelder-Mead, the polish least squares and
+//!   the objective never leave the host.
 //! * **Stage three**, the final fit whose information gives the standard
 //!   errors, stays on the CPU in `f64`.
 //!
-//! So the only `f32` influence on the output is through the variance
-//! components stage two lands on. The coefficients and standard errors are
-//! then the `f64` answer at those components.
+//! ### Why the host finishes every fit
+//!
+//! The search compares profile likelihoods to about `1e-6`. The penalised
+//! log-likelihood is of order `1e4` on a real gene, where one `f32` unit in the
+//! last place is already `1e-3`, so a single `f32` cannot carry the value the
+//! search needs, and the compensated summation that would carry it is folded
+//! away by the shader compiler (see [`crate::gpu::pml_kernel`]). Measured on
+//! the R fixtures, searching on the device's own values drove half the genes'
+//! subject-level variance onto its lower bound. The finish is one Newton step
+//! from the device's optimum, about a quarter of a cold fit, and what comes back
+//! is exactly the CPU path's inner fit.
+//!
+//! ### Cost, measured
+//!
+//! That finish is the ceiling. At 4000 genes and 20000 cells on the forced-HL
+//! path, stage two spent 140 s in device solves and 79 s finishing on the host,
+//! and the run as a whole was level with the CPU (245 s against 243 s). At 500
+//! genes it was four and a half times slower, because the lockstep rounds carry
+//! too few requests to fill the device.
 //!
 //! ### Why lockstep rounds
 //!
