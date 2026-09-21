@@ -7,8 +7,9 @@
 //!
 //! ### Split
 //!
-//! * **Stage one** (L-BFGS-B on the marginal likelihood) stays on the CPU. It is
-//!   a few per cent of the time and has an exact gradient.
+//! * **Stage one** (L-BFGS-B on the marginal likelihood) stays on the CPU. It
+//!   has an exact gradient, and it was a few per cent of the run before stage two
+//!   got fast; it is a fifth to a third of it now.
 //! * **Stage two** runs as one `StageTwoSearch` per gene,
 //!   the same state machine the CPU path drives. Each round, every live search
 //!   asks for its next points and all of them go out as one device launch of
@@ -60,17 +61,29 @@
 //!
 //! ### Cost, measured
 //!
-//! Forced HL, 20000 cells, against a 10-thread CPU:
+//! Forced HL, 500 genes, 20 subjects, against a 10-thread CPU on an M1 Max.
+//! Seconds; "device" is the time the host spends blocked on it.
 //!
-//! | genes | CPU | GPU | stage one | device | host finish |
-//! |---|---|---|---|---|---|
-//! | 500 | 30.6 s | 23.1 s | | | |
-//! | 4000 | 236 s | 151 s | 25 s | 45 s | 80 s |
+//! | cells | coefficients | density | CPU | GPU | stage one | device | host finish |
+//! |---|---|---|---|---|---|---|---|
+//! | 20000 | 3 | 46% | 30.8 | 10.9 | 3.0 | 1.6 | 6.0 |
+//! | 20000 | 3 | 9% | 33.0 | 8.2 | 1.5 | 1.3 | 5.1 |
+//! | 20000 | 3 | 10%, subjects 100:1 | 32.4 | 8.0 | 1.5 | 1.1 | 5.2 |
+//! | 20000 | 8 | 10% | 49.8 | 21.2 | 2.1 | 11.0 | 7.7 |
+//! | 50000 | 6 | 6%, subjects 30:1 | 126.7 | 34.7 | 6.1 | 9.1 | 18.6 |
+//! | 100000 | 3 | 5% | 183.4 | 45.0 | 9.4 | 3.9 | 30.4 |
 //!
-//! The host finish is now the largest part and the ceiling: it costs about a
-//! third of the CPU's own stage two. With one thread per fit the device took
-//! 140 s at 4000 genes and the run only broke even; see the kernel's module doc
-//! for the mapping that fixed it.
+//! At 4000 genes on the first shape: CPU 237 s, GPU 76 s, of which stage one
+//! 24 s and the host finish 46 s.
+//!
+//! The host is the ceiling on every shape but the wide one: the `f64` finish and
+//! stage one are all CPU work, and the device mostly waits for them. The wide
+//! design is bound by the latency of a launch, which is one fit's serial walk
+//! over the cells however many fits ride along.
+//!
+//! Under NEBULA-LN none of this applies unless stage one sends genes to stage
+//! two. On these shapes it sends none, or one gene in 500, and the GPU path is
+//! the CPU path.
 //!
 //! ### Why lockstep rounds
 //!

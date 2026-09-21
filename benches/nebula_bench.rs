@@ -32,9 +32,10 @@
 //! `NEBULA_BENCH_GENES`, `NEBULA_BENCH_CELLS`, `NEBULA_BENCH_SUBJECTS` and
 //! `NEBULA_BENCH_COEF` change the shape. `NEBULA_BENCH_INTERCEPT_SHIFT` moves
 //! every gene's baseline on the log scale, which sets the density, and
-//! `NEBULA_BENCH_IMBALANCE` is the ratio of the largest subject to the smallest. `NEBULA_BENCH_ONLY=ptmg,pml` runs a
-//! comma-separated subset of the cells. `NEBULA_BENCH_SWEEP=1` adds a cell-count
-//! sweep of the two inner kernels, which is the scaling a GPU port cares about.
+//! `NEBULA_BENCH_IMBALANCE` is the ratio of the largest subject to the smallest.
+//! `NEBULA_BENCH_ONLY=ptmg,pml` runs a comma-separated subset of the cells.
+//! `NEBULA_BENCH_SWEEP=1` adds a cell-count sweep of the two inner kernels, which
+//! is the scaling a GPU port cares about.
 
 use std::env;
 use std::hint::black_box;
@@ -578,7 +579,8 @@ fn checksum(fit: &NebulaFit) -> String {
 /// ### Returns
 ///
 /// The worst absolute difference on a coefficient, on `sigma^2` and on
-/// `phi^-1`, then the median absolute difference on `sigma^2`, formatted.
+/// `phi^-1`, the median absolute difference on `sigma^2`, and both fits' values
+/// at the gene with the worst `phi^-1`, formatted.
 #[cfg(feature = "gpu")]
 fn drift(got: &NebulaFit, want: &NebulaFit) -> String {
     let worst = |a: &[f64], b: &[f64]| {
@@ -594,12 +596,23 @@ fn drift(got: &NebulaFit, want: &NebulaFit) -> String {
         .map(|(x, y)| (x - y).abs())
         .collect();
     sigma.sort_by(f64::total_cmp);
+    let at = (0..got.cell_overdispersion.len())
+        .max_by(|&a, &b| {
+            let da = (got.cell_overdispersion[a] - want.cell_overdispersion[a]).abs();
+            let db = (got.cell_overdispersion[b] - want.cell_overdispersion[b]).abs();
+            da.total_cmp(&db)
+        })
+        .unwrap_or(0);
     format!(
-        "vs cpu: max |d beta| {:.2e}, max |d sigma2| {:.2e} (median {:.2e}), max |d phi| {:.2e}",
+        "vs cpu: max |d beta| {:.2e}, max |d sigma2| {:.2e} (median {:.2e}), max |d phi| {:.2e} at gene {at}: phi {:.6} vs {:.6}, sigma2 {:.6} vs {:.6}",
         worst(&got.coefficients, &want.coefficients),
         worst(&got.subject_overdispersion, &want.subject_overdispersion),
         sigma[sigma.len() / 2],
         worst(&got.cell_overdispersion, &want.cell_overdispersion),
+        got.cell_overdispersion[at],
+        want.cell_overdispersion[at],
+        got.subject_overdispersion[at],
+        want.subject_overdispersion[at],
     )
 }
 
