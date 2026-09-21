@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.0
+
+* GPU-accelerated NEBULA added via the wgpu/cubecl framework.
+
 ## v0.0.5
 
 * `AplWorkspace` added: the adjusted profile likelihood point by point, with the
