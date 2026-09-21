@@ -69,10 +69,10 @@ use crate::gpu::pml_kernel::F32_NOISE_SCALE;
 use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
 use crate::sc::nebula::{
-    GeneOutcome, GenePlan, InnerFit, NebulaFit, NebulaParams, Shared, StageTwoSearch,
-    finish_gene, gene_pml, nebula_sparse_with, plan_gene, variance_bounds, variance_objective,
+    GeneOutcome, GenePlan, InnerFit, NebulaFit, NebulaParams, Shared, StageTwoSearch, finish_gene,
+    gene_pml, nebula_sparse_with, plan_gene, variance_bounds, variance_objective,
 };
-use crate::sc::pml::{PmlParams, PmlVariance, opt_pml_from};
+use crate::sc::pml::{PmlParams, PmlVariance, newton_finish, opt_pml_from};
 use crate::sc::ptmg::{GeneCounts, positive_indices};
 
 ////////////
@@ -516,6 +516,29 @@ fn finish_at_argmax(
     if !reply.beta.iter().chain(&reply.log_w).all(|v| v.is_finite()) {
         return None;
     }
+    // The fused steps cover an order-one fit that needs no damping, which is
+    // nearly all of them; anything else takes the general loop.
+    if params.ord == 1
+        && !params.reml
+        && let Some(fit) = newton_finish(
+            pml,
+            &reply.beta,
+            &reply.log_w,
+            &PmlVariance { subject, cell },
+            params.eps,
+            params.max_iter,
+        )
+    {
+        return Some((
+            InnerFit {
+                log_likelihood: fit.log_likelihood,
+                log_likelihood_prev: fit.log_likelihood_prev,
+                log_det: fit.log_det,
+                second_order: 0.0,
+            },
+            fit.iterations,
+        ));
+    }
     let fit = opt_pml_from(
         pml,
         &reply.beta,
@@ -577,10 +600,7 @@ fn count_histogram(counts: &[f64]) -> Vec<(f64, f64)> {
 ///
 /// The tail term of the profile objective.
 fn histogram_tail(histogram: &[(f64, f64)], cell: f64) -> f64 {
-    histogram
-        .iter()
-        .map(|&(y, m)| m * ln_gamma(y + cell))
-        .sum()
+    histogram.iter().map(|&(y, m)| m * ln_gamma(y + cell)).sum()
 }
 
 #[cfg(test)]
@@ -598,6 +618,10 @@ mod tests {
             .sum();
         let histogram = count_histogram(&counts);
         assert_eq!(histogram, vec![(3.0, 3.0), (7.0, 2.0), (12.0, 1.0)]);
-        approx::assert_relative_eq!(histogram_tail(&histogram, cell), direct, max_relative = 1e-14);
+        approx::assert_relative_eq!(
+            histogram_tail(&histogram, cell),
+            direct,
+            max_relative = 1e-14
+        );
     }
 }
