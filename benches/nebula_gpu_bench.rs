@@ -27,7 +27,9 @@ use rand::rngs::SmallRng;
 use rand_distr::{Distribution, Gamma, LogNormal, Poisson};
 use rayon::prelude::*;
 
-use edge_rs::gpu::nebula_gpu::{GpuGene, ResidentBatch, opt_pml_batch};
+use edge_rs::gpu::nebula_gpu::{
+    GpuGene, GpuSolveParams, ResidentBatch, opt_pml_batch, solve_per_gene,
+};
 use edge_rs::gpu::pml_kernel::F32_NOISE_SCALE;
 use edge_rs::sc::pml::{PmlData, PmlParams, PmlVariance, opt_pml};
 
@@ -388,32 +390,19 @@ fn main() {
             ord: 1,
             ..PmlParams::default()
         };
-        black_box(
-            resident
-                .solve(
-                    &genes,
-                    params.eps,
-                    f64::from(F32_NOISE_SCALE),
-                    params.max_iter as u32,
-                    params.max_backtrack as u32,
-                    &client,
-                )
-                .expect("solve"),
-        );
+        let solve_params = GpuSolveParams {
+            eps: params.eps,
+            noise_scale: f64::from(F32_NOISE_SCALE),
+            max_iter: params.max_iter as u32,
+            max_backtrack: params.max_backtrack as u32,
+            full: false,
+        };
+        black_box(solve_per_gene(&mut resident, &genes, &solve_params, &client).expect("solve"));
 
         let t = Instant::now();
         for _ in 0..RESIDENT_SOLVES {
             black_box(
-                resident
-                    .solve(
-                        &genes,
-                        params.eps,
-                        f64::from(F32_NOISE_SCALE),
-                        params.max_iter as u32,
-                        params.max_backtrack as u32,
-                        &client,
-                    )
-                    .expect("solve"),
+                solve_per_gene(&mut resident, &genes, &solve_params, &client).expect("solve"),
             );
         }
         let resident_time = t.elapsed().as_secs_f64();

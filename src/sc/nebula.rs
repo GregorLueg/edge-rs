@@ -437,6 +437,66 @@ pub fn nebula_sparse<T: EdgeFloat>(
     offset: Option<&[T]>,
     params: Option<NebulaParams>,
 ) -> Result<NebulaFit, EdgeErrors> {
+    nebula_sparse_with(
+        counts,
+        subject_id,
+        design,
+        n_coef,
+        offset,
+        params,
+        |shared, sparse, totals, kept| {
+            let n_subjects = shared.n_subjects;
+            kept.par_iter()
+                .map(|&g| {
+                    let counts = positive_indices(sparse, g)?;
+                    let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
+                    fit_gene(shared, &counts, subject_totals)
+                })
+                .collect()
+        },
+    )
+}
+
+/// The shared body of every NEBULA entry point, with the per-gene fan-out left
+/// to the caller.
+///
+/// Everything that is the same whichever device fits the genes lives here: the
+/// validation, the offsets, the centred design, the expression filter and the
+/// reassembly on the user's scale. `fit` gets the kept genes and returns one
+/// outcome per kept gene, in order.
+///
+/// ### Params
+///
+/// * `counts` - Raw counts, [`SparseFormat::Csr`] over `(n_genes, n_cells)`
+/// * `subject_id` - Subject of each cell, with each subject's cells contiguous
+/// * `design` - Predictors, row-major `n_cells * n_coef`, including an intercept
+/// * `n_coef` - Number of design columns
+/// * `offset` - Strictly positive scaling factor per cell, or `None` for ones
+/// * `params` - Tuning knobs, or [`NebulaParams::default`]
+/// * `fit` - Fits the kept genes: `(shared, counts, subject totals gene-major,
+///   kept gene indices)` to one outcome per kept gene
+///
+/// ### Returns
+///
+/// The per-gene fits, or [`EdgeErrors`] as for [`nebula_sparse`] or from `fit`.
+pub(crate) fn nebula_sparse_with<T, Fit>(
+    counts: &CompressedSparse<f64>,
+    subject_id: &[usize],
+    design: &[T],
+    n_coef: usize,
+    offset: Option<&[T]>,
+    params: Option<NebulaParams>,
+    fit: Fit,
+) -> Result<NebulaFit, EdgeErrors>
+where
+    T: EdgeFloat,
+    Fit: FnOnce(
+        &Shared<'_>,
+        &CompressedSparse<f64>,
+        &[f64],
+        &[usize],
+    ) -> Result<Vec<GeneOutcome>, EdgeErrors>,
+{
     let params = params.unwrap_or_default();
     params.validate()?;
 
@@ -575,14 +635,7 @@ pub fn nebula_sparse<T: EdgeFloat>(
         params,
     };
 
-    let outcomes: Vec<GeneOutcome> = kept
-        .par_iter()
-        .map(|&g| {
-            let counts = positive_indices(sparse, g)?;
-            let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
-            fit_gene(&shared, &counts, subject_totals)
-        })
-        .collect::<Result<Vec<_>, EdgeErrors>>()?;
+    let outcomes = fit(&shared, sparse, &totals, &kept)?;
 
     Ok(assemble(
         outcomes,
@@ -634,7 +687,7 @@ pub(crate) struct Shared<'a> {
 }
 
 /// One gene's fit on the centred design scale.
-struct GeneOutcome {
+pub(crate) struct GeneOutcome {
     /// Fixed effects, length `n_coef`.
     beta: Vec<f64>,
     /// Packed upper-triangular covariance, length `packed_len(n_coef)`.
@@ -653,7 +706,76 @@ struct GeneOutcome {
 // Per-gene fit //
 //////////////////
 
-/// Runs the three stages for one gene.
+/// Which stage-two search, if any, stage one left a gene needing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Refit {
+    /// Stage one's variance components stand.
+    None,
+    /// Refit both variance components, from stage one's.
+    Both,
+    /// Refit the subject-level component alone, with the cell-level one held at
+    /// stage one's value. NEBULA-LN's one-dimensional restriction.
+    SubjectOnly,
+}
+
+/// What stage one decided for a gene, and everything stages two and three need.
+pub(crate) struct GenePlan {
+    /// Laplace order the stage-two search attempts first.
+    pub(crate) ord: u32,
+    /// nebula's `sigma[0]` after stage one.
+    pub(crate) sigma: f64,
+    /// Cell-level negative binomial size after stage one.
+    pub(crate) gamma: f64,
+    /// Convergence code carried out of stage one.
+    pub(crate) convergence: i32,
+    /// Fixed effects every inner fit starts from, before the intercept shift.
+    pub(crate) beta_start: Vec<f64>,
+    /// The stage-two search stage one calls for.
+    pub(crate) refit: Refit,
+}
+
+impl GenePlan {
+    /// The stage-two search's starting point and fixed cell-level component.
+    ///
+    /// ### Returns
+    ///
+    /// `(start, fixed_cell)`, or `None` when no refit is needed.
+    pub(crate) fn search(&self) -> Option<(Vec<f64>, Option<f64>)> {
+        match self.refit {
+            Refit::None => None,
+            Refit::Both => Some((vec![self.sigma, self.gamma], None)),
+            Refit::SubjectOnly => Some((vec![self.sigma], Some(self.gamma))),
+        }
+    }
+}
+
+/// The per-gene view [`opt_pml`] reads.
+///
+/// ### Params
+///
+/// * `shared` - The inputs common to every gene
+/// * `counts` - This gene's positive counts
+/// * `subject_totals` - This gene's count total per subject
+///
+/// ### Returns
+///
+/// The borrowed view.
+pub(crate) fn gene_pml<'a>(
+    shared: &Shared<'a>,
+    counts: &'a crate::sc::ptmg::GeneCounts,
+    subject_totals: &'a [f64],
+) -> PmlData<'a> {
+    PmlData {
+        design: shared.design,
+        offset: shared.log_offset,
+        counts: &counts.counts,
+        cell_index: &counts.cells,
+        subject_start: shared.fid,
+        subject_total: subject_totals,
+    }
+}
+
+/// Stage one for one gene, and the decision about stage two.
 ///
 /// ### Params
 ///
@@ -663,13 +785,12 @@ struct GeneOutcome {
 ///
 /// ### Returns
 ///
-/// The fit on the centred design scale, or [`EdgeErrors`] if the kernels reject
-/// the assembled per-gene view.
-fn fit_gene(
+/// The plan, or [`EdgeErrors`] if the kernels reject the assembled view.
+pub(crate) fn plan_gene(
     shared: &Shared<'_>,
     counts: &crate::sc::ptmg::GeneCounts,
     subject_totals: &[f64],
-) -> Result<GeneOutcome, EdgeErrors> {
+) -> Result<GenePlan, EdgeErrors> {
     let n_coef = shared.n_coef;
     let params = &shared.params;
 
@@ -705,48 +826,17 @@ fn fit_gene(
     upper[n_coef + 1] = params.max.1;
 
     let (stage_one, stage_one_failed) = minimise_marginal(&gene, &start, &lower, &upper);
-    let mut convergence = if stage_one_failed { 0 } else { CONV_SUCCESS };
-    let mut sigma = stage_one[n_coef];
-    let mut gamma = stage_one[n_coef + 1];
+    let convergence = if stage_one_failed { 0 } else { CONV_SUCCESS };
+    let sigma = stage_one[n_coef];
+    let gamma = stage_one[n_coef + 1];
 
     // nebula discards the stage-one fixed effects and restarts them from the
     // gene's mean count, keeping only the two variance components.
     let mut beta_start = vec![0.0; n_coef];
     beta_start[shared.intercept] = log_mean_count - shared.log_mean_offset;
 
-    let pml = PmlData {
-        design: shared.design,
-        offset: shared.log_offset,
-        counts: &counts.counts,
-        cell_index: &counts.cells,
-        subject_start: shared.fid,
-        subject_total: subject_totals,
-    };
-
-    // Stage two: the profile likelihood over the variance components alone.
-    let refit_both = |sigma: f64, gamma: f64| -> (f64, f64, bool) {
-        let x = refine_variance(
-            shared,
-            &pml,
-            &beta_start,
-            counts,
-            ord,
-            &[sigma, gamma],
-            None,
-        );
-        match x {
-            Some(v) => (v[0], v[1], true),
-            None => (sigma, gamma, false),
-        }
-    };
-
-    match shared.method {
-        NebulaMethod::Hl => {
-            let (s, g, ok) = refit_both(sigma, gamma);
-            sigma = s;
-            gamma = g;
-            convergence = if ok { CONV_SUCCESS } else { CONV_OUTER_FAILED };
-        }
+    let refit = match shared.method {
+        NebulaMethod::Hl => Refit::Both,
         NebulaMethod::Ln => {
             // nebula measures how far the fitted cell means spread within a
             // subject; without a cell-level column that is just the offsets.
@@ -764,43 +854,82 @@ fn fit_gene(
             };
             let gni = shared.cells_per_subject * gamma;
             if gni < params.cutoff_cell || convergence == 0 || cv2p.is_nan() {
-                let (s, g, ok) = refit_both(sigma, gamma);
-                sigma = s;
-                gamma = g;
-                convergence = if ok { CONV_SUCCESS } else { CONV_OUTER_FAILED };
+                Refit::Both
             } else {
                 let kappa_obs = gni / (1.0 + cv2p);
                 let weak = kappa_obs < KAPPA_FLOOR
                     || (kappa_obs < params.kappa && sigma < KAPPA_SIGMA_NUMERATOR / kappa_obs);
-                if weak {
-                    let x = refine_variance(
-                        shared,
-                        &pml,
-                        &beta_start,
-                        counts,
-                        ord,
-                        &[sigma],
-                        Some(gamma),
-                    );
-                    match x {
-                        Some(v) => {
-                            sigma = v[0];
-                            convergence = CONV_SUCCESS;
-                        }
-                        None => convergence = CONV_OUTER_FAILED,
-                    }
-                }
+                if weak { Refit::SubjectOnly } else { Refit::None }
             }
         }
+    };
+
+    Ok(GenePlan {
+        ord,
+        sigma,
+        gamma,
+        convergence,
+        beta_start,
+        refit,
+    })
+}
+
+/// Applies the stage-two result and runs stage three for one gene.
+///
+/// ### Params
+///
+/// * `shared` - The inputs common to every gene
+/// * `counts` - This gene's positive counts and their summaries
+/// * `subject_totals` - This gene's count total per subject
+/// * `plan` - What stage one decided
+/// * `refit` - The stage-two minimiser, `None` if no refit ran; `Some(None)` if
+///   one ran and found nothing finite
+///
+/// ### Returns
+///
+/// The fit on the centred design scale, or [`EdgeErrors`] if the final fit
+/// rejects the view.
+pub(crate) fn finish_gene(
+    shared: &Shared<'_>,
+    counts: &crate::sc::ptmg::GeneCounts,
+    subject_totals: &[f64],
+    plan: GenePlan,
+    refit: Option<Option<Vec<f64>>>,
+) -> Result<GeneOutcome, EdgeErrors> {
+    let n_coef = shared.n_coef;
+    let params = &shared.params;
+    let mut sigma = plan.sigma;
+    let mut gamma = plan.gamma;
+    let mut convergence = plan.convergence;
+
+    match (plan.refit, refit) {
+        (Refit::Both, Some(found)) => match found {
+            Some(v) => {
+                sigma = v[0];
+                gamma = v[1];
+                convergence = CONV_SUCCESS;
+            }
+            None => convergence = CONV_OUTER_FAILED,
+        },
+        (Refit::SubjectOnly, Some(found)) => match found {
+            Some(v) => {
+                sigma = v[0];
+                convergence = CONV_SUCCESS;
+            }
+            None => convergence = CONV_OUTER_FAILED,
+        },
+        _ => {}
     }
 
     // Stage three: the final penalised fit, always at the leading Laplace order.
+    let pml = gene_pml(shared, counts, subject_totals);
     let final_params = PmlParams {
         reml: params.reml,
         eps: params.eps,
         ord: 1,
         ..PmlParams::default()
     };
+    let mut beta_start = plan.beta_start;
     beta_start[shared.intercept] -= sigma / 2.0;
     let fit = opt_pml(
         &pml,
@@ -843,6 +972,39 @@ fn fit_gene(
         cell: 1.0 / gamma,
         convergence: code,
     })
+}
+
+/// Runs the three stages for one gene on the CPU.
+///
+/// ### Params
+///
+/// * `shared` - The inputs common to every gene
+/// * `counts` - This gene's positive counts and their summaries
+/// * `subject_totals` - This gene's count total per subject, nebula's `cumsumy`
+///
+/// ### Returns
+///
+/// The fit on the centred design scale, or [`EdgeErrors`] if the kernels reject
+/// the assembled per-gene view.
+fn fit_gene(
+    shared: &Shared<'_>,
+    counts: &crate::sc::ptmg::GeneCounts,
+    subject_totals: &[f64],
+) -> Result<GeneOutcome, EdgeErrors> {
+    let plan = plan_gene(shared, counts, subject_totals)?;
+    let refit = plan.search().map(|(start, fixed_cell)| {
+        let pml = gene_pml(shared, counts, subject_totals);
+        refine_variance(
+            shared,
+            &pml,
+            &plan.beta_start,
+            counts,
+            plan.ord,
+            &start,
+            fixed_cell,
+        )
+    });
+    finish_gene(shared, counts, subject_totals, plan, refit)
 }
 
 /////////////////////////

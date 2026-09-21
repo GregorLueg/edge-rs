@@ -205,7 +205,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     cells: &Tensor<u32>,
     gene_ptr: &Tensor<u32>,
     subject_total: &Tensor<F>,
-    gene_params: &Tensor<F>,
+    request_gene: &Tensor<u32>,
+    request_ord: &Tensor<u32>,
+    request_params: &Tensor<F>,
     beta_init: &Tensor<F>,
     tolerance: &Tensor<F>,
     subject_scratch: &mut Tensor<F>,
@@ -215,16 +217,19 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     out_scalars: &mut Tensor<F>,
     out_counts: &mut Tensor<u32>,
     n_genes: u32,
+    n_req: u32,
     k: u32,
     nb: u32,
     max_iter: u32,
     max_backtrack: u32,
     #[comptime] nb_cap: u32,
 ) {
-    let g = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * GENE_WORKGROUP + UNIT_POS_X;
-    if g >= n_genes {
+    let q = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * GENE_WORKGROUP + UNIT_POS_X;
+    if q >= n_req {
         terminate!();
     }
+    let gene = request_gene[q as usize];
+    let ord = request_ord[q as usize];
 
     let zero = F::new(0.0_f32);
     let one = F::new(1.0_f32);
@@ -238,12 +243,12 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let eps = tolerance[0];
     let noise_scale = tolerance[1];
 
-    let alpha = gene_params[g as usize];
-    let lambda = gene_params[(n_genes + g) as usize];
-    let gamma = gene_params[(2u32 * n_genes + g) as usize];
+    let alpha = request_params[q as usize];
+    let lambda = request_params[(n_req + q) as usize];
+    let gamma = request_params[(2u32 * n_req + q) as usize];
 
-    let ptr_lo = gene_ptr[g as usize];
-    let ptr_hi = gene_ptr[(g + 1u32) as usize];
+    let ptr_lo = gene_ptr[gene as usize];
+    let ptr_hi = gene_ptr[(gene + 1u32) as usize];
 
     let mut beta = Array::<F>::new(nb_cap as usize);
     let mut new_beta = Array::<F>::new(nb_cap as usize);
@@ -256,12 +261,12 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 
     let mut j = 0u32;
     while j < nb {
-        beta[j as usize] = beta_init[(j * n_genes + g) as usize];
+        beta[j as usize] = beta_init[(j * n_req + q) as usize];
         j += 1u32;
     }
     let mut s = 0u32;
     while s < k {
-        subject_scratch[((SLOT_LOG_W * k + s) * n_genes + g) as usize] = zero;
+        subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize] = zero;
         s += 1u32;
     }
 
@@ -281,8 +286,10 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         ptr_lo,
         ptr_hi,
         n_genes,
+        n_req,
         k,
-        g,
+        q,
+        gene,
         nb,
     );
 
@@ -296,6 +303,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     // nebula, which reports the penultimate iterate's.
     let mut settled = false;
     let mut running = true;
+    let mut second = zero;
 
     while running {
         j = 0u32;
@@ -307,7 +315,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         }
         s = 0u32;
         while s < k {
-            subject_scratch[((SLOT_DAMP_LOG_W * k + s) * n_genes + g) as usize] = one;
+            subject_scratch[((SLOT_DAMP_LOG_W * k + s) * n_req + q) as usize] = one;
             s += 1u32;
         }
         let mut i = 0u32;
@@ -320,12 +328,19 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         // Gradient and curvature, fused //
         ///////////////////////////////////
 
+        // The higher-order Laplace correction is only ever read at the point the
+        // fit returns, so it is only assembled on the settling pass.
+        let do_laplace = settled && ord > 1u32;
+        let mut acc3 = zero;
+        let mut acc4 = zero;
+        let mut acc5 = zero;
+
         let mut ptr = ptr_lo;
         s = 0u32;
         while s < k {
-            let log_w_s = subject_scratch[((SLOT_LOG_W * k + s) * n_genes + g) as usize];
+            let log_w_s = subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize];
             let w_s = F::exp(log_w_s);
-            subject_scratch[((SLOT_W * k + s) * n_genes + g) as usize] = w_s;
+            subject_scratch[((SLOT_W * k + s) * n_req + q) as usize] = w_s;
 
             let begin = subject_start[s as usize];
             let end = subject_start[(s + 1u32) as usize];
@@ -337,6 +352,12 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             //    is cancellation-free for the same reason the two-pass form is.
             let mut resid = zero;
             let mut resid_block = zero;
+            let mut t3 = zero;
+            let mut t3_block = zero;
+            let mut t4 = zero;
+            let mut t4_block = zero;
+            let mut t5 = zero;
+            let mut t5_block = zero;
             let mut p_sum = zero;
             j = 0u32;
             while j < nb {
@@ -403,10 +424,34 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 }
                 p_sum = p_next;
 
+                // The third, fourth and fifth derivative summands of
+                // `laplace_correction` in `crate::sc::pml`, each a further
+                // division of the curvature weight by `extb + gamma`.
+                if do_laplace {
+                    let p1 = phi_c / (extb + gamma);
+                    t3_block += p1 * (gamma - extb);
+                    if ord > 2u32 {
+                        let e2 = extb * extb;
+                        let p2 = p1 / (extb + gamma);
+                        t4_block += p2 * (gamma * gamma + e2 - F::new(4.0_f32) * gamma * extb);
+                        let p3 = p2 / (extb + gamma);
+                        t5_block += p3
+                            * (gamma * gamma * gamma - F::new(11.0_f32) * gamma * gamma * extb
+                                + F::new(11.0_f32) * gamma * e2
+                                - e2 * extb);
+                    }
+                }
+
                 since_flush += 1u32;
                 if since_flush == SUM_BLOCK {
                     resid += resid_block;
                     resid_block = zero;
+                    t3 += t3_block;
+                    t4 += t4_block;
+                    t5 += t5_block;
+                    t3_block = zero;
+                    t4_block = zero;
+                    t5_block = zero;
                     j = 0u32;
                     while j < nb {
                         db[j as usize] += db_block[j as usize];
@@ -418,6 +463,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 r += 1u32;
             }
             resid += resid_block;
+            t3 += t3_block;
+            t4 += t4_block;
+            t5 += t5_block;
             j = 0u32;
             while j < nb {
                 db[j as usize] += db_block[j as usize];
@@ -426,15 +474,28 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             }
 
             let dw_s = resid + (alpha - lambda * w_s);
-            subject_scratch[((SLOT_DW * k + s) * n_genes + g) as usize] = dw_s;
+            subject_scratch[((SLOT_DW * k + s) * n_req + q) as usize] = dw_s;
             let vw_s = gamma * p_sum + lambda * w_s;
-            subject_scratch[((SLOT_VW * k + s) * n_genes + g) as usize] = vw_s;
+            subject_scratch[((SLOT_VW * k + s) * n_req + q) as usize] = vw_s;
 
             j = 0u32;
             while j < nb {
-                vwb_scratch[((s * nb + j) * n_genes + g) as usize] =
+                vwb_scratch[((s * nb + j) * n_req + q) as usize] =
                     gamma * a_bar[j as usize] * p_sum;
                 j += 1u32;
+            }
+
+            if do_laplace {
+                let third = gamma * t3 + lambda * w_s;
+                let vw3 = vw_s * vw_s * vw_s;
+                acc3 += third * third / vw3;
+                if ord > 2u32 {
+                    let fourth = gamma * t4 + lambda * w_s;
+                    acc4 += fourth / (vw_s * vw_s);
+                    let fifth = gamma * t5 + lambda * w_s;
+                    let vw2 = vw_s * vw_s;
+                    acc5 += fifth * third / (vw2 * vw2);
+                }
             }
 
             let shrink = lambda * w_s / vw_s;
@@ -452,6 +513,14 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             }
 
             s += 1u32;
+        }
+
+        if do_laplace {
+            second = F::new(5.0_f32) * acc3 / F::new(24.0_f32);
+            if ord > 2u32 {
+                second -= acc4 / F::new(8.0_f32);
+                second += F::new(7.0_f32) * acc5 / F::new(48.0_f32);
+            }
         }
 
         let mut a = 0u32;
@@ -477,9 +546,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 
                 s = 0u32;
             while s < k {
-                let dw_s = subject_scratch[((SLOT_DW * k + s) * n_genes + g) as usize];
-                let vw_s = subject_scratch[((SLOT_VW * k + s) * n_genes + g) as usize];
-                subject_scratch[((SLOT_DWVW * k + s) * n_genes + g) as usize] = dw_s / vw_s;
+                let dw_s = subject_scratch[((SLOT_DW * k + s) * n_req + q) as usize];
+                let vw_s = subject_scratch[((SLOT_VW * k + s) * n_req + q) as usize];
+                subject_scratch[((SLOT_DWVW * k + s) * n_req + q) as usize] = dw_s / vw_s;
                 s += 1u32;
             }
 
@@ -488,8 +557,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let mut acc = zero;
                 s = 0u32;
                 while s < k {
-                    acc += vwb_scratch[((s * nb + j) * n_genes + g) as usize]
-                        * subject_scratch[((SLOT_DWVW * k + s) * n_genes + g) as usize];
+                    acc += vwb_scratch[((s * nb + j) * n_req + q) as usize]
+                        * subject_scratch[((SLOT_DWVW * k + s) * n_req + q) as usize];
                     s += 1u32;
                 }
                 step_beta[j as usize] = db[j as usize] - acc;
@@ -505,12 +574,12 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 let mut acc = zero;
                 j = 0u32;
                 while j < nb {
-                    acc += vwb_scratch[((s * nb + j) * n_genes + g) as usize] * step_beta[j as usize];
+                    acc += vwb_scratch[((s * nb + j) * n_req + q) as usize] * step_beta[j as usize];
                     j += 1u32;
                 }
-                let vw_s = subject_scratch[((SLOT_VW * k + s) * n_genes + g) as usize];
-                let dwvw = subject_scratch[((SLOT_DWVW * k + s) * n_genes + g) as usize];
-                subject_scratch[((SLOT_STEP_LOG_W * k + s) * n_genes + g) as usize] = dwvw - acc / vw_s;
+                let vw_s = subject_scratch[((SLOT_VW * k + s) * n_req + q) as usize];
+                let dwvw = subject_scratch[((SLOT_DWVW * k + s) * n_req + q) as usize];
+                subject_scratch[((SLOT_STEP_LOG_W * k + s) * n_req + q) as usize] = dwvw - acc / vw_s;
                 s += 1u32;
             }
 
@@ -521,9 +590,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             }
             s = 0u32;
             while s < k {
-                let base = subject_scratch[((SLOT_LOG_W * k + s) * n_genes + g) as usize];
-                let d = subject_scratch[((SLOT_STEP_LOG_W * k + s) * n_genes + g) as usize];
-                subject_scratch[((SLOT_NEW_LOG_W * k + s) * n_genes + g) as usize] = base + d;
+                let base = subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize];
+                let d = subject_scratch[((SLOT_STEP_LOG_W * k + s) * n_req + q) as usize];
+                subject_scratch[((SLOT_NEW_LOG_W * k + s) * n_req + q) as usize] = base + d;
                 s += 1u32;
             }
 
@@ -544,8 +613,10 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 ptr_lo,
                 ptr_hi,
                 n_genes,
+                n_req,
                 k,
-                g,
+                q,
+                gene,
                 nb,
             );
             likdif = ll - ll_prev;
@@ -578,7 +649,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                     }
                     s = 0u32;
                     while s < k {
-                        let v = F::abs(subject_scratch[((SLOT_DW * k + s) * n_genes + g) as usize]);
+                        let v = F::abs(subject_scratch[((SLOT_DW * k + s) * n_req + q) as usize]);
                         if v > worst {
                             worst = v;
                         }
@@ -604,9 +675,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                     }
                     s = 0u32;
                     while s < k {
-                        let d = subject_scratch[((SLOT_STEP_LOG_W * k + s) * n_genes + g) as usize];
-                        let base = subject_scratch[((SLOT_LOG_W * k + s) * n_genes + g) as usize];
-                        let damp_idx = ((SLOT_DAMP_LOG_W * k + s) * n_genes + g) as usize;
+                        let d = subject_scratch[((SLOT_STEP_LOG_W * k + s) * n_req + q) as usize];
+                        let base = subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize];
+                        let damp_idx = ((SLOT_DAMP_LOG_W * k + s) * n_req + q) as usize;
                         let trial = if d < cutoff && d > zero - cutoff {
                             let damped = subject_scratch[damp_idx] / two;
                             subject_scratch[damp_idx] = damped;
@@ -616,7 +687,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                         } else {
                             base - min_step
                         };
-                        subject_scratch[((SLOT_NEW_LOG_W * k + s) * n_genes + g) as usize] = trial;
+                        subject_scratch[((SLOT_NEW_LOG_W * k + s) * n_req + q) as usize] = trial;
                         s += 1u32;
                     }
 
@@ -636,8 +707,10 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                         ptr_lo,
                         ptr_hi,
                         n_genes,
+                        n_req,
                         k,
-                        g,
+                        q,
+                        gene,
                         nb,
                     );
                     likdif = ll - ll_prev;
@@ -652,8 +725,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             }
             s = 0u32;
             while s < k {
-                subject_scratch[((SLOT_LOG_W * k + s) * n_genes + g) as usize] =
-                    subject_scratch[((SLOT_NEW_LOG_W * k + s) * n_genes + g) as usize];
+                subject_scratch[((SLOT_LOG_W * k + s) * n_req + q) as usize] =
+                    subject_scratch[((SLOT_NEW_LOG_W * k + s) * n_req + q) as usize];
                 s += 1u32;
             }
 
@@ -669,27 +742,28 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     s = 0u32;
     while s < k {
         log_det += F::ln(F::abs(
-            subject_scratch[((SLOT_VW * k + s) * n_genes + g) as usize],
+            subject_scratch[((SLOT_VW * k + s) * n_req + q) as usize],
         ));
         s += 1u32;
     }
 
     j = 0u32;
     while j < nb {
-        out_beta[(j * n_genes + g) as usize] = beta[j as usize];
+        out_beta[(j * n_req + q) as usize] = beta[j as usize];
         j += 1u32;
     }
     let mut idx = 0u32;
     while idx < nb * nb {
-        out_information[(idx * n_genes + g) as usize] = vb2[idx as usize];
+        out_information[(idx * n_req + q) as usize] = vb2[idx as usize];
         idx += 1u32;
     }
-    out_scalars[g as usize] = ll;
-    out_scalars[(n_genes + g) as usize] = ll_prev;
-    out_scalars[(2u32 * n_genes + g) as usize] = log_det;
-    out_scalars[(3u32 * n_genes + g) as usize] = likdif;
-    out_counts[g as usize] = step;
-    out_counts[(n_genes + g) as usize] = backtracks;
+    out_scalars[q as usize] = ll;
+    out_scalars[(n_req + q) as usize] = ll_prev;
+    out_scalars[(2u32 * n_req + q) as usize] = log_det;
+    out_scalars[(3u32 * n_req + q) as usize] = likdif;
+    out_scalars[(4u32 * n_req + q) as usize] = second;
+    out_counts[q as usize] = step;
+    out_counts[(n_req + q) as usize] = backtracks;
 }
 
 /////////////////
@@ -720,9 +794,11 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 /// * `gamma` - Cell-level negative binomial size
 /// * `ptr_lo` - Start of this gene's block in `counts`
 /// * `ptr_hi` - End of this gene's block in `counts`
-/// * `n_genes` - Genes in the batch
+/// * `n_genes` - Genes resident on the device, the stride of `subject_total`
+/// * `n_req` - Requests in the launch, the stride of `subject_scratch`
 /// * `k` - Subjects
-/// * `g` - This thread's gene
+/// * `q` - This thread's request
+/// * `gene` - The gene the request is for
 /// * `nb` - Design width
 ///
 /// ### Returns
@@ -746,8 +822,10 @@ fn evaluate_pass<F: Float>(
     ptr_lo: u32,
     ptr_hi: u32,
     n_genes: u32,
+    n_req: u32,
     k: u32,
-    g: u32,
+    q: u32,
+    gene: u32,
     nb: u32,
 ) -> F {
     let zero = F::new(0.0_f32);
@@ -781,8 +859,8 @@ fn evaluate_pass<F: Float>(
     // Stage two: the random effect against each subject's count total.
     let mut s = 0u32;
     while s < k {
-        let log_w_s = subject_scratch[((slot_log_w * k + s) * n_genes + g) as usize];
-        acc += log_w_s * subject_total[(s * n_genes + g) as usize];
+        let log_w_s = subject_scratch[((slot_log_w * k + s) * n_req + q) as usize];
+        acc += log_w_s * subject_total[(s * n_genes + gene) as usize];
         s += 1u32;
     }
 
@@ -800,7 +878,7 @@ fn evaluate_pass<F: Float>(
     since_flush = 0u32;
     s = 0u32;
     while s < k {
-        let log_w_s = subject_scratch[((slot_log_w * k + s) * n_genes + g) as usize];
+        let log_w_s = subject_scratch[((slot_log_w * k + s) * n_req + q) as usize];
         sum_log_w += log_w_s;
         sum_w += F::exp(log_w_s);
 
@@ -999,12 +1077,13 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
 // Dispatch //
 //////////////
 
-/// Launches [`fn@opt_pml_gpu`] over a batch of genes.
+/// Launches [`fn@opt_pml_gpu`] over a batch of requests.
 ///
 /// ### Params
 ///
 /// * `tensors` - Every device buffer the kernel reads or writes
-/// * `n_genes` - Genes in the batch
+/// * `n_genes` - Genes resident on the device
+/// * `n_req` - Requests in this launch, which is the thread count
 /// * `k` - Subjects
 /// * `nb` - Design width
 /// * `max_iter` - Newton budget
@@ -1013,7 +1092,8 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
 ///
 /// ### Returns
 ///
-/// `Ok(())`, with the outputs in `tensors` filled.
+/// `Ok(())`, with the outputs in `tensors` filled for the first `n_req`
+/// requests.
 ///
 /// ### Errors
 ///
@@ -1021,8 +1101,9 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
 /// * [`EdgeErrors::Gpu`] if the grid busts the device's cube-count limit.
 #[allow(clippy::too_many_arguments)]
 pub fn launch_opt_pml<R, F>(
-    tensors: &mut PmlGpuTensors<R, F>,
+    tensors: &PmlGpuTensors<R, F>,
     n_genes: usize,
+    n_req: usize,
     k: usize,
     nb: usize,
     max_iter: u32,
@@ -1038,9 +1119,12 @@ where
             "The GPU NEBULA path is compiled for designs of one to {MAX_BETA_CAP} columns; got {nb}."
         )));
     }
+    if n_req == 0 {
+        return Ok(());
+    }
 
     let limits = GpuLimits::from_client(client);
-    let blocks = (n_genes as u32).div_ceil(GENE_WORKGROUP);
+    let blocks = (n_req as u32).div_ceil(GENE_WORKGROUP);
     let (gx, gy) = grid_2d(blocks, &limits).map_err(|e| EdgeErrors::Gpu(e.to_string()))?;
     let count = checked_cube_count("opt_pml_gpu", gx, gy, 1, &limits)
         .map_err(|e| EdgeErrors::Gpu(e.to_string()))?;
@@ -1059,7 +1143,9 @@ where
                     tensors.cells.clone().into_tensor_arg(),
                     tensors.gene_ptr.clone().into_tensor_arg(),
                     tensors.subject_total.clone().into_tensor_arg(),
-                    tensors.gene_params.clone().into_tensor_arg(),
+                    tensors.request_gene.clone().into_tensor_arg(),
+                    tensors.request_ord.clone().into_tensor_arg(),
+                    tensors.request_params.clone().into_tensor_arg(),
                     tensors.beta_init.clone().into_tensor_arg(),
                     tensors.tolerance.clone().into_tensor_arg(),
                     tensors.subject_scratch.clone().into_tensor_arg(),
@@ -1069,6 +1155,7 @@ where
                     tensors.out_scalars.clone().into_tensor_arg(),
                     tensors.out_counts.clone().into_tensor_arg(),
                     n_genes as u32,
+                    n_req as u32,
                     k as u32,
                     nb as u32,
                     max_iter,
@@ -1095,8 +1182,12 @@ where
 
 /// Every device buffer [`launch_opt_pml`] binds.
 ///
-/// Grouped because the kernel takes sixteen of them and a constructor is the
-/// only place the gene-minor layouts are documented once.
+/// Two kinds, with two strides. The gene-resident buffers (the design, the
+/// offsets, the subject boundaries, the counts and the per-gene totals) are
+/// uploaded once and indexed through a request's gene. The request buffers are
+/// rewritten per launch and indexed by request, request-minor: entry `i` of
+/// request `q` lives at `i * n_req + q`, so consecutive threads touch
+/// consecutive addresses.
 pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     /// Shared design, row-major `n_cells * nb`.
     pub design: GpuTensor<R, F>,
@@ -1104,31 +1195,36 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     pub log_offset: GpuTensor<R, F>,
     /// Shared subject boundaries, length `k + 1`.
     pub subject_start: GpuTensor<R, u32>,
-    /// Concatenated positive counts for every gene in the batch.
+    /// Concatenated positive counts for every resident gene.
     pub counts: GpuTensor<R, F>,
     /// Cell index of each entry of `counts`.
     pub cells: GpuTensor<R, u32>,
     /// Start of each gene's block in `counts`, length `n_genes + 1`.
     pub gene_ptr: GpuTensor<R, u32>,
-    /// Count total per subject, `[s * n_genes + g]`.
+    /// Count total per subject, `[s * n_genes + gene]`.
     pub subject_total: GpuTensor<R, F>,
-    /// `alpha`, `lambda` and `gamma` per gene, `[i * n_genes + g]`.
-    pub gene_params: GpuTensor<R, F>,
-    /// Starting fixed effects, `[j * n_genes + g]`.
+    /// The gene each request is for.
+    pub request_gene: GpuTensor<R, u32>,
+    /// The Laplace order each request is fitted at.
+    pub request_ord: GpuTensor<R, u32>,
+    /// `alpha`, `lambda` and `gamma` per request, `[i * n_req + q]`.
+    pub request_params: GpuTensor<R, F>,
+    /// Starting fixed effects, `[j * n_req + q]`.
     pub beta_init: GpuTensor<R, F>,
     /// nebula's absolute stopping tolerance, then the relative resolution
     /// floor. Two elements.
     pub tolerance: GpuTensor<R, F>,
-    /// Per-subject working store, `[(slot * k + s) * n_genes + g]`.
+    /// Per-subject working store, `[(slot * k + s) * n_req + q]`.
     pub subject_scratch: GpuTensor<R, F>,
-    /// Cross block of the information, `[(s * nb + j) * n_genes + g]`.
+    /// Cross block of the information, `[(s * nb + j) * n_req + q]`.
     pub vwb_scratch: GpuTensor<R, F>,
-    /// Fitted fixed effects, `[j * n_genes + g]`.
+    /// Fitted fixed effects, `[j * n_req + q]`.
     pub out_beta: GpuTensor<R, F>,
-    /// Schur complement, `[(i * nb + j) * n_genes + g]`.
+    /// Schur complement, `[(i * nb + j) * n_req + q]`.
     pub out_information: GpuTensor<R, F>,
-    /// Log-likelihood, previous log-likelihood, log-determinant, improvement.
+    /// Log-likelihood, previous log-likelihood, log-determinant, final
+    /// improvement and the higher-order Laplace correction, `[i * n_req + q]`.
     pub out_scalars: GpuTensor<R, F>,
-    /// Newton steps taken and backtracks used, `[i * n_genes + g]`.
+    /// Newton steps taken and backtracks used, `[i * n_req + q]`.
     pub out_counts: GpuTensor<R, u32>,
 }
