@@ -419,6 +419,9 @@ fn main() {
         );
     }
 
+    #[cfg(feature = "gpu")]
+    gpu_cells(&problem);
+
     if env::var("NEBULA_BENCH_SWEEP").is_ok() {
         println!("\ncell-count sweep of the inner kernels:");
         for &cells in SWEEP_CELLS.iter() {
@@ -497,5 +500,51 @@ fn inner_kernels(problem: &Problem, gene: &OneGene, note: &str) {
             );
         }
         report("pml (one solve)", t.elapsed(), INNER_REPEATS, note);
+    }
+}
+
+/// The GPU path end to end, on both NEBULA variants, against the same problem.
+///
+/// Stage two's penalised fits go to the device; stage one, the `f64` finish of
+/// each inner fit and stage three stay on the CPU. The first call compiles the
+/// shader, so a small warm-up runs first.
+///
+/// ### Params
+///
+/// * `problem` - The generated problem
+#[cfg(feature = "gpu")]
+fn gpu_cells(problem: &Problem) {
+    use cubecl::Runtime;
+    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use edge_rs::gpu::stage_two::nebula_sparse_gpu;
+
+    let device = WgpuDevice::default();
+    let client = WgpuRuntime::client(&device);
+
+    for (name, method) in [("gpu_ln", NebulaMethod::Ln), ("gpu_hl", NebulaMethod::Hl)] {
+        if !selected(name) {
+            continue;
+        }
+        let params = NebulaParams {
+            method,
+            ..NebulaParams::default()
+        };
+        let t = Instant::now();
+        let fit = nebula_sparse_gpu(
+            &problem.counts,
+            &problem.subject_id,
+            &problem.design,
+            problem.n_coef,
+            Some(&problem.offset),
+            Some(params),
+            &client,
+        )
+        .expect("gpu nebula fits");
+        report(
+            &format!("{name} (end to end)"),
+            t.elapsed(),
+            1,
+            &format!("{} genes kept", fit.gene_index.len()),
+        );
     }
 }
