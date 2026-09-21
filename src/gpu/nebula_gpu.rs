@@ -35,8 +35,8 @@ use crate::gpu::pml_kernel::{PmlGpuTensors, SUBJECT_SLOTS, launch_opt_pml};
 ////////////
 
 /// Scalars the kernel writes per request: the log-likelihood, the previous
-/// one, the log-determinant, the final improvement and the Laplace correction.
-const OUT_SCALARS: usize = 5;
+/// one, the log-determinant and the final improvement.
+const OUT_SCALARS: usize = 4;
 
 ///////////
 // Input //
@@ -74,8 +74,6 @@ pub struct PmlRequest {
     pub cell: f64,
     /// Starting fixed effects, length `nb`.
     pub beta_init: Vec<f64>,
-    /// Laplace order, one to three.
-    pub ord: u32,
 }
 
 ////////////
@@ -91,14 +89,15 @@ pub struct PmlReply {
     pub log_likelihood_prev: f64,
     /// Log-determinant of the random-effect block.
     pub log_det: f64,
-    /// Higher-order Laplace correction, zero at order one.
-    pub second_order: f64,
     /// Newton steps taken.
     pub iterations: u32,
     /// Backtracks used in the final step.
     pub backtracks: u32,
     /// Fitted fixed effects, length `nb`; empty unless read back in full.
     pub beta: Vec<f64>,
+    /// Fitted random effects on the log scale, length `k`; empty unless read
+    /// back in full.
+    pub log_w: Vec<f64>,
     /// Schur complement, row-major `nb * nb`; empty unless read back in full.
     pub information: Vec<f64>,
 }
@@ -134,9 +133,8 @@ pub struct GpuSolveParams {
     pub max_iter: u32,
     /// Backtracking budget within one step.
     pub max_backtrack: u32,
-    /// Whether to read back the coefficients and the information as well as
-    /// the scalars. Stage two needs only the scalars, and at a polish round of
-    /// nine requests per gene the rest is most of the read-back.
+    /// Whether to read back the fitted point (coefficients and random effects)
+    /// and the information as well as the scalars.
     pub full: bool,
 }
 
@@ -358,7 +356,6 @@ impl<R: Runtime> ResidentBatch<R> {
         let err = |e: CubeclUtilsErrors| EdgeErrors::Gpu(e.to_string());
 
         let mut request_gene = vec![0u32; n_req];
-        let mut request_ord = vec![0u32; n_req];
         let mut request_params = vec![0.0f32; 3 * n_req];
         let mut beta_init = vec![0.0f32; nb * n_req];
         for (q, req) in requests.iter().enumerate() {
@@ -387,7 +384,6 @@ impl<R: Runtime> ResidentBatch<R> {
                 return Err(EdgeErrors::InvalidDispersion(req.cell));
             }
             request_gene[q] = req.gene as u32;
-            request_ord[q] = req.ord;
             request_params[q] = (1.0 / (exps - 1.0)) as f32;
             request_params[n_req + q] = (1.0 / (exps.sqrt() * (exps - 1.0))) as f32;
             request_params[2 * n_req + q] = req.cell as f32;
@@ -413,7 +409,6 @@ impl<R: Runtime> ResidentBatch<R> {
             subject_total: self.subject_total.clone(),
             request_gene: GpuTensor::from_slice(&request_gene, vec![n_req], client)
                 .map_err(err)?,
-            request_ord: GpuTensor::from_slice(&request_ord, vec![n_req], client).map_err(err)?,
             request_params: GpuTensor::from_slice(&request_params, vec![3 * n_req], client)
                 .map_err(err)?,
             beta_init: GpuTensor::from_slice(&beta_init, vec![nb * n_req], client).map_err(err)?,
@@ -444,13 +439,16 @@ impl<R: Runtime> ResidentBatch<R> {
 
         let scalars = tensors.out_scalars.read(client).map_err(err)?;
         let counts = tensors.out_counts.read(client).map_err(err)?;
-        let (beta_dev, info_dev) = if params.full {
+        // The random effects are left in slot zero of the per-subject scratch,
+        // `[s * n_req + q]`, which is the one scratch read the host makes.
+        let (beta_dev, info_dev, scratch) = if params.full {
             (
                 tensors.out_beta.read(client).map_err(err)?,
                 tensors.out_information.read(client).map_err(err)?,
+                tensors.subject_scratch.clone().read(client).map_err(err)?,
             )
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
 
         Ok((0..n_req)
@@ -458,11 +456,15 @@ impl<R: Runtime> ResidentBatch<R> {
                 log_likelihood: scalars[q] as f64,
                 log_likelihood_prev: scalars[n_req + q] as f64,
                 log_det: scalars[2 * n_req + q] as f64,
-                second_order: scalars[4 * n_req + q] as f64,
                 iterations: counts[q],
                 backtracks: counts[n_req + q],
                 beta: if params.full {
                     (0..nb).map(|j| beta_dev[j * n_req + q] as f64).collect()
+                } else {
+                    Vec::new()
+                },
+                log_w: if params.full {
+                    (0..k).map(|s| scratch[s * n_req + q] as f64).collect()
                 } else {
                     Vec::new()
                 },
@@ -559,7 +561,6 @@ pub fn solve_per_gene<R: Runtime>(
             subject: gene.sigma,
             cell: gene.gamma,
             beta_init: gene.beta_init.to_vec(),
-            ord: 1,
         })
         .collect();
     let replies = resident.solve(&requests, params, client)?;

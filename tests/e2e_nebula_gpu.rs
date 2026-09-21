@@ -562,3 +562,94 @@ info {worst_info:.3e} (needs {INFO_TOL:.0e}), loglik {worst_ll:.3e} (needs {LL_T
         "log-likelihood disagrees by {worst_ll:.3e}, above {LL_TOL:.0e}"
     );
 }
+
+/// The inner fit across the range of subject-level variance stage two visits.
+///
+/// Stage two's search runs `sigma^2` down to its lower bound of `1e-4`, where
+/// the gamma prior's `alpha` and `lambda` both grow like `1 / sigma^2`. The fit
+/// has to hold there too, not only at the variance the counts were drawn with.
+#[test]
+fn gpu_opt_pml_holds_across_the_variance_range() {
+    let batch = make_batch();
+    let (n_genes, _, _, n_coef) = shape();
+    let device = WgpuDevice::default();
+    let client = WgpuRuntime::client(&device);
+    let params = PmlParams {
+        ord: 1,
+        ..PmlParams::default()
+    };
+    let beta_init = vec![0.0; n_coef];
+
+    println!("\n  sigma^2    subject     worst |dll|   worst rel ll   worst |dlogdet|   mean dll    iter cpu/gpu");
+    for sigma2 in [1e-4, 1e-3, 1e-2, 1e-1, 1.0] {
+        let subject = f64::ln_1p(sigma2);
+        let cpu: Vec<PmlResult> = (0..n_genes)
+            .map(|g| {
+                let data = PmlData {
+                    design: &batch.design,
+                    offset: &batch.log_offset,
+                    counts: &batch.counts[g],
+                    cell_index: &batch.cells[g],
+                    subject_start: &batch.subject_start,
+                    subject_total: &batch.subject_totals[g],
+                };
+                opt_pml(
+                    &data,
+                    &beta_init,
+                    &PmlVariance {
+                        subject,
+                        cell: 1.0 / TRUE_PHI_INV,
+                    },
+                    Some(params),
+                )
+                .expect("cpu pml fits")
+            })
+            .collect();
+        let genes: Vec<GpuGene<'_>> = (0..n_genes)
+            .map(|g| GpuGene {
+                counts: &batch.counts[g],
+                cell_index: &batch.cells[g],
+                subject_total: &batch.subject_totals[g],
+                beta_init: &beta_init,
+                sigma: subject,
+                gamma: 1.0 / TRUE_PHI_INV,
+            })
+            .collect();
+        let gpu = opt_pml_batch::<WgpuRuntime>(
+            &batch.design,
+            &batch.log_offset,
+            &batch.subject_start,
+            &genes,
+            params.eps,
+            f64::from(F32_NOISE_SCALE),
+            params.max_iter as u32,
+            params.max_backtrack as u32,
+            &client,
+        )
+        .expect("gpu pml fits");
+
+        let mut abs_ll = 0.0f64;
+        let mut rel_ll = 0.0f64;
+        let mut abs_det = 0.0f64;
+        let mut signed = 0.0f64;
+        let mut it_cpu = 0.0f64;
+        let mut it_gpu = 0.0f64;
+        for (g, fit) in cpu.iter().enumerate() {
+            let signed_d = gpu.log_likelihood[g] - fit.log_likelihood;
+            let d = signed_d.abs();
+            signed += signed_d;
+            it_cpu += fit.iterations as f64;
+            it_gpu += f64::from(gpu.iterations[g]);
+            abs_ll = abs_ll.max(d);
+            rel_ll = rel_ll.max(d / fit.log_likelihood.abs());
+            abs_det = abs_det.max((gpu.log_det[g] - fit.log_det).abs());
+        }
+        let n = n_genes as f64;
+        println!(
+            "  {sigma2:>7.0e}  {subject:>9.3e}   {abs_ll:>10.3e}   {rel_ll:>10.3e}   {abs_det:>10.3e}   {:>+9.2e}   {:.1}/{:.1}",
+            signed / n,
+            it_cpu / n,
+            it_gpu / n
+        );
+    }
+}

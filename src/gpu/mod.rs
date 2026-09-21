@@ -22,6 +22,7 @@
 
 pub mod nebula_gpu;
 pub mod pml_kernel;
+pub mod stage_two;
 
 ////////////
 // Consts //

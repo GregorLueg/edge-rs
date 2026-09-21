@@ -517,6 +517,7 @@ pub fn opt_pml(
     optimise(
         data,
         beta_init,
+        None,
         penalty,
         variance.cell,
         params.unwrap_or_default(),
@@ -561,6 +562,7 @@ pub fn opt_pml_nbm(
     optimise(
         data,
         beta_init,
+        None,
         penalty,
         variance.cell,
         params.unwrap_or_default(),
@@ -631,6 +633,56 @@ pub fn pml_log_likelihood_gradient(
         objective: -log_likelihood,
         gradient,
     })
+}
+
+/// [`opt_pml`], started from a given point rather than from zero random effects.
+///
+/// The GPU path finds the optimum in `f32` and finishes it here in `f64`. From a
+/// point already at the optimum this takes one Newton step and stops, which
+/// costs about four passes over the cells against the fourteen or so of a cold
+/// fit, and what it returns is exactly what [`opt_pml`] returns: the same
+/// value, and the log-determinant at the penultimate iterate, which is nebula's
+/// convention and the one the profile objective is calibrated against.
+///
+/// ### Params
+///
+/// * `data` - One gene's design, offsets, positive counts and subject blocks
+/// * `beta_init` - Starting fixed effects, length `n_beta`
+/// * `log_w_init` - Starting random effects on the log scale, length
+///   `n_subjects`
+/// * `variance` - The two variance components, read as [`opt_pml`] reads them
+/// * `params` - Tuning knobs, or `None` for nebula's defaults
+///
+/// ### Returns
+///
+/// As [`opt_pml`].
+#[cfg(feature = "gpu")]
+pub(crate) fn opt_pml_from(
+    data: &PmlData<'_>,
+    beta_init: &[f64],
+    log_w_init: &[f64],
+    variance: &PmlVariance,
+    params: Option<PmlParams>,
+) -> Result<PmlResult, EdgeErrors> {
+    let exps = variance.subject.exp();
+    if !(exps.is_finite() && exps > 1.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "PmlVariance::subject must be finite and strictly positive for opt_pml; got {}.",
+            variance.subject
+        )));
+    }
+    let penalty = Penalty::Gamma {
+        alpha: 1.0 / (exps - 1.0),
+        lambda: 1.0 / (exps.sqrt() * (exps - 1.0)),
+    };
+    optimise(
+        data,
+        beta_init,
+        Some(log_w_init),
+        penalty,
+        variance.cell,
+        params.unwrap_or_default(),
+    )
 }
 
 /// nebula's `check_conv`, applied to a finished fit.
@@ -1040,6 +1092,7 @@ impl Workspace {
 fn optimise(
     data: &PmlData<'_>,
     beta_init: &[f64],
+    log_w_init: Option<&[f64]>,
     penalty: Penalty,
     gamma: f64,
     params: PmlParams,
@@ -1059,7 +1112,17 @@ fn optimise(
     }
 
     let mut beta = beta_init.to_vec();
-    let mut log_w = vec![0.0; k];
+    let mut log_w = match log_w_init {
+        Some(init) if init.len() == k => init.to_vec(),
+        Some(init) => {
+            return Err(EdgeErrors::LengthMismatch {
+                name: "log_w_init",
+                expected: k,
+                got: init.len(),
+            });
+        }
+        None => vec![0.0; k],
+    };
     let mut work = Workspace::new(data);
     work.seed(data, gamma);
 

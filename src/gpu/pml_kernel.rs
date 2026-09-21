@@ -206,7 +206,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     gene_ptr: &Tensor<u32>,
     subject_total: &Tensor<F>,
     request_gene: &Tensor<u32>,
-    request_ord: &Tensor<u32>,
     request_params: &Tensor<F>,
     beta_init: &Tensor<F>,
     tolerance: &Tensor<F>,
@@ -229,7 +228,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         terminate!();
     }
     let gene = request_gene[q as usize];
-    let ord = request_ord[q as usize];
 
     let zero = F::new(0.0_f32);
     let one = F::new(1.0_f32);
@@ -302,8 +300,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     // the fit actually returns. See the module doc for why this departs from
     // nebula, which reports the penultimate iterate's.
     let mut settled = false;
+    // Whether the stopping test has passed once already. See below.
+    let mut confirmed = false;
     let mut running = true;
-    let mut second = zero;
 
     while running {
         j = 0u32;
@@ -328,13 +327,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         // Gradient and curvature, fused //
         ///////////////////////////////////
 
-        // The higher-order Laplace correction is only ever read at the point the
-        // fit returns, so it is only assembled on the settling pass.
-        let do_laplace = settled && ord > 1u32;
-        let mut acc3 = zero;
-        let mut acc4 = zero;
-        let mut acc5 = zero;
-
         let mut ptr = ptr_lo;
         s = 0u32;
         while s < k {
@@ -352,12 +344,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             //    is cancellation-free for the same reason the two-pass form is.
             let mut resid = zero;
             let mut resid_block = zero;
-            let mut t3 = zero;
-            let mut t3_block = zero;
-            let mut t4 = zero;
-            let mut t4_block = zero;
-            let mut t5 = zero;
-            let mut t5_block = zero;
+
             let mut p_sum = zero;
             j = 0u32;
             while j < nb {
@@ -424,34 +411,10 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 }
                 p_sum = p_next;
 
-                // The third, fourth and fifth derivative summands of
-                // `laplace_correction` in `crate::sc::pml`, each a further
-                // division of the curvature weight by `extb + gamma`.
-                if do_laplace {
-                    let p1 = phi_c / (extb + gamma);
-                    t3_block += p1 * (gamma - extb);
-                    if ord > 2u32 {
-                        let e2 = extb * extb;
-                        let p2 = p1 / (extb + gamma);
-                        t4_block += p2 * (gamma * gamma + e2 - F::new(4.0_f32) * gamma * extb);
-                        let p3 = p2 / (extb + gamma);
-                        t5_block += p3
-                            * (gamma * gamma * gamma - F::new(11.0_f32) * gamma * gamma * extb
-                                + F::new(11.0_f32) * gamma * e2
-                                - e2 * extb);
-                    }
-                }
-
                 since_flush += 1u32;
                 if since_flush == SUM_BLOCK {
                     resid += resid_block;
                     resid_block = zero;
-                    t3 += t3_block;
-                    t4 += t4_block;
-                    t5 += t5_block;
-                    t3_block = zero;
-                    t4_block = zero;
-                    t5_block = zero;
                     j = 0u32;
                     while j < nb {
                         db[j as usize] += db_block[j as usize];
@@ -463,9 +426,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 r += 1u32;
             }
             resid += resid_block;
-            t3 += t3_block;
-            t4 += t4_block;
-            t5 += t5_block;
             j = 0u32;
             while j < nb {
                 db[j as usize] += db_block[j as usize];
@@ -485,19 +445,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 j += 1u32;
             }
 
-            if do_laplace {
-                let third = gamma * t3 + lambda * w_s;
-                let vw3 = vw_s * vw_s * vw_s;
-                acc3 += third * third / vw3;
-                if ord > 2u32 {
-                    let fourth = gamma * t4 + lambda * w_s;
-                    acc4 += fourth / (vw_s * vw_s);
-                    let fifth = gamma * t5 + lambda * w_s;
-                    let vw2 = vw_s * vw_s;
-                    acc5 += fifth * third / (vw2 * vw2);
-                }
-            }
-
             let shrink = lambda * w_s / vw_s;
             // What the centring leaves over, which the prior's share of the
             // subject curvature keeps from cancelling.
@@ -513,14 +460,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             }
 
             s += 1u32;
-        }
-
-        if do_laplace {
-            second = F::new(5.0_f32) * acc3 / F::new(24.0_f32);
-            if ord > 2u32 {
-                second -= acc4 / F::new(8.0_f32);
-                second += F::new(7.0_f32) * acc5 / F::new(48.0_f32);
-            }
         }
 
         let mut a = 0u32;
@@ -730,7 +669,19 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 s += 1u32;
             }
 
-            settled = !(likdif > eps) || step >= max_iter;
+            // In `f32` the improvement near the optimum is rounding, so the
+            // stopping test passes as soon as one step happens not to improve,
+            // which is early. The value the host reads off is insensitive to
+            // that at first order, but the log-determinant is not stationary at
+            // the optimum and carries the location error straight into the
+            // profile objective. So the test has to pass twice: the second
+            // pass is one more Newton step, which squares the location error.
+            if step >= max_iter {
+                settled = true;
+            } else if !(likdif > eps) {
+                settled = confirmed;
+                confirmed = true;
+            }
         }
     }
 
@@ -761,7 +712,6 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     out_scalars[(n_req + q) as usize] = ll_prev;
     out_scalars[(2u32 * n_req + q) as usize] = log_det;
     out_scalars[(3u32 * n_req + q) as usize] = likdif;
-    out_scalars[(4u32 * n_req + q) as usize] = second;
     out_counts[q as usize] = step;
     out_counts[(n_req + q) as usize] = backtracks;
 }
@@ -1144,7 +1094,6 @@ where
                     tensors.gene_ptr.clone().into_tensor_arg(),
                     tensors.subject_total.clone().into_tensor_arg(),
                     tensors.request_gene.clone().into_tensor_arg(),
-                    tensors.request_ord.clone().into_tensor_arg(),
                     tensors.request_params.clone().into_tensor_arg(),
                     tensors.beta_init.clone().into_tensor_arg(),
                     tensors.tolerance.clone().into_tensor_arg(),
@@ -1205,8 +1154,6 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     pub subject_total: GpuTensor<R, F>,
     /// The gene each request is for.
     pub request_gene: GpuTensor<R, u32>,
-    /// The Laplace order each request is fitted at.
-    pub request_ord: GpuTensor<R, u32>,
     /// `alpha`, `lambda` and `gamma` per request, `[i * n_req + q]`.
     pub request_params: GpuTensor<R, F>,
     /// Starting fixed effects, `[j * n_req + q]`.
@@ -1222,8 +1169,8 @@ pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     pub out_beta: GpuTensor<R, F>,
     /// Schur complement, `[(i * nb + j) * n_req + q]`.
     pub out_information: GpuTensor<R, F>,
-    /// Log-likelihood, previous log-likelihood, log-determinant, final
-    /// improvement and the higher-order Laplace correction, `[i * n_req + q]`.
+    /// Log-likelihood, previous log-likelihood, log-determinant and final
+    /// improvement, `[i * n_req + q]`.
     pub out_scalars: GpuTensor<R, F>,
     /// Newton steps taken and backtracks used, `[i * n_req + q]`.
     pub out_counts: GpuTensor<R, u32>,

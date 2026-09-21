@@ -28,7 +28,7 @@ mod common;
 
 use common::{Tol, assert_close, assert_close_scalar, assert_eq_usize};
 
-use edge_rs::sc::nebula::{NebulaParams, nebula};
+use edge_rs::sc::nebula::{NebulaFit, NebulaParams, nebula};
 use edge_rs::sc::shrink::{sc_residual_df, shrink_sc_dispersion};
 use edge_rs::sc::test::{ScTested, glm_sc_test, packed_len};
 
@@ -155,6 +155,35 @@ const TOL_SHRINK: Tol = Tol::rel(1e-12);
 
 /// Prior degrees of freedom from that shrinkage. Needs `8.3e-13`.
 const TOL_SHRINK_DF: Tol = Tol::rel(1e-11);
+
+/// Every tolerance the R-parity check applies to one NEBULA fit.
+struct NebulaTols {
+    /// Coefficients on the pure paths.
+    coef: Tol,
+    /// Standard errors on the pure paths.
+    se: Tol,
+    /// Covariance entries on the pure paths.
+    cov: Tol,
+    /// Subject-level overdispersion on the pure paths.
+    subject: Tol,
+    /// Cell-level overdispersion on the pure paths.
+    cell: Tol,
+    /// Coefficients on the mixed LN-then-HL path.
+    ln_hl_coef: Tol,
+    /// Subject-level overdispersion on the mixed path.
+    ln_hl_subject: Tol,
+}
+
+/// The CPU path's gates.
+const CPU_TOLS: NebulaTols = NebulaTols {
+    coef: TOL_COEF,
+    se: TOL_SE,
+    cov: TOL_COV,
+    subject: TOL_SUBJECT,
+    cell: TOL_CELL,
+    ln_hl_coef: LN_HL_COEF,
+    ln_hl_subject: LN_HL_SUBJECT,
+};
 
 /////////////
 // Loading //
@@ -306,8 +335,6 @@ fn test_nebula_matches_the_r_package() {
 
     for d in &DATASETS {
         let l = load(d);
-        let want = common::table(&format!("{}_nebula.csv", d.tag));
-        let want_cov = common::table(&format!("{}_covariance.csv", d.tag));
 
         let cells_per_subject = l.n_cells as f64 / l.n_subjects as f64;
         assert_eq!(
@@ -334,21 +361,48 @@ fn test_nebula_matches_the_r_package() {
             Some(golden_params()),
         )
         .expect("nebula failed");
+        check_against_r(d.tag, d.tag, &fit, &s, &CPU_TOLS);
+    }
+}
+
+/// Gates one NEBULA fit against the R package's output for its dataset.
+///
+/// Shared by the CPU test and the GPU one, so the device path is held to
+/// exactly the gates the CPU path is, and the tolerance report shows both
+/// under their own labels.
+///
+/// ### Params
+///
+/// * `tag` - Fixture prefix
+/// * `label` - Prefix for the tolerance report
+/// * `fit` - The fit to check
+/// * `s` - The fixture scalars
+/// * `tols` - The gates to apply
+fn check_against_r(
+    tag: &str,
+    label: &str,
+    fit: &NebulaFit,
+    s: &common::Scalars,
+    tols: &NebulaTols,
+) {
+    {
+        let want = common::table(&format!("{}_nebula.csv", tag));
+        let want_cov = common::table(&format!("{}_covariance.csv", tag));
 
         // Gene filtering. R reports the surviving genes one-based.
         let want_index: Vec<usize> = want.column_usize("gene_id").iter().map(|g| g - 1).collect();
         assert_eq_usize(
             &fit.gene_index,
             &want_index,
-            &format!("{}/gene_index", d.tag),
+            &format!("{label}/gene_index"),
         );
         assert_eq!(
             fit.gene_index.len(),
-            s.get_usize(d.tag, "n_genes_out"),
+            s.get_usize(tag, "n_genes_out"),
             "{}: surviving gene count",
-            d.tag
+            tag
         );
-        assert_eq!(fit.n_coef, 3, "{}: three coefficients", d.tag);
+        assert_eq!(fit.n_coef, 3, "{}: three coefficients", tag);
 
         let n = fit.gene_index.len();
         let names = ["int", "grp", "cov2"];
@@ -381,26 +435,26 @@ fn test_nebula_matches_the_r_package() {
         assert_close(
             &pick(&fit.coefficients, &pure, 3),
             &pick(&want_coef, &pure, 3),
-            TOL_COEF,
-            &format!("{}/coefficients_pure", d.tag),
+            tols.coef,
+            &format!("{label}/coefficients_pure"),
         );
         assert_close(
             &pick(&fit.se, &pure, 3),
             &pick(&want_se, &pure, 3),
-            TOL_SE,
-            &format!("{}/se_pure", d.tag),
+            tols.se,
+            &format!("{label}/se_pure"),
         );
         assert_close(
             &pick(fit.subject_overdispersion.as_slice(), &pure, 1),
             &pick(want.column("Subject"), &pure, 1),
-            TOL_SUBJECT,
-            &format!("{}/subject_overdispersion_pure", d.tag),
+            tols.subject,
+            &format!("{label}/subject_overdispersion_pure"),
         );
         assert_close(
             &pick(fit.cell_overdispersion.as_slice(), &pure, 1),
             &pick(want.column("Cell"), &pure, 1),
-            TOL_CELL,
-            &format!("{}/cell_overdispersion_pure", d.tag),
+            tols.cell,
+            &format!("{label}/cell_overdispersion_pure"),
         );
 
         // The mixed path, at the tolerance it currently earns rather than the
@@ -409,14 +463,14 @@ fn test_nebula_matches_the_r_package() {
             assert_close(
                 &pick(&fit.coefficients, &mixed, 3),
                 &pick(&want_coef, &mixed, 3),
-                LN_HL_COEF,
-                &format!("{}/coefficients_ln_hl", d.tag),
+                tols.ln_hl_coef,
+                &format!("{label}/coefficients_ln_hl"),
             );
             assert_close(
                 &pick(fit.subject_overdispersion.as_slice(), &mixed, 1),
                 &pick(want.column("Subject"), &mixed, 1),
-                LN_HL_SUBJECT,
-                &format!("{}/subject_overdispersion_ln_hl", d.tag),
+                tols.ln_hl_subject,
+                &format!("{label}/subject_overdispersion_ln_hl"),
             );
         }
 
@@ -433,8 +487,8 @@ fn test_nebula_matches_the_r_package() {
         assert_close(
             &pick(&fit.covariance, &pure, packed),
             &pick(&want_packed, &pure, packed),
-            TOL_COV,
-            &format!("{}/covariance_pure", d.tag),
+            tols.cov,
+            &format!("{label}/covariance_pure"),
         );
 
         for g in 0..n {
@@ -763,4 +817,92 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
         shrunk.df_residual, df_residual,
         "the result should carry the residual df it was given"
     );
+}
+
+/// The GPU path's gates, read off the NEEDS column of its own tolerance report.
+///
+/// Stage two's penalised fits run in `f32` on the device, so the variance
+/// components land within about `1e-3` of where the CPU puts them, and the
+/// coefficients and standard errors stage three computes from them follow.
+/// Worst measured needs, across both fixtures, against R:
+///
+/// * coefficients `3.9e-3`, standard errors `2.4e-3`, cell-level
+///   overdispersion `2.2e-3`;
+/// * covariance entries `5.8e-3` above an absolute `1e-6`. Without the floor
+///   one entry needs `3.6e-1`: it is `cov(intercept, cov2) = 6.9e-7` on a gene
+///   whose diagonals are `1.8e-2` and `6.9e-3`, a correlation of `6e-5`, and a
+///   relative error on it measures nothing;
+/// * subject-level overdispersion `6.6e-3` above an absolute `1e-3`, the floor
+///   the CPU's own mixed-path gate uses. Without it one gene needs `8.9e-1`: R
+///   and the CPU put `sigma^2` at `1.0e-3`, just above its `1e-4` bound, and the
+///   GPU puts it on the bound. Both say the gene has no subject effect.
+///
+/// The mixed LN-then-HL path is held to the CPU's own gates, which the GPU meets
+/// as well as the CPU does (`8.0e-2` against the CPU's `7.9e-2`).
+#[cfg(feature = "gpu")]
+const GPU_TOLS: NebulaTols = NebulaTols {
+    coef: Tol::new(1e-2, 1e-9),
+    se: Tol::rel(1e-2),
+    cov: Tol::new(1.5e-2, 1e-6),
+    subject: Tol::new(1.5e-2, 1e-3),
+    cell: Tol::rel(1e-2),
+    ln_hl_coef: LN_HL_COEF,
+    ln_hl_subject: LN_HL_SUBJECT,
+};
+
+/// The GPU path, against the same R goldens as the CPU path.
+///
+/// Stage two's penalised fits run on the device in `f32`; the optimum's value,
+/// the search, and stage three stay in `f64` on the host. See
+/// `edge_rs::gpu::stage_two`.
+#[cfg(feature = "gpu")]
+#[test]
+fn test_gpu_nebula_matches_the_r_package() {
+    use cubecl::Runtime;
+    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use edge_rs::gpu::stage_two::nebula_sparse_gpu;
+    use edge_rs::prelude::{CompressedSparse, SparseFormat};
+
+    let s = common::scalars();
+    let device = WgpuDevice::default();
+    let client = WgpuRuntime::client(&device);
+
+    for d in &DATASETS {
+        let l = load(d);
+        let mut data = Vec::new();
+        let mut indices = Vec::new();
+        let mut indptr = vec![0u32];
+        for g in 0..l.n_genes {
+            for (c, &v) in l.counts[g * l.n_cells..(g + 1) * l.n_cells]
+                .iter()
+                .enumerate()
+            {
+                if v > 0.0 {
+                    data.push(v);
+                    indices.push(c as u32);
+                }
+            }
+            indptr.push(data.len() as u32);
+        }
+        let sparse = CompressedSparse::from_parts(
+            data,
+            indices,
+            indptr,
+            SparseFormat::Csr,
+            (l.n_genes, l.n_cells),
+        )
+        .expect("well-formed CSR");
+
+        let fit = nebula_sparse_gpu(
+            &sparse,
+            &l.subject,
+            &l.design,
+            3,
+            Some(&l.offset),
+            Some(golden_params()),
+            &client,
+        )
+        .expect("gpu nebula failed");
+        check_against_r(d.tag, &format!("gpu/{}", d.tag), &fit, &s, &GPU_TOLS);
+    }
 }

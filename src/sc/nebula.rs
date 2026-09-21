@@ -654,17 +654,17 @@ where
 /// Everything the per-gene fit reads but never writes.
 pub(crate) struct Shared<'a> {
     /// Centred and scaled design, row-major `n_cells * n_coef`.
-    design: &'a [f64],
+    pub(crate) design: &'a [f64],
     /// Log offset per cell.
-    log_offset: &'a [f64],
+    pub(crate) log_offset: &'a [f64],
     /// Subject boundaries, length `n_subjects + 1`.
-    fid: &'a [usize],
+    pub(crate) fid: &'a [usize],
     /// Number of cells.
     n_cells: usize,
     /// Number of design columns.
     n_coef: usize,
     /// Number of subjects.
-    n_subjects: usize,
+    pub(crate) n_subjects: usize,
     /// Index of the intercept column.
     intercept: usize,
     /// Log of the mean offset, nebula's `moffset`.
@@ -683,7 +683,7 @@ pub(crate) struct Shared<'a> {
     /// The variant actually being run, after the cells-per-subject override.
     method: NebulaMethod,
     /// The user's knobs.
-    params: NebulaParams,
+    pub(crate) params: NebulaParams,
 }
 
 /// One gene's fit on the centred design scale.
