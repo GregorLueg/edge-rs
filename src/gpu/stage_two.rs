@@ -56,11 +56,15 @@
 //! the slowest gene's count times the gene count. A polish stencil goes out as
 //! all of its points in one round.
 
+use std::time::{Duration, Instant};
+
 use cubecl::prelude::*;
 use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
-use crate::gpu::nebula_gpu::{GpuGene, GpuSolveParams, PmlReply, PmlRequest, ResidentBatch};
+use crate::gpu::nebula_gpu::{
+    GpuGene, GpuSolveParams, PmlReply, PmlRequest, ResidentBatch, SolveTiming,
+};
 use crate::gpu::pml_kernel::F32_NOISE_SCALE;
 use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
@@ -70,6 +74,100 @@ use crate::sc::nebula::{
 };
 use crate::sc::pml::{PmlParams, PmlVariance, opt_pml_from};
 use crate::sc::ptmg::{GeneCounts, positive_indices};
+
+////////////
+// Consts //
+////////////
+
+/// Environment variable that switches on the per-phase timing report.
+const TIMING_ENV: &str = "EDGE_RS_GPU_TIMING";
+
+/// Bins of the Newton-step histograms; the last one collects everything above.
+const STEP_BINS: usize = 12;
+
+////////////
+// Timing //
+////////////
+
+/// Where one [`fit_all`] spent its wall clock, reported under [`TIMING_ENV`].
+#[derive(Default)]
+struct Timing {
+    /// Stage one, every gene.
+    stage_one: Duration,
+    /// Resident upload.
+    upload: Duration,
+    /// Building the requests of every round.
+    gather: Duration,
+    /// [`ResidentBatch::solve`], every round.
+    solve: Duration,
+    /// The `f64` finish and the objective assembly, every round.
+    finish: Duration,
+    /// Handing the searches their values.
+    tell: Duration,
+    /// Stage three, every gene.
+    stage_three: Duration,
+    /// Requests per round.
+    requests: Vec<usize>,
+    /// Newton steps the device took, per request.
+    device_steps: [usize; STEP_BINS],
+    /// Newton steps the `f64` finish took, per request.
+    finish_steps: [usize; STEP_BINS],
+}
+
+impl Timing {
+    /// Prints the report to stderr.
+    ///
+    /// ### Params
+    ///
+    /// * `solve` - The phases inside the device solves
+    fn report(&self, solve: Option<SolveTiming>) {
+        let secs = |d: Duration| d.as_secs_f64();
+        let mut sorted = self.requests.clone();
+        sorted.sort_unstable();
+        let at = |f: f64| {
+            sorted
+                .get(((sorted.len() as f64 - 1.0) * f) as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        eprintln!(
+            "gpu nebula: stage one {:.2} s, upload {:.2} s, gather {:.2} s, solve {:.2} s, finish {:.2} s, tell {:.2} s, stage three {:.2} s",
+            secs(self.stage_one),
+            secs(self.upload),
+            secs(self.gather),
+            secs(self.solve),
+            secs(self.finish),
+            secs(self.tell),
+            secs(self.stage_three),
+        );
+        if let Some(t) = solve {
+            eprintln!(
+                "  solve: staging {:.2} s, device {:.2} s, read-back {:.2} s",
+                secs(t.staging),
+                secs(t.device),
+                secs(t.read_back),
+            );
+        }
+        eprintln!(
+            "  rounds {}, requests {}, per round min {} / median {} / max {}",
+            sorted.len(),
+            sorted.iter().sum::<usize>(),
+            at(0.0),
+            at(0.5),
+            at(1.0),
+        );
+        eprintln!(
+            "  device newton steps (last bin is {}+): {:?}",
+            STEP_BINS - 1,
+            self.device_steps
+        );
+        eprintln!(
+            "  finish newton steps (last bin is {}+): {:?}",
+            STEP_BINS - 1,
+            self.finish_steps
+        );
+    }
+}
 
 /////////////////
 // Entry point //
@@ -151,6 +249,8 @@ fn fit_all<R: Runtime>(
     client: &ComputeClient<R>,
 ) -> Result<Vec<GeneOutcome>, EdgeErrors> {
     let k = shared.n_subjects;
+    let mut timing = std::env::var_os(TIMING_ENV).map(|_| Timing::default());
+    let started = Instant::now();
     let genes: Vec<(GeneCounts, GenePlan)> = kept
         .par_iter()
         .map(|&g| {
@@ -160,16 +260,26 @@ fn fit_all<R: Runtime>(
         })
         .collect::<Result<_, EdgeErrors>>()?;
 
-    let refits = search_all(shared, &genes, totals, kept, client)?;
+    if let Some(t) = timing.as_mut() {
+        t.stage_one = started.elapsed();
+    }
 
-    genes
+    let (refits, solve_timing) = search_all(shared, &genes, totals, kept, client, timing.as_mut())?;
+
+    let started = Instant::now();
+    let outcomes = genes
         .into_par_iter()
         .zip(refits)
         .zip(kept.par_iter())
         .map(|(((counts, plan), refit), &g)| {
             finish_gene(shared, &counts, &totals[g * k..(g + 1) * k], plan, refit)
         })
-        .collect()
+        .collect();
+    if let Some(t) = timing.as_mut() {
+        t.stage_three = started.elapsed();
+        t.report(solve_timing);
+    }
+    outcomes
 }
 
 ///////////////
@@ -201,18 +311,21 @@ struct Live<'a> {
 /// * `totals` - Count total per subject, gene-major
 /// * `kept` - Genes that passed the expression filter
 /// * `client` - CubeCL compute client
+/// * `timing` - Where to book the phases, when the report is on
 ///
 /// ### Returns
 ///
 /// One entry per kept gene: `None` where no refit was called for, else the
-/// search's result.
+/// search's result. Then the phases inside the device solves, when timed.
+#[allow(clippy::type_complexity)]
 fn search_all<R: Runtime>(
     shared: &Shared<'_>,
     genes: &[(GeneCounts, GenePlan)],
     totals: &[f64],
     kept: &[usize],
     client: &ComputeClient<R>,
-) -> Result<Vec<Option<Option<Vec<f64>>>>, EdgeErrors> {
+    mut timing: Option<&mut Timing>,
+) -> Result<(Vec<Option<Option<Vec<f64>>>>, Option<SolveTiming>), EdgeErrors> {
     let k = shared.n_subjects;
     let mut refits: Vec<Option<Option<Vec<f64>>>> = vec![None; genes.len()];
 
@@ -233,7 +346,7 @@ fn search_all<R: Runtime>(
         });
     }
     if live.is_empty() {
-        return Ok(refits);
+        return Ok((refits, None));
     }
 
     let resident_genes: Vec<GpuGene<'_>> = live
@@ -247,6 +360,7 @@ fn search_all<R: Runtime>(
             gamma: 0.0,
         })
         .collect();
+    let started = Instant::now();
     let mut resident = ResidentBatch::upload(
         shared.design,
         shared.log_offset,
@@ -254,6 +368,10 @@ fn search_all<R: Runtime>(
         &resident_genes,
         client,
     )?;
+    if let Some(t) = timing.as_deref_mut() {
+        t.upload = started.elapsed();
+        resident.time_solves();
+    }
 
     let inner = PmlParams::default();
     let solve_params = GpuSolveParams {
@@ -267,6 +385,7 @@ fn search_all<R: Runtime>(
     loop {
         // -- Gather: every live search's points, as device requests. Points
         //    outside the domain are infinite without a fit. --
+        let started = Instant::now();
         let mut requests = Vec::new();
         let mut routes: Vec<(usize, usize, f64, f64)> = Vec::new();
         let mut values: Vec<Vec<f64>> = vec![Vec::new(); live.len()];
@@ -302,11 +421,13 @@ fn search_all<R: Runtime>(
             break;
         }
 
+        let gathered = Instant::now();
         let replies = resident.solve(&requests, &solve_params, client)?;
+        let solved = Instant::now();
 
         // -- Scatter: assemble the profile objective in f64, in parallel, then
         //    hand each search its values. --
-        let assembled: Vec<f64> = routes
+        let assembled: Vec<(f64, usize)> = routes
             .par_iter()
             .zip(replies.par_iter())
             .map(|(&(i, _, subject, cell), reply)| {
@@ -320,14 +441,19 @@ fn search_all<R: Runtime>(
                     l.search.order(),
                     l.fixed_cell,
                 );
-                let Some(fit) = finish_at_argmax(&l.pml, reply, subject, cell, objective.params)
+                let Some((fit, steps)) =
+                    finish_at_argmax(&l.pml, reply, subject, cell, objective.params)
                 else {
-                    return f64::INFINITY;
+                    return (f64::INFINITY, 0);
                 };
-                objective.assemble(subject, cell, &fit, histogram_tail(&l.tail, cell))
+                (
+                    objective.assemble(subject, cell, &fit, histogram_tail(&l.tail, cell)),
+                    steps,
+                )
             })
             .collect();
-        for (&(i, p, _, _), v) in routes.iter().zip(assembled) {
+        let finished = Instant::now();
+        for (&(i, p, _, _), &(v, _)) in routes.iter().zip(&assembled) {
             values[i][p] = v;
         }
         for (l, v) in live.iter_mut().zip(values) {
@@ -335,12 +461,24 @@ fn search_all<R: Runtime>(
                 l.search.tell(&v);
             }
         }
+        if let Some(t) = timing.as_deref_mut() {
+            t.gather += gathered - started;
+            t.solve += solved - gathered;
+            t.finish += finished - solved;
+            t.tell += finished.elapsed();
+            t.requests.push(requests.len());
+            for (reply, &(_, steps)) in replies.iter().zip(&assembled) {
+                t.device_steps[(reply.iterations as usize).min(STEP_BINS - 1)] += 1;
+                t.finish_steps[steps.min(STEP_BINS - 1)] += 1;
+            }
+        }
     }
 
+    let solve_timing = resident.timing();
     for l in live {
         refits[l.index] = Some(l.search.result());
     }
-    Ok(refits)
+    Ok((refits, solve_timing))
 }
 
 /// The four scalars the objective reads: the CPU's fit, started from the
@@ -366,15 +504,15 @@ fn search_all<R: Runtime>(
 ///
 /// ### Returns
 ///
-/// The inner fit, or `None` if the device's point is not finite or the fit
-/// fails.
+/// The inner fit and the Newton steps it took, or `None` if the device's point
+/// is not finite or the fit fails.
 fn finish_at_argmax(
     pml: &crate::sc::pml::PmlData<'_>,
     reply: &PmlReply,
     subject: f64,
     cell: f64,
     params: PmlParams,
-) -> Option<InnerFit> {
+) -> Option<(InnerFit, usize)> {
     if !reply.beta.iter().chain(&reply.log_w).all(|v| v.is_finite()) {
         return None;
     }
@@ -386,12 +524,15 @@ fn finish_at_argmax(
         Some(params),
     )
     .ok()?;
-    Some(InnerFit {
-        log_likelihood: fit.log_likelihood,
-        log_likelihood_prev: fit.log_likelihood_prev,
-        log_det: fit.log_det,
-        second_order: fit.second_order,
-    })
+    Some((
+        InnerFit {
+            log_likelihood: fit.log_likelihood,
+            log_likelihood_prev: fit.log_likelihood_prev,
+            log_det: fit.log_det,
+            second_order: fit.second_order,
+        },
+        fit.iterations,
+    ))
 }
 
 /// Distinct positive counts other than one and two, with their multiplicities.

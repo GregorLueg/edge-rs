@@ -25,6 +25,8 @@
 //! prior's `alpha` and `lambda`, is computed in `f64` and cast once, because
 //! `alpha = 1 / (e^s - 1)` cancels badly for the small `s` most genes land on.
 
+use std::time::{Duration, Instant};
+
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 use rayon::prelude::*;
@@ -140,6 +142,17 @@ pub struct GpuSolveParams {
     pub full: bool,
 }
 
+/// Wall clock inside [`ResidentBatch::solve`], accumulated over launches.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SolveTiming {
+    /// Request staging on the host and its upload.
+    pub staging: Duration,
+    /// Launch to the end of the device queue.
+    pub device: Duration,
+    /// Read-back and the scatter into replies.
+    pub read_back: Duration,
+}
+
 //////////////////
 // Resident set //
 //////////////////
@@ -180,6 +193,8 @@ pub struct ResidentBatch<R: Runtime> {
     k: usize,
     /// Design columns.
     nb: usize,
+    /// Per-phase wall clock, when [`Self::time_solves`] switched it on.
+    timing: Option<SolveTiming>,
 }
 
 impl<R: Runtime> ResidentBatch<R> {
@@ -333,7 +348,25 @@ impl<R: Runtime> ResidentBatch<R> {
             n_genes,
             k,
             nb,
+            timing: None,
         })
+    }
+
+    /// Switches on per-phase timing of every later [`Self::solve`].
+    ///
+    /// A timed solve waits for the device queue to drain before it reads back,
+    /// so the launch and the copy are told apart; an untimed one does not.
+    pub fn time_solves(&mut self) {
+        self.timing = Some(SolveTiming::default());
+    }
+
+    /// What the timed solves have cost so far.
+    ///
+    /// ### Returns
+    ///
+    /// The accumulated phases, or `None` unless [`Self::time_solves`] was called.
+    pub fn timing(&self) -> Option<SolveTiming> {
+        self.timing
     }
 
     /// Design width of the resident set.
@@ -372,6 +405,7 @@ impl<R: Runtime> ResidentBatch<R> {
         }
         let (n_genes, k, nb) = (self.n_genes, self.k, self.nb);
         let err = |e: CubeclUtilsErrors| EdgeErrors::Gpu(e.to_string());
+        let started = Instant::now();
 
         let mut request_gene = vec![0u32; n_req];
         let mut request_params = vec![0.0f32; 3 * n_req];
@@ -444,6 +478,7 @@ impl<R: Runtime> ResidentBatch<R> {
             out_counts: GpuTensor::empty(vec![2 * n_req], client).map_err(err)?,
         };
 
+        let staged = Instant::now();
         launch_opt_pml::<R, f32>(
             &tensors,
             n_genes,
@@ -454,6 +489,10 @@ impl<R: Runtime> ResidentBatch<R> {
             params.max_backtrack,
             client,
         )?;
+        if self.timing.is_some() {
+            cubecl::future::block_on(client.sync()).map_err(|e| EdgeErrors::Gpu(e.to_string()))?;
+        }
+        let launched = Instant::now();
 
         let scalars = tensors.out_scalars.read(client).map_err(err)?;
         let counts = tensors.out_counts.read(client).map_err(err)?;
@@ -469,7 +508,7 @@ impl<R: Runtime> ResidentBatch<R> {
             (Vec::new(), Vec::new(), Vec::new())
         };
 
-        Ok((0..n_req)
+        let replies = (0..n_req)
             .map(|q| PmlReply {
                 log_likelihood: scalars[q] as f64,
                 log_likelihood_prev: scalars[n_req + q] as f64,
@@ -494,7 +533,13 @@ impl<R: Runtime> ResidentBatch<R> {
                     Vec::new()
                 },
             })
-            .collect())
+            .collect();
+        if let Some(t) = self.timing.as_mut() {
+            t.staging += staged - started;
+            t.device += launched - staged;
+            t.read_back += launched.elapsed();
+        }
+        Ok(replies)
     }
 }
 
