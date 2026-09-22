@@ -9,9 +9,10 @@
 //! ### The three stages of one gene
 //!
 //! 1. Bounded L-BFGS-B on the marginal likelihood
-//!    ([`ptmg_value_and_gradient`]) over `[beta, sigma, phi]`. Only the two
-//!    variance components survive this stage; nebula throws the fixed effects
-//!    away and restarts them from `log(mean count) - mean log offset`.
+//!    ([`ptmg_value_and_gradient`](crate::sc::ptmg::ptmg_value_and_gradient))
+//!    over `[beta, sigma, phi]`. Only the two variance components survive
+//!    this stage; nebula throws the fixed effects away and restarts them from
+//!    `log(mean count) - mean log offset`.
 //! 2. A bounded search over the two variance components alone, with the fixed
 //!    effects profiled out by [`opt_pml`] inside every evaluation. NEBULA-HL
 //!    always runs this; NEBULA-LN runs it, or a one-dimensional restriction of
@@ -66,8 +67,8 @@ use crate::sc::pml::{
     CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml,
 };
 use crate::sc::ptmg::{
-    GeneData, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
-    positive_indices, ptmg_value_and_gradient,
+    GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv,
+    offset_summary, positive_indices, ptmg_value_and_gradient_with,
 };
 use crate::sc::test::packed_len;
 
@@ -1044,7 +1045,8 @@ fn minimise_marginal(
 ) -> (Vec<f64>, bool) {
     let n = start.len();
     let mut best: Vec<f64> = (0..n).map(|j| start[j].clamp(lower[j], upper[j])).collect();
-    let best_f = ptmg_value_and_gradient(gene, &best).0;
+    let mut scratch = PtmgScratch::new(gene);
+    let best_f = ptmg_value_and_gradient_with(gene, &best, &mut scratch).0;
     if !best_f.is_finite() {
         return (best, true);
     }
@@ -1059,7 +1061,7 @@ fn minimise_marginal(
 
     if let Ok(step) = minimise(
         |x, g| {
-            let (value, gradient) = ptmg_value_and_gradient(gene, x);
+            let (value, gradient) = ptmg_value_and_gradient_with(gene, x, &mut scratch);
             g.copy_from_slice(&gradient);
             value
         },

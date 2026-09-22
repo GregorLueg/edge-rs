@@ -19,10 +19,9 @@
 //! the parallel axis and belong to the caller. The only exception is
 //! [`cumsum_y`], which sees the whole matrix and fans out over genes itself.
 //!
-//! Scratch buffers are allocated per evaluation rather than threaded through
-//! the API, because the required signatures take none. They are
-//! `O(n_cells * n_coef)` and the optimiser calls this a few dozen times per
-//! gene.
+//! The public kernels allocate their scratch per call. Stage one's optimiser
+//! evaluates one gene tens to hundreds of times, so it holds a `PtmgScratch`
+//! per gene and goes through `ptmg_value_and_gradient_with` instead.
 //!
 //! ### References
 //!
@@ -196,6 +195,41 @@ impl<'a> GeneData<'a> {
     #[inline]
     pub fn n_params(&self) -> usize {
         self.n_coef + 2
+    }
+}
+
+/// Per-gene buffers for the kernels, so repeated evaluations of one gene
+/// allocate nothing.
+pub(crate) struct PtmgScratch {
+    /// Count per cell, zero where the gene is not expressed. Constant per gene,
+    /// so filled once.
+    y_cell: Vec<f64>,
+    /// `exp(eta)` per cell, overwritten by every evaluation.
+    extb: Vec<f64>,
+    /// Sum of `extb` per subject, overwritten by every evaluation.
+    cumsumxtb: Vec<f64>,
+}
+
+impl PtmgScratch {
+    /// Buffers for one gene.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - The gene the scratch will serve, and only that gene
+    ///
+    /// ### Returns
+    ///
+    /// The scratch with the per-cell counts scattered in.
+    pub(crate) fn new(data: &GeneData<'_>) -> Self {
+        let mut y_cell = vec![0.0; data.n_cells()];
+        for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
+            y_cell[c] = y;
+        }
+        Self {
+            y_cell,
+            extb: vec![0.0; data.n_cells()],
+            cumsumxtb: vec![0.0; data.n_subjects()],
+        }
     }
 }
 
@@ -429,17 +463,17 @@ pub fn ptmg_neg_log_likelihood(data: &GeneData<'_>, params: &[f64]) -> f64 {
     let terms = Terms::new(params[nb], params[nb + 1]);
     let gamma = terms.gamma;
 
-    let mut y_cell = vec![0.0; n_cells];
-    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
-        y_cell[c] = y;
-    }
-
-    let mut extb = vec![0.0; n_cells];
-    let mut total = linear_predictor(data, beta, &y_cell, &mut extb);
+    let mut scratch = PtmgScratch::new(data);
+    let mut total = linear_predictor(data, beta, &mut scratch);
+    let PtmgScratch {
+        y_cell,
+        extb,
+        cumsumxtb,
+    } = &scratch;
 
     for s in 0..n_subjects {
         let span = data.fid[s]..data.fid[s + 1];
-        let cumsumxtb: f64 = extb[span.clone()].iter().sum();
+        let cumsumxtb = cumsumxtb[s];
         let ystar = data.subject_totals[s] + terms.alpha;
         let mustar = cumsumxtb + terms.lambda;
         total -= ystar * mustar.ln();
@@ -476,7 +510,7 @@ pub fn ptmg_neg_log_likelihood(data: &GeneData<'_>, params: &[f64]) -> f64 {
 ///
 /// The gradient, length `n_coef + 2`.
 pub fn ptmg_gradient(data: &GeneData<'_>, params: &[f64]) -> Vec<f64> {
-    evaluate(data, params, false).1
+    evaluate(data, params, false, &mut PtmgScratch::new(data)).1
 }
 
 /// Value and gradient of the marginal negative log-likelihood together.
@@ -493,7 +527,28 @@ pub fn ptmg_gradient(data: &GeneData<'_>, params: &[f64]) -> Vec<f64> {
 ///
 /// The negative log-likelihood and its gradient, length `n_coef + 2`.
 pub fn ptmg_value_and_gradient(data: &GeneData<'_>, params: &[f64]) -> (f64, Vec<f64>) {
-    let (value, gradient, _) = evaluate(data, params, false);
+    ptmg_value_and_gradient_with(data, params, &mut PtmgScratch::new(data))
+}
+
+/// [`ptmg_value_and_gradient`] on buffers the caller keeps across evaluations
+/// of one gene.
+///
+/// ### Params
+///
+/// * `data` - The gene, as validated by [`GeneData::new`]
+/// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
+/// * `scratch` - Built by [`PtmgScratch::new`] from this same gene
+///
+/// ### Returns
+///
+/// The negative log-likelihood and its gradient, bit for bit what
+/// [`ptmg_value_and_gradient`] returns.
+pub(crate) fn ptmg_value_and_gradient_with(
+    data: &GeneData<'_>,
+    params: &[f64],
+    scratch: &mut PtmgScratch,
+) -> (f64, Vec<f64>) {
+    let (value, gradient, _) = evaluate(data, params, false, scratch);
     (value, gradient)
 }
 
@@ -523,40 +578,47 @@ pub fn ptmg_value_gradient_hessian(
     data: &GeneData<'_>,
     params: &[f64],
 ) -> (f64, Vec<f64>, Vec<f64>) {
-    evaluate(data, params, true)
+    evaluate(data, params, true, &mut PtmgScratch::new(data))
 }
 
-/// Fills the exponentiated linear predictor and accumulates `sum y * eta`.
+/// Fills the exponentiated linear predictor and its subject sums, and
+/// accumulates `sum y * eta`.
 ///
 /// ### Params
 ///
 /// * `data` - The gene
 /// * `beta` - Coefficients, length `n_coef`
-/// * `y_cell` - Count per cell, zero where the gene is not expressed
-/// * `extb` - Output buffer of length `n_cells`, overwritten with `exp(eta)`
+/// * `scratch` - The gene's buffers; `extb` and `cumsumxtb` are overwritten
 ///
 /// ### Returns
 ///
 /// `sum_i y_i * eta_i`, the only part of the likelihood linear in `eta`.
-fn linear_predictor(data: &GeneData<'_>, beta: &[f64], y_cell: &[f64], extb: &mut [f64]) -> f64 {
+fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch) -> f64 {
     let nb = data.n_coef;
     let mut total = 0.0;
 
-    for (i, (row, extb_i)) in data
-        .design
-        .chunks_exact(nb)
-        .zip(extb.iter_mut())
-        .enumerate()
-    {
-        let mut eta = data.log_offset[i];
-        for (&x, &b) in row.iter().zip(beta.iter()) {
-            eta += x * b;
+    for (s, csx_s) in scratch.cumsumxtb.iter_mut().enumerate() {
+        let span = data.fid[s]..data.fid[s + 1];
+        let mut csx = 0.0;
+        for (((row, &offset), &y), extb_i) in data.design[span.start * nb..span.end * nb]
+            .chunks_exact(nb)
+            .zip(&data.log_offset[span.clone()])
+            .zip(&scratch.y_cell[span.clone()])
+            .zip(&mut scratch.extb[span])
+        {
+            let mut eta = offset;
+            for (&x, &b) in row.iter().zip(beta.iter()) {
+                eta += x * b;
+            }
+            // Guarded so a huge eta paired with a zero count cannot make `0 * inf`.
+            if y != 0.0 {
+                total += eta * y;
+            }
+            let e = eta.exp();
+            *extb_i = e;
+            csx += e;
         }
-        // Guarded so a huge eta paired with a zero count cannot make `0 * inf`.
-        if y_cell[i] != 0.0 {
-            total += eta * y_cell[i];
-        }
-        *extb_i = eta.exp();
+        *csx_s = csx;
     }
 
     total
@@ -576,12 +638,18 @@ fn linear_predictor(data: &GeneData<'_>, beta: &[f64], y_cell: &[f64], extb: &mu
 /// * `data` - The gene, as validated by [`GeneData::new`]
 /// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
 /// * `with_hessian` - Whether to build the Hessian
+/// * `scratch` - Built by [`PtmgScratch::new`] from this same gene
 ///
 /// ### Returns
 ///
 /// The negative log-likelihood, its gradient of length `n_coef + 2`, and its
 /// row-major Hessian, which is empty when `with_hessian` is false.
-fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Vec<f64>, Vec<f64>) {
+fn evaluate(
+    data: &GeneData<'_>,
+    params: &[f64],
+    with_hessian: bool,
+    scratch: &mut PtmgScratch,
+) -> (f64, Vec<f64>, Vec<f64>) {
     debug_assert_eq!(params.len(), data.n_params());
 
     let nb = data.n_coef;
@@ -593,25 +661,23 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
     let terms = Terms::new(params[nb], params[nb + 1]);
     let gamma = terms.gamma;
 
-    let mut y_cell = vec![0.0; n_cells];
-    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
-        y_cell[c] = y;
-    }
-    let mut extb = vec![0.0; n_cells];
-    let mut total = linear_predictor(data, beta, &y_cell, &mut extb);
+    let mut total = linear_predictor(data, beta, scratch);
+    let PtmgScratch {
+        y_cell,
+        extb,
+        cumsumxtb,
+    } = &*scratch;
 
-    let mut cumsumxtb = vec![0.0; k];
     let mut mustar = vec![0.0; k];
     let mut mustar_log = vec![0.0; k];
     let mut ymustar = vec![0.0; k];
     let mut ymumustar = vec![0.0; k];
     let mut imustar = vec![0.0; k];
     for s in 0..k {
-        let csx: f64 = extb[fid[s]..fid[s + 1]].iter().sum();
+        let csx = cumsumxtb[s];
         let ystar = data.subject_totals[s] + terms.alpha;
         let mu = csx + terms.lambda;
         let log_mu = mu.ln();
-        cumsumxtb[s] = csx;
         mustar[s] = mu;
         mustar_log[s] = log_mu;
         ymustar[s] = ystar / mu;
@@ -622,42 +688,48 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
     total += (k as f64) * terms.alpha * terms.log_lambda;
     total += (n_cells as f64) * gamma * terms.log_gamma;
 
-    let mut tempa = vec![0.0; n_cells];
-    let mut gstar = vec![0.0; n_cells];
+    // One pass per cell for the value and the gradient. The Hessian's per-cell
+    // buffers are only kept when it is wanted. Every sum runs in the same order
+    // as the two passes this was, so the result is unchanged to the bit.
+    let per_cell = |len: usize| if with_hessian { vec![0.0; len] } else { Vec::new() };
+    let mut tempa = per_cell(n_cells);
+    let mut gstar = per_cell(n_cells);
+    let mut xexb = per_cell(n_cells * nb);
+    let mut gstar_sum = 0.0;
     let mut slpey = 0.0;
+    let mut xexb_f = vec![0.0; k * nb];
+    let mut dbeta_41 = vec![0.0; k * nb];
+    let mut d42c = vec![0.0; k];
     for s in 0..k {
         let ym = ymustar[s];
+        let mut acc = 0.0;
         for i in fid[s]..fid[s + 1] {
-            let we = ym * extb[i];
+            let e = extb[i];
+            let we = ym * e;
             let w = we + gamma;
             let log_w = w.ln();
             let inv_w = 1.0 / w;
             total += we;
             total -= (gamma + y_cell[i]) * log_w;
             slpey += log_w;
-            tempa[i] = inv_w;
-            gstar[i] = (gamma + y_cell[i]) * inv_w;
-        }
-    }
+            let g = (gamma + y_cell[i]) * inv_w;
+            gstar_sum += g;
 
-    let mut xexb = vec![0.0; n_cells * nb];
-    let mut xexb_f = vec![0.0; k * nb];
-    let mut dbeta_41 = vec![0.0; k * nb];
-    let mut d42c = vec![0.0; k];
-    for s in 0..k {
-        let mut acc = 0.0;
-        for i in fid[s]..fid[s + 1] {
-            let e = extb[i];
-            let g = gstar[i];
             let row = &data.design[i * nb..(i + 1) * nb];
-            let out = &mut xexb[i * nb..(i + 1) * nb];
             for j in 0..nb {
                 let v = row[j] * e;
-                out[j] = v;
                 xexb_f[s * nb + j] += v;
                 dbeta_41[s * nb + j] += g * v;
             }
             acc += g * e;
+
+            if with_hessian {
+                tempa[i] = inv_w;
+                gstar[i] = g;
+                for j in 0..nb {
+                    xexb[i * nb + j] = row[j] * e;
+                }
+            }
         }
         d42c[s] = acc - cumsumxtb[s];
     }
@@ -690,7 +762,7 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], with_hessian: bool) -> (f64, Ve
         + terms.alpha_pr * ldm
         + terms.lambda_pr * adlmy;
     gradient[nb + 1] =
-        terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar.iter().sum::<f64>();
+        terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
 
     let value = -total;
     for g in gradient.iter_mut() {
