@@ -695,6 +695,18 @@ pub(crate) fn opt_pml_from(
 #[cfg(feature = "gpu")]
 const EXP_SERIES_MAX: f64 = 1e-3;
 
+/// Relative fall in the objective that [`newton_finish`] still reads as
+/// rounding at a converged point rather than a step that went wrong.
+///
+/// From the device's `f32` optimum the `f64` step gains less than the rounding
+/// of a sum over every cell, so its `likdif` comes out a few ulp negative on
+/// about 15 per cent of fits (S1: all 10804 of 73650 between `1e-16` and
+/// `1e-15` relative). Handing those to [`opt_pml_from`] only buys a backtracking
+/// search that ends at the same point. A step that genuinely overshoots loses
+/// orders of magnitude more than this.
+#[cfg(feature = "gpu")]
+const LIKDIF_ROUNDING: f64 = 1e-12;
+
 /// `exp(z)` to fifth order, for `|z|` within [`EXP_SERIES_MAX`].
 ///
 /// ### Params
@@ -841,9 +853,10 @@ pub(crate) struct NewtonFinish {
 ///
 /// ### Returns
 ///
-/// The finished scalars, or `None` when a full step worsens the objective or
-/// leaves it not finite, or the budget runs out. Those need the backtracking
-/// search and the convergence codes, so the caller wants [`opt_pml_from`].
+/// The finished scalars, or `None` when a full step worsens the objective by
+/// more than [`LIKDIF_ROUNDING`] or leaves it not finite, or the budget runs
+/// out. Those need the backtracking search and the convergence codes, so the
+/// caller wants [`opt_pml_from`].
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn newton_finish(
@@ -1119,7 +1132,7 @@ fn newton_finish_width<const NB: usize>(
         }
 
         let likdif = log_likelihood - log_likelihood_prev;
-        if likdif.is_nan() || likdif < 0.0 {
+        if likdif.is_nan() || likdif < -LIKDIF_ROUNDING * log_likelihood.abs() {
             return None;
         }
         if likdif <= eps {
