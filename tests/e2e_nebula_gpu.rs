@@ -10,16 +10,23 @@
 //! relative each, which compensated summation cannot undo. See the module doc
 //! of `edge_rs::gpu::pml_kernel`.
 //!
+//! Past the sweep, a handful of tiny shapes check what neither the sweep nor
+//! the R fixtures in `tests/e2e_nebula.rs` can: the error paths, run-to-run
+//! determinism of the stage-two cohorts, odd request counts, and a launch wide
+//! enough to need the second grid dimension.
+//!
 //! The resolution floor is swept rather than asserted at one value. A gate that
 //! does not move across the sweep is insensitive rather than permissive, and
 //! the sweep is also how the shipped default was chosen.
 //!
 //! Run with:
 //! ```text
-//! cargo test --release --features gpu --test e2e_nebula_gpu -- --nocapture
+//! cargo test --release --features gpu-tests --test e2e_nebula_gpu -- --nocapture
 //! ```
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "gpu-tests")]
+
+mod common;
 
 use cubecl::Runtime;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
@@ -27,8 +34,12 @@ use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rand_distr::{Distribution, Gamma, LogNormal, Poisson};
 
+use edge_rs::errors::EdgeErrors;
 use edge_rs::gpu::nebula_gpu::{GpuGene, opt_pml_batch};
 use edge_rs::gpu::pml_kernel::F32_NOISE_SCALE;
+use edge_rs::gpu::stage_two::nebula_sparse_gpu;
+use edge_rs::prelude::{CompressedSparse, SparseFormat};
+use edge_rs::sc::nebula::{NebulaFit, NebulaMethod, NebulaParams};
 use edge_rs::sc::pml::{PmlData, PmlParams, PmlResult, PmlVariance, opt_pml};
 
 ////////////////
@@ -90,10 +101,18 @@ const TRUE_SIGMA: f64 = 0.25;
 /// Cell-level overdispersion the counts are drawn with.
 const TRUE_PHI_INV: f64 = 0.5;
 
+/// Requests per launch past which the grid needs its second dimension.
+///
+/// A dispatch dimension holds at most 65535 workgroups and a workgroup carries
+/// two requests, so anything above `2 * 65535` spills into `y`.
+const ONE_DIM_REQUESTS: usize = 2 * 65_535;
+
 /// One generated batch, in the layout both paths read.
 struct Batch {
     /// Design, row-major `n_cells * n_coef`.
     design: Vec<f64>,
+    /// Design columns.
+    n_coef: usize,
     /// Log offset per cell.
     log_offset: Vec<f64>,
     /// Subject boundaries, length `n_subjects + 1`.
@@ -106,16 +125,33 @@ struct Batch {
     subject_totals: Vec<Vec<f64>>,
 }
 
-/// Draws a batch from the gamma-gamma-Poisson model NEBULA fits.
-///
-/// Cells are laid out subject by subject, with uneven block sizes so the ragged
-/// subject path is exercised.
+/// Draws the sweep's batch, at [`shape`].
 ///
 /// ### Returns
 ///
 /// The assembled [`Batch`].
 fn make_batch() -> Batch {
     let (n_genes, n_cells, n_subjects, n_coef) = shape();
+    make_batch_with(n_genes, n_cells, n_subjects, n_coef)
+}
+
+/// Draws a batch from the gamma-gamma-Poisson model NEBULA fits.
+///
+/// Cells are laid out subject by subject, with uneven block sizes so the ragged
+/// subject path is exercised. Column one is a subject-level group, the rest
+/// vary by cell.
+///
+/// ### Params
+///
+/// * `n_genes` - Genes
+/// * `n_cells` - Cells
+/// * `n_subjects` - Subjects
+/// * `n_coef` - Design columns, intercept included
+///
+/// ### Returns
+///
+/// The assembled [`Batch`].
+fn make_batch_with(n_genes: usize, n_cells: usize, n_subjects: usize, n_coef: usize) -> Batch {
     let mut rng = SmallRng::seed_from_u64(SEED);
 
     let mut subject_id = Vec::with_capacity(n_cells);
@@ -140,7 +176,9 @@ fn make_batch() -> Batch {
     let mut design = vec![0.0; n_cells * n_coef];
     for c in 0..n_cells {
         design[c * n_coef] = 1.0;
-        design[c * n_coef + 1] = f64::from(subject_id[c] % 2 == 1);
+        if n_coef > 1 {
+            design[c * n_coef + 1] = f64::from(subject_id[c] % 2 == 1);
+        }
         for j in 2..n_coef {
             design[c * n_coef + j] = rng.random_range(-1.0..1.0);
         }
@@ -186,6 +224,7 @@ fn make_batch() -> Batch {
 
     Batch {
         design,
+        n_coef,
         log_offset,
         subject_start,
         counts,
@@ -227,7 +266,7 @@ fn rel(got: f64, want: f64) -> f64 {
 ///
 /// One [`PmlResult`] per gene.
 fn cpu_reference(batch: &Batch) -> Vec<PmlResult> {
-    let (n_genes, _, _, n_coef) = shape();
+    let (n_genes, n_coef) = (batch.counts.len(), batch.n_coef);
     let params = PmlParams {
         ord: 1,
         ..PmlParams::default()
@@ -280,7 +319,7 @@ fn compare(
     noise_scale: f64,
     eps: f64,
 ) -> (f64, f64, f64, usize) {
-    let (n_genes, _, _, n_coef) = shape();
+    let (n_genes, n_coef) = (batch.counts.len(), batch.n_coef);
     let params = PmlParams {
         ord: 1,
         ..PmlParams::default()
@@ -410,7 +449,9 @@ fn diagnose(
             gpu.iterations[g],
             gpu.backtracks[g],
         );
-        let cb: Vec<String> = (0..n_coef).map(|j| format!("{:+.6}", cpu[g].beta[j])).collect();
+        let cb: Vec<String> = (0..n_coef)
+            .map(|j| format!("{:+.6}", cpu[g].beta[j]))
+            .collect();
         let gb: Vec<String> = (0..n_coef)
             .map(|j| format!("{:+.6}", gpu.beta[g * n_coef + j]))
             .collect();
@@ -474,8 +515,9 @@ fn gpu_first_newton_step_matches_cpu() {
             gamma: 1.0 / TRUE_PHI_INV,
         })
         .collect();
-    let device = WgpuDevice::default();
-    let client = WgpuRuntime::client(&device);
+    let Some(client) = common::gpu_client() else {
+        return;
+    };
     let gpu = opt_pml_batch::<WgpuRuntime>(
         &batch.design,
         &batch.log_offset,
@@ -525,12 +567,16 @@ fn gpu_first_newton_step_matches_cpu() {
 fn gpu_opt_pml_matches_cpu() {
     let batch = make_batch();
     let cpu = cpu_reference(&batch);
-    let device = WgpuDevice::default();
-    let client = WgpuRuntime::client(&device);
+    let Some(client) = common::gpu_client() else {
+        return;
+    };
 
     println!(
         "\n{} genes, {} cells, {} subjects, {} coefficients",
-        shape().0, shape().1, shape().2, shape().3
+        shape().0,
+        shape().1,
+        shape().2,
+        shape().3
     );
     println!("  noise_scale       eps     beta        info      loglik   stalled");
     for &eps in EPS_SWEEP.iter() {
@@ -572,15 +618,18 @@ info {worst_info:.3e} (needs {INFO_TOL:.0e}), loglik {worst_ll:.3e} (needs {LL_T
 fn gpu_opt_pml_holds_across_the_variance_range() {
     let batch = make_batch();
     let (n_genes, _, _, n_coef) = shape();
-    let device = WgpuDevice::default();
-    let client = WgpuRuntime::client(&device);
+    let Some(client) = common::gpu_client() else {
+        return;
+    };
     let params = PmlParams {
         ord: 1,
         ..PmlParams::default()
     };
     let beta_init = vec![0.0; n_coef];
 
-    println!("\n  sigma^2    subject     worst |dll|   worst rel ll   worst |dlogdet|   mean dll    iter cpu/gpu");
+    println!(
+        "\n  sigma^2    subject     worst |dll|   worst rel ll   worst |dlogdet|   mean dll    iter cpu/gpu"
+    );
     for sigma2 in [1e-4, 1e-3, 1e-2, 1e-1, 1.0] {
         let subject = f64::ln_1p(sigma2);
         let cpu: Vec<PmlResult> = (0..n_genes)
@@ -651,5 +700,279 @@ fn gpu_opt_pml_holds_across_the_variance_range() {
             it_cpu / n,
             it_gpu / n
         );
+    }
+}
+
+//////////////////
+// Tiny shapes  //
+//////////////////
+
+/// A fixture from `tests/data/e2e`, as [`nebula_sparse_gpu`] takes it.
+struct Fixture {
+    /// Counts, CSR over `(n_genes, n_cells)`.
+    counts: CompressedSparse<f64>,
+    /// Subject index per cell, zero-based.
+    subject: Vec<usize>,
+    /// Design, row-major `n_cells * n_coef`.
+    design: Vec<f64>,
+    /// Design columns.
+    n_coef: usize,
+    /// Per-cell offset, on the linear scale.
+    offset: Vec<f64>,
+}
+
+/// Loads one single-cell fixture written by `tests/r/generate_fixtures.R`.
+///
+/// ### Params
+///
+/// * `tag` - Fixture prefix
+/// * `design_file` - Whether the design is `{tag}_design.csv`, rather than
+///   `[1, grp, cov2]` from the meta file
+///
+/// ### Returns
+///
+/// The fixture.
+fn fixture(tag: &str, design_file: bool) -> Fixture {
+    let t = common::table(&format!("{tag}_counts.csv"));
+    let (n_genes, n_cells) = (t.n_rows(), t.n_cols());
+    let dense = t.row_major_counts();
+    let meta = common::table(&format!("{tag}_meta.csv"));
+    let subject = meta.column_usize("subject").iter().map(|s| s - 1).collect();
+    let (design, n_coef) = if design_file {
+        let (design, _, cols) = common::matrix(&format!("{tag}_design.csv"));
+        (design, cols)
+    } else {
+        let (grp, cov2) = (meta.column("grp"), meta.column("cov2"));
+        (
+            (0..n_cells).flat_map(|c| [1.0, grp[c], cov2[c]]).collect(),
+            3,
+        )
+    };
+
+    let mut data = Vec::new();
+    let mut indices = Vec::new();
+    let mut indptr = vec![0u32];
+    for row in dense.chunks_exact(n_cells) {
+        for (c, &v) in row.iter().enumerate() {
+            if v > 0.0 {
+                data.push(v);
+                indices.push(c as u32);
+            }
+        }
+        indptr.push(data.len() as u32);
+    }
+    let counts =
+        CompressedSparse::from_parts(data, indices, indptr, SparseFormat::Csr, (n_genes, n_cells))
+            .expect("well-formed CSR");
+
+    Fixture {
+        counts,
+        subject,
+        design,
+        n_coef,
+        offset: meta.column("offset").to_vec(),
+    }
+}
+
+/// Keeps only the genes with at least `min_cells` positive counts.
+///
+/// A gene with no counts at all has its intercept running to minus infinity,
+/// which neither path is meant to fit and NEBULA's own filter never passes.
+///
+/// ### Params
+///
+/// * `batch` - The batch, filtered in place
+/// * `min_cells` - Fewest expressed cells a gene keeps
+fn drop_sparse_genes(batch: &mut Batch, min_cells: usize) {
+    let keep: Vec<bool> = batch.counts.iter().map(|c| c.len() >= min_cells).collect();
+    let mut it = keep.iter();
+    batch
+        .counts
+        .retain(|_| *it.next().expect("one flag per gene"));
+    let mut it = keep.iter();
+    batch
+        .cells
+        .retain(|_| *it.next().expect("one flag per gene"));
+    let mut it = keep.iter();
+    batch
+        .subject_totals
+        .retain(|_| *it.next().expect("one flag per gene"));
+}
+
+/// Asserts two NEBULA fits are bit-identical, NaNs included.
+///
+/// ### Params
+///
+/// * `a` - First fit
+/// * `b` - Second fit
+fn assert_same_bits(a: &NebulaFit, b: &NebulaFit) {
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+    assert_eq!(a.gene_index, b.gene_index, "gene_index");
+    assert_eq!(bits(&a.coefficients), bits(&b.coefficients), "coefficients");
+    assert_eq!(bits(&a.se), bits(&b.se), "se");
+    assert_eq!(bits(&a.covariance), bits(&b.covariance), "covariance");
+    assert_eq!(
+        bits(&a.subject_overdispersion),
+        bits(&b.subject_overdispersion),
+        "subject_overdispersion"
+    );
+    assert_eq!(
+        bits(&a.cell_overdispersion),
+        bits(&b.cell_overdispersion),
+        "cell_overdispersion"
+    );
+    assert_eq!(a.convergence, b.convergence, "convergence");
+}
+
+/// Asserts one GPU run of `batch` against its CPU reference at the default
+/// resolution floor.
+///
+/// ### Params
+///
+/// * `batch` - The problem
+/// * `client` - CubeCL compute client
+/// * `label` - What the batch is, for the report
+fn assert_batch_matches_cpu(
+    batch: &Batch,
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    label: &str,
+) {
+    let cpu = cpu_reference(batch);
+    let (beta, info, ll, stalled) = compare(
+        batch,
+        &cpu,
+        client,
+        f64::from(F32_NOISE_SCALE),
+        PmlParams::default().eps,
+    );
+    println!(
+        "{label}: {} genes, beta {beta:.3e}, info {info:.3e}, loglik {ll:.3e}, stalled {stalled}",
+        batch.counts.len()
+    );
+    assert!(
+        beta < BETA_TOL,
+        "{label}: coefficients disagree by {beta:.3e}"
+    );
+    assert!(
+        info < INFO_TOL,
+        "{label}: information disagrees by {info:.3e}"
+    );
+    assert!(ll < LL_TOL, "{label}: log-likelihood disagrees by {ll:.3e}");
+}
+
+/// The two things the device fit cannot do come back as errors, not as
+/// answers: `reml`, and a design wider than [`MAX_BETA_CAP`](edge_rs::gpu::pml_kernel::MAX_BETA_CAP).
+///
+/// HL, so every gene reaches stage two and the width check actually runs; under
+/// LN a gene that needs no refit never touches the device.
+#[test]
+fn gpu_rejects_what_it_cannot_fit() {
+    let f = fixture("sc_k2", true);
+    let client = WgpuRuntime::client(&WgpuDevice::default());
+    let hl = NebulaParams {
+        method: NebulaMethod::Hl,
+        ..NebulaParams::default()
+    };
+
+    let reml = nebula_sparse_gpu(
+        &f.counts,
+        &f.subject,
+        &f.design,
+        f.n_coef,
+        Some(&f.offset),
+        Some(NebulaParams { reml: true, ..hl }),
+        &client,
+    );
+    assert!(
+        matches!(reml, Err(EdgeErrors::InvalidArgument(_))),
+        "reml should be refused, got {:?}",
+        reml.map(|_| ())
+    );
+
+    // Nine columns: the fixture's three plus six cell-level ones.
+    let mut rng = SmallRng::seed_from_u64(SEED);
+    let wide: Vec<f64> = f
+        .design
+        .chunks_exact(f.n_coef)
+        .flat_map(|row| {
+            let mut row = row.to_vec();
+            row.extend((0..6).map(|_| rng.random_range(-1.0..1.0)));
+            row
+        })
+        .collect();
+    let nine = nebula_sparse_gpu(
+        &f.counts,
+        &f.subject,
+        &wide,
+        f.n_coef + 6,
+        Some(&f.offset),
+        Some(hl),
+        &client,
+    );
+    assert!(
+        matches!(nine, Err(EdgeErrors::InvalidArgument(_))),
+        "nine columns should be refused, got {:?}",
+        nine.map(|_| ())
+    );
+}
+
+/// Two runs of the same input give the same bits.
+///
+/// Whether stage two splits its searches into two cohorts is decided by timing
+/// the first rounds, so it can differ between runs. The cohorts are meant to
+/// change only when a search is told its values, never what, and `sc_small`
+/// runs 118 HL searches, above the count at which the cohorts merge. A machine
+/// that never splits only shows plain run-to-run determinism.
+#[test]
+fn gpu_nebula_is_deterministic() {
+    let f = fixture("sc_small", false);
+    let Some(client) = common::gpu_client() else {
+        return;
+    };
+    let run = || {
+        nebula_sparse_gpu(
+            &f.counts,
+            &f.subject,
+            &f.design,
+            f.n_coef,
+            Some(&f.offset),
+            None,
+            &client,
+        )
+        .expect("gpu nebula fits")
+    };
+    assert_same_bits(&run(), &run());
+}
+
+/// A launch wide enough to need the grid's second dimension.
+///
+/// A request the grid does not cover fails silently: its output is whatever
+/// the buffer held. Tiny genes keep the launch cheap; the ones past
+/// [`ONE_DIM_REQUESTS`] are the point.
+#[test]
+fn gpu_grid_past_one_dimension() {
+    let mut batch = make_batch_with(ONE_DIM_REQUESTS + 4096, 40, 2, 1);
+    drop_sparse_genes(&mut batch, 5);
+    assert!(
+        batch.counts.len() > ONE_DIM_REQUESTS,
+        "only {} genes survived, which fits in one grid dimension",
+        batch.counts.len()
+    );
+    let Some(client) = common::gpu_client() else {
+        return;
+    };
+    assert_batch_matches_cpu(&batch, &client, "two-dimensional grid");
+}
+
+/// One request, and three: a workgroup carries two, so both leave a plane
+/// idle.
+#[test]
+fn gpu_odd_request_counts() {
+    let Some(client) = common::gpu_client() else {
+        return;
+    };
+    for n in [1, 3] {
+        let batch = make_batch_with(n, 400, 5, 3);
+        assert_batch_matches_cpu(&batch, &client, &format!("{n} requests"));
     }
 }
