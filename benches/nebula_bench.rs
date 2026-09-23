@@ -193,7 +193,9 @@ fn make_problem(
                 eta += design[c * n_coef + j] * beta[j];
             }
             let mu = offset[c] * eta.exp() * w[subject_id[c]] * cell_noise.sample(&mut rng);
-            let y = Poisson::new(mu.max(1e-12)).expect("positive rate").sample(&mut rng);
+            let y = Poisson::new(mu.max(1e-12))
+                .expect("positive rate")
+                .sample(&mut rng);
             if y > 0.0 {
                 data.push(y);
                 indices.push(c as u32);
@@ -202,14 +204,9 @@ fn make_problem(
         indptr.push(data.len() as u32);
     }
 
-    let counts = CompressedSparse::from_parts(
-        data,
-        indices,
-        indptr,
-        SparseFormat::Csr,
-        (n_genes, n_cells),
-    )
-    .expect("well-formed CSR");
+    let counts =
+        CompressedSparse::from_parts(data, indices, indptr, SparseFormat::Csr, (n_genes, n_cells))
+            .expect("well-formed CSR");
 
     Problem {
         counts,
@@ -510,7 +507,10 @@ fn inner_kernels(problem: &Problem, gene: &OneGene, note: &str) {
         black_box(ptmg_value_and_gradient(&data, &params));
         let t = Instant::now();
         for _ in 0..INNER_REPEATS {
-            black_box(ptmg_value_and_gradient(black_box(&data), black_box(&params)));
+            black_box(ptmg_value_and_gradient(
+                black_box(&data),
+                black_box(&params),
+            ));
         }
         report("ptmg (one eval)", t.elapsed(), INNER_REPEATS, note);
     }

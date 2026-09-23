@@ -56,7 +56,6 @@
 //!
 //! He et al., Communications Biology 4, 629, 2021
 
-
 use rayon::prelude::*;
 
 use crate::numeric::gamma::ln_gamma;
@@ -67,8 +66,8 @@ use crate::sc::pml::{
     CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml,
 };
 use crate::sc::ptmg::{
-    GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv,
-    offset_summary, positive_indices, ptmg_value_and_gradient_with,
+    GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
+    positive_indices, ptmg_value_and_gradient_with,
 };
 use crate::sc::test::packed_len;
 
@@ -860,7 +859,11 @@ pub(crate) fn plan_gene(
                 let kappa_obs = gni / (1.0 + cv2p);
                 let weak = kappa_obs < KAPPA_FLOOR
                     || (kappa_obs < params.kappa && sigma < KAPPA_SIGMA_NUMERATOR / kappa_obs);
-                if weak { Refit::SubjectOnly } else { Refit::None }
+                if weak {
+                    Refit::SubjectOnly
+                } else {
+                    Refit::None
+                }
             }
         }
     };
@@ -1656,7 +1659,8 @@ fn refine_variance(
     let (lower, upper) = variance_bounds(&shared.params, fixed_cell);
     let mut search = StageTwoSearch::new(start, &lower, &upper, ord);
     while let Some(points) = search.ask() {
-        let objective = variance_objective(shared, pml, beta_start, counts, search.order(), fixed_cell);
+        let objective =
+            variance_objective(shared, pml, beta_start, counts, search.order(), fixed_cell);
         let values: Vec<f64> = points.iter().map(|x| objective.value(x)).collect();
         search.tell(&values);
     }

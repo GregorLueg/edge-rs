@@ -935,7 +935,12 @@ mod tests {
         // Non-convex with a narrow valley: exercises shrink steps.
         let bumpy =
             |x: &[f64]| (x[0] * 3.0).sin() * (x[1] * 5.0).cos() + 0.1 * (x[0] * x[0] + x[1] * x[1]);
-        let three_d = |x: &[f64]| x.iter().enumerate().map(|(i, v)| (i as f64 + 1.0) * v * v).sum();
+        let three_d = |x: &[f64]| {
+            x.iter()
+                .enumerate()
+                .map(|(i, v)| (i as f64 + 1.0) * v * v)
+                .sum()
+        };
 
         type Case<'a> = (&'a dyn Fn(&[f64]) -> f64, Vec<f64>);
         let cases: Vec<Case<'_>> = vec![

@@ -699,7 +699,13 @@ fn evaluate(
     // One pass per cell for the value and the gradient. The Hessian's per-cell
     // buffers are only kept when it is wanted. Every sum runs in the same order
     // as the two passes this was, so the result is unchanged to the bit.
-    let per_cell = |len: usize| if with_hessian { vec![0.0; len] } else { Vec::new() };
+    let per_cell = |len: usize| {
+        if with_hessian {
+            vec![0.0; len]
+        } else {
+            Vec::new()
+        }
+    };
     let mut tempa = per_cell(n_cells);
     let mut gstar = per_cell(n_cells);
     let mut xexb = per_cell(n_cells * nb);
@@ -787,8 +793,7 @@ fn evaluate(
         + terms.lambda_pr * sum_ymm_d
         + terms.alpha_pr * ldm
         + terms.lambda_pr * adlmy;
-    gradient[nb + 1] =
-        terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
+    gradient[nb + 1] = terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
 
     let value = -total;
     for g in gradient.iter_mut() {

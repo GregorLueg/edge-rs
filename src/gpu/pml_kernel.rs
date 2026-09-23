@@ -593,7 +593,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         } else {
             step += 1u32;
 
-                s = 0u32;
+            s = 0u32;
             while s < k {
                 let dw_s = subject_scratch[((SLOT_DW * k + s) * n_req + q) as usize];
                 let vw_s = subject_scratch[((SLOT_VW * k + s) * n_req + q) as usize];
@@ -634,7 +634,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 }
                 let vw_s = subject_scratch[((SLOT_VW * k + s) * n_req + q) as usize];
                 let dwvw = subject_scratch[((SLOT_DWVW * k + s) * n_req + q) as usize];
-                subject_scratch[((SLOT_STEP_LOG_W * k + s) * n_req + q) as usize] = dwvw - acc / vw_s;
+                subject_scratch[((SLOT_STEP_LOG_W * k + s) * n_req + q) as usize] =
+                    dwvw - acc / vw_s;
                 s += 1u32;
             }
 

@@ -41,7 +41,12 @@ use edge_rs::sc::pml::{PmlData, PmlParams, PmlVariance, opt_pml};
 ///
 /// The first is a small batch where the GPU cannot fill the device; the last is
 /// the regime a real single-cell run is in, where the per-gene work dominates.
-const SWEEP: [(usize, usize); 4] = [(256, 20_000), (1024, 20_000), (4096, 20_000), (1024, 80_000)];
+const SWEEP: [(usize, usize); 4] = [
+    (256, 20_000),
+    (1024, 20_000),
+    (4096, 20_000),
+    (1024, 80_000),
+];
 
 /// Solves run against one resident upload, to show what stage two would see.
 ///
@@ -333,10 +338,11 @@ fn main() {
     let device = WgpuDevice::default();
     let client = WgpuRuntime::client(&device);
 
-    let shapes: Vec<(usize, usize)> = match (env_usize("NEBULA_GPU_GENES"), env_usize("NEBULA_GPU_CELLS")) {
-        (Some(g), Some(c)) => vec![(g, c)],
-        _ => SWEEP.to_vec(),
-    };
+    let shapes: Vec<(usize, usize)> =
+        match (env_usize("NEBULA_GPU_GENES"), env_usize("NEBULA_GPU_CELLS")) {
+            (Some(g), Some(c)) => vec![(g, c)],
+            _ => SWEEP.to_vec(),
+        };
 
     println!(
         "\nNEBULA opt_pml, {SUBJECTS} subjects, {COEF} coefficients, {} CPU threads",
