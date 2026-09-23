@@ -8,11 +8,10 @@
 //! ### Split
 //!
 //! * **Stage one** (L-BFGS-B on the marginal likelihood) stays on the CPU. It
-//!   has an exact gradient, and it was a few per cent of the run before stage two
-//!   got fast; it is a tenth to a third of it now.
-//! * **Stage two** runs as one `StageTwoSearch` per gene,
-//!   the same state machine the CPU path drives. Each round, every live search
-//!   asks for its next points and all of them go out as one device launch of
+//!   has an exact gradient.
+//! * **Stage two** runs as one `StageTwoSearch` per gene, the same state
+//!   machine the CPU path drives. Each round, every live search asks for its
+//!   next points and all of them go out as one device launch of
 //!   [`ResidentBatch::submit`]. The device finds each penalised fit's optimum;
 //!   the host then finishes that fit in `f64` from the device's point and
 //!   assembles the profile objective. Nelder-Mead, the polish least squares and
@@ -135,17 +134,6 @@ const TIMING_ENV: &str = "EDGE_RS_GPU_TIMING";
 const COHORTS: usize = 2;
 
 /// Rounds, after the first, run as one cohort to decide whether to split.
-///
-/// A launch costs the device about the same for 250 fits as for 500: measured
-/// 75 ms either way at eight coefficients and 20000 cells, because what a
-/// launch costs is one fit's serial walk over the cells and the device has
-/// lanes to spare. Splitting the searches in two therefore doubles the device's
-/// launches, and a search then advances once per two launches instead of once
-/// per launch plus finish. That wins exactly when a round's `f64` finish takes
-/// longer than its launch, which depends on the design width, the cell count
-/// and the machine: measured 1.25x and 1.16x end to end at three coefficients
-/// with 20000 and 100000 cells, and nothing at eight, where the launch is the
-/// longer of the two. So the two are timed rather than assumed.
 const PROBE_ROUNDS: usize = 8;
 
 /// Running searches below which the cohorts merge into one.
@@ -260,7 +248,8 @@ impl Timing {
 ///
 /// * `counts` - Raw counts, CSR over `(n_genes, n_cells)`
 /// * `subject_id` - Subject of each cell, with each subject's cells contiguous
-/// * `design` - Predictors, row-major `n_cells * n_coef`, including an intercept
+/// * `design` - Predictors, row-major `n_cells * n_coef`, including an
+///   intercept
 /// * `n_coef` - Number of design columns
 /// * `offset` - Strictly positive scaling factor per cell, or `None` for ones
 /// * `params` - Tuning knobs, or [`NebulaParams::default`]
@@ -493,8 +482,6 @@ fn search_all<R: Runtime>(
             let replies = resident.collect(flight.pending)?;
             let solved = Instant::now();
 
-            // -- Scatter: assemble the profile objective in f64, in parallel,
-            //    then hand each search its values. --
             let assembled: Vec<(f64, usize)> = flight
                 .routes
                 .par_iter()

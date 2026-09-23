@@ -81,11 +81,6 @@
 //!
 //! He et al., Communications Biology 4, 629, 2021
 
-// The nested `if ptr < ptr_hi { if cells[ptr] == r { .. } }` guards cannot be
-// collapsed: `&&` in a `#[cube]` body is not a short-circuit, so the collapsed
-// form indexes `cells` past the gene's block. `!(likdif > eps)` is deliberate
-// too, because it is the NaN-safe reading: a NaN improvement settles the loop
-// rather than spinning it to the iteration cap.
 #![allow(
     clippy::collapsible_if,
     clippy::neg_cmp_op_on_partial_ord,
@@ -125,17 +120,6 @@ const PLANES_PER_CUBE: u32 = 2;
 
 /// Default resolution floor on the objective, relative to its magnitude.
 ///
-/// The CPU path has no equivalent: in `f64` nebula's absolute `1e-6` sits far
-/// above its own noise floor. In `f32` it sits below it, and the consequence is
-/// not a slow loop but a wrong answer. A genuine improvement smaller than the
-/// per-cell rounding reads as a *worsening*, the backtracking search then damps
-/// a good step to nothing, exhausts its budget and leaves the gene short of the
-/// optimum. So a trial step is rejected only when it worsens the objective by
-/// more than this floor. The stopping test keeps nebula's absolute `eps`:
-/// applying the floor there as well costs a Newton step, and the direction that
-/// has not converged is the one confounded with the random effects, which is
-/// usually the coefficient of interest.
-///
 /// Swept rather than guessed; see `tests/e2e_nebula_gpu.rs`. Overridable per
 /// call because the right value scales with the cell count.
 pub const F32_NOISE_SCALE: f32 = 1e-6;
@@ -149,18 +133,25 @@ pub const SUBJECT_SLOTS: u32 = 8;
 
 /// Slot index of `log_w` within the per-subject scratch.
 const SLOT_LOG_W: u32 = 0;
+
 /// Slot index of the trial `log_w`.
 const SLOT_NEW_LOG_W: u32 = 1;
+
 /// Slot index of the Newton step in `log_w`.
 const SLOT_STEP_LOG_W: u32 = 2;
+
 /// Slot index of the per-coordinate damping on `log_w`.
 const SLOT_DAMP_LOG_W: u32 = 3;
+
 /// Slot index of `exp(log_w)`.
 const SLOT_W: u32 = 4;
+
 /// Slot index of the random-effect gradient.
 const SLOT_DW: u32 = 5;
+
 /// Slot index of the random-effect curvature.
 const SLOT_VW: u32 = 6;
+
 /// Slot index of `dw / vw`.
 const SLOT_DWVW: u32 = 7;
 
