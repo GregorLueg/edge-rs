@@ -1043,17 +1043,102 @@ if (!file.exists(file.path(DATA_DIR, "sc_small_counts.csv"))) {
   cat("wrote sc small inputs\n")
 }
 
+# Small shapes aimed at the corners of the GPU kernel rather than at realism:
+# explicit subject sizes (so blocks can sit either side of a 32-lane plane and
+# of the four-plane unroll), any design width up to eight, and optional planted
+# genes. The design is written whole, intercept first, then the subject-level
+# columns (the first a 0/1 group), then the cell-level ones. `off_mu = NULL`
+# means no offset at all.
+make_sc_edge <- function(seed, ng, sizes, n_subj_cov, n_cell_cov, base_lo,
+                         base_hi, off_mu, plant = FALSE) {
+  set.seed(seed)
+  nsub <- length(sizes)
+  nc <- sum(sizes)
+  id <- rep(seq_len(nsub), times = sizes)
+
+  subj <- matrix(round(rnorm(nsub * n_subj_cov), 8), nsub, n_subj_cov)
+  if (n_subj_cov >= 1) subj[, 1] <- rep(0:1, length.out = nsub)
+  cell <- matrix(round(rnorm(nc * n_cell_cov), 8), nc, n_cell_cov)
+  x <- cbind(1, subj[id, , drop = FALSE], cell)
+  nb <- ncol(x)
+
+  beta <- cbind(log(2^runif(ng, base_lo, base_hi)),
+                matrix(rnorm(ng * (nb - 1), 0, 0.3), ng, nb - 1))
+  re <- matrix(rnorm(ng * nsub, 0, 0.3), ng, nsub)
+  sf <- if (is.null(off_mu)) rep(1, nc) else round(exp(rnorm(nc, log(off_mu), 0.3)))
+  scale <- if (is.null(off_mu)) 1 else off_mu
+
+  eta <- beta %*% t(x) + re[, id]
+  mu <- exp(eta) * rep(sf / scale, each = ng)
+  phi <- 1 / runif(ng, 0.5, 3)
+  cnt <- matrix(rnbinom(ng * nc, mu = as.vector(mu), size = rep(phi, nc)), ng, nc)
+
+  # Planted: one gene silent in the third subject, two at a low enough mean to
+  # take the third-order Laplace path, one at exactly `mincp` expressed cells
+  # and one a cell short of it.
+  if (plant) {
+    cnt[ng, id == 3] <- 0L
+    cnt[ng - 1, ] <- rbinom(nc, 1, 0.02)
+    cnt[ng - 2, ] <- rbinom(nc, 1, 0.03) * 2
+    cnt[ng - 3, ] <- 0L
+    cnt[ng - 3, seq(1, nc, length.out = 5)] <- 2L
+    cnt[ng - 4, ] <- 0L
+    cnt[ng - 4, seq(1, nc, length.out = 4)] <- 2L
+  }
+
+  storage.mode(cnt) <- "integer"
+  list(counts = cnt, id = id, x = x, sf = sf)
+}
+
+SC_EDGE <- list(
+  list(tag = "sc_k2", seed = 20260923, sizes = c(23, 41), subj = 1, cell = 1,
+       lo = 0, hi = 4, off = 1000, plant = FALSE, method = "HL"),
+  list(tag = "sc_blocks", seed = 20260924,
+       sizes = c(5, 31, 32, 33, 127, 128, 129, 160), subj = 1, cell = 1,
+       lo = -3, hi = 4, off = 1000, plant = TRUE, method = "LN"),
+  list(tag = "sc_intercept", seed = 20260925, sizes = rep(40, 6), subj = 0,
+       cell = 0, lo = -1, hi = 3, off = NULL, plant = FALSE, method = "HL"),
+  list(tag = "sc_wide", seed = 20260926, sizes = rep(12, 40), subj = 3,
+       cell = 4, lo = 0, hi = 4, off = 1000, plant = FALSE, method = "HL"),
+  # nebula 1.5.8 errors ("Wrong R type for mapped matrix") on any `pred` whose
+  # only non-intercept columns are constant within subjects, so every design
+  # wider than one carries a cell-level column.
+  list(tag = "sc_high", seed = 20260927, sizes = rep(50, 10), subj = 1,
+       cell = 1, lo = 10, hi = 13, off = 5000, plant = FALSE, method = "HL")
+)
+
+for (e in SC_EDGE) {
+  if (!file.exists(file.path(DATA_DIR, paste0(e$tag, "_counts.csv")))) {
+    s <- make_sc_edge(e$seed, 30L, e$sizes, e$subj, e$cell, e$lo, e$hi,
+                      e$off, e$plant)
+    write_int(s$counts, paste0(e$tag, "_counts.csv"),
+              paste0("c", seq_len(ncol(s$counts))))
+    write_num(cbind(subject = s$id, offset = s$sf), paste0(e$tag, "_meta.csv"),
+              c("subject", "offset"))
+    write_num(s$x, paste0(e$tag, "_design.csv"), paste0("x", seq_len(ncol(s$x))))
+    cat(sprintf("wrote %s inputs\n", e$tag))
+  }
+}
+
 if (requireNamespace("nebula", quietly = TRUE)) {
-  run_sc <- function(tag, counts_file, meta_file) {
+  # `pred = NULL` builds the original `[1, grp, cov2]` from the meta file, which
+  # is what the two realistic sets use; the edge sets pass their own design.
+  run_sc <- function(tag, counts_file, meta_file, pred = NULL, method = "LN",
+                     use_offset = TRUE, names = c("int", "grp", "cov2")) {
     cnt <- read_int(counts_file)
     meta <- read.csv(file.path(DATA_DIR, meta_file))
-    pred <- cbind(1, grp = meta$grp, cov2 = meta$cov2)
+    if (is.null(pred)) pred <- cbind(1, grp = meta$grp, cov2 = meta$cov2)
+    nb <- ncol(pred)
+    stopifnot(length(names) == nb)
     nsub <- length(unique(meta$subject))
     cells_per <- nrow(meta) / nsub
 
+    # nebula drops a one-column `pred` to a vector and its C++ then rejects it;
+    # leaving `pred` out gives the same intercept-only model.
     res <- nebula::nebula(
-      cnt, meta$subject, pred = pred, offset = meta$offset,
-      model = "NBGMM", method = "LN", covariance = TRUE,
+      cnt, meta$subject, pred = if (nb == 1) NULL else pred,
+      offset = if (use_offset) meta$offset else NULL,
+      model = "NBGMM", method = method, covariance = TRUE,
       verbose = FALSE, ncore = 1
     )
 
@@ -1063,16 +1148,14 @@ if (requireNamespace("nebula", quietly = TRUE)) {
     # it took explains most of how closely the port can be expected to agree.
     algo <- match(res$algorithm, c("NBGMM (LN)", "NBGMM (LN+HL)", "NBGMM (HL)"))
     write_num(
-      cbind(as.matrix(res$summary[, 1:9]),
+      cbind(as.matrix(res$summary[, 1:(3 * nb)]),
             gene_id = res$summary$gene_id,
             Subject = res$overdispersion$Subject,
             Cell = res$overdispersion$Cell,
             convergence = res$convergence,
             algorithm = algo),
       paste0(tag, "_nebula.csv"),
-      c("logFC_int", "logFC_grp", "logFC_cov2",
-        "se_int", "se_grp", "se_cov2",
-        "p_int", "p_grp", "p_cov2",
+      c(paste0("logFC_", names), paste0("se_", names), paste0("p_", names),
         "gene_id", "Subject", "Cell", "convergence", "algorithm")
     )
     # R packs the covariance lower-triangular column-major; the Rust repacks it.
@@ -1090,6 +1173,16 @@ if (requireNamespace("nebula", quietly = TRUE)) {
 
   sc_big <- run_sc("sc", "sc_counts.csv", "sc_meta.csv")
   invisible(run_sc("sc_small", "sc_small_counts.csv", "sc_small_meta.csv"))
+
+  for (e in SC_EDGE) {
+    x <- read_num(paste0(e$tag, "_design.csv"))
+    colnames(x) <- NULL
+    r <- run_sc(e$tag, paste0(e$tag, "_counts.csv"), paste0(e$tag, "_meta.csv"),
+                pred = x, method = e$method, use_offset = !is.null(e$off),
+                names = seq_len(ncol(x)))
+    put(e$tag, "n_coef", ncol(x))
+    put(e$tag, "n_pinned", sum(r$overdispersion$Subject <= 1e-4))
+  }
 
   # shrink_sc_dispersion has no upstream of its own: its reference is limma's
   # squeezeVar applied to the reciprocal cell overdispersions, on the residual
