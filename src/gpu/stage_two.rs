@@ -9,7 +9,7 @@
 //!
 //! * **Stage one** (L-BFGS-B on the marginal likelihood) stays on the CPU. It
 //!   has an exact gradient, and it was a few per cent of the run before stage two
-//!   got fast; it is a fifth to a third of it now.
+//!   got fast; it is a tenth to a third of it now.
 //! * **Stage two** runs as one `StageTwoSearch` per gene,
 //!   the same state machine the CPU path drives. Each round, every live search
 //!   asks for its next points and all of them go out as one device launch of
@@ -62,24 +62,25 @@
 //! ### Cost, measured
 //!
 //! Forced HL, 500 genes, 20 subjects, against a 10-thread CPU on an M1 Max.
-//! Seconds; "device" is the time the host spends blocked on it.
+//! Seconds; "device" is the time in the device solves, staging and read-back
+//! included.
 //!
 //! | cells | coefficients | density | CPU | GPU | stage one | device | host finish |
 //! |---|---|---|---|---|---|---|---|
-//! | 20000 | 3 | 46% | 30.8 | 10.9 | 3.0 | 1.6 | 6.0 |
-//! | 20000 | 3 | 9% | 33.0 | 8.2 | 1.5 | 1.3 | 5.1 |
-//! | 20000 | 3 | 10%, subjects 100:1 | 32.4 | 8.0 | 1.5 | 1.1 | 5.2 |
-//! | 20000 | 8 | 10% | 49.8 | 21.2 | 2.1 | 11.0 | 7.7 |
-//! | 50000 | 6 | 6%, subjects 30:1 | 126.7 | 34.7 | 6.1 | 9.1 | 18.6 |
-//! | 100000 | 3 | 5% | 183.4 | 45.0 | 9.4 | 3.9 | 30.4 |
+//! | 20000 | 3 | 46% | 29.4 | 7.0 | 2.4 | 1.1 | 3.1 |
+//! | 20000 | 3 | 9% | 30.7 | 4.8 | 1.0 | 1.3 | 2.2 |
+//! | 20000 | 3 | 10%, subjects 100:1 | 29.7 | 5.0 | 1.1 | 1.6 | 2.2 |
+//! | 20000 | 8 | 10% | 48.4 | 14.2 | 1.5 | 9.1 | 3.1 |
+//! | 50000 | 6 | 6%, subjects 30:1 | 117.9 | 23.6 | 3.9 | 12.4 | 6.5 |
+//! | 100000 | 3 | 5% | 171.5 | 22.9 | 6.3 | 5.2 | 10.1 |
 //!
-//! At 4000 genes on the first shape: CPU 237 s, GPU 76 s, of which stage one
-//! 24 s and the host finish 46 s.
+//! At 4000 genes on the first shape: CPU 231 s, GPU 50.6 s, of which stage one
+//! 19.3 s and the host finish 24.6 s.
 //!
-//! The host is the ceiling on every shape but the wide one: the `f64` finish and
-//! stage one are all CPU work, and the device mostly waits for them. The wide
-//! design is bound by the latency of a launch, which is one fit's serial walk
-//! over the cells however many fits ride along.
+//! At three coefficients the host is the ceiling: the `f64` finish and stage
+//! one are CPU work, and the device mostly waits for them. At six and eight the
+//! device is, because a launch costs one fit's serial walk over the cells
+//! however many fits ride along, and a wider design makes that walk longer.
 //!
 //! Under NEBULA-LN none of this applies unless stage one sends genes to stage
 //! two. On these shapes it sends none, or one gene in 500, and the GPU path is

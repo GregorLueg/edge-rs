@@ -23,13 +23,14 @@ device and in the finish. Bench knobs: `NEBULA_BENCH_CELLS`, `_COEF`,
 smallest). The bench prints checksums and the drift against the CPU fit; the
 CPU checksums must not move unless the change is meant to touch the CPU path.
 
-Stage split at 4000 genes, 20000 cells, nb = 3, 46 per cent dense (seconds):
+Stage split at 4000 genes, 20000 cells, nb = 3, 48 per cent dense (seconds;
+"device" is the whole solve, staging and read-back included):
 
-| total | stage one | host finish | blocked on device | stage three |
+| total | stage one | host finish | device | stage three |
 |---|---|---|---|---|
-| 76 | 24 | 46 | 4 | 2 |
+| 50.6 | 19.3 | 24.6 | 4.3 | 1.8 |
 
-The two CPU items are 92 per cent of the run. Nothing below carries a
+The two CPU items are 87 per cent of the run. Nothing below carries a
 predicted saving; measure the small case first, report, then scale.
 
 ## Lever 1: the `f64` finish (`newton_finish`, `src/sc/pml.rs`)
@@ -102,7 +103,7 @@ and the two step vectors is visible. They are `O(k * nb)`, so probably not, but
 
 ## Not on the list
 
-- Stage three is 2 of 76 s.
+- Stage three is 1.8 of 50.6 s.
 - The device. Wide designs are bound by launch latency (one fit's serial walk
   over the cells), and the fix there is more lanes per fit, which is GPU work.
 - Compensated summation on the device (folded by fast-math), searching on
@@ -117,7 +118,7 @@ and the two step vectors is visible. They are `O(k * nb)`, so probably not, but
   the commit's report. Never two benches at once.
 - `cargo clippy --all-targets --features gpu -- -D warnings` and the same
   without the feature; `cargo test --release --features gpu`.
-- `cargo fmt --check` fails on seven files that predate this work. Leave them.
+- `cargo fmt --check` is clean; keep it that way.
 - Work on the branch, never push, no version bumps, no README or NEWS edits.
   Report the branch from `git rev-parse --abbrev-ref HEAD`, the commit count,
   and the merge line.
