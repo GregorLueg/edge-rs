@@ -9,9 +9,10 @@
 //! ### The three stages of one gene
 //!
 //! 1. Bounded L-BFGS-B on the marginal likelihood
-//!    ([`ptmg_value_and_gradient`]) over `[beta, sigma, phi]`. Only the two
-//!    variance components survive this stage; nebula throws the fixed effects
-//!    away and restarts them from `log(mean count) - mean log offset`.
+//!    ([`ptmg_value_and_gradient`](crate::sc::ptmg::ptmg_value_and_gradient))
+//!    over `[beta, sigma, phi]`. Only the two variance components survive
+//!    this stage; nebula throws the fixed effects away and restarts them from
+//!    `log(mean count) - mean log offset`.
 //! 2. A bounded search over the two variance components alone, with the fixed
 //!    effects profiled out by [`opt_pml`] inside every evaluation. NEBULA-HL
 //!    always runs this; NEBULA-LN runs it, or a one-dimensional restriction of
@@ -55,20 +56,18 @@
 //!
 //! He et al., Communications Biology 4, 629, 2021
 
-use std::cell::Cell;
-
 use rayon::prelude::*;
 
 use crate::numeric::gamma::ln_gamma;
 use crate::numeric::lbfgsb::{LbfgsbParams, minimise};
-use crate::numeric::optimise::{NelderMeadParams, nelder_mead};
+use crate::numeric::optimise::{NelderMeadParams, NelderMeadStepper};
 use crate::prelude::*;
 use crate::sc::pml::{
     CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml,
 };
 use crate::sc::ptmg::{
-    GeneData, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
-    positive_indices, ptmg_value_and_gradient,
+    GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
+    positive_indices, ptmg_value_and_gradient_with,
 };
 use crate::sc::test::packed_len;
 
@@ -438,6 +437,66 @@ pub fn nebula_sparse<T: EdgeFloat>(
     offset: Option<&[T]>,
     params: Option<NebulaParams>,
 ) -> Result<NebulaFit, EdgeErrors> {
+    nebula_sparse_with(
+        counts,
+        subject_id,
+        design,
+        n_coef,
+        offset,
+        params,
+        |shared, sparse, totals, kept| {
+            let n_subjects = shared.n_subjects;
+            kept.par_iter()
+                .map(|&g| {
+                    let counts = positive_indices(sparse, g)?;
+                    let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
+                    fit_gene(shared, &counts, subject_totals)
+                })
+                .collect()
+        },
+    )
+}
+
+/// The shared body of every NEBULA entry point, with the per-gene fan-out left
+/// to the caller.
+///
+/// Everything that is the same whichever device fits the genes lives here: the
+/// validation, the offsets, the centred design, the expression filter and the
+/// reassembly on the user's scale. `fit` gets the kept genes and returns one
+/// outcome per kept gene, in order.
+///
+/// ### Params
+///
+/// * `counts` - Raw counts, [`SparseFormat::Csr`] over `(n_genes, n_cells)`
+/// * `subject_id` - Subject of each cell, with each subject's cells contiguous
+/// * `design` - Predictors, row-major `n_cells * n_coef`, including an intercept
+/// * `n_coef` - Number of design columns
+/// * `offset` - Strictly positive scaling factor per cell, or `None` for ones
+/// * `params` - Tuning knobs, or [`NebulaParams::default`]
+/// * `fit` - Fits the kept genes: `(shared, counts, subject totals gene-major,
+///   kept gene indices)` to one outcome per kept gene
+///
+/// ### Returns
+///
+/// The per-gene fits, or [`EdgeErrors`] as for [`nebula_sparse`] or from `fit`.
+pub(crate) fn nebula_sparse_with<T, Fit>(
+    counts: &CompressedSparse<f64>,
+    subject_id: &[usize],
+    design: &[T],
+    n_coef: usize,
+    offset: Option<&[T]>,
+    params: Option<NebulaParams>,
+    fit: Fit,
+) -> Result<NebulaFit, EdgeErrors>
+where
+    T: EdgeFloat,
+    Fit: FnOnce(
+        &Shared<'_>,
+        &CompressedSparse<f64>,
+        &[f64],
+        &[usize],
+    ) -> Result<Vec<GeneOutcome>, EdgeErrors>,
+{
     let params = params.unwrap_or_default();
     params.validate()?;
 
@@ -576,14 +635,7 @@ pub fn nebula_sparse<T: EdgeFloat>(
         params,
     };
 
-    let outcomes: Vec<GeneOutcome> = kept
-        .par_iter()
-        .map(|&g| {
-            let counts = positive_indices(sparse, g)?;
-            let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
-            fit_gene(&shared, &counts, subject_totals)
-        })
-        .collect::<Result<Vec<_>, EdgeErrors>>()?;
+    let outcomes = fit(&shared, sparse, &totals, &kept)?;
 
     Ok(assemble(
         outcomes,
@@ -600,19 +652,19 @@ pub fn nebula_sparse<T: EdgeFloat>(
 /////////////////////
 
 /// Everything the per-gene fit reads but never writes.
-struct Shared<'a> {
+pub(crate) struct Shared<'a> {
     /// Centred and scaled design, row-major `n_cells * n_coef`.
-    design: &'a [f64],
+    pub(crate) design: &'a [f64],
     /// Log offset per cell.
-    log_offset: &'a [f64],
+    pub(crate) log_offset: &'a [f64],
     /// Subject boundaries, length `n_subjects + 1`.
-    fid: &'a [usize],
+    pub(crate) fid: &'a [usize],
     /// Number of cells.
     n_cells: usize,
     /// Number of design columns.
     n_coef: usize,
     /// Number of subjects.
-    n_subjects: usize,
+    pub(crate) n_subjects: usize,
     /// Index of the intercept column.
     intercept: usize,
     /// Log of the mean offset, nebula's `moffset`.
@@ -631,11 +683,11 @@ struct Shared<'a> {
     /// The variant actually being run, after the cells-per-subject override.
     method: NebulaMethod,
     /// The user's knobs.
-    params: NebulaParams,
+    pub(crate) params: NebulaParams,
 }
 
 /// One gene's fit on the centred design scale.
-struct GeneOutcome {
+pub(crate) struct GeneOutcome {
     /// Fixed effects, length `n_coef`.
     beta: Vec<f64>,
     /// Packed upper-triangular covariance, length `packed_len(n_coef)`.
@@ -654,7 +706,76 @@ struct GeneOutcome {
 // Per-gene fit //
 //////////////////
 
-/// Runs the three stages for one gene.
+/// Which stage-two search, if any, stage one left a gene needing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Refit {
+    /// Stage one's variance components stand.
+    None,
+    /// Refit both variance components, from stage one's.
+    Both,
+    /// Refit the subject-level component alone, with the cell-level one held at
+    /// stage one's value. NEBULA-LN's one-dimensional restriction.
+    SubjectOnly,
+}
+
+/// What stage one decided for a gene, and everything stages two and three need.
+pub(crate) struct GenePlan {
+    /// Laplace order the stage-two search attempts first.
+    pub(crate) ord: u32,
+    /// nebula's `sigma[0]` after stage one.
+    pub(crate) sigma: f64,
+    /// Cell-level negative binomial size after stage one.
+    pub(crate) gamma: f64,
+    /// Convergence code carried out of stage one.
+    pub(crate) convergence: i32,
+    /// Fixed effects every inner fit starts from, before the intercept shift.
+    pub(crate) beta_start: Vec<f64>,
+    /// The stage-two search stage one calls for.
+    pub(crate) refit: Refit,
+}
+
+impl GenePlan {
+    /// The stage-two search's starting point and fixed cell-level component.
+    ///
+    /// ### Returns
+    ///
+    /// `(start, fixed_cell)`, or `None` when no refit is needed.
+    pub(crate) fn search(&self) -> Option<(Vec<f64>, Option<f64>)> {
+        match self.refit {
+            Refit::None => None,
+            Refit::Both => Some((vec![self.sigma, self.gamma], None)),
+            Refit::SubjectOnly => Some((vec![self.sigma], Some(self.gamma))),
+        }
+    }
+}
+
+/// The per-gene view [`opt_pml`] reads.
+///
+/// ### Params
+///
+/// * `shared` - The inputs common to every gene
+/// * `counts` - This gene's positive counts
+/// * `subject_totals` - This gene's count total per subject
+///
+/// ### Returns
+///
+/// The borrowed view.
+pub(crate) fn gene_pml<'a>(
+    shared: &Shared<'a>,
+    counts: &'a crate::sc::ptmg::GeneCounts,
+    subject_totals: &'a [f64],
+) -> PmlData<'a> {
+    PmlData {
+        design: shared.design,
+        offset: shared.log_offset,
+        counts: &counts.counts,
+        cell_index: &counts.cells,
+        subject_start: shared.fid,
+        subject_total: subject_totals,
+    }
+}
+
+/// Stage one for one gene, and the decision about stage two.
 ///
 /// ### Params
 ///
@@ -664,13 +785,12 @@ struct GeneOutcome {
 ///
 /// ### Returns
 ///
-/// The fit on the centred design scale, or [`EdgeErrors`] if the kernels reject
-/// the assembled per-gene view.
-fn fit_gene(
+/// The plan, or [`EdgeErrors`] if the kernels reject the assembled view.
+pub(crate) fn plan_gene(
     shared: &Shared<'_>,
     counts: &crate::sc::ptmg::GeneCounts,
     subject_totals: &[f64],
-) -> Result<GeneOutcome, EdgeErrors> {
+) -> Result<GenePlan, EdgeErrors> {
     let n_coef = shared.n_coef;
     let params = &shared.params;
 
@@ -706,48 +826,17 @@ fn fit_gene(
     upper[n_coef + 1] = params.max.1;
 
     let (stage_one, stage_one_failed) = minimise_marginal(&gene, &start, &lower, &upper);
-    let mut convergence = if stage_one_failed { 0 } else { CONV_SUCCESS };
-    let mut sigma = stage_one[n_coef];
-    let mut gamma = stage_one[n_coef + 1];
+    let convergence = if stage_one_failed { 0 } else { CONV_SUCCESS };
+    let sigma = stage_one[n_coef];
+    let gamma = stage_one[n_coef + 1];
 
     // nebula discards the stage-one fixed effects and restarts them from the
     // gene's mean count, keeping only the two variance components.
     let mut beta_start = vec![0.0; n_coef];
     beta_start[shared.intercept] = log_mean_count - shared.log_mean_offset;
 
-    let pml = PmlData {
-        design: shared.design,
-        offset: shared.log_offset,
-        counts: &counts.counts,
-        cell_index: &counts.cells,
-        subject_start: shared.fid,
-        subject_total: subject_totals,
-    };
-
-    // Stage two: the profile likelihood over the variance components alone.
-    let refit_both = |sigma: f64, gamma: f64| -> (f64, f64, bool) {
-        let x = refine_variance(
-            shared,
-            &pml,
-            &beta_start,
-            counts,
-            ord,
-            &[sigma, gamma],
-            None,
-        );
-        match x {
-            Some(v) => (v[0], v[1], true),
-            None => (sigma, gamma, false),
-        }
-    };
-
-    match shared.method {
-        NebulaMethod::Hl => {
-            let (s, g, ok) = refit_both(sigma, gamma);
-            sigma = s;
-            gamma = g;
-            convergence = if ok { CONV_SUCCESS } else { CONV_OUTER_FAILED };
-        }
+    let refit = match shared.method {
+        NebulaMethod::Hl => Refit::Both,
         NebulaMethod::Ln => {
             // nebula measures how far the fitted cell means spread within a
             // subject; without a cell-level column that is just the offsets.
@@ -765,43 +854,86 @@ fn fit_gene(
             };
             let gni = shared.cells_per_subject * gamma;
             if gni < params.cutoff_cell || convergence == 0 || cv2p.is_nan() {
-                let (s, g, ok) = refit_both(sigma, gamma);
-                sigma = s;
-                gamma = g;
-                convergence = if ok { CONV_SUCCESS } else { CONV_OUTER_FAILED };
+                Refit::Both
             } else {
                 let kappa_obs = gni / (1.0 + cv2p);
                 let weak = kappa_obs < KAPPA_FLOOR
                     || (kappa_obs < params.kappa && sigma < KAPPA_SIGMA_NUMERATOR / kappa_obs);
                 if weak {
-                    let x = refine_variance(
-                        shared,
-                        &pml,
-                        &beta_start,
-                        counts,
-                        ord,
-                        &[sigma],
-                        Some(gamma),
-                    );
-                    match x {
-                        Some(v) => {
-                            sigma = v[0];
-                            convergence = CONV_SUCCESS;
-                        }
-                        None => convergence = CONV_OUTER_FAILED,
-                    }
+                    Refit::SubjectOnly
+                } else {
+                    Refit::None
                 }
             }
         }
+    };
+
+    Ok(GenePlan {
+        ord,
+        sigma,
+        gamma,
+        convergence,
+        beta_start,
+        refit,
+    })
+}
+
+/// Applies the stage-two result and runs stage three for one gene.
+///
+/// ### Params
+///
+/// * `shared` - The inputs common to every gene
+/// * `counts` - This gene's positive counts and their summaries
+/// * `subject_totals` - This gene's count total per subject
+/// * `plan` - What stage one decided
+/// * `refit` - The stage-two minimiser, `None` if no refit ran; `Some(None)` if
+///   one ran and found nothing finite
+///
+/// ### Returns
+///
+/// The fit on the centred design scale, or [`EdgeErrors`] if the final fit
+/// rejects the view.
+pub(crate) fn finish_gene(
+    shared: &Shared<'_>,
+    counts: &crate::sc::ptmg::GeneCounts,
+    subject_totals: &[f64],
+    plan: GenePlan,
+    refit: Option<Option<Vec<f64>>>,
+) -> Result<GeneOutcome, EdgeErrors> {
+    let n_coef = shared.n_coef;
+    let params = &shared.params;
+    let mut sigma = plan.sigma;
+    let mut gamma = plan.gamma;
+    let mut convergence = plan.convergence;
+
+    match (plan.refit, refit) {
+        (Refit::Both, Some(found)) => match found {
+            Some(v) => {
+                sigma = v[0];
+                gamma = v[1];
+                convergence = CONV_SUCCESS;
+            }
+            None => convergence = CONV_OUTER_FAILED,
+        },
+        (Refit::SubjectOnly, Some(found)) => match found {
+            Some(v) => {
+                sigma = v[0];
+                convergence = CONV_SUCCESS;
+            }
+            None => convergence = CONV_OUTER_FAILED,
+        },
+        _ => {}
     }
 
     // Stage three: the final penalised fit, always at the leading Laplace order.
+    let pml = gene_pml(shared, counts, subject_totals);
     let final_params = PmlParams {
         reml: params.reml,
         eps: params.eps,
         ord: 1,
         ..PmlParams::default()
     };
+    let mut beta_start = plan.beta_start;
     beta_start[shared.intercept] -= sigma / 2.0;
     let fit = opt_pml(
         &pml,
@@ -846,6 +978,39 @@ fn fit_gene(
     })
 }
 
+/// Runs the three stages for one gene on the CPU.
+///
+/// ### Params
+///
+/// * `shared` - The inputs common to every gene
+/// * `counts` - This gene's positive counts and their summaries
+/// * `subject_totals` - This gene's count total per subject, nebula's `cumsumy`
+///
+/// ### Returns
+///
+/// The fit on the centred design scale, or [`EdgeErrors`] if the kernels reject
+/// the assembled per-gene view.
+fn fit_gene(
+    shared: &Shared<'_>,
+    counts: &crate::sc::ptmg::GeneCounts,
+    subject_totals: &[f64],
+) -> Result<GeneOutcome, EdgeErrors> {
+    let plan = plan_gene(shared, counts, subject_totals)?;
+    let refit = plan.search().map(|(start, fixed_cell)| {
+        let pml = gene_pml(shared, counts, subject_totals);
+        refine_variance(
+            shared,
+            &pml,
+            &plan.beta_start,
+            counts,
+            plan.ord,
+            &start,
+            fixed_cell,
+        )
+    });
+    finish_gene(shared, counts, subject_totals, plan, refit)
+}
+
 /////////////////////////
 // Marginal likelihood //
 /////////////////////////
@@ -883,7 +1048,8 @@ fn minimise_marginal(
 ) -> (Vec<f64>, bool) {
     let n = start.len();
     let mut best: Vec<f64> = (0..n).map(|j| start[j].clamp(lower[j], upper[j])).collect();
-    let best_f = ptmg_value_and_gradient(gene, &best).0;
+    let mut scratch = PtmgScratch::new(gene);
+    let best_f = ptmg_value_and_gradient_with(gene, &best, &mut scratch).0;
     if !best_f.is_finite() {
         return (best, true);
     }
@@ -898,7 +1064,7 @@ fn minimise_marginal(
 
     if let Ok(step) = minimise(
         |x, g| {
-            let (value, gradient) = ptmg_value_and_gradient(gene, x);
+            let (value, gradient) = ptmg_value_and_gradient_with(gene, x, &mut scratch);
             g.copy_from_slice(&gradient);
             value
         },
@@ -918,43 +1084,58 @@ fn minimise_marginal(
 // Variance objective //
 ////////////////////////
 
+/// What the profile likelihood needs from one penalised fit.
+///
+/// The four scalars of [`crate::sc::pml::PmlResult`] the outer objective reads.
+/// Split out so the fit can come from somewhere other than [`opt_pml`]; the GPU
+/// path batches these across genes and hands them back one at a time.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InnerFit {
+    /// Penalised log-likelihood at the optimum.
+    pub(crate) log_likelihood: f64,
+    /// At the previous iterate, nebula's fallback when the last is NaN.
+    pub(crate) log_likelihood_prev: f64,
+    /// Log-determinant of the observed information.
+    pub(crate) log_det: f64,
+    /// Higher-order Laplace correction, zero at order one.
+    pub(crate) second_order: f64,
+}
+
 /// nebula's `pql_ll`: the marginal likelihood with the fixed effects and the
-/// random effects profiled out by [`opt_pml`].
+/// random effects profiled out by a penalised fit.
 ///
 /// Every evaluation runs a full penalised fit, so this is the expensive part of
-/// a NEBULA run. The `invalid` flag records whether any evaluation was rejected,
-/// which is how the caller learns to retry at the leading Laplace order, as the
-/// R package does through its `tryCatch`.
-struct VarianceObjective<'a> {
+/// a NEBULA run. Whether an evaluation was rejected is not tracked here: every
+/// rejection returns positive infinity and every infinite return is a
+/// rejection, so [`StageTwoSearch`] reads it straight off the values.
+pub(crate) struct VarianceObjective<'a> {
     /// The gene, in the layout [`opt_pml`] wants.
-    data: &'a PmlData<'a>,
+    pub(crate) data: &'a PmlData<'a>,
     /// Fixed effects to start the inner fit from, before the intercept shift.
-    beta_start: &'a [f64],
+    pub(crate) beta_start: &'a [f64],
     /// Index of the intercept column.
-    intercept: usize,
+    pub(crate) intercept: usize,
     /// Knobs for the inner fit, including the Laplace order under test.
-    params: PmlParams,
+    pub(crate) params: PmlParams,
     /// Number of cells.
-    n_cells: f64,
+    pub(crate) n_cells: f64,
     /// Number of subjects.
-    n_subjects: f64,
+    pub(crate) n_subjects: f64,
     /// This gene's positive counts.
-    counts: &'a [f64],
+    pub(crate) counts: &'a [f64],
     /// How many positive counts there are.
-    n_positive: f64,
+    pub(crate) n_positive: f64,
     /// How many equal one.
-    n_one: f64,
+    pub(crate) n_one: f64,
     /// How many equal two.
-    n_two: f64,
+    pub(crate) n_two: f64,
     /// Cell-level overdispersion held fixed, for the one-dimensional restriction
     /// NEBULA-LN uses.
-    fixed_cell: Option<f64>,
-    /// Whether any evaluation had to be rejected.
-    invalid: Cell<bool>,
+    pub(crate) fixed_cell: Option<f64>,
 }
 
 impl VarianceObjective<'_> {
-    /// Evaluates the negated profile log-likelihood.
+    /// Resolves a search point into the inner fit it needs.
     ///
     /// ### Params
     ///
@@ -962,43 +1143,65 @@ impl VarianceObjective<'_> {
     ///
     /// ### Returns
     ///
-    /// The objective, or positive infinity where the inner fit failed or the
-    /// higher-order Laplace correction left `log(1 + second)` undefined.
-    fn value(&self, x: &[f64]) -> f64 {
+    /// `(subject, cell, beta_init)`, or `None` if the point is outside the
+    /// domain and the objective is infinite there without a fit.
+    pub(crate) fn request(&self, x: &[f64]) -> Option<(f64, f64, Vec<f64>)> {
         let subject = x[0];
         let cell = match self.fixed_cell {
             Some(c) => c,
             None => x[1],
         };
         if !(subject.is_finite() && subject > 0.0 && cell.is_finite() && cell > 0.0) {
-            self.invalid.set(true);
+            return None;
+        }
+        let mut beta = self.beta_start.to_vec();
+        beta[self.intercept] -= subject / 2.0;
+        Some((subject, cell, beta))
+    }
+
+    /// The `lgamma` tail over the positive counts, in count order.
+    ///
+    /// Counts of one and two have closed forms for the gamma ratio, which is
+    /// most of a single-cell matrix; only the rest needs `lgamma`.
+    ///
+    /// ### Params
+    ///
+    /// * `cell` - Cell-level negative binomial size
+    ///
+    /// ### Returns
+    ///
+    /// `sum lgamma(y + cell)` over the positive counts other than one and two.
+    pub(crate) fn tail(&self, cell: f64) -> f64 {
+        let mut tail = 0.0;
+        for &y in self.counts {
+            if y != 1.0 && y != 2.0 {
+                tail += ln_gamma(y + cell);
+            }
+        }
+        tail
+    }
+
+    /// Assembles the negated profile log-likelihood from a finished inner fit.
+    ///
+    /// ### Params
+    ///
+    /// * `subject` - nebula's `sigma[0]`
+    /// * `cell` - The cell-level negative binomial size
+    /// * `fit` - The inner fit at `(subject, cell)`
+    /// * `tail` - [`Self::tail`] at `cell`, or anything equal to it
+    ///
+    /// ### Returns
+    ///
+    /// The objective, or positive infinity where the higher-order Laplace
+    /// correction left `log(1 + second)` undefined or the result is not finite.
+    pub(crate) fn assemble(&self, subject: f64, cell: f64, fit: &InnerFit, tail: f64) -> f64 {
+        // nebula raises an error here and restarts the whole search at `ord = 1`.
+        if fit.second_order < -1.0 {
             return f64::INFINITY;
         }
-
         let exps = subject.exp();
         let alpha = 1.0 / (exps - 1.0);
         let lambda = 1.0 / (exps.sqrt() * (exps - 1.0));
-
-        let mut beta = self.beta_start.to_vec();
-        beta[self.intercept] -= subject / 2.0;
-
-        let fit = match opt_pml(
-            self.data,
-            &beta,
-            &PmlVariance { subject, cell },
-            Some(self.params),
-        ) {
-            Ok(f) => f,
-            Err(_) => {
-                self.invalid.set(true);
-                return f64::INFINITY;
-            }
-        };
-        // nebula raises an error here and restarts the whole search at `ord = 1`.
-        if fit.second_order < -1.0 {
-            self.invalid.set(true);
-            return f64::INFINITY;
-        }
 
         let base = if fit.log_likelihood.is_nan() {
             fit.log_likelihood_prev
@@ -1008,15 +1211,6 @@ impl VarianceObjective<'_> {
         let mut log_likelihood =
             base + self.n_cells * cell * cell.ln() + self.n_subjects * alpha * lambda.ln()
                 - self.n_subjects * ln_gamma(alpha);
-
-        // Counts of one and two have closed forms for the gamma ratio, which is
-        // most of a single-cell matrix; only the rest needs `lgamma`.
-        let mut tail = 0.0;
-        for &y in self.counts {
-            if y != 1.0 && y != 2.0 {
-                tail += ln_gamma(y + cell);
-            }
-        }
         log_likelihood += tail - (self.n_positive - self.n_one - self.n_two) * ln_gamma(cell)
             + (self.n_one + self.n_two) * cell.ln()
             + self.n_two * (cell + 1.0).ln();
@@ -1025,18 +1219,418 @@ impl VarianceObjective<'_> {
         if log_likelihood.is_finite() {
             -log_likelihood
         } else {
-            self.invalid.set(true);
             f64::INFINITY
         }
     }
+
+    /// Evaluates the negated profile log-likelihood with the `f64` inner fit.
+    ///
+    /// ### Params
+    ///
+    /// * `x` - `[sigma]` when [`Self::fixed_cell`] is set, else `[sigma, phi]`
+    ///
+    /// ### Returns
+    ///
+    /// The objective, or positive infinity where the inner fit failed or the
+    /// point is outside the domain.
+    fn value(&self, x: &[f64]) -> f64 {
+        let Some((subject, cell, beta)) = self.request(x) else {
+            return f64::INFINITY;
+        };
+        let fit = match opt_pml(
+            self.data,
+            &beta,
+            &PmlVariance { subject, cell },
+            Some(self.params),
+        ) {
+            Ok(f) => f,
+            Err(_) => return f64::INFINITY,
+        };
+        let inner = InnerFit {
+            log_likelihood: fit.log_likelihood,
+            log_likelihood_prev: fit.log_likelihood_prev,
+            log_det: fit.log_det,
+            second_order: fit.second_order,
+        };
+        self.assemble(subject, cell, &inner, self.tail(cell))
+    }
 }
 
-/// Minimises the profile likelihood over the variance components.
+///////////////////////
+// Stage-two search  //
+///////////////////////
+
+/// Where a [`StageTwoSearch`] is waiting for values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchStage {
+    /// The clamped starting point.
+    Start,
+    /// A Nelder-Mead evaluation.
+    NelderMead,
+    /// The clamped Nelder-Mead minimiser, checked once more.
+    Check,
+    /// A quadratic polish stencil, all `3^n` points at once.
+    Polish,
+    /// Finished.
+    Done,
+}
+
+/// nebula's stage two over the variance components, as a reverse-communication
+/// state machine.
 ///
-/// Bounded Nelder-Mead, then the quadratic polish cascade. If the search at a
-/// raised Laplace order hit an evaluation the expansion could not support, the
-/// whole thing is repeated at the leading order, which is what the R package's
-/// `tryCatch` around `bobyqa` does.
+/// The search asks for the objective at a batch of points, the caller evaluates
+/// them however it likes, and tells the search the values. That lets many
+/// genes' searches advance in lockstep with every evaluation of a round batched
+/// onto one device launch. The CPU path drives it with an immediate evaluation,
+/// so the two paths cannot drift apart in control flow.
+///
+/// The sequence is: the clamped start; bounded Nelder-Mead, which evaluates
+/// every point clamped into the box so that a component can settle exactly on
+/// its bound; the clamped minimiser once more; then three quadratic polish
+/// stencils at shrinking widths. The polish is the part that matters: the
+/// objective jitters at the `1e-6` level, and a quadratic fitted over a stencil
+/// wider than the jitter averages it out where a simplex does not. If the pass
+/// at a raised Laplace order hit an evaluation the expansion could not support,
+/// the whole pass is repeated at the leading order, which is what the R
+/// package's `tryCatch` around `bobyqa` does.
+///
+/// A polish stencil asks for all its points in one batch, where the closure form
+/// stopped at the first infinite value. The result is the same: an infinite
+/// value discards the stencil either way, and the rejection flag is set by the
+/// first one.
+pub(crate) struct StageTwoSearch {
+    /// Lower bounds.
+    lower: Vec<f64>,
+    /// Upper bounds.
+    upper: Vec<f64>,
+    /// Starting point, restarted from on the leading-order retry.
+    start: Vec<f64>,
+    /// Laplace order under test.
+    order: u32,
+    /// Whether any evaluation in this pass was rejected.
+    invalid: bool,
+    /// What the pending values are for.
+    stage: SearchStage,
+    /// The points awaiting values.
+    asked: Vec<Vec<f64>>,
+    /// The simplex search, during [`SearchStage::NelderMead`].
+    simplex: Option<NelderMeadStepper>,
+    /// The incumbent.
+    best: Vec<f64>,
+    /// Index into [`POLISH_WIDTHS`] of the stencil in flight.
+    width: usize,
+    /// Per-coordinate step of the stencil in flight.
+    step: Vec<f64>,
+    /// Scaled offsets of the stencil in flight, one row per point.
+    offsets: Vec<Vec<f64>>,
+    /// The minimiser once [`SearchStage::Done`], `None` if nothing was finite.
+    found: Option<Vec<f64>>,
+}
+
+impl StageTwoSearch {
+    /// Starts a search.
+    ///
+    /// ### Params
+    ///
+    /// * `start` - Starting variance components, one or two
+    /// * `lower` - Lower bounds, same length
+    /// * `upper` - Upper bounds, same length
+    /// * `ord` - Laplace order to attempt first
+    ///
+    /// ### Returns
+    ///
+    /// The search, asking for the clamped start.
+    pub(crate) fn new(start: &[f64], lower: &[f64], upper: &[f64], ord: u32) -> Self {
+        let mut search = Self {
+            lower: lower.to_vec(),
+            upper: upper.to_vec(),
+            start: start.to_vec(),
+            order: ord,
+            invalid: false,
+            stage: SearchStage::Start,
+            asked: Vec::new(),
+            simplex: None,
+            best: Vec::new(),
+            width: 0,
+            step: Vec::new(),
+            offsets: Vec::new(),
+            found: None,
+        };
+        search.begin_pass();
+        search
+    }
+
+    /// The Laplace order the pending points are to be evaluated at.
+    ///
+    /// ### Returns
+    ///
+    /// The order of the current pass.
+    pub(crate) fn order(&self) -> u32 {
+        self.order
+    }
+
+    /// The points the search wants evaluated next.
+    ///
+    /// ### Returns
+    ///
+    /// The batch, or `None` once the search has finished.
+    pub(crate) fn ask(&self) -> Option<&[Vec<f64>]> {
+        if self.stage == SearchStage::Done {
+            None
+        } else {
+            Some(&self.asked)
+        }
+    }
+
+    /// Hands the search the objective at every point [`Self::ask`] returned.
+    ///
+    /// ### Params
+    ///
+    /// * `values` - One value per asked point, in the same order
+    pub(crate) fn tell(&mut self, values: &[f64]) {
+        debug_assert_eq!(values.len(), self.asked.len());
+        if values.iter().any(|v| !v.is_finite()) {
+            self.invalid = true;
+        }
+        match self.stage {
+            SearchStage::Start => {
+                if !values[0].is_finite() {
+                    self.end_pass(None);
+                    return;
+                }
+                let x0 = self.clamped(&self.start);
+                let stepper = NelderMeadStepper::new(
+                    &x0,
+                    Some(NelderMeadParams {
+                        xatol: VARIANCE_XATOL,
+                        fatol: VARIANCE_FATOL,
+                        max_iter: VARIANCE_MAX_ITER,
+                    }),
+                )
+                .expect("the variance components are never empty");
+                self.simplex = Some(stepper);
+                self.stage = SearchStage::NelderMead;
+                self.ask_simplex();
+            }
+            SearchStage::NelderMead => {
+                let simplex = self.simplex.as_mut().expect("in the simplex stage");
+                simplex.tell(values[0]);
+                self.ask_simplex();
+            }
+            SearchStage::Check => {
+                if !values[0].is_finite() {
+                    self.end_pass(None);
+                    return;
+                }
+                self.width = 0;
+                self.begin_polish();
+            }
+            SearchStage::Polish => {
+                if values.iter().all(|v| v.is_finite())
+                    && let Some(next) = self.fit_polish(values)
+                {
+                    self.best = next;
+                }
+                self.width += 1;
+                self.begin_polish();
+            }
+            SearchStage::Done => {}
+        }
+    }
+
+    /// The minimiser, once [`Self::ask`] returns `None`.
+    ///
+    /// ### Returns
+    ///
+    /// The minimiser, clamped into the box, or `None` if nothing finite was
+    /// found.
+    pub(crate) fn result(self) -> Option<Vec<f64>> {
+        self.found
+    }
+
+    /// Clamps a point into the box.
+    ///
+    /// ### Params
+    ///
+    /// * `x` - The point
+    ///
+    /// ### Returns
+    ///
+    /// The clamped copy.
+    fn clamped(&self, x: &[f64]) -> Vec<f64> {
+        (0..x.len())
+            .map(|j| x[j].clamp(self.lower[j], self.upper[j]))
+            .collect()
+    }
+
+    /// Starts a pass at the current order from the starting point.
+    fn begin_pass(&mut self) {
+        self.invalid = false;
+        self.simplex = None;
+        self.stage = SearchStage::Start;
+        self.asked = vec![self.clamped(&self.start)];
+    }
+
+    /// Ends a pass, retrying at the leading order where nebula would.
+    ///
+    /// ### Params
+    ///
+    /// * `found` - What the pass produced
+    fn end_pass(&mut self, found: Option<Vec<f64>>) {
+        if (found.is_some() && !self.invalid) || self.order == 1 {
+            self.found = found;
+            self.stage = SearchStage::Done;
+            self.asked.clear();
+        } else {
+            self.order = 1;
+            self.begin_pass();
+        }
+    }
+
+    /// Asks for the simplex's next point, clamped, or moves on when it is done.
+    fn ask_simplex(&mut self) {
+        let simplex = self.simplex.as_ref().expect("in the simplex stage");
+        if let Some(x) = simplex.ask() {
+            self.asked = vec![self.clamped(x)];
+            return;
+        }
+        let best = self.clamped(&simplex.result().x);
+        self.best = best.clone();
+        self.simplex = None;
+        self.stage = SearchStage::Check;
+        self.asked = vec![best];
+    }
+
+    /// Builds the next polish stencil, or finishes the pass after the last.
+    ///
+    /// The stencil is `3^n` points at offsets `-1, 0, 1` times the step, shifted
+    /// to `0, 1, 2` or `-2, -1, 0` in any coordinate sitting on a bound so that
+    /// the points stay distinct and inside the box.
+    fn begin_polish(&mut self) {
+        if self.width == POLISH_WIDTHS.len() {
+            let best = std::mem::take(&mut self.best);
+            self.end_pass(Some(best));
+            return;
+        }
+        let width = POLISH_WIDTHS[self.width];
+        let n = self.best.len();
+        let x = &self.best;
+        let step: Vec<f64> = (0..n)
+            .map(|j| (width * x[j].abs()).max(POLISH_FLOOR[j]))
+            .collect();
+        let nodes: Vec<[f64; 3]> = (0..n)
+            .map(|j| {
+                if x[j] - step[j] < self.lower[j] {
+                    [0.0, 1.0, 2.0]
+                } else if x[j] + step[j] > self.upper[j] {
+                    [-2.0, -1.0, 0.0]
+                } else {
+                    [-1.0, 0.0, 1.0]
+                }
+            })
+            .collect();
+
+        let n_points = 3_usize.pow(n as u32);
+        let mut offsets = Vec::with_capacity(n_points);
+        let mut asked = Vec::with_capacity(n_points);
+        for point in 0..n_points {
+            let mut u = vec![0.0; n];
+            let mut rest = point;
+            for j in 0..n {
+                let node = nodes[j][rest % 3];
+                rest /= 3;
+                let p = (x[j] + node * step[j]).clamp(self.lower[j], self.upper[j]);
+                u[j] = (p - x[j]) / step[j];
+            }
+            asked.push((0..n).map(|j| x[j] + u[j] * step[j]).collect());
+            offsets.push(u);
+        }
+        self.step = step;
+        self.offsets = offsets;
+        self.asked = asked;
+        self.stage = SearchStage::Polish;
+    }
+
+    /// One step of Newton on a quadratic fitted to the stencil values.
+    ///
+    /// The quadratic is fitted by least squares through the normal equations,
+    /// which are well conditioned at these sizes, and the step is taken only if
+    /// the fitted curvature is positive definite and the step stays inside the
+    /// stencil.
+    ///
+    /// ### Params
+    ///
+    /// * `values` - The objective at each stencil point, all finite
+    ///
+    /// ### Returns
+    ///
+    /// The polished point, or `None` if the model was unusable.
+    fn fit_polish(&self, values: &[f64]) -> Option<Vec<f64>> {
+        let x = &self.best;
+        let n = x.len();
+        // 1 constant, n linear, n square and n(n-1)/2 cross terms.
+        let n_terms = 1 + 2 * n + n * (n - 1) / 2;
+        let mut rows = Vec::with_capacity(values.len() * n_terms);
+        for u in &self.offsets {
+            rows.push(1.0);
+            rows.extend_from_slice(u);
+            rows.extend(u.iter().map(|v| 0.5 * v * v));
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    rows.push(u[i] * u[j]);
+                }
+            }
+        }
+
+        // Normal equations. Cheaper than a QR and perfectly conditioned here:
+        // the stencil spans the quadratic space exactly.
+        let mut normal = vec![0.0; n_terms * n_terms];
+        let mut rhs = vec![0.0; n_terms];
+        for (point, &f) in values.iter().enumerate() {
+            let row = &rows[point * n_terms..(point + 1) * n_terms];
+            for a in 0..n_terms {
+                rhs[a] += row[a] * f;
+                for b in 0..n_terms {
+                    normal[a * n_terms + b] += row[a] * row[b];
+                }
+            }
+        }
+        let coefficients = cholesky_solve(&normal, n_terms, &rhs)?;
+
+        let gradient = &coefficients[1..=n];
+        let mut hessian = vec![0.0; n * n];
+        for j in 0..n {
+            hessian[j * n + j] = coefficients[1 + n + j];
+        }
+        let mut cross = 1 + 2 * n;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                hessian[i * n + j] = coefficients[cross];
+                hessian[j * n + i] = coefficients[cross];
+                cross += 1;
+            }
+        }
+
+        let negated: Vec<f64> = gradient.iter().map(|g| -g).collect();
+        let delta = cholesky_solve(&hessian, n, &negated)?;
+        if delta
+            .iter()
+            .any(|d| !d.is_finite() || d.abs() > POLISH_MAX_STEP)
+        {
+            return None;
+        }
+
+        Some(
+            (0..n)
+                .map(|j| (x[j] + delta[j] * self.step[j]).clamp(self.lower[j], self.upper[j]))
+                .collect(),
+        )
+    }
+}
+
+/// Minimises the profile likelihood over the variance components on the CPU.
+///
+/// [`StageTwoSearch`] driven by the `f64` inner fit, one evaluation at a time.
 ///
 /// ### Params
 ///
@@ -1062,226 +1656,82 @@ fn refine_variance(
     fixed_cell: Option<f64>,
 ) -> Option<Vec<f64>> {
     debug_assert_eq!(start.len(), if fixed_cell.is_some() { 1 } else { 2 });
-    let params = &shared.params;
-    let (lower, upper) = if fixed_cell.is_some() {
+    let (lower, upper) = variance_bounds(&shared.params, fixed_cell);
+    let mut search = StageTwoSearch::new(start, &lower, &upper, ord);
+    while let Some(points) = search.ask() {
+        let objective =
+            variance_objective(shared, pml, beta_start, counts, search.order(), fixed_cell);
+        let values: Vec<f64> = points.iter().map(|x| objective.value(x)).collect();
+        search.tell(&values);
+    }
+    search.result()
+}
+
+/// The box the stage-two search runs in.
+///
+/// ### Params
+///
+/// * `params` - The NEBULA knobs holding the bounds
+/// * `fixed_cell` - Whether the cell-level component is held fixed
+///
+/// ### Returns
+///
+/// `(lower, upper)`, one or two components each.
+pub(crate) fn variance_bounds(
+    params: &NebulaParams,
+    fixed_cell: Option<f64>,
+) -> (Vec<f64>, Vec<f64>) {
+    if fixed_cell.is_some() {
         (vec![params.min.0], vec![params.max.0])
     } else {
         (
             vec![params.min.0, params.min.1],
             vec![params.max.0, params.max.1],
         )
-    };
-    for order in [ord, 1] {
-        let objective = VarianceObjective {
-            data: pml,
-            beta_start,
-            intercept: shared.intercept,
-            params: PmlParams {
-                reml: params.reml,
-                eps: params.eps,
-                ord: order,
-                ..PmlParams::default()
-            },
-            n_cells: shared.n_cells as f64,
-            n_subjects: shared.n_subjects as f64,
-            counts: &counts.counts,
-            n_positive: counts.counts.len() as f64,
-            n_one: counts.n_one as f64,
-            n_two: counts.n_two as f64,
-            fixed_cell,
-            invalid: Cell::new(false),
-        };
-        let evaluate = |x: &[f64]| objective.value(x);
-        let found = minimise_box(&evaluate, start, &lower, &upper);
-        if found.is_some() && !objective.invalid.get() {
-            return found;
-        }
-        if order == 1 {
-            return found;
-        }
     }
-    None
 }
 
-/// Bounded derivative-free minimisation with a quadratic polish.
-///
-/// Nelder-Mead localises the basin, evaluating a point clamped into the box so
-/// that a component can settle exactly on its bound, then a least-squares
-/// quadratic over a shrinking sequence of stencils finds the minimum inside it.
-/// The polish is the part that matters: the objective jitters at the `1e-6`
-/// level, and a quadratic fitted over a stencil wider than the jitter averages
-/// it out where a simplex does not.
+/// The profile objective for one gene at one Laplace order.
 ///
 /// ### Params
 ///
-/// * `objective` - The profile likelihood, already clamped-safe
-/// * `start` - Starting point, one or two variance components
-/// * `lower` - Lower bounds
-/// * `upper` - Upper bounds
+/// * `shared` - The inputs common to every gene
+/// * `pml` - The gene, in the layout [`opt_pml`] wants
+/// * `beta_start` - Fixed effects to start each inner fit from
+/// * `counts` - This gene's positive counts and their summaries
+/// * `order` - Laplace order
+/// * `fixed_cell` - Cell-level overdispersion to hold fixed, if any
 ///
 /// ### Returns
 ///
-/// The minimiser, clamped into the box, or `None` if nothing finite was found.
-fn minimise_box(
-    objective: &dyn Fn(&[f64]) -> f64,
-    start: &[f64],
-    lower: &[f64],
-    upper: &[f64],
-) -> Option<Vec<f64>> {
-    let n = start.len();
-    let clamped = |x: &[f64]| -> Vec<f64> {
-        (0..n)
-            .map(|j| x[j].clamp(lower[j], upper[j]))
-            .collect::<Vec<f64>>()
-    };
-    let evaluate = |x: &[f64]| objective(&clamped(x));
-
-    let x0 = clamped(start);
-    if !evaluate(&x0).is_finite() {
-        return None;
+/// The objective.
+pub(crate) fn variance_objective<'a>(
+    shared: &Shared<'_>,
+    pml: &'a PmlData<'a>,
+    beta_start: &'a [f64],
+    counts: &'a crate::sc::ptmg::GeneCounts,
+    order: u32,
+    fixed_cell: Option<f64>,
+) -> VarianceObjective<'a> {
+    let params = &shared.params;
+    VarianceObjective {
+        data: pml,
+        beta_start,
+        intercept: shared.intercept,
+        params: PmlParams {
+            reml: params.reml,
+            eps: params.eps,
+            ord: order,
+            ..PmlParams::default()
+        },
+        n_cells: shared.n_cells as f64,
+        n_subjects: shared.n_subjects as f64,
+        counts: &counts.counts,
+        n_positive: counts.counts.len() as f64,
+        n_one: counts.n_one as f64,
+        n_two: counts.n_two as f64,
+        fixed_cell,
     }
-
-    let simplex = nelder_mead(
-        evaluate,
-        &x0,
-        Some(NelderMeadParams {
-            xatol: VARIANCE_XATOL,
-            fatol: VARIANCE_FATOL,
-            max_iter: VARIANCE_MAX_ITER,
-        }),
-    )
-    .ok()?;
-    let mut best = clamped(&simplex.x);
-    if !objective(&best).is_finite() {
-        return None;
-    }
-
-    for width in POLISH_WIDTHS {
-        let step: Vec<f64> = (0..n)
-            .map(|j| (width * best[j].abs()).max(POLISH_FLOOR[j]))
-            .collect();
-        if let Some(next) = quadratic_polish(objective, &best, lower, upper, &step) {
-            best = next;
-        }
-    }
-    Some(best)
-}
-
-/// One step of Newton on a quadratic fitted to a tensor-product stencil.
-///
-/// The stencil is `3^n` points at offsets `-1, 0, 1` times `step`, shifted to
-/// `0, 1, 2` or `-2, -1, 0` in any coordinate sitting on a bound so that the
-/// points stay distinct and inside the box. The quadratic is fitted by least
-/// squares through the normal equations, which are well conditioned at these
-/// sizes, and the step is taken only if the fitted curvature is positive
-/// definite and the step stays inside the stencil.
-///
-/// ### Params
-///
-/// * `objective` - The function being minimised
-/// * `x` - Incumbent
-/// * `lower` - Lower bounds
-/// * `upper` - Upper bounds
-/// * `step` - Stencil width per coordinate
-///
-/// ### Returns
-///
-/// The polished point, or `None` if the model was unusable.
-fn quadratic_polish(
-    objective: &dyn Fn(&[f64]) -> f64,
-    x: &[f64],
-    lower: &[f64],
-    upper: &[f64],
-    step: &[f64],
-) -> Option<Vec<f64>> {
-    let n = x.len();
-    let offsets: Vec<[f64; 3]> = (0..n)
-        .map(|j| {
-            if x[j] - step[j] < lower[j] {
-                [0.0, 1.0, 2.0]
-            } else if x[j] + step[j] > upper[j] {
-                [-2.0, -1.0, 0.0]
-            } else {
-                [-1.0, 0.0, 1.0]
-            }
-        })
-        .collect();
-
-    // 1 constant, n linear, n square and n(n-1)/2 cross terms.
-    let n_terms = 1 + 2 * n + n * (n - 1) / 2;
-    let n_points = 3_usize.pow(n as u32);
-    let mut rows = Vec::with_capacity(n_points * n_terms);
-    let mut values = Vec::with_capacity(n_points);
-
-    for point in 0..n_points {
-        let mut u = vec![0.0; n];
-        let mut rest = point;
-        for j in 0..n {
-            let node = offsets[j][rest % 3];
-            rest /= 3;
-            let p = (x[j] + node * step[j]).clamp(lower[j], upper[j]);
-            u[j] = (p - x[j]) / step[j];
-        }
-        let candidate: Vec<f64> = (0..n).map(|j| x[j] + u[j] * step[j]).collect();
-        let f = objective(&candidate);
-        if !f.is_finite() {
-            return None;
-        }
-        values.push(f);
-
-        rows.push(1.0);
-        rows.extend_from_slice(&u);
-        rows.extend(u.iter().map(|v| 0.5 * v * v));
-        for i in 0..n {
-            for j in (i + 1)..n {
-                rows.push(u[i] * u[j]);
-            }
-        }
-    }
-
-    // Normal equations. Cheaper than a QR and perfectly conditioned here: the
-    // stencil spans the quadratic space exactly.
-    let mut normal = vec![0.0; n_terms * n_terms];
-    let mut rhs = vec![0.0; n_terms];
-    for (point, &f) in values.iter().enumerate() {
-        let row = &rows[point * n_terms..(point + 1) * n_terms];
-        for a in 0..n_terms {
-            rhs[a] += row[a] * f;
-            for b in 0..n_terms {
-                normal[a * n_terms + b] += row[a] * row[b];
-            }
-        }
-    }
-    let coefficients = cholesky_solve(&normal, n_terms, &rhs)?;
-
-    let gradient = &coefficients[1..=n];
-    let mut hessian = vec![0.0; n * n];
-    for j in 0..n {
-        hessian[j * n + j] = coefficients[1 + n + j];
-    }
-    let mut cross = 1 + 2 * n;
-    for i in 0..n {
-        for j in (i + 1)..n {
-            hessian[i * n + j] = coefficients[cross];
-            hessian[j * n + i] = coefficients[cross];
-            cross += 1;
-        }
-    }
-
-    let negated: Vec<f64> = gradient.iter().map(|g| -g).collect();
-    let delta = cholesky_solve(&hessian, n, &negated)?;
-    if delta
-        .iter()
-        .any(|d| !d.is_finite() || d.abs() > POLISH_MAX_STEP)
-    {
-        return None;
-    }
-
-    Some(
-        (0..n)
-            .map(|j| (x[j] + delta[j] * step[j]).clamp(lower[j], upper[j]))
-            .collect(),
-    )
 }
 
 ////////////////////

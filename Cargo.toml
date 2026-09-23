@@ -1,6 +1,6 @@
 [package]
 name = "edge-rs"
-version = "0.0.5"
+version = "0.1.0"
 edition = "2024"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -13,7 +13,17 @@ categories = ["science", "mathematics"]
 name = "edge_rs"
 path = "src/lib.rs"
 
+[features]
+## Default build: pure CPU, no GPU runtime.
+default = []
+## Enables the CubeCL/wgpu NEBULA path in `crate::gpu`.
+gpu = ["cubecl", "cubecl-utils-rs"]
+## Enables the tests that need a wgpu adapter on the machine. This is for CI/CD
+gpu-tests = ["gpu"]
+
 [dependencies]
+cubecl = { version = "0.10.0", features = ["wgpu"], optional = true }
+cubecl-utils-rs = { version = "0.1.0", optional = true }
 faer = "0.23.2"
 faer-traits = "0.23.2"
 num-traits = "0.2.19"
@@ -32,3 +42,16 @@ rand_distr = "0.5.1"
 opt-level = 3
 lto = "thin"
 codegen-units = 4
+
+###########
+# Benches #
+###########
+
+[[bench]]
+name = "nebula_bench"
+harness = false
+
+[[bench]]
+name = "nebula_gpu_bench"
+harness = false
+required-features = ["gpu"]

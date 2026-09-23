@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.0
+
+* GPU-accelerated NEBULA added via the wgpu/cubecl framework, behind the `gpu`
+  feature. `nebula_sparse_gpu` takes and returns what `nebula_sparse` does, runs
+  stage two's fits on the device in `f32` and finishes each in `f64` on the
+  host. 3.4x to 7.5x over the CPU path under NEBULA-HL on an M1 Max.
+* `gpu-tests` feature and a GPU lane in CI.
+
 ## v0.0.5
 
 * `AplWorkspace` added: the adjusted profile likelihood point by point, with the

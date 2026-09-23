@@ -47,6 +47,19 @@ const NELDER_MEAD_STEP: f64 = 0.05;
 /// A relative step cannot move a zero, so scipy substitutes this constant.
 const NELDER_MEAD_ZERO_STEP: f64 = 0.000_25;
 
+/// Simplex extent, in units of `f64::EPSILON` times the best vertex's largest
+/// coordinate, below which Nelder-Mead stops whatever the objective says.
+///
+/// Both of scipy's tolerances must pass, which a discontinuous objective can
+/// make impossible: NEBULA's profile likelihood jumps by a few `1e-7` wherever
+/// an inner Newton loop changes its step count, and a simplex that has shrunk
+/// onto such a jump to adjacent floating-point numbers then cycles through the
+/// same handful of points until the iteration cap. Measured on one gene in 500:
+/// vertices two ulp apart, a `4.5e-7` jump against an `fatol` of `1e-7`, and
+/// 1650 wasted evaluations. No move is left to a simplex this small, so
+/// stopping returns the same minimiser to the last few bits.
+const NELDER_MEAD_COLLAPSED_ULPS: f64 = 16.0;
+
 //////////////////
 // Root finding //
 //////////////////
@@ -352,131 +365,328 @@ pub fn nelder_mead<F>(
 where
     F: FnMut(&[f64]) -> f64,
 {
-    let params = params.unwrap_or_default();
-    let n = x0.len();
-    if n == 0 {
-        return Err(EdgeErrors::MustBePositive("x0.len()".to_string()));
+    let mut stepper = NelderMeadStepper::new(x0, params)?;
+    while let Some(x) = stepper.ask() {
+        let value = f(x);
+        stepper.tell(value);
     }
+    Ok(stepper.result())
+}
 
-    // scipy's initial simplex.
-    let mut simplex: Vec<Vec<f64>> = Vec::with_capacity(n + 1);
-    simplex.push(x0.to_vec());
-    for i in 0..n {
-        let mut vertex = x0.to_vec();
-        if vertex[i] != 0.0 {
-            vertex[i] *= 1.0 + NELDER_MEAD_STEP;
-        } else {
-            vertex[i] = NELDER_MEAD_ZERO_STEP;
+/// Where a [`NelderMeadStepper`] is waiting for a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NelderMeadPhase {
+    /// Evaluating vertex `i` of the initial simplex.
+    Init(usize),
+    /// Evaluating the reflected point.
+    Reflect,
+    /// Evaluating the expanded point.
+    Expand,
+    /// Evaluating the contracted point.
+    Contract,
+    /// Evaluating the shrunk vertex at position `i` of the sorted order.
+    Shrink(usize),
+    /// Finished.
+    Done,
+}
+
+/// [`nelder_mead`] as a reverse-communication state machine.
+///
+/// The caller asks for the next point, evaluates it however it likes, and tells
+/// the stepper the value. That is what lets many independent searches advance
+/// in lockstep with their evaluations batched together, which a closure-driven
+/// search cannot do. The sequence of points asked for, and every floating-point
+/// operation on them, is exactly that of the closure-driven form: [`nelder_mead`]
+/// is this stepper driven by a closure.
+#[derive(Clone, Debug)]
+pub struct NelderMeadStepper {
+    /// Tuning knobs.
+    params: NelderMeadParams,
+    /// Dimension.
+    n: usize,
+    /// Vertices, `n + 1` of them.
+    simplex: Vec<Vec<f64>>,
+    /// Objective at each vertex.
+    values: Vec<f64>,
+    /// Vertex indices, sorted by value at the top of every iteration. Kept
+    /// across iterations because the sort is stable and ties keep the previous
+    /// order.
+    order: Vec<usize>,
+    /// Index of the next iteration to run.
+    next_iter: usize,
+    /// Iterations performed so far.
+    iterations: usize,
+    /// Whether both tolerances were met.
+    converged: bool,
+    /// What the pending value is for.
+    phase: NelderMeadPhase,
+    /// The point awaiting a value.
+    pending: Vec<f64>,
+    /// Centroid of all but the worst vertex, for the current iteration.
+    centroid: Vec<f64>,
+    /// The reflected point of the current iteration.
+    reflected: Vec<f64>,
+    /// Its value.
+    f_reflected: f64,
+    /// Whether the current contraction is the inside one.
+    inside: bool,
+    /// Best vertex of the current iteration.
+    best: usize,
+    /// Worst vertex of the current iteration.
+    worst: usize,
+    /// Second worst vertex of the current iteration.
+    second_worst: usize,
+}
+
+impl NelderMeadStepper {
+    /// Builds the initial simplex, scipy's, and asks for its first vertex.
+    ///
+    /// ### Params
+    ///
+    /// * `x0` - Starting point
+    /// * `params` - Tuning knobs, or [`NelderMeadParams::default`]
+    ///
+    /// ### Returns
+    ///
+    /// The stepper, or [`EdgeErrors::MustBePositive`] if `x0` is empty.
+    pub fn new(x0: &[f64], params: Option<NelderMeadParams>) -> Result<Self, EdgeErrors> {
+        let params = params.unwrap_or_default();
+        let n = x0.len();
+        if n == 0 {
+            return Err(EdgeErrors::MustBePositive("x0.len()".to_string()));
         }
-        simplex.push(vertex);
+        let mut simplex: Vec<Vec<f64>> = Vec::with_capacity(n + 1);
+        simplex.push(x0.to_vec());
+        for i in 0..n {
+            let mut vertex = x0.to_vec();
+            if vertex[i] != 0.0 {
+                vertex[i] *= 1.0 + NELDER_MEAD_STEP;
+            } else {
+                vertex[i] = NELDER_MEAD_ZERO_STEP;
+            }
+            simplex.push(vertex);
+        }
+        let pending = simplex[0].clone();
+        Ok(Self {
+            params,
+            n,
+            simplex,
+            values: vec![0.0; n + 1],
+            order: (0..=n).collect(),
+            next_iter: 0,
+            iterations: 0,
+            converged: false,
+            phase: NelderMeadPhase::Init(0),
+            pending,
+            centroid: vec![0.0; n],
+            reflected: vec![0.0; n],
+            f_reflected: 0.0,
+            inside: false,
+            best: 0,
+            worst: 0,
+            second_worst: 0,
+        })
     }
 
-    let mut values: Vec<f64> = simplex.iter().map(|v| f(v)).collect();
-    let mut order: Vec<usize> = (0..=n).collect();
-    let mut iterations = 0;
-    let mut converged = false;
+    /// The point the search wants evaluated next.
+    ///
+    /// ### Returns
+    ///
+    /// The point, or `None` once the search has finished.
+    pub fn ask(&self) -> Option<&[f64]> {
+        if self.phase == NelderMeadPhase::Done {
+            None
+        } else {
+            Some(&self.pending)
+        }
+    }
 
-    for iter in 0..params.max_iter {
-        iterations = iter + 1;
+    /// Hands the stepper the value at the point [`Self::ask`] returned.
+    ///
+    /// ### Params
+    ///
+    /// * `value` - The objective at the pending point
+    pub fn tell(&mut self, value: f64) {
+        let n = self.n;
+        match self.phase {
+            NelderMeadPhase::Init(i) => {
+                self.values[i] = value;
+                if i < n {
+                    self.phase = NelderMeadPhase::Init(i + 1);
+                    self.pending.clone_from(&self.simplex[i + 1]);
+                } else {
+                    self.begin_iteration();
+                }
+            }
+            NelderMeadPhase::Reflect => {
+                self.f_reflected = value;
+                let worst = self.worst;
+                if value < self.values[self.best] {
+                    self.pending = (0..n)
+                        .map(|j| {
+                            self.centroid[j] + 2.0 * (self.centroid[j] - self.simplex[worst][j])
+                        })
+                        .collect();
+                    self.phase = NelderMeadPhase::Expand;
+                } else if value < self.values[self.second_worst] {
+                    self.simplex[worst].clone_from(&self.reflected);
+                    self.values[worst] = value;
+                    self.begin_iteration();
+                } else {
+                    self.inside = value >= self.values[worst];
+                    self.pending = if self.inside {
+                        (0..n)
+                            .map(|j| {
+                                self.centroid[j] - 0.5 * (self.centroid[j] - self.simplex[worst][j])
+                            })
+                            .collect()
+                    } else {
+                        (0..n)
+                            .map(|j| {
+                                self.centroid[j] + 0.5 * (self.centroid[j] - self.simplex[worst][j])
+                            })
+                            .collect()
+                    };
+                    self.phase = NelderMeadPhase::Contract;
+                }
+            }
+            NelderMeadPhase::Expand => {
+                let worst = self.worst;
+                if value < self.f_reflected {
+                    self.simplex[worst] = std::mem::take(&mut self.pending);
+                    self.values[worst] = value;
+                } else {
+                    self.simplex[worst].clone_from(&self.reflected);
+                    self.values[worst] = self.f_reflected;
+                }
+                self.begin_iteration();
+            }
+            NelderMeadPhase::Contract => {
+                let worst = self.worst;
+                let accept = if self.inside {
+                    value < self.values[worst]
+                } else {
+                    value <= self.f_reflected
+                };
+                if accept {
+                    self.simplex[worst] = std::mem::take(&mut self.pending);
+                    self.values[worst] = value;
+                    self.begin_iteration();
+                } else {
+                    // Shrink every vertex towards the best one, one at a time in
+                    // sorted order; each only touches itself.
+                    self.shrink_vertex(1);
+                }
+            }
+            NelderMeadPhase::Shrink(pos) => {
+                let i = self.order[pos];
+                self.values[i] = value;
+                if pos < n {
+                    self.shrink_vertex(pos + 1);
+                } else {
+                    self.begin_iteration();
+                }
+            }
+            NelderMeadPhase::Done => {}
+        }
+    }
 
-        order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
-        let best = order[0];
-        let worst = order[n];
-        let second_worst = order[n - 1];
+    /// Moves the vertex at sorted position `pos` halfway to the best one and
+    /// asks for its value.
+    ///
+    /// ### Params
+    ///
+    /// * `pos` - Position in the sorted order, from `1` to `n`
+    fn shrink_vertex(&mut self, pos: usize) {
+        let i = self.order[pos];
+        let best = self.best;
+        for j in 0..self.n {
+            let anchor = self.simplex[best][j];
+            self.simplex[i][j] = anchor + 0.5 * (self.simplex[i][j] - anchor);
+        }
+        self.pending.clone_from(&self.simplex[i]);
+        self.phase = NelderMeadPhase::Shrink(pos);
+    }
 
-        // Convergence: both the simplex and the objective values have collapsed.
-        let spread_x = order[1..]
+    /// Runs the top of an iteration: sort, test convergence, reflect.
+    fn begin_iteration(&mut self) {
+        let n = self.n;
+        if self.next_iter >= self.params.max_iter {
+            self.finish();
+            return;
+        }
+        self.iterations = self.next_iter + 1;
+        self.next_iter += 1;
+
+        let values = &self.values;
+        self.order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+        self.best = self.order[0];
+        self.worst = self.order[n];
+        self.second_worst = self.order[n - 1];
+        let best = self.best;
+
+        let spread_x = self.order[1..]
             .iter()
             .map(|&i| {
-                simplex[i]
+                self.simplex[i]
                     .iter()
-                    .zip(simplex[best].iter())
+                    .zip(self.simplex[best].iter())
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0_f64, f64::max)
             })
             .fold(0.0_f64, f64::max);
-        let spread_f = order[1..]
+        let spread_f = self.order[1..]
             .iter()
-            .map(|&i| (values[i] - values[best]).abs())
+            .map(|&i| (self.values[i] - self.values[best]).abs())
             .fold(0.0_f64, f64::max);
-        if spread_x <= params.xatol && spread_f <= params.fatol {
-            converged = true;
-            break;
+        let scale = self.simplex[best]
+            .iter()
+            .fold(f64::MIN_POSITIVE, |m, v| m.max(v.abs()));
+        let collapsed = spread_x <= NELDER_MEAD_COLLAPSED_ULPS * f64::EPSILON * scale;
+        if collapsed || (spread_x <= self.params.xatol && spread_f <= self.params.fatol) {
+            self.converged = true;
+            self.finish();
+            return;
         }
 
-        // Centroid of everything but the worst vertex.
-        let mut centroid = vec![0.0; n];
-        for &i in &order[..n] {
-            for (c, v) in centroid.iter_mut().zip(simplex[i].iter()) {
+        self.centroid.iter_mut().for_each(|c| *c = 0.0);
+        for &i in &self.order[..n] {
+            for (c, v) in self.centroid.iter_mut().zip(self.simplex[i].iter()) {
                 *c += *v;
             }
         }
-        for c in centroid.iter_mut() {
+        for c in self.centroid.iter_mut() {
             *c /= n as f64;
         }
-
-        let reflected: Vec<f64> = (0..n)
-            .map(|j| centroid[j] + (centroid[j] - simplex[worst][j]))
+        let worst = self.worst;
+        self.reflected = (0..n)
+            .map(|j| self.centroid[j] + (self.centroid[j] - self.simplex[worst][j]))
             .collect();
-        let f_reflected = f(&reflected);
-
-        if f_reflected < values[best] {
-            let expanded: Vec<f64> = (0..n)
-                .map(|j| centroid[j] + 2.0 * (centroid[j] - simplex[worst][j]))
-                .collect();
-            let f_expanded = f(&expanded);
-            if f_expanded < f_reflected {
-                simplex[worst] = expanded;
-                values[worst] = f_expanded;
-            } else {
-                simplex[worst] = reflected;
-                values[worst] = f_reflected;
-            }
-        } else if f_reflected < values[second_worst] {
-            simplex[worst] = reflected;
-            values[worst] = f_reflected;
-        } else {
-            let inside = f_reflected >= values[worst];
-            let contracted: Vec<f64> = if inside {
-                (0..n)
-                    .map(|j| centroid[j] - 0.5 * (centroid[j] - simplex[worst][j]))
-                    .collect()
-            } else {
-                (0..n)
-                    .map(|j| centroid[j] + 0.5 * (centroid[j] - simplex[worst][j]))
-                    .collect()
-            };
-            let f_contracted = f(&contracted);
-            let accept = if inside {
-                f_contracted < values[worst]
-            } else {
-                f_contracted <= f_reflected
-            };
-
-            if accept {
-                simplex[worst] = contracted;
-                values[worst] = f_contracted;
-            } else {
-                // Shrink every vertex towards the best one.
-                let anchor = simplex[best].clone();
-                for &i in &order[1..] {
-                    for j in 0..n {
-                        simplex[i][j] = anchor[j] + 0.5 * (simplex[i][j] - anchor[j]);
-                    }
-                    values[i] = f(&simplex[i]);
-                }
-            }
-        }
+        self.pending.clone_from(&self.reflected);
+        self.phase = NelderMeadPhase::Reflect;
     }
 
-    order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
-    let best = order[0];
-    Ok(NelderMeadResult {
-        x: simplex[best].clone(),
-        f: values[best],
-        iterations,
-        converged,
-    })
+    /// Sorts once more and stops.
+    fn finish(&mut self) {
+        let values = &self.values;
+        self.order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+        self.phase = NelderMeadPhase::Done;
+    }
+
+    /// The best vertex found so far.
+    ///
+    /// ### Returns
+    ///
+    /// The result; meaningful once [`Self::ask`] returns `None`.
+    pub fn result(&self) -> NelderMeadResult {
+        let best = self.order[0];
+        NelderMeadResult {
+            x: self.simplex[best].clone(),
+            f: self.values[best],
+            iterations: self.iterations,
+            converged: self.converged,
+        }
+    }
 }
 
 ///////////
@@ -561,5 +771,212 @@ mod tests {
     fn test_nelder_mead_rejects_empty_start() {
         let err = nelder_mead(|_: &[f64]| 0.0, &[], None).unwrap_err();
         assert!(matches!(err, EdgeErrors::MustBePositive(_)));
+    }
+
+    /// The original closure-driven Nelder-Mead, kept as the specification
+    /// [`NelderMeadStepper`] is checked against bit for bit.
+    fn nelder_mead_reference<F>(
+        mut f: F,
+        x0: &[f64],
+        params: Option<NelderMeadParams>,
+    ) -> Result<NelderMeadResult, EdgeErrors>
+    where
+        F: FnMut(&[f64]) -> f64,
+    {
+        let params = params.unwrap_or_default();
+        let n = x0.len();
+        if n == 0 {
+            return Err(EdgeErrors::MustBePositive("x0.len()".to_string()));
+        }
+
+        // scipy's initial simplex.
+        let mut simplex: Vec<Vec<f64>> = Vec::with_capacity(n + 1);
+        simplex.push(x0.to_vec());
+        for i in 0..n {
+            let mut vertex = x0.to_vec();
+            if vertex[i] != 0.0 {
+                vertex[i] *= 1.0 + NELDER_MEAD_STEP;
+            } else {
+                vertex[i] = NELDER_MEAD_ZERO_STEP;
+            }
+            simplex.push(vertex);
+        }
+
+        let mut values: Vec<f64> = simplex.iter().map(|v| f(v)).collect();
+        let mut order: Vec<usize> = (0..=n).collect();
+        let mut iterations = 0;
+        let mut converged = false;
+
+        for iter in 0..params.max_iter {
+            iterations = iter + 1;
+
+            order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+            let best = order[0];
+            let worst = order[n];
+            let second_worst = order[n - 1];
+
+            // Convergence: both the simplex and the objective values have collapsed.
+            let spread_x = order[1..]
+                .iter()
+                .map(|&i| {
+                    simplex[i]
+                        .iter()
+                        .zip(simplex[best].iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f64, f64::max)
+                })
+                .fold(0.0_f64, f64::max);
+            let spread_f = order[1..]
+                .iter()
+                .map(|&i| (values[i] - values[best]).abs())
+                .fold(0.0_f64, f64::max);
+            if spread_x <= params.xatol && spread_f <= params.fatol {
+                converged = true;
+                break;
+            }
+
+            // Centroid of everything but the worst vertex.
+            let mut centroid = vec![0.0; n];
+            for &i in &order[..n] {
+                for (c, v) in centroid.iter_mut().zip(simplex[i].iter()) {
+                    *c += *v;
+                }
+            }
+            for c in centroid.iter_mut() {
+                *c /= n as f64;
+            }
+
+            let reflected: Vec<f64> = (0..n)
+                .map(|j| centroid[j] + (centroid[j] - simplex[worst][j]))
+                .collect();
+            let f_reflected = f(&reflected);
+
+            if f_reflected < values[best] {
+                let expanded: Vec<f64> = (0..n)
+                    .map(|j| centroid[j] + 2.0 * (centroid[j] - simplex[worst][j]))
+                    .collect();
+                let f_expanded = f(&expanded);
+                if f_expanded < f_reflected {
+                    simplex[worst] = expanded;
+                    values[worst] = f_expanded;
+                } else {
+                    simplex[worst] = reflected;
+                    values[worst] = f_reflected;
+                }
+            } else if f_reflected < values[second_worst] {
+                simplex[worst] = reflected;
+                values[worst] = f_reflected;
+            } else {
+                let inside = f_reflected >= values[worst];
+                let contracted: Vec<f64> = if inside {
+                    (0..n)
+                        .map(|j| centroid[j] - 0.5 * (centroid[j] - simplex[worst][j]))
+                        .collect()
+                } else {
+                    (0..n)
+                        .map(|j| centroid[j] + 0.5 * (centroid[j] - simplex[worst][j]))
+                        .collect()
+                };
+                let f_contracted = f(&contracted);
+                let accept = if inside {
+                    f_contracted < values[worst]
+                } else {
+                    f_contracted <= f_reflected
+                };
+
+                if accept {
+                    simplex[worst] = contracted;
+                    values[worst] = f_contracted;
+                } else {
+                    // Shrink every vertex towards the best one.
+                    let anchor = simplex[best].clone();
+                    for &i in &order[1..] {
+                        for j in 0..n {
+                            simplex[i][j] = anchor[j] + 0.5 * (simplex[i][j] - anchor[j]);
+                        }
+                        values[i] = f(&simplex[i]);
+                    }
+                }
+            }
+        }
+
+        order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+        let best = order[0];
+        Ok(NelderMeadResult {
+            x: simplex[best].clone(),
+            f: values[best],
+            iterations,
+            converged,
+        })
+    }
+
+    /// Drives a [`NelderMeadStepper`] with a closure, recording every point.
+    fn drive_stepper(
+        f: &dyn Fn(&[f64]) -> f64,
+        x0: &[f64],
+        params: NelderMeadParams,
+    ) -> (NelderMeadResult, Vec<Vec<f64>>) {
+        let mut stepper = NelderMeadStepper::new(x0, Some(params)).unwrap();
+        let mut asked = Vec::new();
+        while let Some(x) = stepper.ask() {
+            asked.push(x.to_vec());
+            let v = f(x);
+            stepper.tell(v);
+        }
+        (stepper.result(), asked)
+    }
+
+    #[test]
+    fn test_nelder_mead_stepper_is_bit_identical_to_the_closure_form() {
+        let rosenbrock = |x: &[f64]| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2);
+        let quadratic_1d = |x: &[f64]| (x[0] - 0.3).powi(2) + 1.0;
+        // Plateaus force ties, so the stable sort's ordering has to match.
+        let staircase = |x: &[f64]| (x[0] * 4.0).floor().abs() + (x[1] * 4.0).floor().abs();
+        // Non-convex with a narrow valley: exercises shrink steps.
+        let bumpy =
+            |x: &[f64]| (x[0] * 3.0).sin() * (x[1] * 5.0).cos() + 0.1 * (x[0] * x[0] + x[1] * x[1]);
+        let three_d = |x: &[f64]| {
+            x.iter()
+                .enumerate()
+                .map(|(i, v)| (i as f64 + 1.0) * v * v)
+                .sum()
+        };
+
+        type Case<'a> = (&'a dyn Fn(&[f64]) -> f64, Vec<f64>);
+        let cases: Vec<Case<'_>> = vec![
+            (&rosenbrock, vec![-1.2, 1.0]),
+            (&quadratic_1d, vec![2.0]),
+            (&quadratic_1d, vec![0.0]),
+            (&staircase, vec![1.3, -0.7]),
+            (&bumpy, vec![0.4, 0.9]),
+            (&three_d, vec![1.0, -2.0, 0.5]),
+        ];
+
+        for max_iter in [3, 17, 1000] {
+            let params = NelderMeadParams {
+                xatol: 1e-9,
+                fatol: 1e-9,
+                max_iter,
+            };
+            for (f, x0) in &cases {
+                let mut expected_points = Vec::new();
+                let expected = nelder_mead_reference(
+                    |x: &[f64]| {
+                        expected_points.push(x.to_vec());
+                        f(x)
+                    },
+                    x0,
+                    Some(params),
+                )
+                .unwrap();
+                let (got, got_points) = drive_stepper(*f, x0, params);
+
+                assert_eq!(got_points, expected_points, "evaluation sequence differs");
+                assert_eq!(got.x, expected.x);
+                assert_eq!(got.f.to_bits(), expected.f.to_bits());
+                assert_eq!(got.iterations, expected.iterations);
+                assert_eq!(got.converged, expected.converged);
+            }
+        }
     }
 }

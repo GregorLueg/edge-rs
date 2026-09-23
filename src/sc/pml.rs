@@ -517,6 +517,7 @@ pub fn opt_pml(
     optimise(
         data,
         beta_init,
+        None,
         penalty,
         variance.cell,
         params.unwrap_or_default(),
@@ -561,6 +562,7 @@ pub fn opt_pml_nbm(
     optimise(
         data,
         beta_init,
+        None,
         penalty,
         variance.cell,
         params.unwrap_or_default(),
@@ -631,6 +633,528 @@ pub fn pml_log_likelihood_gradient(
         objective: -log_likelihood,
         gradient,
     })
+}
+
+/// [`opt_pml`], started from a given point rather than from zero random effects.
+///
+/// The GPU path finds the optimum in `f32` and finishes it here in `f64`. From a
+/// point already at the optimum this takes one Newton step and stops, which
+/// costs about four passes over the cells against the fourteen or so of a cold
+/// fit, and what it returns is exactly what [`opt_pml`] returns: the same
+/// value, and the log-determinant at the penultimate iterate, which is nebula's
+/// convention and the one the profile objective is calibrated against.
+///
+/// ### Params
+///
+/// * `data` - One gene's design, offsets, positive counts and subject blocks
+/// * `beta_init` - Starting fixed effects, length `n_beta`
+/// * `log_w_init` - Starting random effects on the log scale, length
+///   `n_subjects`
+/// * `variance` - The two variance components, read as [`opt_pml`] reads them
+/// * `params` - Tuning knobs, or `None` for nebula's defaults
+///
+/// ### Returns
+///
+/// As [`opt_pml`].
+#[cfg(feature = "gpu")]
+pub(crate) fn opt_pml_from(
+    data: &PmlData<'_>,
+    beta_init: &[f64],
+    log_w_init: &[f64],
+    variance: &PmlVariance,
+    params: Option<PmlParams>,
+) -> Result<PmlResult, EdgeErrors> {
+    let exps = variance.subject.exp();
+    if !(exps.is_finite() && exps > 1.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "PmlVariance::subject must be finite and strictly positive for opt_pml; got {}.",
+            variance.subject
+        )));
+    }
+    let penalty = Penalty::Gamma {
+        alpha: 1.0 / (exps - 1.0),
+        lambda: 1.0 / (exps.sqrt() * (exps - 1.0)),
+    };
+    optimise(
+        data,
+        beta_init,
+        Some(log_w_init),
+        penalty,
+        variance.cell,
+        params.unwrap_or_default(),
+    )
+}
+
+/// Largest move in a cell's linear predictor for which [`newton_finish`]
+/// updates the stored `exp` by series instead of taking it again.
+///
+/// The second sweep of a step sits one converged Newton step from the first, so
+/// `exp(eta + z) = exp(eta) exp(z)` with `z` of order `1e-4`. To fifth order the
+/// truncation is `z^6 / 720`, `1.4e-21` relative at this bound and far under an
+/// ulp, for five multiply-adds against one `exp`.
+#[cfg(feature = "gpu")]
+const EXP_SERIES_MAX: f64 = 1e-3;
+
+/// Relative fall in the objective that [`newton_finish`] still reads as
+/// rounding at a converged point rather than a step that went wrong.
+///
+/// From the device's `f32` optimum the `f64` step gains less than the rounding
+/// of a sum over every cell, so its `likdif` comes out a few ulp negative on
+/// about 15 per cent of fits (S1: all 10804 of 73650 between `1e-16` and
+/// `1e-15` relative). Handing those to [`opt_pml_from`] only buys a backtracking
+/// search that ends at the same point. A step that genuinely overshoots loses
+/// orders of magnitude more than this.
+#[cfg(feature = "gpu")]
+const LIKDIF_ROUNDING: f64 = 1e-12;
+
+/// `exp(z)` to fifth order, for `|z|` within [`EXP_SERIES_MAX`].
+///
+/// ### Params
+///
+/// * `z` - The exponent
+///
+/// ### Returns
+///
+/// `exp(z)`, to well under an ulp.
+#[cfg(feature = "gpu")]
+#[inline(always)]
+fn exp_series(z: f64) -> f64 {
+    1.0 + z * (1.0 + z * (0.5 + z * (1.0 / 6.0 + z * (1.0 / 24.0 + z * (1.0 / 120.0)))))
+}
+
+/// Terms multiplied together before [`LogSum`] takes one logarithm.
+///
+/// Each term is `extb + gamma`, bounded below by the cell-level size and in
+/// practice far inside `1e-38..1e38`, so eight of them cannot leave the `f64`
+/// range. A product that does overflow gives an infinite sum, which is what the
+/// per-term logarithm gives for the same input.
+#[cfg(feature = "gpu")]
+const LOG_PRODUCT_GROUP: u32 = 8;
+
+/// `sum ln(t)` taken as `ln` of running products, one logarithm per
+/// [`LOG_PRODUCT_GROUP`] terms.
+///
+/// The logarithm is the dearest operation in the dense sweep of
+/// [`newton_finish`], and the product costs a multiply. The rounding of a group
+/// is a few ulp relative on the product, so of order `1e-15` absolute on its
+/// logarithm, the same size as the per-term form's.
+#[cfg(feature = "gpu")]
+struct LogSum {
+    /// Logarithms of the finished groups.
+    sum: f64,
+    /// Product of the group in flight.
+    product: f64,
+    /// Terms in the group in flight.
+    count: u32,
+}
+
+#[cfg(feature = "gpu")]
+impl LogSum {
+    /// An empty sum.
+    fn new() -> Self {
+        Self {
+            sum: 0.0,
+            product: 1.0,
+            count: 0,
+        }
+    }
+
+    /// Adds `ln(t)`.
+    ///
+    /// ### Params
+    ///
+    /// * `t` - The term, strictly positive
+    #[inline(always)]
+    fn push(&mut self, t: f64) {
+        self.product *= t;
+        self.count += 1;
+        if self.count == LOG_PRODUCT_GROUP {
+            self.sum += self.product.ln();
+            self.product = 1.0;
+            self.count = 0;
+        }
+    }
+
+    /// The sum, with the group in flight folded in.
+    ///
+    /// ### Returns
+    ///
+    /// `sum ln(t)` over everything pushed.
+    fn finish(self) -> f64 {
+        self.sum + self.product.ln()
+    }
+}
+
+/// The device's curvature at, or one converged step behind, the point
+/// [`newton_finish`] starts from.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeviceCurvature<'a> {
+    /// Curvature of each random effect, `vw`, length `n_subjects`.
+    pub(crate) subject: &'a [f64],
+    /// Cross block, `vwb`, row-major `n_subjects * n_beta`.
+    pub(crate) cross: &'a [f64],
+    /// Schur complement, row-major `n_beta * n_beta`.
+    pub(crate) schur: &'a [f64],
+}
+
+/// What [`newton_finish`] brings back: the three scalars the profile objective
+/// reads off an order-one inner fit.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewtonFinish {
+    /// Penalised log-likelihood after the step.
+    pub(crate) log_likelihood: f64,
+    /// Penalised log-likelihood at the starting point.
+    pub(crate) log_likelihood_prev: f64,
+    /// Log-determinant of the random-effect block at the final iterate.
+    pub(crate) log_det: f64,
+    /// Newton steps taken.
+    pub(crate) iterations: usize,
+}
+
+/// Full `f64` Newton steps from a point already near the optimum, two fused
+/// passes over the cells per step.
+///
+/// The common case of [`opt_pml_from`] on the GPU path: the device's point is
+/// converged to `f32`, one step settles it (two or three for a few per cent of
+/// fits), and no step needs damping. The loop in [`opt_pml`] is written for
+/// parity with nebula's C++: it allocates
+/// a workspace of `(5 + n_beta) * n_cells` per call and walks it in a dozen
+/// passes. Here the assembly is one pass per subject with nothing stored per
+/// cell, split as the device kernel splits it: a dense sweep over every cell at
+/// a count of zero, then a sparse sweep adding what the positive counts change.
+/// The sums therefore associate differently from [`opt_pml`] and agree with it
+/// to rounding, not to the bit.
+///
+/// The log-determinant is taken at the final iterate, where [`opt_pml`] follows
+/// nebula and reports the penultimate one. On the CPU the two iterates are both
+/// `f64` and a converged step apart. Here the penultimate iterate is the
+/// device's `f32` point, whose location error the log-determinant carries at
+/// first order, so the second pass accumulates the curvature weight as well.
+///
+/// ### Params
+///
+/// * `data` - One gene's design, offsets, positive counts and subject blocks
+/// * `beta` - Starting fixed effects, length `n_beta`
+/// * `log_w` - Starting random effects on the log scale, length `n_subjects`
+/// * `variance` - The two variance components, read as [`opt_pml`] reads them
+/// * `eps` - nebula's absolute stopping tolerance
+/// * `max_iter` - Newton budget
+/// * `curvature` - The device's curvature near the starting point. When given,
+///   the first step takes its gradient in `f64` and its Hessian from here, so
+///   its sweep skips the `n_beta^2` cross-products per cell. The Hessian only
+///   steers the step: `f32` curvature and an `f64` gradient land as close as an
+///   exact step from a point already converged to `f32`. Later steps, which a
+///   few per cent of fits need, assemble their own
+///
+/// * `stored` - Scratch the first sweep leaves each cell's `exp` in for the
+///   second; resized here, so one per thread serves every call
+///
+/// ### Returns
+///
+/// The finished scalars, or `None` when a full step worsens the objective by
+/// more than [`LIKDIF_ROUNDING`] or leaves it not finite, or the budget runs
+/// out. Those need the backtracking search and the convergence codes, so the
+/// caller wants [`opt_pml_from`].
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn newton_finish(
+    data: &PmlData<'_>,
+    beta: &[f64],
+    log_w: &[f64],
+    variance: &PmlVariance,
+    eps: f64,
+    max_iter: usize,
+    curvature: Option<DeviceCurvature<'_>>,
+    stored: &mut Vec<f64>,
+) -> Option<NewtonFinish> {
+    match data.n_beta() {
+        1 => newton_finish_width::<1>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        2 => newton_finish_width::<2>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        3 => newton_finish_width::<3>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        4 => newton_finish_width::<4>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        5 => newton_finish_width::<5>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        6 => newton_finish_width::<6>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        7 => newton_finish_width::<7>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        8 => newton_finish_width::<8>(
+            data, beta, log_w, variance, eps, max_iter, curvature, stored,
+        ),
+        // The device never fits a wider design, so nothing reaches this.
+        _ => None,
+    }
+}
+
+/// [`newton_finish`] for one design width.
+///
+/// The sweeps spend their time in loops over the design columns, a handful of
+/// iterations each. With the width a run-time value those loops are never
+/// unrolled and every access is bounds-checked; with it a constant they
+/// disappear into straight-line code, and a subject's sums over the cells sit
+/// in `NB`-sized arrays the compiler keeps in registers, where heap
+/// accumulators cost a store-to-load round trip per cell.
+///
+/// The first sweep takes a subject's `exp` in a loop of its own, so the loop
+/// that accumulates has no call in it and the positive cells read the stored
+/// value back instead of taking it again. With the registers, 15.6 to 12.1 ns
+/// per cell for one step on a 20000-cell gene; the split alone is slower.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn newton_finish_width<const NB: usize>(
+    data: &PmlData<'_>,
+    beta: &[f64],
+    log_w: &[f64],
+    variance: &PmlVariance,
+    eps: f64,
+    max_iter: usize,
+    curvature: Option<DeviceCurvature<'_>>,
+    stored: &mut Vec<f64>,
+) -> Option<NewtonFinish> {
+    let nb = NB;
+    let k = data.n_subjects();
+    let gamma = variance.cell;
+    let exps = variance.subject.exp();
+    if beta.len() != nb || log_w.len() != k || !(exps.is_finite() && exps > 1.0) {
+        return None;
+    }
+    if curvature.is_some_and(|c| {
+        c.subject.len() != k || c.cross.len() != k * nb || c.schur.len() != nb * nb
+    }) {
+        return None;
+    }
+    let alpha = 1.0 / (exps - 1.0);
+    let lambda = 1.0 / (exps.sqrt() * (exps - 1.0));
+
+    // Where each subject's run of positive counts starts.
+    let mut run = vec![0usize; k + 1];
+    let mut at = 0usize;
+    for s in 0..=k {
+        while at < data.cell_index.len() && data.cell_index[at] < data.subject_start[s] {
+            at += 1;
+        }
+        run[s] = at;
+    }
+
+    let mut beta = beta.to_vec();
+    let mut log_w = log_w.to_vec();
+    let mut new_beta = vec![0.0; nb];
+    let mut new_log_w = vec![0.0; k];
+    let mut db = vec![0.0; nb];
+    let mut dw = vec![0.0; k];
+    let mut vw = vec![0.0; k];
+    let mut vwb = vec![0.0; k * nb];
+    let mut vb = vec![0.0; nb * nb];
+    let mut factor = vec![0.0; nb * nb];
+    let mut step_beta = vec![0.0; nb];
+    let mut perm = vec![0usize; nb];
+    let mut tmp = vec![0.0; nb];
+    // Every entry is written by the first sweep before the second reads it.
+    stored.resize(data.n_cells(), 0.0);
+
+    for iterations in 1..=max_iter {
+        let borrowed = curvature.filter(|_| iterations == 1);
+        let assemble = borrowed.is_none();
+        db.fill(0.0);
+        vb.fill(0.0);
+        let mut log_likelihood_prev = 0.0;
+        for s in 0..k {
+            let w_s = log_w[s].exp();
+            let mut resid = 0.0;
+            let mut weight = 0.0;
+            let mut sum_log = LogSum::new();
+            let mut linear = 0.0;
+            let mut weighted_log = 0.0;
+            let mut score = [0.0; NB];
+            let mut first = [0.0; NB];
+            let mut second = [[0.0; NB]; NB];
+
+            let mut fold = |row: &[f64], d: f64, p: f64| {
+                resid += d;
+                for a in 0..nb {
+                    score[a] += row[a] * d;
+                }
+                if assemble {
+                    weight += p;
+                    for a in 0..nb {
+                        let pa = p * row[a];
+                        first[a] += pa;
+                        for b in a..nb {
+                            second[a][b] += pa * row[b];
+                        }
+                    }
+                }
+            };
+
+            for r in data.subject_start[s]..data.subject_start[s + 1] {
+                let row = &data.design[r * nb..(r + 1) * nb];
+                let mut eta = data.offset[r];
+                for j in 0..nb {
+                    eta += row[j] * beta[j];
+                }
+                stored[r] = (eta + log_w[s]).exp();
+            }
+            for r in data.subject_start[s]..data.subject_start[s + 1] {
+                let row = &data.design[r * nb..(r + 1) * nb];
+                let extb = stored[r];
+                let t = extb + gamma;
+                sum_log.push(t);
+                let inv = 1.0 / t;
+                let u = extb * inv;
+                fold(row, -gamma * u, gamma * u * inv);
+            }
+            for i in run[s]..run[s + 1] {
+                let c = data.cell_index[i];
+                let y = data.counts[i];
+                let row = &data.design[c * nb..(c + 1) * nb];
+                let mut eta = data.offset[c];
+                for j in 0..nb {
+                    eta += row[j] * beta[j];
+                }
+                let extb = stored[c];
+                let t = extb + gamma;
+                linear += eta * y;
+                weighted_log += y * t.ln();
+                let inv = 1.0 / t;
+                let u = extb * inv;
+                fold(row, y * (1.0 - u), y * u * inv);
+            }
+
+            log_likelihood_prev +=
+                linear + log_w[s] * data.subject_total[s] - gamma * sum_log.finish() - weighted_log
+                    + (alpha * log_w[s] - lambda * w_s);
+            dw[s] = resid + (alpha - lambda * w_s);
+            for a in 0..nb {
+                db[a] += score[a];
+            }
+            if assemble {
+                vw[s] = gamma * weight + lambda * w_s;
+                for a in 0..nb {
+                    vwb[s * nb + a] = gamma * first[a];
+                    for b in a..nb {
+                        vb[a * nb + b] += gamma * second[a][b];
+                    }
+                }
+            }
+        }
+
+        // Schur complement and the step, as in `optimise`.
+        if let Some(device) = borrowed {
+            vw.copy_from_slice(device.subject);
+            vwb.copy_from_slice(device.cross);
+            factor.copy_from_slice(device.schur);
+        } else {
+            for a in 0..nb {
+                for b in a..nb {
+                    let mut acc = 0.0;
+                    for s in 0..k {
+                        acc += vwb[s * nb + a] * vwb[s * nb + b] / vw[s];
+                    }
+                    let v = vb[a * nb + b] - acc;
+                    factor[a * nb + b] = v;
+                    factor[b * nb + a] = v;
+                }
+            }
+        }
+        for j in 0..nb {
+            let mut acc = 0.0;
+            for s in 0..k {
+                acc += vwb[s * nb + j] * dw[s] / vw[s];
+            }
+            step_beta[j] = db[j] - acc;
+        }
+        ldlt_solve(&mut factor, &mut step_beta, nb, &mut perm, &mut tmp);
+
+        for j in 0..nb {
+            new_beta[j] = beta[j] + step_beta[j];
+        }
+        let mut log_likelihood = 0.0;
+        let mut log_det = 0.0;
+        for s in 0..k {
+            let mut acc = 0.0;
+            for j in 0..nb {
+                acc += vwb[s * nb + j] * step_beta[j];
+            }
+            let new_log_w_s = log_w[s] + (dw[s] - acc) / vw[s];
+            new_log_w[s] = new_log_w_s;
+            let new_w_s = new_log_w_s.exp();
+            let step_log_w_s = new_log_w_s - log_w[s];
+
+            let mut sum_log = LogSum::new();
+            let mut linear = 0.0;
+            let mut weighted_log = 0.0;
+            let mut weight = 0.0;
+            for r in data.subject_start[s]..data.subject_start[s + 1] {
+                let row = &data.design[r * nb..(r + 1) * nb];
+                let mut z = step_log_w_s;
+                for j in 0..nb {
+                    z += row[j] * step_beta[j];
+                }
+                let extb = if z.abs() < EXP_SERIES_MAX {
+                    stored[r] * exp_series(z)
+                } else {
+                    let mut eta = data.offset[r];
+                    for j in 0..nb {
+                        eta += row[j] * new_beta[j];
+                    }
+                    (eta + new_log_w_s).exp()
+                };
+                let t = extb + gamma;
+                sum_log.push(t);
+                let inv = 1.0 / t;
+                weight += gamma * extb * inv * inv;
+            }
+            for i in run[s]..run[s + 1] {
+                let c = data.cell_index[i];
+                let y = data.counts[i];
+                let row = &data.design[c * nb..(c + 1) * nb];
+                let mut eta = data.offset[c];
+                for j in 0..nb {
+                    eta += row[j] * new_beta[j];
+                }
+                let extb = (eta + new_log_w_s).exp();
+                let t = extb + gamma;
+                linear += eta * y;
+                weighted_log += y * t.ln();
+                let inv = 1.0 / t;
+                weight += y * extb * inv * inv;
+            }
+            log_likelihood += linear + new_log_w_s * data.subject_total[s]
+                - gamma * sum_log.finish()
+                - weighted_log
+                + (alpha * new_log_w_s - lambda * new_w_s);
+            log_det += (gamma * weight + lambda * new_w_s).abs().ln();
+        }
+
+        let likdif = log_likelihood - log_likelihood_prev;
+        if likdif.is_nan() || likdif < -LIKDIF_ROUNDING * log_likelihood.abs() {
+            return None;
+        }
+        if likdif <= eps {
+            return Some(NewtonFinish {
+                log_likelihood,
+                log_likelihood_prev,
+                log_det,
+                iterations,
+            });
+        }
+        beta.copy_from_slice(&new_beta);
+        log_w.copy_from_slice(&new_log_w);
+    }
+    None
 }
 
 /// nebula's `check_conv`, applied to a finished fit.
@@ -1040,6 +1564,7 @@ impl Workspace {
 fn optimise(
     data: &PmlData<'_>,
     beta_init: &[f64],
+    log_w_init: Option<&[f64]>,
     penalty: Penalty,
     gamma: f64,
     params: PmlParams,
@@ -1059,7 +1584,17 @@ fn optimise(
     }
 
     let mut beta = beta_init.to_vec();
-    let mut log_w = vec![0.0; k];
+    let mut log_w = match log_w_init {
+        Some(init) if init.len() == k => init.to_vec(),
+        Some(init) => {
+            return Err(EdgeErrors::LengthMismatch {
+                name: "log_w_init",
+                expected: k,
+                got: init.len(),
+            });
+        }
+        None => vec![0.0; k],
+    };
     let mut work = Workspace::new(data);
     work.seed(data, gamma);
 

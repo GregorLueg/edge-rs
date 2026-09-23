@@ -15,7 +15,8 @@ test and `diffSpliceDGE`. On top of that sits the limma linear model stack
 `lmFit`, `contrasts.fit`, `eBayes`, `topTable`, `removeBatchEffect`) and
 NEBULA, a negative binomial gamma mixed model for single cell.
 
-No R, no Python, no BLAS to hunt down. CPU only.
+No R, no Python, no BLAS to hunt down. CPU by default, with an optional GPU path
+for NEBULA.
 
 ## Install
 
@@ -112,6 +113,40 @@ Swap `glm_fit` for `glm_ql_fit` and `glm_lrt` for `glm_ql_ftest` to get the
 quasi-likelihood pipeline instead. `exact_test` covers the pre-GLM two-group
 path, and `nebula` the single-cell one. Counts already in CSR? Hand them to
 `nebula_sparse` and skip the densification.
+
+### NEBULA on the GPU
+
+NEBULA spends its time in stage two, the search over the two variance
+components, where every evaluation is a penalised fit over every cell. The
+`gpu` feature adds `nebula_sparse_gpu`, which runs those fits on the device via
+[CubeCL](https://github.com/tracel-ai/cubecl) and wgpu (Metal, Vulkan, DX12).
+Same inputs, same `NebulaFit` out as `nebula_sparse`.
+
+```toml
+edge-rs = { version = "0.1", features = ["gpu"] }
+cubecl = { version = "0.10", features = ["wgpu"] }
+```
+
+```rust
+use cubecl::Runtime;
+use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use edge_rs::gpu::stage_two::nebula_sparse_gpu;
+
+let client = WgpuRuntime::client(&WgpuDevice::default());
+let fit = nebula_sparse_gpu(
+    &counts, &subject_id, &design, n_coef, Some(&offset), None, &client,
+)?;
+```
+
+wgpu has no `f64`, so the device fits in `f32` and the host finishes every fit
+in `f64`. It's gated against the same R fixtures as the CPU path, at a looser
+tolerance. Designs up to eight columns; no `reml`.
+
+How much faster? Forced NEBULA-HL, 500 genes, 20 subjects, against the
+10-thread CPU path on an M1 Max: 7.5x at 100000 cells, 4x to 6x at 20000 to
+50000, 3.4x with eight coefficients, where every launch waits out one fit's
+serial walk over the cells. Under the default NEBULA-LN most genes never reach
+stage two, and on the bench data the GPU bought nothing.
 
 ### limma-voom
 
