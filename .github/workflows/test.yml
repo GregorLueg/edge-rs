@@ -14,6 +14,15 @@ jobs:
   test:
     uses: GregorLueg/personal-actions/.github/workflows/rust-test.yml@v1
     with:
-      cpu-args: '--release'
-      # No GPU lane: edge-rs is CPU only. An empty gpu-args skips that job.
+      # `gpu` here is compile coverage plus the host-side unit tests. The tests
+      # that need an adapter sit behind `gpu-tests`, so the CPU lanes, which
+      # have none, never try to open one.
+      cpu-args: '--release --features gpu'
+      # Windows drops gpu, as in ann-search-rs.
+      windows-cpu-args: '--release'
+      # Linux is lavapipe, macOS the runner's Metal. The NEBULA kernel needs a
+      # 32-lane plane and refuses anything else; the device tests print the
+      # adapter's plane width and skip where it is not 32, so check the log
+      # for SKIPPED before reading a green Linux lane as kernel coverage.
+      gpu-args: '--release --features gpu-tests'
     secrets: inherit

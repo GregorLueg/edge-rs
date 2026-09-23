@@ -18,6 +18,8 @@ path = "src/lib.rs"
 default = []
 ## Enables the CubeCL/wgpu NEBULA path in `crate::gpu`.
 gpu = ["cubecl", "cubecl-utils-rs"]
+## Enables the tests that need a wgpu adapter on the machine. This is for CI/CD
+gpu-tests = ["gpu"]
 
 [dependencies]
 cubecl = { version = "0.10.0", features = ["wgpu"], optional = true }
