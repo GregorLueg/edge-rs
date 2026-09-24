@@ -1,0 +1,31 @@
+name: Intel macOS GPU probe
+
+on:
+  push:
+    branches: [ fix-old-mac ]
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  probe:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-15-intel-gpu
+
+      - name: Adapter
+        run: system_profiler SPDisplaysDataType
+
+      - name: Plane layout probe
+        continue-on-error: true
+        run: cargo test --release --features gpu-tests --test plane_probe -- --nocapture
+
+      - name: GPU NEBULA suite
+        run: cargo test --release --features gpu-tests --test e2e_nebula_gpu -- --nocapture --test-threads=1
