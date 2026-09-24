@@ -37,7 +37,9 @@ use cubecl_utils_rs::prelude::*;
 use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
-use crate::gpu::pml_kernel::{OUT_HEADER, PmlGpuTensors, SUBJECT_SLOTS, launch_opt_pml};
+use crate::gpu::pml_kernel::{
+    OUT_HEADER, PmlGpuTensors, SUBJECT_SLOTS, check_plane_ops, launch_opt_pml,
+};
 
 ///////////
 // Input //
@@ -252,8 +254,9 @@ impl<R: Runtime> ResidentBatch<R> {
     ///
     /// ### Returns
     ///
-    /// The resident set, or [`EdgeErrors`] if the inputs disagree in shape or a
-    /// device limit rejects the allocation.
+    /// The resident set, or [`EdgeErrors`] if the inputs disagree in shape, a
+    /// device limit rejects the allocation, or the device does not run plane
+    /// operations.
     pub fn upload(
         design: &[f64],
         log_offset: &[f64],
@@ -261,6 +264,7 @@ impl<R: Runtime> ResidentBatch<R> {
         genes: &[GpuGene<'_>],
         client: &ComputeClient<R>,
     ) -> Result<Self, EdgeErrors> {
+        check_plane_ops(client)?;
         let n_genes = genes.len();
         if n_genes == 0 {
             return Err(EdgeErrors::MustBePositive("n_genes".to_string()));

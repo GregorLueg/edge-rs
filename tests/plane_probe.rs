@@ -51,6 +51,11 @@ fn probe(out: &mut Tensor<u32>, fsum: &mut Tensor<f32>, n_req: u32) {
 }
 
 #[cube(launch_unchecked)]
+fn control(out: &mut Tensor<u32>) {
+    out[UNIT_POS_X as usize] = UNIT_POS_X + 1u32;
+}
+
+#[cube(launch_unchecked)]
 fn raw(out: &mut Tensor<u32>) {
     let base = (UNIT_POS_X * 5u32) as usize;
     out[base] = PLANE_DIM;
@@ -226,6 +231,24 @@ fn plane_layout_probe() {
     );
 
     let mut total = 0usize;
+    println!(
+        "  check_plane_ops: {:?}",
+        edge_rs::gpu::pml_kernel::check_plane_ops(&client)
+    );
+    let ctl = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0; 64], vec![64], &client).unwrap();
+    unsafe {
+        control::launch_unchecked::<WgpuRuntime>(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(64),
+            ctl.into_tensor_arg(),
+        );
+    }
+    let ctl = ctl.read(&client).unwrap();
+    println!(
+        "  control kernel without plane ops ran: {}",
+        ctl.iter().enumerate().all(|(i, &v)| v == i as u32 + 1)
+    );
     for width in [128, 64, 32] {
         dump_raw(&client, width);
     }

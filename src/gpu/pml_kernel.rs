@@ -1343,6 +1343,53 @@ where
     Ok(())
 }
 
+/// Writes one plane's width, counted by a plane reduction.
+#[cube(launch_unchecked)]
+fn plane_check(out: &mut Tensor<u32>) {
+    let n = plane_sum(1u32);
+    if UNIT_POS_X == 0 {
+        out[0] = n;
+        out[1] = PLANE_DIM;
+    }
+}
+
+/// Checks that the device actually runs plane operations.
+///
+/// Advertising them is not enough: the paravirtualised GPU of a macOS VM, as
+/// on the macos-15-intel GitHub runners, reports planes of 4 to 64 lanes but
+/// drops every dispatch that uses one, with no error. [`opt_pml_gpu`] would
+/// then return whatever its output buffer held.
+///
+/// ### Params
+///
+/// * `client` - CubeCL compute client for the target device
+///
+/// ### Returns
+///
+/// `Ok(())` if a plane reduction runs and agrees with the plane width, else
+/// [`EdgeErrors::Gpu`].
+pub fn check_plane_ops<R: Runtime>(client: &ComputeClient<R>) -> Result<(), EdgeErrors> {
+    let limits = GpuLimits::from_client(client);
+    let err = |e: CubeclUtilsErrors| EdgeErrors::Gpu(e.to_string());
+    let out = GpuTensor::<R, u32>::from_slice(&[0, 0], vec![2], client).map_err(err)?;
+    unsafe {
+        plane_check::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(limits.plane_size_max.max(1)),
+            out.into_tensor_arg(),
+        );
+    }
+    let got = out.read(client).map_err(err)?;
+    if got[0] == 0 || got[0] != got[1] {
+        return Err(EdgeErrors::Gpu(format!(
+            "The GPU NEBULA kernel needs plane (subgroup) operations, which this device advertises but does not run (plane sum {}, plane width {}). Use the CPU path.",
+            got[0], got[1]
+        )));
+    }
+    Ok(())
+}
+
 /// Every device buffer [`launch_opt_pml`] binds.
 ///
 /// Two kinds, with two strides. The gene-resident buffers (the design, the
