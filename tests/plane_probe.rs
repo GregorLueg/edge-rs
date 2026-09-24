@@ -50,6 +50,40 @@ fn probe(out: &mut Tensor<u32>, fsum: &mut Tensor<f32>, n_req: u32) {
     out[base + 8] = plane_sum(1u32);
 }
 
+#[cube(launch_unchecked)]
+fn raw(out: &mut Tensor<u32>) {
+    let base = (UNIT_POS_X * 5u32) as usize;
+    out[base] = PLANE_DIM;
+    out[base + 1] = PLANE_POS;
+    out[base + 2] = UNIT_POS_PLANE;
+    out[base + 3] = plane_sum(1u32);
+    out[base + 4] = plane_broadcast(UNIT_POS_X, 0u32);
+}
+
+/// Dumps the plane builtins of one cube, before any early exit can hide them.
+fn dump_raw(client: &ComputeClient<WgpuRuntime>, width: u32) {
+    let n = (width * 5) as usize;
+    let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![UNSET; n], vec![n], client).unwrap();
+    unsafe {
+        raw::launch_unchecked::<WgpuRuntime>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(width),
+            out.into_tensor_arg(),
+        );
+    }
+    let out = out.read(client).unwrap();
+    println!(
+        "  raw builtins, width {width} (unit: PLANE_DIM PLANE_POS UNIT_POS_PLANE plane_sum(1) broadcast(lane 0)):"
+    );
+    for u in 0..width as usize {
+        let r = &out[u * 5..u * 5 + 5];
+        if u < 4 || u % 16 == 0 || u + 1 == width as usize {
+            println!("    {u:>3}: {r:?}");
+        }
+    }
+}
+
 /// One launch; returns the number of invariant violations and prints a summary.
 fn run(client: &ComputeClient<WgpuRuntime>, width: u32, cubes: u32, n_req: u32) -> usize {
     let n_units = (width * cubes) as usize;
@@ -192,6 +226,10 @@ fn plane_layout_probe() {
     );
 
     let mut total = 0usize;
+    for width in [128, 64, 32] {
+        dump_raw(&client, width);
+    }
+
     // The NEBULA launch: a cube of two widest planes, one cube per two requests.
     let width = 2 * limits.plane_size_max;
     for n_req in [1u32, 3, 5, 64, 200] {
