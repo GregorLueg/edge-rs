@@ -636,33 +636,11 @@ pub fn scalars() -> Scalars {
 // GPU //
 /////////
 
-/// A wgpu client, or `None` when this device cannot run the NEBULA kernel.
-///
-/// The kernel refuses any device whose plane is not exactly
-/// [`PLANE`](edge_rs::gpu::pml_kernel::PLANE) lanes rather than return wrong
-/// answers, and a software adapter such as CI's lavapipe may report another
-/// width. The tests that need the kernel skip there and print the width, so the
-/// log says why a lane passed without running them.
-///
-/// ### Returns
-///
-/// The client, or `None` with the reason on stderr.
+/// The default wgpu client.
 #[cfg(feature = "gpu-tests")]
-pub fn gpu_client() -> Option<cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>> {
+pub fn gpu_client() -> cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime> {
     use cubecl::Runtime;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-    use cubecl_utils_rs::prelude::{GpuLimits, plane_uniform};
-    use edge_rs::gpu::pml_kernel::PLANE;
 
-    let client = WgpuRuntime::client(&WgpuDevice::default());
-    let limits = GpuLimits::from_client(&client);
-    if plane_uniform(PLANE, &limits) {
-        Some(client)
-    } else {
-        eprintln!(
-            "SKIPPED: this adapter reports a plane of {} to {} lanes; the NEBULA kernel needs exactly {PLANE}",
-            limits.plane_size_min, limits.plane_size_max
-        );
-        None
-    }
+    WgpuRuntime::client(&WgpuDevice::default())
 }

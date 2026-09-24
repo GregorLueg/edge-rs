@@ -515,9 +515,7 @@ fn gpu_first_newton_step_matches_cpu() {
             gamma: 1.0 / TRUE_PHI_INV,
         })
         .collect();
-    let Some(client) = common::gpu_client() else {
-        return;
-    };
+    let client = common::gpu_client();
     let gpu = opt_pml_batch::<WgpuRuntime>(
         &batch.design,
         &batch.log_offset,
@@ -567,9 +565,7 @@ fn gpu_first_newton_step_matches_cpu() {
 fn gpu_opt_pml_matches_cpu() {
     let batch = make_batch();
     let cpu = cpu_reference(&batch);
-    let Some(client) = common::gpu_client() else {
-        return;
-    };
+    let client = common::gpu_client();
 
     println!(
         "\n{} genes, {} cells, {} subjects, {} coefficients",
@@ -618,9 +614,7 @@ info {worst_info:.3e} (needs {INFO_TOL:.0e}), loglik {worst_ll:.3e} (needs {LL_T
 fn gpu_opt_pml_holds_across_the_variance_range() {
     let batch = make_batch();
     let (n_genes, _, _, n_coef) = shape();
-    let Some(client) = common::gpu_client() else {
-        return;
-    };
+    let client = common::gpu_client();
     let params = PmlParams {
         ord: 1,
         ..PmlParams::default()
@@ -926,9 +920,7 @@ fn gpu_rejects_what_it_cannot_fit() {
 #[test]
 fn gpu_nebula_is_deterministic() {
     let f = fixture("sc_small", false);
-    let Some(client) = common::gpu_client() else {
-        return;
-    };
+    let client = common::gpu_client();
     let run = || {
         nebula_sparse_gpu(
             &f.counts,
@@ -958,19 +950,15 @@ fn gpu_grid_past_one_dimension() {
         "only {} genes survived, which fits in one grid dimension",
         batch.counts.len()
     );
-    let Some(client) = common::gpu_client() else {
-        return;
-    };
+    let client = common::gpu_client();
     assert_batch_matches_cpu(&batch, &client, "two-dimensional grid");
 }
 
-/// One request, and three: a workgroup carries two, so both leave a plane
-/// idle.
+/// One request, and three: a workgroup carries at least two, so both leave a
+/// plane idle.
 #[test]
 fn gpu_odd_request_counts() {
-    let Some(client) = common::gpu_client() else {
-        return;
-    };
+    let client = common::gpu_client();
     for n in [1, 3] {
         let batch = make_batch_with(n, 400, 5, 3);
         assert_batch_matches_cpu(&batch, &client, &format!("{n} requests"));
