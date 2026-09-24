@@ -1018,9 +1018,7 @@ fn test_gpu_nebula_matches_the_r_package() {
     use edge_rs::gpu::stage_two::nebula_sparse_gpu;
     use edge_rs::prelude::{CompressedSparse, SparseFormat};
 
-    let Some(client) = common::gpu_client() else {
-        return;
-    };
+    let client = common::gpu_client();
     let s = common::scalars();
 
     for d in &DATASETS {

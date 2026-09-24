@@ -20,9 +20,6 @@ jobs:
       cpu-args: '--release --features gpu'
       # Windows drops gpu, as in ann-search-rs.
       windows-cpu-args: '--release'
-      # Linux is lavapipe, macOS the runner's Metal. The NEBULA kernel needs a
-      # 32-lane plane and refuses anything else; the device tests print the
-      # adapter's plane width and skip where it is not 32, so check the log
-      # for SKIPPED before reading a green Linux lane as kernel coverage.
+      # Linux is lavapipe, macOS the runner's Metal: two plane widths.
       gpu-args: '--release --features gpu-tests'
     secrets: inherit

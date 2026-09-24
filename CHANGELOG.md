@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.1
+
+### Bug fixes
+
+* The GPU NEBULA kernel no longer demands a 32-lane plane. It reads the plane
+  width at run time, so it runs on AMD, Intel and software adapters such as
+  lavapipe instead of refusing them. Checked on Metal (32 lanes) and lavapipe
+  (4 lanes); no measurable change on an M1 Max.
+
 ## v0.1.0
 
 * GPU-accelerated NEBULA added via the wgpu/cubecl framework, behind the `gpu`

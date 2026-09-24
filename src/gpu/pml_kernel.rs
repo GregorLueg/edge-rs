@@ -7,7 +7,7 @@
 //!
 //! ### Mapping
 //!
-//! One 32-lane plane owns one fit and every lane runs the whole Newton loop,
+//! One plane owns one fit and every lane runs the whole Newton loop,
 //! backtracking included, on the same values. Only the passes over cells are
 //! split: each lane takes a contiguous chunk of every subject block, and the
 //! partial sums are recombined with plane reductions, so the quantities the
@@ -103,19 +103,13 @@ const STEP_CUTOFF: f32 = 40.0;
 /// Largest gradient component still called a critical point, nebula's `convd`.
 const GRADIENT_TOLERANCE: f32 = 0.01;
 
-/// Lanes per request: one plane.
+/// Widest-plane requests per workgroup, one plane each.
 ///
-/// Every reduction here is a plane reduction, which is only correct when a
-/// plane is exactly this wide; the dispatch refuses to run anywhere else rather
-/// than return wrong answers, which a plane straddling two requests would give
-/// silently.
-pub const PLANE: u32 = 32;
-
-/// Requests per workgroup, one plane each.
-///
-/// The planes share nothing, so this is purely an occupancy knob: two planes
-/// make a 64-thread workgroup, which is what the per-thread kernel measured
-/// best at and no worse than wider.
+/// The planes share nothing, so this is purely an occupancy knob: two 32-lane
+/// planes make a 64-thread workgroup, which is what the per-thread kernel
+/// measured best at and no worse than wider. The workgroup is sized for the
+/// device's widest plane, so a driver that picks a narrower one fits more
+/// requests into it and the surplus cubes at the end of the grid exit at once.
 const PLANES_PER_CUBE: u32 = 2;
 
 /// Default resolution floor on the objective, relative to its magnitude.
@@ -178,7 +172,7 @@ pub const MAX_BETA_CAP: usize = 8;
 // Kernel //
 ////////////
 
-/// Fits one request per 32-lane plane by penalised maximum likelihood.
+/// Fits one request per plane by penalised maximum likelihood.
 ///
 /// Mirrors `optimise` in [`crate::sc::pml`] with the gamma penalty, NEBULA's
 /// NBGMM, at Laplace order one. Higher orders are left to the host, which has
@@ -188,7 +182,8 @@ pub const MAX_BETA_CAP: usize = 8;
 /// passes over cells are split across the lanes, each lane taking a contiguous
 /// chunk of every subject block, and recombined with plane reductions, so every
 /// quantity the Newton step and the backtracking search read is bit-identical
-/// in all 32 lanes and their decisions agree without a barrier.
+/// in every lane and their decisions agree without a barrier. The plane width
+/// is read at run time, so any width the driver picks is correct.
 ///
 /// ### Params
 ///
@@ -237,9 +232,9 @@ pub const MAX_BETA_CAP: usize = 8;
 ///
 /// ### Grid mapping
 ///
-/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * PLANES_PER_CUBE + UNIT_POS_Y`
-///   -> request
-/// * `UNIT_POS_X` -> lane within the request's plane
+/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * (CUBE_DIM_X / PLANE_DIM) +
+///   PLANE_POS` -> request
+/// * `UNIT_POS_PLANE` -> lane within the request's plane
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn opt_pml_gpu<F: Float + CubeElement>(
@@ -270,11 +265,13 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     n_varying: u32,
     #[comptime] nb_cap: u32,
 ) {
-    let q = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * PLANES_PER_CUBE + UNIT_POS_Y;
+    // The plane's own id, never `UNIT_POS_X / PLANE_DIM`: nothing obliges a
+    // driver to lay subgroups out contiguously.
+    let q = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * (CUBE_DIM_X / PLANE_DIM) + PLANE_POS;
     if q >= n_req {
         terminate!();
     }
-    let lane = UNIT_POS_X;
+    let lane = UNIT_POS_PLANE;
     let gene = request_gene[q as usize];
 
     let zero = F::new(0.0_f32);
@@ -451,7 +448,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                     &mut spread,
                     &mut delta,
                 );
-                r += PLANE;
+                r += PLANE_DIM;
             }
 
             let mut p = sp_lo + lane;
@@ -484,7 +481,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                     &mut spread,
                     &mut delta,
                 );
-                p += PLANE;
+                p += PLANE_DIM;
             }
 
             // -- Across the plane. Every moment is taken about the same anchor in
@@ -944,10 +941,10 @@ fn evaluate_pass<F: Float>(
         // halves them; each term is at least `gamma` and a product of two stays
         // far inside the `f32` range for any count a fit can reach.
         let mut r = begin + lane;
-        while r + 3u32 * PLANE < end {
-            let r1 = r + PLANE;
-            let r2 = r1 + PLANE;
-            let r3 = r2 + PLANE;
+        while r + 3u32 * PLANE_DIM < end {
+            let r1 = r + PLANE_DIM;
+            let r2 = r1 + PLANE_DIM;
+            let r3 = r2 + PLANE_DIM;
             let mut eta0 = log_offset[r as usize];
             let mut eta1 = log_offset[r1 as usize];
             let mut eta2 = log_offset[r2 as usize];
@@ -966,7 +963,7 @@ fn evaluate_pass<F: Float>(
             let t2 = F::exp(eta2 + log_w_s) + gamma;
             let t3 = F::exp(eta3 + log_w_s) + gamma;
             phil_lane += F::ln(t0 * t1) + F::ln(t2 * t3);
-            r += 4u32 * PLANE;
+            r += 4u32 * PLANE_DIM;
         }
         while r < end {
             let mut eta = log_offset[r as usize];
@@ -976,7 +973,7 @@ fn evaluate_pass<F: Float>(
                 j += 1u32;
             }
             phil_lane += F::ln(F::exp(eta + log_w_s) + gamma);
-            r += PLANE;
+            r += PLANE_DIM;
         }
         let mut p = sp_lo + lane;
         while p < sp_hi {
@@ -992,7 +989,7 @@ fn evaluate_pass<F: Float>(
             // which the subject term adds back.
             lin_lane += eta * y;
             weighted_lane += y * F::ln(F::exp(eta + log_w_s) + gamma);
-            p += PLANE;
+            p += PLANE_DIM;
         }
         linear += plane_sum(lin_lane);
         phil += plane_sum(phil_lane);
@@ -1280,12 +1277,13 @@ where
     }
 
     let limits = GpuLimits::from_client(client);
-    // Every reduction is a plane reduction; on a plane of any other width they
-    // would mix requests and return wrong answers without an error.
-    if !plane_uniform(PLANE, &limits) {
+    // Every plane width is a power of two, so a workgroup this wide splits into
+    // whole planes whichever width the driver picks.
+    let cube_width = PLANES_PER_CUBE * limits.plane_size_max;
+    if limits.plane_size_max == 0 || cube_width > limits.max_units_per_cube {
         return Err(EdgeErrors::Gpu(format!(
-            "The GPU NEBULA kernel needs a plane of exactly {PLANE} lanes; this device reports {} to {}.",
-            limits.plane_size_min, limits.plane_size_max
+            "The GPU NEBULA kernel needs plane operations; this device reports planes of {} to {} lanes and at most {} units per cube.",
+            limits.plane_size_min, limits.plane_size_max, limits.max_units_per_cube
         )));
     }
     let blocks = (n_req as u32).div_ceil(PLANES_PER_CUBE);
@@ -1299,7 +1297,7 @@ where
                 opt_pml_gpu::launch_unchecked::<F, R>(
                     client,
                     count,
-                    CubeDim::new_2d(PLANE, PLANES_PER_CUBE),
+                    CubeDim::new_1d(cube_width),
                     tensors.design.clone().into_tensor_arg(),
                     tensors.log_offset.clone().into_tensor_arg(),
                     tensors.subject_start.clone().into_tensor_arg(),
