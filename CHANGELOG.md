@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.2
+
+### Features
+
+* Expose the `scran_lowess()` function, a modified version of Limma's Lowess
+  designed for HVG detection in single cell.
+
 ## v0.1.1
 
 ### Bug fixes
