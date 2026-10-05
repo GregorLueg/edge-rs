@@ -36,6 +36,19 @@ use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
 
+////////////
+// Consts //
+////////////
+
+/// Work below which the fan-out over seed points stays sequential.
+///
+/// One iteration costs roughly `n_seeds * span * n` weighted sums, and
+/// `n_seeds * n` is the part of that a caller can vary. With the default
+/// `npts = 200` on a few hundred points the whole pass is a few thousand flops
+/// and rayon's fork costs more than it saves; a 200-seed fit over 20 000 genes,
+/// which is the voom case, is worth splitting.
+pub(crate) const PARALLEL_WORK_THRESHOLD: usize = 1 << 16;
+
 /// Degeneracy threshold lifted verbatim from limma's `weighted_lowess.c`.
 ///
 /// Guards three separate comparisons: a window whose points are effectively
@@ -45,18 +58,13 @@ use crate::errors::EdgeErrors;
 /// the fits only agree to the last digit if this matches.
 const THRESHOLD: f64 = 1e-7;
 
-/// Work below which the fan-out over seed points stays sequential.
-///
-/// One iteration costs roughly `n_seeds * span * n` weighted sums, and
-/// `n_seeds * n` is the part of that a caller can vary. With the default
-/// `npts = 200` on a few hundred points the whole pass is a few thousand flops
-/// and rayon's fork costs more than it saves; a 200-seed fit over 20 000 genes,
-/// which is the voom case, is worth splitting.
-const PARALLEL_WORK_THRESHOLD: usize = 1 << 16;
+/// Fraction of the covariate range used as the lowess interpolation cell width,
+/// which is `stats::lowess`'s `delta = 0.01 * diff(range(x))` default.
+const LOWESS_DELTA_FRACTION: f64 = 0.01;
 
-/////////////////
-// Public API  //
-/////////////////
+//////////////////
+// LowessParams //
+//////////////////
 
 /// Tuning knobs for [`weighted_lowess`].
 ///
@@ -112,6 +120,10 @@ impl Default for LowessParams {
     }
 }
 
+///////////////
+// LowessFit //
+///////////////
+
 /// What [`weighted_lowess`] produces.
 ///
 /// Both vectors are in the caller's original order, not sorted order.
@@ -122,6 +134,10 @@ pub struct LowessFit {
     /// Bisquare robustness weight for each input point, in `[0, 1]`.
     pub robust_weights: Vec<f64>,
 }
+
+////////////
+// Window //
+////////////
 
 /// The span window around one seed point, as indices into the sorted data.
 #[derive(Clone, Copy, Debug)]
@@ -150,7 +166,7 @@ struct Window {
 /// * `out` - Slice to fill; its length sets the index range
 /// * `parallel` - Whether to fan out over rayon
 /// * `f` - Value for index `i`
-fn fill<T, F>(out: &mut [T], parallel: bool, f: F)
+pub(crate) fn fill<T, F>(out: &mut [T], parallel: bool, f: F)
 where
     T: Send,
     F: Fn(usize) -> T + Send + Sync,
@@ -181,7 +197,7 @@ where
 /// The spacing, or zero when `npts` already covers every point so that no
 /// binning is needed. Errors with [`EdgeErrors::MustBePositive`] if `npts` is
 /// zero, matching the R wrapper's own check.
-fn resolve_delta(xs: &[f64], npts: usize) -> Result<f64, EdgeErrors> {
+pub(crate) fn resolve_delta(xs: &[f64], npts: usize) -> Result<f64, EdgeErrors> {
     if npts == 0 {
         return Err(EdgeErrors::MustBePositive("npts".to_string()));
     }
@@ -220,7 +236,7 @@ fn resolve_delta(xs: &[f64], npts: usize) -> Result<f64, EdgeErrors> {
 ///
 /// Seed indices in increasing order, always starting at `0` and ending at
 /// `xs.len() - 1`.
-fn find_seeds(xs: &[f64], delta: f64) -> Vec<usize> {
+pub(crate) fn find_seeds(xs: &[f64], delta: f64) -> Vec<usize> {
     let n = xs.len();
     if delta <= 0.0 || n <= 2 {
         return (0..n).collect();
@@ -389,8 +405,8 @@ fn lowess_fit(xs: &[f64], ys: &[f64], ws: &[f64], rw: &[f64], curpt: usize, wind
 /// of one rather than zero.
 ///
 /// Note that the robustness weights are recomputed after the final fit, so they
-/// describe the returned fit rather than the one before it. limma does the same,
-/// which is why `iterations = 1` still returns non-trivial weights.
+/// describe the returned fit rather than the one before it. limma does the
+/// same, which is why `iterations = 1` still returns non-trivial weights.
 ///
 /// ### Params
 ///
@@ -508,8 +524,8 @@ fn lowess_iterations(
 /// across a window boundary.
 ///
 /// The fit is an approximation by default. Local regressions are performed only
-/// at seed points spaced `delta` apart and the rest is linear interpolation; see
-/// the module documentation. Set `params.delta = Some(0.0)` to fit at every
+/// at seed points spaced `delta` apart and the rest is linear interpolation;
+/// see the module documentation. Set `params.delta = Some(0.0)` to fit at every
 /// point instead.
 ///
 /// ### Params
@@ -628,64 +644,13 @@ pub fn weighted_lowess(
     })
 }
 
-////////////////////////////
-// Cleveland's lowess     //
-////////////////////////////
+////////////////////////
+// Cleveland's lowess //
+////////////////////////
 
-/// Fraction of the covariate range used as the lowess interpolation cell width,
-/// which is `stats::lowess`'s `delta = 0.01 * diff(range(x))` default.
-const LOWESS_DELTA_FRACTION: f64 = 0.01;
-
-/// Fitted values of R's `stats::lowess`, in the caller's original order.
-///
-/// Distinct from [`weighted_lowess`] in this same module, which is limma's own
-/// `weightedLowess`. Both are needed: limma's `loessFit` returns early to this
-/// one whenever it has no prior weights, and edgeR's `compute_ave_qd` uses this
-/// one too. Reaching for the wrong one costs up to 7e-4 on the quasi-likelihood
-/// prior.
-///
-/// limma's `fitFDistRobustly` smooths the log variances with
-/// `loessFit(z, covariate, span = 0.4)`, and `loessFit` with no prior weights is
-/// a straight call to `stats::lowess`. That is Cleveland's original lowess, not
-/// limma's own `weightedLowess` in [`crate::limma::lowess`]: the two differ in
-/// how the local window is chosen and in the robustness weighting, so the trend
-/// only matches limma's if this one is used.
-///
-/// ### Params
-///
-/// * `x` - Covariate, in any order
-/// * `y` - Response, one per `x`
-/// * `span` - Fraction of the points in each local window, in `(0, 1]`
-/// * `n_steps` - Robustness iterations after the first fit, R's `lowess(iter = )`
-///
-/// ### Returns
-///
-/// One fitted value per input point, in the input order.
-///
-/// ### References
-///
-/// Cleveland, Journal of the American Statistical Association, 1979
-pub fn lowess(x: &[f64], y: &[f64], span: f64, n_steps: usize) -> Result<Vec<f64>, EdgeErrors> {
-    let n = x.len();
-    if n < 2 {
-        return Err(EdgeErrors::InvalidArgument(
-            "lowess needs at least two points.".to_string(),
-        ));
-    }
-
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| x[a].total_cmp(&x[b]));
-    let xs: Vec<f64> = order.iter().map(|&i| x[i]).collect();
-    let ys: Vec<f64> = order.iter().map(|&i| y[i]).collect();
-    let delta = LOWESS_DELTA_FRACTION * (xs[n - 1] - xs[0]);
-
-    let fitted = clowess(&xs, &ys, span, n_steps, delta);
-    let mut out = vec![0.0; n];
-    for (k, &i) in order.iter().enumerate() {
-        out[i] = fitted[k];
-    }
-    Ok(out)
-}
+/////////////
+// Helpers //
+/////////////
 
 /// Cleveland's lowess on data already sorted by `x`.
 ///
@@ -893,6 +858,61 @@ fn lowest(
         }
     }
     Some((nleft..=nrt).map(|j| w[j] * y[j]).sum())
+}
+
+//////////
+// Main //
+//////////
+
+/// Fitted values of R's `stats::lowess`, in the caller's original order.
+///
+/// Distinct from [`weighted_lowess`] in this same module, which is limma's own
+/// `weightedLowess`. Both are needed: limma's `loessFit` returns early to this
+/// one whenever it has no prior weights, and edgeR's `compute_ave_qd` uses this
+/// one too. Reaching for the wrong one costs up to 7e-4 on the quasi-likelihood
+/// prior.
+///
+/// limma's `fitFDistRobustly` smooths the log variances with
+/// `loessFit(z, covariate, span = 0.4)`, and `loessFit` with no prior weights is
+/// a straight call to `stats::lowess`. That is Cleveland's original lowess, not
+/// limma's own `weightedLowess` in [`crate::limma::lowess`]: the two differ in
+/// how the local window is chosen and in the robustness weighting, so the trend
+/// only matches limma's if this one is used.
+///
+/// ### Params
+///
+/// * `x` - Covariate, in any order
+/// * `y` - Response, one per `x`
+/// * `span` - Fraction of the points in each local window, in `(0, 1]`
+/// * `n_steps` - Robustness iterations after the first fit, R's `lowess(iter = )`
+///
+/// ### Returns
+///
+/// One fitted value per input point, in the input order.
+///
+/// ### References
+///
+/// Cleveland, Journal of the American Statistical Association, 1979
+pub fn lowess(x: &[f64], y: &[f64], span: f64, n_steps: usize) -> Result<Vec<f64>, EdgeErrors> {
+    let n = x.len();
+    if n < 2 {
+        return Err(EdgeErrors::InvalidArgument(
+            "lowess needs at least two points.".to_string(),
+        ));
+    }
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| x[a].total_cmp(&x[b]));
+    let xs: Vec<f64> = order.iter().map(|&i| x[i]).collect();
+    let ys: Vec<f64> = order.iter().map(|&i| y[i]).collect();
+    let delta = LOWESS_DELTA_FRACTION * (xs[n - 1] - xs[0]);
+
+    let fitted = clowess(&xs, &ys, span, n_steps, delta);
+    let mut out = vec![0.0; n];
+    for (k, &i) in order.iter().enumerate() {
+        out[i] = fitted[k];
+    }
+    Ok(out)
 }
 
 ///////////
