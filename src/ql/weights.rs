@@ -1,32 +1,26 @@
 //! Adjusted deviances, degrees of freedom and the average quasi-dispersion.
 //!
-//! The second half of edgeR's quasi-likelihood machinery, `ql_glm.c`. Where
-//! [`crate::ql::chebyshev`] supplies the two moments of a single unit deviance,
-//! this module spends them: for each gene it rescales every observation's unit
-//! deviance by `alpha`, weights the complementary leverage by `kappa`, and sums
-//! both across samples. The ratio of the two is `s2`, the gene's
-//! quasi-likelihood dispersion, which `glmQLFit` then hands to `squeezeVar`.
+//! Port of edgeR's `ql_glm.c`. [`crate::ql::chebyshev`] supplies the two
+//! moments of a unit deviance; this module spends them. Per gene it rescales
+//! each unit deviance by `alpha`, weights the complementary leverage by
+//! `kappa`, and sums over samples. Their ratio is `s2`, the quasi-likelihood
+//! dispersion that `glmQLFit` hands to `squeezeVar`.
 //!
-//! ### Layout
+//! Each gene needs its own weighted design and QR, so the gene fan-out carries
+//! a per-thread scratch buffer.
 //!
-//! Genes are the parallel axis. Each gene needs its own weighted design matrix
-//! and its own QR, so the fan-out carries a per-thread scratch buffer for both
-//! and nothing larger than one gene's design is allocated inside the loop.
+//! ### Deviations from edgePython
 //!
-//! ### Deviations from edgeR
+//! [`compute_prior`] smooths with Cleveland's `lowess` as edgeR does, not
+//! limma's `weightedLowess`. See `UPSTREAM_DEVIATIONS.md` A11.
 //!
-//! Two of its own, both documented at their use sites: the smoother behind
-//! [`compute_prior`] is limma's `weightedLowess` rather than R's `lowess`, and
-//! the leverages come from an unpivoted QR rather than LINPACK's rank-revealing
-//! `dqrdc2`. See the constants and tests below for what each costs.
+//! ### Deviation from edgeR
 //!
-//! One inherited. edgeR's `compute_weight` has no Poisson branch: a dispersion
-//! of exactly zero falls into the case-1 negative binomial fit, which already
-//! carries the Poisson moments as a factor. [`compute_weight`] here diverts
-//! `phi <= 0` to the bare Poisson fit, and the two disagree by 4.7e-4 relative
-//! on the fixture in `test_near_poisson_dispersion_matches_edger`. Nothing in
-//! this module can correct that; it is noted here because the error surfaces in
-//! these outputs.
+//! Leverages come from an unpivoted QR, not LINPACK's rank-revealing `dqrdc2`.
+//! The two differ only for rank-deficient weighted designs, which structural
+//! zeros would produce, but [`compute_weight`] returns `(0, 0)` for a zero mean
+//! so the difference cancels. See
+//! `test_structural_zeros_collapse_the_degrees_of_freedom`.
 //!
 //! ### References
 //!
@@ -47,44 +41,38 @@ use crate::utils::design::hat_diagonal;
 
 /// Complementary leverage below which an observation is dropped outright.
 ///
-/// edgeR's `thresholdzero`. A sample whose leverage is one is fitted exactly,
-/// so its residual carries no information; counting its unit deviance would
-/// inflate the numerator of `s2` without adding anything to the denominator.
+/// edgeR's `thresholdzero`. A sample with leverage one is fitted exactly, so
+/// its residual carries no information.
 const THRESHOLD_ZERO: f64 = 1e-4;
 
 /// Degrees of freedom below which a gene is excluded from the prior trend.
 ///
-/// edgeR's `t`. Genes at zero residual df have `s2 = 0` by the rule above, and
-/// leaving them in would drag the lowess fit towards zero across whatever
-/// abundance range they occupy.
+/// edgeR's `t`. Genes at zero residual df have `s2 = 0` and would drag the
+/// lowess fit towards zero.
 const MIN_DF: f64 = 1e-8;
 
 /// Span of the lowess fit behind the prior.
 ///
-/// Half the genes per window. edgeR's `f`.
+/// edgeR's `f`: half the genes per window.
 const PRIOR_SPAN: f64 = 0.5;
 
 /// Robustness iterations behind the prior.
 ///
-/// edgeR asks R's `lowess` for `iter = 3`, meaning three robustness passes after
-/// the initial fit, and [`crate::limma::lowess::lowess`] uses the same
-/// convention. Note limma's `weightedLowess` counts *total* passes instead, so
-/// the equivalent there would be four; mixing the two conventions up costs
-/// 3e-3 on the prior.
+/// R's `lowess` counts robustness passes after the initial fit, as
+/// [`crate::limma::lowess::lowess`] does. limma's `weightedLowess` counts total
+/// passes, so its equivalent would be four.
 const PRIOR_ITERATIONS: usize = 3;
 
 /// Quantile of the fitted trend taken as the prior.
 ///
-/// edgeR reads the 90th percentile rather than the mean or the median: the
-/// prior is meant to sit above the bulk of the genes, so that dividing by it
-/// pulls the typical quasi-dispersion below one.
+/// The 90th percentile, so the prior sits above the bulk of the genes.
 const PRIOR_QUANTILE: f64 = 0.9;
 
 /// Lower bound on the prior before it is raised to the fourth power.
 ///
-/// A prior below one would sharpen the dispersions rather than shrink them,
-/// which is not what the adjustment is for. edgeR clamps on the fourth-root
-/// scale, so the effective floor on the returned value is also one.
+/// A prior below one would sharpen the dispersions rather than shrink them.
+/// edgeR clamps on the fourth-root scale, so the floor on the returned value
+/// is also one.
 const PRIOR_FLOOR: f64 = 1.0;
 
 //////////////
@@ -98,8 +86,8 @@ const PRIOR_FLOOR: f64 = 1.0;
 pub struct AdjustedDeviance {
     /// Adjusted residual deviance, summed over samples.
     pub deviance: Vec<f64>,
-    /// Adjusted residual degrees of freedom, summed over samples. Fractional,
-    /// because each sample contributes its own `kappa` rather than one.
+    /// Adjusted residual degrees of freedom, summed over samples. Fractional
+    /// because each sample contributes its own `kappa`.
     pub df: Vec<f64>,
     /// Quasi-likelihood dispersion, `deviance / df`. Zero where `df` has
     /// collapsed below [`THRESHOLD_ZERO`].
@@ -108,18 +96,17 @@ pub struct AdjustedDeviance {
 
 /// Adjusted deviance and degrees of freedom for every gene.
 ///
-/// A port of edgeR's `compute_adjust_vec`. For one gene and one sample the
-/// contribution is
+/// Port of edgeR's `compute_adjust_vec`. Per gene and sample:
 ///
 /// ```text
 /// deviance += alpha * d(y, mu, phi w / prior) * w
 /// df       += kappa * (1 - h)
 /// ```
 ///
-/// with `(alpha, kappa)` from [`compute_weight`], `d` the unit deviance, and `h`
-/// the leverage of that sample under the working weights
-/// `mu / (1 + mu phi w / prior)`. Observations whose complementary leverage
-/// falls below [`THRESHOLD_ZERO`] drop out of both sums.
+/// with `(alpha, kappa)` from [`compute_weight`], `d` the unit deviance and `h`
+/// the leverage under working weights `mu / (1 + mu phi w / prior)`.
+/// Observations with complementary leverage below [`THRESHOLD_ZERO`] drop out
+/// of both sums.
 ///
 /// ### Params
 ///
@@ -209,19 +196,9 @@ pub fn compute_adjust_vec<T: EdgeFloat>(
 
 /// Average quasi-dispersion from one round of quasi-likelihood dispersions.
 ///
-/// A port of edgeR's `compute_prior`. Genes with usable residual degrees of
-/// freedom are smoothed on the fourth-root scale against average log-CPM, the
-/// 90th percentile of that trend is taken, floored at one, and raised back to
-/// the fourth power.
-///
-/// ### Deviation from edgeR
-///
-/// edgeR smooths with R's `lowess` (`f = 0.5`, `iter = 3`,
-/// `delta = 0.01 * diff(range(x))`); this uses limma's `weightedLowess`, which
-/// is a different algorithm with a different window rule and a different seed
-/// spacing. On 500 genes with a heavily overdispersed fit the two priors differ
-/// by 5.2e-5 relative, so the whole quasi-likelihood path inherits an error of
-/// that order.
+/// Port of edgeR's `compute_prior`. Genes with usable residual df are smoothed
+/// on the fourth-root scale against average log-CPM. The 90th percentile of
+/// the trend is floored at one and raised back to the fourth power.
 ///
 /// ### Params
 ///
@@ -231,9 +208,9 @@ pub fn compute_adjust_vec<T: EdgeFloat>(
 ///
 /// ### Returns
 ///
-/// A single-element vector holding the average quasi-dispersion, which is what
-/// [`compute_adjust_vec`] takes as its `prior`. Errors with
-/// [`EdgeErrors::LengthMismatch`] if the three inputs disagree.
+/// A single-element vector with the average quasi-dispersion, as
+/// [`compute_adjust_vec`] takes for `prior`. Errors with
+/// [`EdgeErrors::LengthMismatch`] if the inputs disagree.
 pub fn compute_prior(ave_log_cpm: &[f64], s2: &[f64], df: &[f64]) -> Result<Vec<f64>, EdgeErrors> {
     let n = ave_log_cpm.len();
     if s2.len() != n {
@@ -264,10 +241,7 @@ pub fn compute_prior(ave_log_cpm: &[f64], s2: &[f64], df: &[f64]) -> Result<Vec<
         0 => return Ok(vec![PRIOR_FLOOR]),
         1 => root_s2,
         _ => {
-            // Cleveland's lowess, not limma's `weightedLowess`. edgeR's
-            // `compute_ave_qd` calls `lowess(f = 0.5, iter = 3)`; reaching for
-            // the other smoother costs up to 7e-4 on the prior and on every
-            // quasi-likelihood dispersion downstream of it.
+            // edgeR's `compute_ave_qd` calls `lowess(f = 0.5, iter = 3)`.
             lowess(&abundance, &root_s2, PRIOR_SPAN, PRIOR_ITERATIONS)?
         }
     };
@@ -279,10 +253,8 @@ pub fn compute_prior(ave_log_cpm: &[f64], s2: &[f64], df: &[f64]) -> Result<Vec<
 
 /// Average quasi-dispersion, found by two rounds of adjustment.
 ///
-/// A port of edgeR's `update_prior`. The adjustment needs a prior and the prior
-/// needs an adjustment, so edgeR starts at one, adjusts, re-estimates, adjusts
-/// again and re-estimates once more. Two rounds, not iterated to convergence:
-/// the second move is already small and edgeR stops there.
+/// Port of edgeR's `update_prior`. Starts at one, then twice adjusts and
+/// re-estimates. Two rounds, not iterated to convergence, as in edgeR.
 ///
 /// ### Params
 ///
@@ -365,8 +337,8 @@ impl Scratch {
 
 /// Checks the shapes [`compute_adjust_vec`] cannot recover from.
 ///
-/// Pulled out so that the per-gene kernel can treat [`hat_diagonal`] as
-/// infallible: everything that routine rejects is rejected here first.
+/// Rejects everything [`hat_diagonal`] would, so the per-gene kernel can treat
+/// it as infallible.
 ///
 /// ### Params
 ///
@@ -434,8 +406,7 @@ fn validate(
 /// ### Returns
 ///
 /// `Ok(())` when usable, otherwise [`EdgeErrors`]. The prior divides a
-/// dispersion, so zero and negative values are rejected rather than allowed to
-/// produce an infinity halfway through the sum.
+/// dispersion, so zero and negative values are rejected up front.
 fn validate_prior(prior: &[f64], n_genes: usize) -> Result<(), EdgeErrors> {
     if prior.len() != 1 && prior.len() != n_genes {
         return Err(EdgeErrors::LengthMismatch {
@@ -454,15 +425,14 @@ fn validate_prior(prior: &[f64], n_genes: usize) -> Result<(), EdgeErrors> {
 
 /// Adjusted deviance, degrees of freedom and their ratio for one gene.
 ///
-/// The leverages come from the QR of `sqrt(W) X`, where the working weight is
+/// Leverages come from the QR of `sqrt(W) X` with working weight
 /// `mu / (1 + mu phi w / prior)`. edgeR's `qr_hat` uses LINPACK's `dqrdc2`,
-/// which truncates the factorisation at the numerical rank; [`hat_diagonal`]
-/// does not. The two differ only when the weighted design is rank deficient
-/// while its columns still carry non-negligible norm, which needs a fitted mean
-/// that is tiny but not zero. edgeR's own GLM returns exact zeros for a
-/// structurally zero group, and [`compute_weight`] reports `(0, 0)` there, so
-/// the difference cancels on the path that actually produces these inputs. See
-/// `test_structural_zeros_match_edger`.
+/// which truncates at the numerical rank; [`hat_diagonal`] does not. The two
+/// differ only for a rank-deficient weighted design with non-negligible column
+/// norms, which needs a tiny non-zero fitted mean. edgeR's GLM returns exact
+/// zeros for structural zeros and [`compute_weight`] gives `(0, 0)` there, so
+/// the difference cancels. See
+/// `test_structural_zeros_collapse_the_degrees_of_freedom`.
 ///
 /// ### Params
 ///
@@ -541,18 +511,15 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// Relative tolerance for the deviance and degrees of freedom against
-    /// edgeR's C. Everything on that path is arithmetic the port reproduces
+    /// Relative tolerance against edgeR's C. The port reproduces the arithmetic
     /// operation for operation, so the only slack is the QR.
     const TOL: f64 = 1e-12;
 
-    /// Six genes by six samples. Every count and every fitted mean is exactly
-    /// representable in binary, so R and Rust see identical inputs and any
-    /// disagreement is the algorithm rather than the fixture.
+    /// Six genes by six samples, all values exactly representable in binary.
     ///
-    /// Gene 3 is zero in the first group and gene 4 is zero everywhere, which is
-    /// what `glmFit` returns exact zero fitted values for. Gene 5 sits in the
-    /// thousands, where the Chebyshev fits have switched panels.
+    /// Gene 3 is zero in the first group and gene 4 is zero everywhere (exact
+    /// zero fitted values from `glmFit`). Gene 5 sits in the thousands, past
+    /// the Chebyshev panel switch.
     fn counts() -> Vec<f64> {
         vec![
             10.0, 12.0, 11.0, 40.0, 44.0, 38.0, //
@@ -630,7 +597,7 @@ mod tests {
         }
     }
 
-    /// The shared preamble of every `Rscript` block below.
+    /// Shared preamble of the `Rscript` blocks below.
     ///
     /// ```r
     /// # Rscript, edgeR 4.8.2
@@ -683,9 +650,8 @@ mod tests {
         );
     }
 
-    /// The same fixture at a prior above one, which is the branch `update_prior`
-    /// actually lands on. The prior enters the working weights, the moments and
-    /// the unit deviance separately, so this pins more than a rescaling.
+    /// Prior above one, the branch `update_prior` lands on. The prior enters the
+    /// working weights, moments and unit deviance separately.
     ///
     /// `.Call(edgeR:::.cxx_compute_adj_vec, y, mu, X, dm, 2.5, wm)`
     #[test]
@@ -722,9 +688,8 @@ mod tests {
         );
     }
 
-    /// A dispersion per gene, spanning the Chebyshev cases: gene 5 sits at two,
-    /// past the case-1 boundary, and gene 4 carries zero, which is inert because
-    /// the gene has no counts.
+    /// Per-gene dispersions spanning the Chebyshev cases: gene 5 is at two, past
+    /// case 1, and gene 4 is zero (inert, no counts).
     ///
     /// ```r
     /// dg <- edgeR:::.compressDispersions(y, c(0.05,0.125,0.5,0.25,0,2))
@@ -764,9 +729,8 @@ mod tests {
         );
     }
 
-    /// Explicit observation weights, which enter in three places at once: the
-    /// working weight, the dispersion handed to the moments and the deviance,
-    /// and the multiplier on the adjusted unit deviance.
+    /// Observation weights, which enter the working weight, the dispersion and
+    /// the multiplier on the adjusted unit deviance.
     ///
     /// ```r
     /// w <- matrix(c(1,1,1,1,1,1, 0.5,0.5,2,2,1,1, 1,0.25,1,1,4,1,
@@ -823,10 +787,8 @@ mod tests {
         );
     }
 
-    /// A continuous covariate. Only the leverages change, so the deviances are
-    /// bit-identical to the two-group case while the degrees of freedom are not.
-    /// Gene 3, whose first group is structurally zero, drops to roughly one
-    /// residual degree of freedom here against two under the group design.
+    /// Continuous covariate. Only the leverages change, so deviances match the
+    /// two-group case bit for bit while the df do not.
     ///
     /// `.Call(edgeR:::.cxx_compute_adj_vec, y, mu, Xc, dm, 1.0, wm)`
     #[test]
@@ -863,8 +825,7 @@ mod tests {
         );
     }
 
-    /// One gene on its own must give exactly what it gives inside a batch, since
-    /// the gene axis is the parallel one.
+    /// One gene alone must match the same gene inside a batch.
     ///
     /// ```r
     /// y1 <- y[2,,drop=FALSE]; mu1 <- mu[2,,drop=FALSE]
@@ -896,16 +857,13 @@ mod tests {
         assert_relative_eq!(out.s2[0], 0.004_134_419_685_934_175, max_relative = TOL);
     }
 
-    /// Genes 3 and 4 are the structural-zero cases, and they are why the
-    /// unpivoted QR here is safe.
+    /// Genes 3 and 4 are the structural-zero cases that make the unpivoted QR
+    /// safe.
     ///
     /// edgeR's `dqrdc2` finds rank 1 for gene 3 and rank 0 for gene 4;
-    /// [`hat_diagonal`] keeps both columns and therefore reports different
-    /// leverages. `test_two_group_matches_edger` still passes on those two genes,
-    /// because [`compute_weight`] returns `(0, 0)` wherever the fitted mean is
-    /// zero, so those samples contribute nothing under either set of leverages.
-    /// This test states the consequence directly: gene 4 is entirely inert, and
-    /// gene 3 keeps exactly the three samples that carry counts.
+    /// [`hat_diagonal`] reports different leverages. The result is unchanged
+    /// because [`compute_weight`] returns `(0, 0)` at a zero mean. Gene 4 is
+    /// inert and gene 3 keeps exactly the three samples that carry counts.
     #[test]
     fn test_structural_zeros_collapse_the_degrees_of_freedom() {
         let out = compute_adjust_vec(
@@ -930,8 +888,7 @@ mod tests {
         assert!(out.df[0] > 3.9);
     }
 
-    /// The three `Recycled` forms of one dispersion must not differ, which pins
-    /// the dispatch inside the kernel.
+    /// The three `Recycled` forms of one dispersion must agree.
     #[test]
     fn test_recycled_dispersion_forms_agree() {
         let run = |dispersion: Recycled<f64>| {
@@ -985,8 +942,7 @@ mod tests {
         assert_eq!(scalar.df, vector.df);
     }
 
-    /// `f32` counts must widen to the same answer, since every count in the
-    /// fixture is exactly representable in single precision.
+    /// `f32` counts give the same answer (all fixture counts are exact in `f32`).
     #[test]
     fn test_f32_counts_agree_with_f64() {
         let wide = compute_adjust_vec(
@@ -1025,23 +981,11 @@ mod tests {
     ////////////////////
 
     /// Relative tolerance for anything that passes through the smoother.
-    ///
-    /// This was 1e-3 while `compute_prior` used limma's `weightedLowess`, which
-    /// is a different algorithm from the `lowess` edgeR actually calls: 3.0e-4
-    /// on the 25-point grid, 7.1e-4 once two genes are filtered out of it, and
-    /// 5.2e-5 on 500 genes. Pointing it at
-    /// [`crate::limma::lowess::lowess`] with `iter = 3` closed the gap
-    /// entirely, so the tolerance is now rounding.
-    ///
-    /// Mind the iteration convention if this is ever touched: R's `lowess`
-    /// counts robustness passes *after* the first fit, limma's `weightedLowess`
-    /// counts total passes. Using limma's 4 here instead of edgeR's 3 costs
-    /// 3e-3, worse than the original mismatch.
+    /// Rounding only, since `compute_prior` uses the same `lowess` as edgeR.
     const PRIOR_TOL: f64 = 1e-12;
 
     /// Twenty-five genes on a dyadic grid of average log-CPM, with dyadic `s2`
-    /// and three degrees of freedom each. Exactly representable, so R and Rust
-    /// smooth identical numbers.
+    /// and three df each.
     fn prior_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let ave: Vec<f64> = (0..25).map(|i| i as f64 / 4.0 - 2.0).collect();
         let s2: Vec<f64> = (0..25)
@@ -1050,8 +994,8 @@ mod tests {
         (ave, s2, vec![3.0; 25])
     }
 
-    /// The prior against edgeR's `compute_prior`, replicated in R because the C
-    /// function is not exported on its own.
+    /// The prior against edgeR's `compute_prior`, replicated in R (the C
+    /// function is not exported).
     ///
     /// ```r
     /// # Rscript, R 4.5.1 / edgeR 4.8.2
@@ -1070,9 +1014,8 @@ mod tests {
         assert_relative_eq!(got[0], 2.423_348_828_030_909, max_relative = PRIOR_TOL);
     }
 
-    /// Genes below the degrees of freedom threshold must never reach the
-    /// smoother. Dropping the two end genes changes the answer, and it must
-    /// change it to exactly what fitting the survivors alone gives.
+    /// Genes below the df threshold never reach the smoother: dropping the two
+    /// end genes must equal fitting the survivors alone.
     ///
     /// ```r
     /// a2 <- lowess(ave[2:24], sqrt(sqrt(s2[2:24])), f = 0.5, iter = 3,
@@ -1095,14 +1038,13 @@ mod tests {
         );
     }
 
-    /// With no gene left the prior is inert, and with one gene it is that gene's
-    /// own value. Both sit below the smoother's two-point minimum.
+    /// No gene left gives the floor; one gene gives its own value. Both are
+    /// below the smoother's two-point minimum.
     #[test]
     fn test_compute_prior_degenerate_gene_counts() {
         let none = compute_prior(&[1.0, 2.0], &[4.0, 9.0], &[0.0, 0.0]).unwrap();
         assert_eq!(none, vec![1.0]);
 
-        // The fourth root of 16 is 2, so the fourth power brings 16 straight back.
         let one = compute_prior(&[1.0, 2.0], &[16.0, 9.0], &[3.0, 0.0]).unwrap();
         assert_relative_eq!(one[0], 16.0, max_relative = 1e-12);
     }
@@ -1115,9 +1057,8 @@ mod tests {
         assert_eq!(got, vec![1.0]);
     }
 
-    /// Twenty-four genes by six samples, overdispersed enough that the prior
-    /// lands well above its floor. Counts are integers and every fitted mean is
-    /// a group mean rounded to a quarter, so the fixture is exact.
+    /// Twenty-four overdispersed genes by six samples, so the prior lands well
+    /// above its floor. Fitted means are group means rounded to a quarter.
     ///
     /// Generated by the script quoted on [`test_update_prior_matches_edger`].
     #[allow(clippy::type_complexity)]
@@ -1190,8 +1131,8 @@ mod tests {
         (counts, fitted, ave_log_cpm)
     }
 
-    /// One round of the adjustment followed by one `compute_prior`, which is the
-    /// first half of [`update_prior`] with its intermediate exposed.
+    /// One adjustment round plus one `compute_prior`: the first half of
+    /// [`update_prior`].
     ///
     /// ```r
     /// o1 <- .Call(edgeR:::.cxx_compute_adj_vec, y, mu, X, dm, 1.0, wm)
@@ -1217,8 +1158,8 @@ mod tests {
         assert_relative_eq!(prior[0], 5.250_556_991_969_081, max_relative = PRIOR_TOL);
     }
 
-    /// The whole two-round loop against edgeR's own `compute_ave_qd`, which is
-    /// the exact entry point `glmQLFit(legacy = FALSE)` calls.
+    /// The two-round loop against edgeR's `compute_ave_qd`, the entry point of
+    /// `glmQLFit(legacy = FALSE)`.
     ///
     /// ```r
     /// # Rscript, R 4.5.1 / edgeR 4.8.2
@@ -1257,9 +1198,8 @@ mod tests {
         assert_relative_eq!(prior[0], 18.590_485_410_598_912, max_relative = PRIOR_TOL);
     }
 
-    /// `update_prior` must be exactly two rounds, not one and not three. Running
-    /// the loop by hand reproduces it, and stopping after the first round does
-    /// not.
+    /// `update_prior` is exactly two rounds: the hand-run loop matches, one round
+    /// does not.
     #[test]
     fn test_update_prior_is_exactly_two_rounds() {
         let (counts, fitted, ave) = prior_counts();
@@ -1298,18 +1238,9 @@ mod tests {
         assert!(first[0] != second[0]);
     }
 
-    /// A dispersion of `2^-20`, which is the near-Poisson corner: small enough
-    /// that [`unit_nb_deviance`] takes its Poisson expansion, while
-    /// [`compute_weight`] still uses the case-1 Chebyshev fit, exactly as edgeR
-    /// does.
-    ///
-    /// A dispersion of exactly zero is deliberately not tested here. edgeR's
-    /// `compute_weight` has no Poisson branch at all: `phi = 0` falls into
-    /// `anbinomdevc_1(mu, 0)`, whose fit already carries `pois_alpha` as a
-    /// factor. [`compute_weight`] in this crate diverts `phi <= 0` to the bare
-    /// Poisson fit instead, which disagrees with edgeR by 4.7e-4 relative on
-    /// gene 0 of this fixture. That belongs to [`crate::ql::chebyshev`], not
-    /// here.
+    /// Dispersion `2^-20`, the near-Poisson corner: [`unit_nb_deviance`] takes
+    /// its Poisson expansion while [`compute_weight`] uses the case 1 fit, as in
+    /// edgeR. Exactly zero is covered by `test_zero_dispersion_matches_edger`.
     ///
     /// ```r
     /// d0 <- edgeR:::.compressDispersions(y, 2^-20)
@@ -1349,9 +1280,9 @@ mod tests {
         );
     }
 
-    /////////////////////
-    // Error branches  //
-    /////////////////////
+    ////////////////////
+    // Error branches //
+    ////////////////////
 
     /// Every rejection [`compute_adjust_vec`] can produce, in one table.
     #[test]
@@ -1400,8 +1331,8 @@ mod tests {
             run(6, 6, &counts(), &fitted(), &two_group(), 3),
             EdgeErrors::LengthMismatch { name: "design", .. }
         ));
-        // Two samples, three coefficients: no residual degrees of freedom to
-        // adjust, and the QR would be of a wide matrix.
+        // Two samples, three coefficients: no residual df, and the QR would be
+        // of a wide matrix.
         assert!(matches!(
             run(
                 1,
@@ -1533,13 +1464,9 @@ mod tests {
         ));
     }
 
-    /// Regression guard for the zero-dispersion dispatch.
-    ///
     /// `phi = 0` must reach the case 1 Chebyshev fits, not the Poisson ones.
-    /// An earlier version of `ql/chebyshev.rs` short circuited to the Poisson
-    /// branch and was wrong by 1.8e-4 relative here. edgeR reaches this through
-    /// `glmQLFit(dispersion = 0)` and through any zero entry in a tagwise
-    /// dispersion vector, so it is not a corner case.
+    /// edgeR hits this through `glmQLFit(dispersion = 0)` and any zero tagwise
+    /// dispersion.
     ///
     /// ```r
     /// y <- matrix(c(8,16,32,64,128,256, 4,4,8,8,16,16, 64,64,64,128,128,128),

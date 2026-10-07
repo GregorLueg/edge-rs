@@ -1,19 +1,12 @@
 //! Negative binomial deviance.
 //!
-//! This is the crate's single implementation, used by the Levenberg fit, the
-//! residual deviance and the quasi-likelihood weights alike.
+//! The crate's single implementation, used by the Levenberg fit, the residual
+//! deviance and the quasi-likelihood weights. Ports edgeR's `compute_nbdev.c`,
+//! not edgePython's naive version. See `UPSTREAM_DEVIATIONS.md` A3.
 //!
-//! It follows edgeR's `compute_nbdev.c` rather than edgePython's
-//! `glm_levenberg._unit_nb_deviance`. edgePython carries two versions and only
-//! the one in `ql_weights.py` matches edgeR; the naive one its GLM path uses
-//! disagrees with edgeR by around 1e-8 relative on ordinary values and
-//! completely near `y == mu`.
-//!
-//! Two details carry that accuracy. Both `y` and `mu` are nudged by
-//! [`MILDLY_LOW_VALUE`] before anything else, which is what keeps the
-//! zero-count case finite without a special branch. And the formula switches by
-//! regime, so the difference of large logarithms is never evaluated where it
-//! would cancel.
+//! Two details give the accuracy. `y` and `mu` are both nudged by
+//! [`MILDLY_LOW_VALUE`], which keeps zero counts finite without a special
+//! branch. The formula switches by regime so large logarithms never cancel.
 
 ////////////
 // Consts //
@@ -21,30 +14,26 @@
 
 /// Nudge added to both `y` and `mu` before any logarithm is taken.
 ///
-/// edgeR's `mildly_low_value`. It removes the `y == 0` and `mu == 0` special
-/// cases at the cost of a bias around 1e-8 relative, and reproducing it is
-/// required for parity: edgeR's published deviances carry this bias.
+/// edgeR's `mildly_low_value`. Removes the `y == 0` and `mu == 0` special cases
+/// at the cost of a bias around 1e-8 relative, which edgeR carries too.
 pub const MILDLY_LOW_VALUE: f64 = 1e-8;
 
 /// Dispersion below which the Poisson expansion is used.
 ///
-/// Under this, `1/phi` is large enough that the negative binomial form loses
-/// precision, and the Poisson limit plus a first-order correction in `phi` is
-/// both cheaper and more accurate.
+/// Below this `1/phi` is large enough that the negative binomial form loses
+/// precision. The Poisson limit plus a first-order correction in `phi` is used.
 pub const POISSON_REGIME: f64 = 1e-4;
 
 /// Value of `mu * phi` above which the gamma limit is used.
 ///
-/// The negative binomial tends to a gamma as `mu * phi` grows, and past this the
-/// `log((mu + 1/phi) / (y + 1/phi))` term is all cancellation.
+/// Past this the `log((mu + 1/phi) / (y + 1/phi))` term is all cancellation.
 pub const GAMMA_REGIME: f64 = 1e6;
 
 /// Unit deviance of one observation under a negative binomial model.
 ///
-/// Three regimes, selected exactly as edgeR does: a Poisson expansion for small
-/// dispersion, a gamma limit for large `mu * phi`, and otherwise the rearranged
-/// exact form, which is algebraically identical to the textbook expression but
-/// groups the logarithms so they do not cancel.
+/// Three regimes, selected as in edgeR: a Poisson expansion for small
+/// dispersion, a gamma limit for large `mu * phi`, and otherwise the exact form
+/// with the logarithms grouped so they do not cancel.
 ///
 /// ### Params
 ///
@@ -54,8 +43,7 @@ pub const GAMMA_REGIME: f64 = 1e6;
 ///
 /// ### Returns
 ///
-/// The unit deviance, clamped at zero. A negative value can only arise from
-/// rounding, since the deviance is non-negative by construction.
+/// The unit deviance, clamped at zero (negative values are rounding only).
 ///
 /// ### References
 ///
@@ -68,12 +56,8 @@ pub fn unit_nb_deviance(y: f64, mu: f64, phi: f64) -> f64 {
     let out = if phi < POISSON_REGIME {
         // Poisson limit with the leading correction in phi.
         //
-        // The cubic term is `-phi * y`, not `phi * (2/3 * resid - y)`.
-        // edgeR's C writes `2/3` with integer operands, so it truncates to zero
-        // and the `resid` contribution never enters. edgePython treats that as
-        // a typo and writes `2.0/3.0`, which changes the answer by up to 7e-4
-        // relative on large counts. Reproducing the C is what matches published
-        // edgeR results.
+        // The cubic term is `-phi * y`, not `phi * (2/3 * resid - y)`: edgeR's C
+        // uses integer `2/3` (= 0). See `UPSTREAM_DEVIATIONS.md` A4.
         let resid = y - mu;
         2.0 * (y * (y / mu).ln() - resid - 0.5 * resid * resid * phi * (1.0 - phi * y))
     } else {
@@ -123,9 +107,8 @@ mod tests {
         }
     }
 
-    /// The naive textbook formula, which edgePython's GLM path uses. It must
-    /// disagree with ours, otherwise the regime switching is not doing anything
-    /// and this module has silently reverted to the Python behaviour.
+    /// The naive textbook formula used by edgePython's GLM path. Must disagree
+    /// with ours, otherwise the regime switching does nothing.
     fn naive(y: f64, mu: f64, phi: f64) -> f64 {
         if y > 0.0 {
             2.0 * (y * (y / mu).ln() - (y + 1.0 / phi) * ((1.0 + phi * y) / (1.0 + phi * mu)).ln())
@@ -154,10 +137,8 @@ mod tests {
         assert!(d.is_finite());
     }
 
-    /// The Poisson-regime correction term, checked against edgeR where it
-    /// actually bites: large counts and a dispersion just under the 1e-4
-    /// threshold. This is the case that separates edgeR's integer-truncated
-    /// `2/3` from edgePython's `2.0/3.0`.
+    /// Poisson-regime correction: large counts, dispersion just under 1e-4.
+    /// Separates edgeR's integer-truncated `2/3` from edgePython's `2.0/3.0`.
     ///
     /// ```r
     /// nbinomUnitDeviance(c(1e6, 1e6, 100, 5, 0),
@@ -178,8 +159,8 @@ mod tests {
         }
     }
 
-    /// edgeR: `nbinomUnitDeviance(c(0,1,3,5,100), c(5,5,5,5,100), 1e-8)`
-    /// exercises the Poisson regime, since the dispersion is below 1e-4.
+    /// Poisson regime (dispersion below 1e-4), checked against the Poisson
+    /// deviance. edgeR: `nbinomUnitDeviance(c(0,1,3,5,100), c(5,5,5,5,100), 1e-8)`
     #[test]
     fn test_poisson_regime_matches_the_poisson_deviance() {
         let phi = 1e-10;
@@ -200,11 +181,8 @@ mod tests {
 
     /// Beyond `mu * phi > 1e6` the gamma limit takes over.
     ///
-    /// The switch is genuinely discontinuous, by around 0.2%: the gamma form is
-    /// a limit, not an identity, and edgeR accepts that jump. The assertion is
-    /// therefore that the two branches agree to within a few tenths of a
-    /// percent, which is loose enough to allow the real discontinuity and tight
-    /// enough to catch a wrong formula on either side.
+    /// The switch is discontinuous by around 0.2% (as in edgeR), so the two
+    /// branches are only asserted to agree within 0.5%.
     #[test]
     fn test_gamma_regime_agrees_across_the_boundary() {
         let mu = 1e7;

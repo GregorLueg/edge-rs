@@ -1,20 +1,17 @@
 //! Turning a fitted negative binomial GLM into p-values.
 //!
-//! Three tests, all of them nested-model comparisons against the same fit:
-//! [`glm_lrt`] refits the null and reads the deviance difference off a
-//! chi-squared, [`glm_ql_ftest`] divides that difference by a squeezed
-//! quasi-likelihood dispersion and reads an F, and [`glm_treat`] shifts the
-//! offsets by a fold-change threshold and tests against an interval null rather
-//! than a point.
+//! Three nested-model tests against the same fit:
 //!
-//! Only [`glm_lrt`] and [`glm_treat`] refit anything of their own.
-//! [`glm_ql_ftest`] is handed the quasi-likelihood quantities in a
-//! [`QlSummary`], because the squeezing that produces them belongs to
-//! `glmQLFit`, not here.
+//! * [`glm_lrt`] (`glmLRT`) refits the null and reads the deviance difference
+//!   off a chi-squared.
+//! * [`glm_ql_ftest`] (`glmQLFTest`) divides that difference by a squeezed
+//!   quasi-likelihood dispersion and reads an F.
+//! * [`glm_treat`] (`glmTreat`) shifts the offsets by a fold-change threshold and
+//!   tests against an interval null.
 //!
-//! Everything a test needs about the data it is testing travels in one
-//! [`GlmTestInput`], so the three entry points stay narrow and the caller
-//! assembles the shared half once.
+//! The quasi-likelihood quantities arrive in a [`QlSummary`]; the squeezing
+//! belongs to `glmQLFit`. The data behind the fit travels in one
+//! [`GlmTestInput`].
 
 use rayon::prelude::*;
 
@@ -30,20 +27,16 @@ use crate::utils::design::{contrast_as_coef, design_as_factor, matrix_rank, non_
 
 /// Half-width of the interval null in [`glm_treat`], on the z scale.
 ///
-/// edgeR's `glmTreat` hard-codes this. It is the constant that makes the
-/// interval null's p-value agree with the point null's at the boundary; see
-/// McCarthy and Smyth (2009).
+/// Hard-coded in edgeR's `glmTreat` (McCarthy and Smyth, 2009).
 const TREAT_INTERVAL_WIDTH: f64 = 1.470402;
 
 /// Largest magnitude a treat z-score is allowed to reach.
 ///
-/// `norm_sf(38)` is about 2.9e-316, so past this the tail is numerically zero
-/// anyway. The clamp exists because the interval null divides by `b - a`: an
-/// infinite z would turn the whole p-value into a NaN rather than into the zero
-/// it is trying to express.
+/// `norm_sf(38)` is about 2.9e-316, so the tail is zero past this. The clamp
+/// stops an infinite z turning the interval null's `b - a` division into a NaN.
 const MAX_TREAT_ZSCORE: f64 = 38.0;
 
-/// `1 / sqrt(2 * pi)`, the standard normal density's normalising constant.
+/// `1 / sqrt(2 * pi)`.
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /////////////
@@ -64,9 +57,8 @@ struct Resolved {
 
 /// Works out which columns a test drops and what fold change it reports.
 ///
-/// For a contrast this is where [`contrast_as_coef`] runs, with `first = true`
-/// so that the contrasts land in the leading columns. That is the placement
-/// edgeR's `glmLRT` builds by hand and the one `glmTreat` asks limma for.
+/// For a contrast this runs [`contrast_as_coef`] with `first = true`, so the
+/// contrasts land in the leading columns, as in edgeR's `glmLRT` and `glmTreat`.
 ///
 /// ### Params
 ///
@@ -128,8 +120,8 @@ fn resolve_tested<T: EdgeFloat>(
                     got: values.len(),
                 });
             }
-            // The contrast is column-major `n_coef * n_contrasts`; read as
-            // row-major it is its own transpose, whose rank is the same.
+            // Column-major `n_coef * n_contrasts` read as row-major is the
+            // transpose, which has the same rank.
             let rank = matrix_rank(values, *n_contrasts, input.n_coef)?;
             if rank == 0 {
                 return Err(EdgeErrors::InvalidArgument(
@@ -150,10 +142,8 @@ fn resolve_tested<T: EdgeFloat>(
                 *n_contrasts,
                 true,
             )?;
-            // `project`'s zip against `values` naturally stops at `n_coef`
-            // elements, so passing the un-narrowed, possibly multi-column
-            // `tested` here still reads only the first contrast column - the
-            // same restriction `values[..input.n_coef]` made explicit above.
+            // `project` zips against `values`, so it stops at `n_coef` elements
+            // and reads only the first contrast column of a multi-column `tested`.
             let log_fc = project(&fit.coefficients, input.n_genes, input.n_coef, tested, 0);
             Ok(Resolved {
                 design: reform.design,
@@ -201,8 +191,8 @@ fn narrow(tested: &Tested, n_coef: usize) -> Result<Tested, EdgeErrors> {
 
 /// Log2 fold change of one column of a coefficient matrix, or of a contrast.
 ///
-/// Used for the unshrunk fold change [`glm_treat`] compares against `lfc`; the
-/// reported one comes from the shrunk coefficients instead.
+/// Gives the unshrunk fold change [`glm_treat`] compares against `lfc`; the
+/// reported one comes from the shrunk coefficients.
 ///
 /// ### Params
 ///
@@ -238,13 +228,10 @@ fn project(
 
 /// Refits the null model, warm-starting it where that is safe.
 ///
-/// edgePython starts the null fit from the full fit's coefficients on the kept
-/// columns, which cuts the Levenberg iteration count from roughly twenty to two
-/// on wide designs, but only when the null design is *not* a one-way layout. A
-/// one-way null goes through Fisher scoring in `mglm_one_way` instead, where a
-/// warm start taken from a near-zero gene can push the iteration straight off a
-/// cliff. This reproduces that condition: one-way nulls go through [`glm_fit`]
-/// cold, everything else goes to the Levenberg fitter with the start.
+/// As in edgePython, a non-one-way null starts the Levenberg fit from the full
+/// fit's coefficients on the kept columns (about twenty iterations down to two
+/// on wide designs). A one-way null goes through [`glm_fit`] cold, as a warm
+/// start from a near-zero gene can derail the Fisher scoring.
 ///
 /// ### Params
 ///
@@ -277,9 +264,7 @@ fn fit_null<T: EdgeFloat>(
                     rank: n_coef_null - bad.len(),
                 });
             }
-            // The null fit is the last thing standing between the caller and a
-            // missing p-value, so it gets `glm_fit`'s own iteration budget
-            // rather than `mglmLevenberg`'s stingier default of 200.
+            // Same iteration budget as `glm_fit`, not the default of 200.
             let params = LevenbergParams {
                 max_iter: crate::glm::fit::GLM_FIT_MAX_ITER,
                 ..Default::default()
@@ -317,9 +302,8 @@ fn fit_null<T: EdgeFloat>(
 
 /// One bound of the threshold test.
 ///
-/// Fits the full and null models against offsets shifted by `sign * adjustment`
-/// and returns the square root of the deviance difference, which is the z-score
-/// for the shifted null.
+/// Fits the full and null models at offsets shifted by `sign * adjustment` and
+/// returns the root of the deviance difference, the z-score for the shifted null.
 ///
 /// ### Params
 ///
@@ -405,9 +389,8 @@ fn treat_p_value(z_left: f64, z_right: f64, null: TreatNull) -> f64 {
 
 /// Mean of the standard normal CDF over `[a, b]`.
 ///
-/// Port of edgeR's `.integratepnorm`. The closed form is
-/// `(b F(b) + f(b) - a F(a) - f(a)) / (b - a)`, with the degenerate `a == b`
-/// collapsing to `F(a)`. The equality test is exact, as edgeR's is.
+/// Ports edgeR's `.integratepnorm`: `(b F(b) + f(b) - a F(a) - f(a)) / (b - a)`,
+/// collapsing to `F(a)` when `a == b` (exact test, as in edgeR).
 ///
 /// ### Params
 ///
@@ -440,12 +423,11 @@ fn norm_pdf(x: f64) -> f64 {
 
 /// Converts a t statistic to the z with the same tail probability.
 ///
-/// Port of limma's `zscoreT` at its exact setting: the upper tail of the t is
-/// evaluated directly and inverted through the normal quantile, never as
-/// `1 - cdf`. limma works in logs to keep going past `f64`'s smallest normal;
-/// here the tail probability is floored instead and the answer clamped to
-/// [`MAX_TREAT_ZSCORE`], which is where the normal tail has already reached
-/// 1e-316 and the treat integral would otherwise divide by an infinity.
+/// Ports limma's `zscoreT` (exact setting): the upper t tail is evaluated
+/// directly and inverted through the normal quantile, never as `1 - cdf`. limma
+/// works in logs; here the tail probability is floored and the answer clamped to
+/// [`MAX_TREAT_ZSCORE`], where the normal tail is already 1e-316 and the treat
+/// integral would otherwise divide by an infinity.
 ///
 /// ### Params
 ///
@@ -465,10 +447,9 @@ fn zscore_t(x: f64, df: f64) -> Result<f64, EdgeErrors> {
 
 /// Genes whose quasi-likelihood variance has dropped below the Poisson variance.
 ///
-/// Port of edgeR's `check_poisson_bound`: a gene is flagged as soon as one
-/// library has `s2_post * (1 + dispersion * mu) < 1`. The dispersion read here
-/// is the one stored on the fit, undivided by `average_ql_dispersion`, matching
-/// edgeR.
+/// Ports edgeR's `check_poisson_bound`: a gene is flagged once one library has
+/// `s2_post * (1 + dispersion * mu) < 1`. The dispersion is the one stored on the
+/// fit, undivided by `average_ql_dispersion`, as in edgeR.
 ///
 /// ### Params
 ///
@@ -494,11 +475,8 @@ fn below_poisson_bound<T: EdgeFloat>(input: &GlmTestInput<'_, T>, ql: &QlSummary
 
 /// Refits at zero dispersion and runs the likelihood ratio test on that fit.
 ///
-/// The Poisson bound compares a gene's quasi-likelihood p-value against what its
-/// Poisson likelihood alone would support. edgeR subsets to the flagged genes
-/// first; this fits all of them, because the flag is usually set for a large
-/// fraction of the low-count genes anyway and the subsetting would have to
-/// rebuild every recycled matrix.
+/// edgeR subsets to the flagged genes first; this fits all of them, to avoid
+/// rebuilding every recycled matrix.
 ///
 /// ### Params
 ///
@@ -521,8 +499,7 @@ fn poisson_refit_lrt<T: EdgeFloat>(
 /// The same bound for [`glm_treat`].
 ///
 /// edgeR re-enters `glmTreat` here without forwarding `null`, so the bound is
-/// always taken against the interval null. That is reproduced rather than
-/// corrected.
+/// always against the interval null. Reproduced.
 ///
 /// ### Params
 ///
@@ -553,8 +530,7 @@ fn poisson_refit_treat<T: EdgeFloat>(
 ///
 /// ### Returns
 ///
-/// A copy of the input with the dispersion replaced and the log-CPM dropped,
-/// since the bound only ever reads p-values off it.
+/// A copy of the input with the dispersion replaced and the log-CPM dropped.
 fn poisson_input<'a, T: EdgeFloat>(
     input: &GlmTestInput<'a, T>,
     dispersion: &'a Recycled<f64>,
@@ -618,9 +594,8 @@ fn drop_columns(design: &[f64], n_rows: usize, n_cols: usize, drop: &[usize]) ->
 
 /// Adds a per-sample shift to a recycled offset matrix.
 ///
-/// Stays compressed where it can: a scalar or per-sample offset shifted by a
-/// per-sample vector is still per-sample. A per-gene or full offset has to
-/// expand, since the result varies along both axes.
+/// A scalar or per-sample offset stays per-sample; a per-gene or full offset
+/// expands, as the result varies along both axes.
 ///
 /// ### Params
 ///
@@ -814,9 +789,8 @@ fn validate_ql<T: EdgeFloat>(
 pub enum Tested {
     /// Design columns to drop from the null model, as zero-based indices.
     ///
-    /// Repeats are collapsed, keeping the first occurrence, as edgeR's
-    /// `unique` does. The first surviving index is the one whose coefficient
-    /// becomes the reported log-fold-change.
+    /// Repeats are collapsed to the first occurrence, as edgeR's `unique` does.
+    /// The first surviving index gives the reported log-fold-change.
     Coef(Vec<usize>),
     /// A contrast, or several, over the coefficients.
     Contrast {
@@ -830,8 +804,7 @@ pub enum Tested {
 /// Which null [`glm_treat`] tests against.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TreatNull {
-    /// The whole interval `[-lfc, lfc]` is null. edgeR's default, and the one
-    /// that keeps the test from being anti-conservative near the threshold.
+    /// The whole interval `[-lfc, lfc]` is null. edgeR's default.
     #[default]
     Interval,
     /// Only the worst point of the interval is null, giving the conservative
@@ -841,9 +814,7 @@ pub enum TreatNull {
 
 /// Everything a test needs to know about the data behind the fit.
 ///
-/// Layouts follow the crate's conventions: counts are row-major
-/// `n_genes * n_samples`, the design is row-major `n_samples * n_coef`, and the
-/// recycled matrices are logically `n_genes * n_samples`.
+/// The recycled matrices are logically `n_genes * n_samples`.
 #[derive(Clone, Debug)]
 pub struct GlmTestInput<'a, T: EdgeFloat> {
     /// Counts, row-major `n_genes * n_samples`.
@@ -868,8 +839,8 @@ pub struct GlmTestInput<'a, T: EdgeFloat> {
 
 /// The quasi-likelihood quantities `glmQLFit` produces.
 ///
-/// [`glm_ql_ftest`] and the quasi-likelihood flavour of [`glm_treat`] read these
-/// rather than recomputing them, exactly as edgeR reads them off the `DGEGLM`.
+/// Read by [`glm_ql_ftest`] and the quasi-likelihood flavour of [`glm_treat`],
+/// as edgeR reads them off the `DGEGLM`.
 #[derive(Clone, Debug)]
 pub struct QlSummary<'a> {
     /// Posterior quasi-likelihood dispersion per gene, `s2.post`.
@@ -883,16 +854,14 @@ pub struct QlSummary<'a> {
     /// Residual degrees of freedom after dropping structural zeros,
     /// `df.residual.zeros`. One per gene.
     ///
-    /// `Some` marks the legacy quasi-likelihood pipeline, which is the only one
-    /// where the Poisson bound applies; `None` takes its place *and* switches
-    /// the bound off, as edgeR does.
+    /// `Some` marks the legacy pipeline, the only one where the Poisson bound
+    /// applies; `None` switches the bound off, as in edgeR.
     pub df_residual_zeros: Option<&'a [f64]>,
     /// Fitted means from the quasi-likelihood fit, row-major
     /// `n_genes * n_samples`. Only read by the Poisson bound.
     pub fitted: &'a [f64],
-    /// Average quasi-likelihood dispersion the fit was divided by, if the
-    /// non-legacy pipeline produced one. The null refit divides the dispersion
-    /// by it again so that the two models see the same scale.
+    /// Average quasi-likelihood dispersion the fit was divided by (current
+    /// pipeline only). The null refit divides by it too, to match scales.
     pub average_ql_dispersion: Option<f64>,
 }
 
@@ -901,23 +870,21 @@ pub struct QlSummary<'a> {
 pub struct GlmTest {
     /// Log2 fold change per gene.
     ///
-    /// The shrunk coefficient of the first tested column, or the contrast
-    /// applied to the shrunk coefficients, divided by `ln 2`. When several
-    /// coefficients are tested at once only the first one is reported, matching
-    /// the first `logFC` column of edgeR's table.
+    /// The shrunk coefficient of the first tested column, or the contrast applied
+    /// to the shrunk coefficients, divided by `ln 2`. With several coefficients
+    /// only the first is reported, as in edgeR's first `logFC` column.
     pub log_fc: Vec<f64>,
     /// Average log-CPM per gene, passed through from the input.
     pub log_cpm: Option<Vec<f64>>,
     /// Test statistic per gene.
     ///
     /// The likelihood ratio for [`glm_lrt`], the F statistic for
-    /// [`glm_ql_ftest`], and `z_right` for [`glm_treat`], which is the larger of
-    /// the two threshold z-scores. edgeR reports no statistic for `glmTreat`, so
-    /// that last one is this crate's choice rather than a ported column.
+    /// [`glm_ql_ftest`], and `z_right` (the larger threshold z-score) for
+    /// [`glm_treat`]. edgeR reports no `glmTreat` statistic; this is our choice.
     pub statistic: Vec<f64>,
     /// P-value per gene.
     pub p_value: Vec<f64>,
-    /// Degrees of freedom under test, that is, how many columns the null drops.
+    /// Degrees of freedom under test: the number of columns the null drops.
     pub df_test: f64,
     /// Denominator degrees of freedom per gene. Only the quasi-likelihood tests
     /// set this.
@@ -930,22 +897,21 @@ pub struct GlmTest {
 
 /// Genewise likelihood ratio test.
 ///
-/// Port of edgeR's `glmLRT`. Drops the tested columns from the design, refits
-/// the null model at the fit's own dispersion and offsets, and reads the
-/// deviance difference off a chi-squared with as many degrees of freedom as
-/// columns were dropped. When a contrast is given the design is first rotated
-/// through [`contrast_as_coef`] so that the contrast becomes the leading
-/// coefficients; the likelihood ratio depends only on the column space the null
-/// keeps, so the rotation's sign conventions do not reach the p-value.
+/// Ports edgeR's `glmLRT`. Drops the tested columns, refits the null at the
+/// fit's own dispersion and offsets, and reads the deviance difference off a
+/// chi-squared on as many degrees of freedom as columns dropped. A contrast
+/// first rotates the design through [`contrast_as_coef`]; the p-value depends
+/// only on the column space the null keeps, so the rotation's signs do not reach
+/// it.
 ///
 /// ### Params
 ///
 /// * `input` - Counts, design and the recycled matrices behind the fit
 /// * `fit` - The full-model fit, from [`glm_fit`]
 /// * `tested` - Coefficients or contrast under test
-/// * `ql` - Quasi-likelihood summary when the fit came from `glmQLFit`, purely
-///   so that `average_ql_dispersion` can be divided out before the null refit.
-///   `None` for a plain `glmFit`.
+/// * `ql` - Quasi-likelihood summary when the fit came from `glmQLFit`, so
+///   `average_ql_dispersion` can be divided out before the null refit. `None` for
+///   a plain `glmFit`.
 ///
 /// ### Returns
 ///
@@ -979,17 +945,15 @@ pub fn glm_lrt<T: EdgeFloat>(
         &resolved.coef,
     );
 
-    // edgeR stores the undivided dispersion on a quasi-likelihood fit but fits
-    // with `dispersion / average.ql.dispersion`, so the null must be divided
-    // again or the two models sit on different scales.
+    // edgeR stores the undivided dispersion on a quasi-likelihood fit but fits at
+    // `dispersion / average.ql.dispersion`; the null must match.
     let scaled = ql
         .and_then(|q| q.average_ql_dispersion)
         .map(|a| input.dispersion.map(|d| d / a));
     let dispersion = scaled.as_ref().unwrap_or(input.dispersion);
 
-    // Warm start only when the coefficients are still in the original basis. A
-    // contrast has been rotated by `contrast_as_coef`, which does not hand back
-    // the transformation, so there is nothing to project the full fit through.
+    // Warm start only in the original basis: `contrast_as_coef` does not return
+    // its rotation, so a contrast has nothing to project the full fit through.
     let start = match tested {
         Tested::Coef(_) => Some(drop_columns(
             fit.unshrunk_coefficients
@@ -1038,18 +1002,16 @@ pub fn glm_lrt<T: EdgeFloat>(
 
 /// Genewise quasi-likelihood F test.
 ///
-/// Port of edgeR's `glmQLFTest`. Runs [`glm_lrt`] for the deviance difference,
-/// then divides by the tested degrees of freedom and the posterior
-/// quasi-likelihood dispersion to get an F statistic on `df_test` and
-/// `df_prior + df_residual` degrees of freedom. The denominator is capped at
-/// the total residual degrees of freedom in the experiment, which is what stops
-/// a large `df_prior` claiming more information than the data hold.
+/// Ports edgeR's `glmQLFTest`. Runs [`glm_lrt`], then divides the deviance
+/// difference by the tested degrees of freedom and the posterior
+/// quasi-likelihood dispersion to get an F on `df_test` and
+/// `df_prior + df_residual` degrees of freedom. The denominator is capped at the
+/// total residual degrees of freedom, so a large `df_prior` cannot claim more
+/// information than the data hold.
 ///
-/// The Poisson bound, when it applies, refits every gene at zero dispersion and
-/// raises the p-value of any gene whose quasi-likelihood variance
-/// `s2_post * (1 + dispersion * mu)` has fallen below the Poisson variance for
-/// some library. Such a gene would otherwise look more significant than its own
-/// counts can justify.
+/// The Poisson bound refits at zero dispersion and raises the p-value of any
+/// gene whose `s2_post * (1 + dispersion * mu)` has fallen below the Poisson
+/// variance for some library.
 ///
 /// ### Params
 ///
@@ -1058,8 +1020,7 @@ pub fn glm_lrt<T: EdgeFloat>(
 /// * `ql` - The squeezed quantities that fit produced
 /// * `tested` - Coefficients or contrast under test
 /// * `poisson_bound` - Apply the Poisson bound. Silently ignored, as in edgeR,
-///   when `ql.df_residual_zeros` is `None`, since the non-legacy pipeline has
-///   no zero-adjusted degrees of freedom to bound against.
+///   when `ql.df_residual_zeros` is `None` (current pipeline).
 ///
 /// ### Returns
 ///
@@ -1129,26 +1090,22 @@ pub fn glm_ql_ftest<T: EdgeFloat>(
 
 /// Genewise test against a fold-change threshold.
 ///
-/// Port of edgeR's `glmTreat`. Rather than asking whether the log-fold-change
-/// is zero, it asks whether it is outside `[-lfc, lfc]`. Both bounds are tested
-/// by shifting the offsets by `lfc * ln 2 * design[, coef]` and refitting,
-/// which gives two deviance-difference z-scores; the smaller is signed negative
-/// when the estimated fold change lies inside the interval, and the pair is fed
-/// to either the interval null or the conservative worst-case null.
+/// Ports edgeR's `glmTreat`: tests whether the log-fold-change lies outside
+/// `[-lfc, lfc]`. Both bounds are refitted with offsets shifted by
+/// `lfc * ln 2 * design[, coef]`, giving two deviance-difference z-scores. The
+/// smaller is signed negative when the estimate lies inside the interval, and
+/// the pair feeds the interval null or the worst-case null.
 ///
-/// A zero `lfc` falls straight through to [`glm_lrt`] or [`glm_ql_ftest`], as
-/// edgeR does.
-///
-/// Only one coefficient can be tested. Extra entries in `tested` are dropped,
-/// which is edgeR's behaviour for a multi-column contrast, there with a warning.
+/// A zero `lfc` falls through to [`glm_lrt`] or [`glm_ql_ftest`], as in edgeR.
+/// Only one coefficient is tested: extra entries in `tested` are dropped (edgeR
+/// warns).
 ///
 /// ### Params
 ///
 /// * `input` - Counts, design and the recycled matrices behind the fit
 /// * `fit` - The fit, from [`glm_fit`] or `glmQLFit`
-/// * `ql` - The squeezed quantities when the fit is a quasi-likelihood one,
-///   which switches the test from the likelihood ratio flavour to the moderated
-///   t flavour. `None` for a plain `glmFit`.
+/// * `ql` - The squeezed quantities for a quasi-likelihood fit, which switches
+///   to the moderated t flavour. `None` for a plain `glmFit`.
 /// * `tested` - Coefficient or contrast under test
 /// * `lfc` - Log2 fold-change threshold, non-negative
 /// * `null` - Which null to test against
@@ -1200,8 +1157,7 @@ pub fn glm_treat<T: EdgeFloat>(
         .map(|a| input.dispersion.map(|d| d / a));
     let dispersion = scaled.as_ref().unwrap_or(input.dispersion);
 
-    // The threshold enters as an offset shift along the tested column, so both
-    // bounds are ordinary fits of the same two models on shifted data.
+    // Both bounds are ordinary fits of the same two models at shifted offsets.
     let adjustment: Vec<f64> = (0..input.n_samples)
         .map(|sample| lfc * std::f64::consts::LN_2 * resolved.design[sample * input.n_coef + coef])
         .collect();
@@ -1228,8 +1184,7 @@ pub fn glm_treat<T: EdgeFloat>(
         }
     }
 
-    // Under the quasi-likelihood pipeline the two deviance roots are moderated
-    // t statistics, not z, so they are pushed through the t quantile first.
+    // Under quasi-likelihood the deviance roots are moderated t, not z.
     let df_total = ql.map(|q| {
         let df_residual = q.df_residual_zeros.unwrap_or(q.df_residual_adj);
         let cap = (input.n_genes * (input.n_samples - input.n_coef)) as f64;
@@ -1256,9 +1211,8 @@ pub fn glm_treat<T: EdgeFloat>(
         .map(|(left, right)| treat_p_value(*left, *right, null))
         .collect();
 
-    // edgeR's recursive Poisson bound. Note that it re-enters `glmTreat` without
-    // passing `null` through, so the bound is always computed against the
-    // interval null even when the caller asked for the worst case.
+    // edgeR's recursive call drops `null`: the bound is always against the
+    // interval null.
     if let Some(q) = ql
         && q.df_residual_zeros.is_some()
     {
@@ -1456,9 +1410,8 @@ mod tests {
         }
     }
 
-    /// The intercept is testable too, and its null design is the group
-    /// indicator alone, which is not a one-way layout. That sends the null fit
-    /// down the warm-started Levenberg branch.
+    /// Testing the intercept: the null design is the group indicator alone, not
+    /// a one-way layout, so the null fit takes the warm-started Levenberg branch.
     ///
     /// ```r
     /// glmLRT(f, coef = 1)$table
@@ -1611,10 +1564,9 @@ mod tests {
         ];
         assert_eq!(out.df_test, 2.0);
         for gene in 0..4 {
-            // Gene 3 has an empty group, so its null maximum sits at minus
-            // infinity and both fitters stop wherever their own tolerance runs
-            // out. That is the one place the agreement drops to 1e-9, and the
-            // chi-squared tail turns that into 1e-8 on the p-value.
+            // Gene 3 has an empty group: its null maximum is at minus infinity
+            // and each fitter stops at its own tolerance. Agreement drops to 1e-9
+            // here, which the chi-squared tail turns into 1e-8 on the p-value.
             assert_relative_eq!(out.statistic[gene], lr[gene], max_relative = 1e-8);
             assert_relative_eq!(out.p_value[gene], p[gene], max_relative = 1e-7);
         }
@@ -1649,10 +1601,9 @@ mod tests {
         ];
         assert_eq!(out.df_test, 2.0);
         for gene in 0..4 {
-            // Dropping both group columns leaves a null design that is a single
-            // indicator, and gene 3 has no counts in that group at all. Its
-            // null coefficient diverges, so the two fitters part company in the
-            // ninth digit.
+            // The null design is a single indicator and gene 3 has no counts in
+            // that group: its null coefficient diverges and the fitters differ
+            // in the ninth digit.
             assert_relative_eq!(out.statistic[gene], lr[gene], max_relative = 1e-8);
             assert_relative_eq!(out.p_value[gene], p[gene], max_relative = 1e-8);
         }
@@ -1687,8 +1638,7 @@ mod tests {
             assert_relative_eq!(out.statistic[gene], lr[gene], epsilon = 1e-9);
             assert_relative_eq!(out.p_value[gene], p[gene], max_relative = 1e-10);
         }
-        // The zero gene carries no information, so its fold change is zero to
-        // rounding and its p-value is exactly one.
+        // The zero gene: fold change zero to rounding, p-value exactly one.
         assert!(out.log_fc[1].abs() < 1e-12);
         assert_eq!(out.p_value[1], 1.0);
     }
@@ -1697,8 +1647,7 @@ mod tests {
     // `glm_ql_ftest` //
     ////////////////////
 
-    /// Owned storage for the legacy quasi-likelihood fixture, so that a
-    /// [`QlSummary`] can borrow from it.
+    /// Owned storage for the legacy fixture, which a [`QlSummary`] borrows.
     struct LegacyQl {
         /// Posterior quasi-likelihood dispersions.
         s2_post: Vec<f64>,
@@ -1817,8 +1766,7 @@ mod tests {
     /// ```
     ///
     /// Genes 2, 4 and 7 sit below the Poisson bound, so their p-values are
-    /// raised. The others are untouched, which is what makes the pair of
-    /// expectations a real test of the bound rather than of the F tail.
+    /// raised; the others are untouched.
     #[test]
     fn test_glm_ql_ftest_matches_edger_with_and_without_the_poisson_bound() {
         let (counts, design, offset) = wide();
@@ -1880,9 +1828,9 @@ mod tests {
         }
     }
 
-    /// The non-legacy pipeline has no zero-adjusted degrees of freedom, so
-    /// edgeR turns the bound off however the caller asked for it, and the
-    /// denominator degrees of freedom hit the cap at the experiment's total.
+    /// The current pipeline has no zero-adjusted degrees of freedom, so edgeR
+    /// turns the bound off whatever the caller asked, and the denominator degrees
+    /// of freedom hit the cap at the experiment's total.
     ///
     /// ```r
     /// q2 <- glmQLFit(y, X, dispersion = 0.1)
@@ -1954,8 +1902,8 @@ mod tests {
         }
     }
 
-    /// The F tail, well past where `1 - pf` collapses. The squeezed quantities
-    /// are chosen rather than fitted, since the point is the tail.
+    /// The F tail, past where `1 - pf` collapses. The squeezed quantities are
+    /// chosen, not fitted.
     ///
     /// ```r
     /// LR <- c(12.419239754410078547, 0.360912841338069723, 1.184592896990613653,
@@ -2156,8 +2104,8 @@ mod tests {
         }
     }
 
-    /// The contrast path, including a gene whose unshrunk fold change is
-    /// effectively infinite because one group is all zeros.
+    /// The contrast path, including a gene with an effectively infinite unshrunk
+    /// fold change (one group all zeros).
     ///
     /// ```r
     /// glmTreat(f2, contrast = c(-1, 1, 0), lfc = 1)$table$PValue
@@ -2197,18 +2145,16 @@ mod tests {
         let b = glm_treat(&inp, &fit, None, &contrast, 1.0, TreatNull::WorstCase).unwrap();
         for gene in 0..4 {
             assert_relative_eq!(a.log_fc[gene], log_fc[gene], max_relative = 1e-10);
-            // Gene 3's unshrunk fold change is infinite, so the shifted fits it
-            // is compared against are only as reproducible as their stopping
-            // rule; 1e-9 is where the two agree.
+            // Gene 3's unshrunk fold change is infinite, so agreement is only as
+            // good as the stopping rule: 1e-9.
             assert_relative_eq!(a.p_value[gene], interval[gene], max_relative = 1e-8);
             assert_relative_eq!(b.p_value[gene], worst[gene], max_relative = 1e-8);
         }
     }
 
-    /// The quasi-likelihood flavour, where the deviance roots become moderated
-    /// t statistics and the Poisson bound applies. Genes 1 and 8 come out with
-    /// the same p-value under both nulls, because the bound has caught them and
-    /// edgeR's recursive call always uses the interval null.
+    /// The quasi-likelihood flavour: moderated t statistics and the Poisson
+    /// bound. Genes 1 and 8 get the same p-value under both nulls, as the bound
+    /// catches them and edgeR's recursive call always uses the interval null.
     ///
     /// ```r
     /// q <- glmQLFit(y, X, dispersion = 0.1, legacy = TRUE)
@@ -2332,8 +2278,7 @@ mod tests {
         }
     }
 
-    /// A zero threshold is not a threshold, so edgeR falls straight through to
-    /// the ordinary test. Both flavours do.
+    /// A zero threshold falls through to the ordinary test, in both flavours.
     #[test]
     fn test_glm_treat_with_zero_lfc_falls_back() {
         let (counts, design, offset) = wide();
@@ -2357,8 +2302,7 @@ mod tests {
         }
     }
 
-    /// A larger threshold must make every gene less significant, since the null
-    /// it is tested against has grown.
+    /// A larger threshold must make every gene less significant.
     #[test]
     fn test_glm_treat_is_monotone_in_the_threshold() {
         let (counts, design, offset) = wide();
@@ -2379,9 +2323,9 @@ mod tests {
         }
     }
 
-    ////////////////
-    // Numerics   //
-    ////////////////
+    //////////////
+    // Numerics //
+    //////////////
 
     /// ```r
     /// limma::zscoreT(c(0.5, 2, 6, 20), df = 8.4609653887470486)
@@ -2543,8 +2487,8 @@ mod tests {
         assert!(matches!(err, EdgeErrors::LengthMismatch { .. }));
     }
 
-    /// A per-gene offset has to expand when the threshold shift is applied,
-    /// but the answer must not depend on how the offsets were stored.
+    /// A per-gene offset expands under the threshold shift, but the answer must
+    /// not depend on how the offsets were stored.
     #[test]
     fn test_treat_is_insensitive_to_the_offset_storage() {
         let (counts, design, _) = wide();

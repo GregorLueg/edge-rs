@@ -1,28 +1,19 @@
 //! `glmQLFit`: quasi-likelihood negative binomial fits.
 //!
-//! The quasi-likelihood pipeline is edgeR's default for bulk RNA-seq. It sits
-//! on top of an ordinary negative binomial fit and adds a second layer of
-//! dispersion: the negative binomial dispersion describes variation shared
-//! across genes, and the quasi-likelihood dispersion `s2` describes what is
-//! left over for each gene individually. Shrinking `s2` towards a fitted prior
-//! is what buys the method its power on small experiments.
+//! Adds a second dispersion layer on top of an ordinary negative binomial fit:
+//! the NB dispersion is shared across genes, the quasi-likelihood dispersion
+//! `s2` is per gene and is shrunk towards a fitted prior.
 //!
 //! ### Two pipelines
 //!
-//! edgeR carries an old and a new one:
+//! The **legacy** path (edgeR before 4.0) divides the residual deviance by the
+//! residual degrees of freedom after dropping structural zeros, and shrinks that.
 //!
-//! The **legacy** path takes the residual deviance at face value, divides by
-//! the residual degrees of freedom after dropping structural zeros, and shrinks
-//! that. It is what every edgeR result before 4.0 used.
-//!
-//! The **current** path, the default here as in edgeR, replaces both numerator
-//! and denominator. Each observation contributes a fraction of a degree of
-//! freedom rather than one, because a low-count observation carries less
-//! information about the dispersion than a high-count one, and the deviance is
-//! rescaled to match. Those adjustments come from [`crate::ql::weights`]. It
-//! also rescales the negative binomial dispersion by an average
-//! quasi-dispersion first, so the two layers do not describe the same variation
-//! twice.
+//! The **current** path, the default as in edgeR, adjusts both numerator and
+//! denominator: each observation contributes a fraction of a degree of freedom
+//! and the deviance is rescaled to match (see [`crate::ql::weights`]). It also
+//! rescales the NB dispersion by an average quasi-dispersion first, so the two
+//! layers do not count the same variation twice.
 //!
 //! ### References
 //!
@@ -44,8 +35,8 @@ use crate::utils::design::choose_lowess_span;
 
 /// Largest negative binomial dispersion the current pipeline will accept.
 ///
-/// edgeR clamps here rather than erroring. Above 4 the quasi-likelihood weights
-/// are being asked about a regime the Chebyshev fits do not cover.
+/// edgeR clamps here rather than erroring: above 4 the Chebyshev fits behind the
+/// quasi-likelihood weights do not cover the regime.
 const MAX_DISPERSION: f64 = 4.0;
 
 /// Floor on the residual degrees of freedom before dividing a deviance by it.
@@ -137,8 +128,7 @@ pub struct QlFit {
     pub df_residual: usize,
     /// Which fitter ran.
     pub method: FitMethod,
-    /// The negative binomial dispersion actually used, after any clamping or
-    /// estimation.
+    /// The NB dispersion used, after any clamping or estimation.
     pub dispersion: Recycled<f64>,
     /// Posterior quasi-likelihood dispersion per gene.
     pub s2_post: Vec<f64>,
@@ -164,12 +154,9 @@ pub struct QlFit {
 impl QlFit {
     /// Borrows the GLM half of the fit.
     ///
-    /// [`crate::glm::test::glm_ql_ftest`] wants a [`GlmFit`], and the right one
-    /// is the fit `glm_ql_fit` already performed rather than a fresh one.
-    /// Refitting at [`QlFit::dispersion`] would be wrong: that field holds the
-    /// *undivided* dispersion, while the fit itself ran at
-    /// `dispersion / average_ql_dispersion`. edgeR has no equivalent trap
-    /// because its `DGEGLM` is one object carrying both halves.
+    /// [`crate::glm::test::glm_ql_ftest`] needs the fit `glm_ql_fit` already ran.
+    /// Do not refit at [`QlFit::dispersion`]: it is the *undivided* dispersion,
+    /// while the fit ran at `dispersion / average_ql_dispersion`.
     ///
     /// ### Returns
     ///
@@ -187,12 +174,10 @@ impl QlFit {
 
     /// Assembles the quasi-likelihood summary the tests read.
     ///
-    /// Which degrees of freedom go where depends on the pipeline that ran, and
-    /// getting it wrong is silent. The current path has no `df.residual.zeros`,
-    /// and `None` there is also what switches the Poisson bound off, exactly as
-    /// edgeR does. The legacy path has no `df.residual.adj` and uses the
-    /// zero-adjusted degrees of freedom for both, with no average
-    /// quasi-dispersion to divide out.
+    /// The degrees of freedom depend on the pipeline. The current path has no
+    /// `df.residual.zeros`, and that `None` switches the Poisson bound off, as in
+    /// edgeR. The legacy path has no `df.residual.adj`, uses the zero-adjusted
+    /// degrees of freedom for both, and has no average quasi-dispersion.
     ///
     /// ### Returns
     ///
@@ -225,9 +210,8 @@ impl QlFit {
 
 /// Estimates a negative binomial dispersion from the most abundant genes.
 ///
-/// edgeR does not use every gene. The quasi-likelihood weights need a dispersion
-/// describing the well-measured genes, and the low-count tail that dominates a
-/// typical experiment would drag it around.
+/// The quasi-likelihood weights need a dispersion for the well-measured genes,
+/// so the low-count tail is left out, as in edgeR.
 ///
 /// ### Params
 ///
@@ -269,8 +253,7 @@ fn dispersion_from_top_genes<T: EdgeFloat>(
     let selected_offset = offset.subset(kept, n_samples);
     let selected_weights = weights.map(|w| w.subset(kept, n_samples));
 
-    // Subsetting is off here: this already is a subset, chosen by abundance
-    // rather than stratified across it, and a second one would compound them.
+    // Already a subset, chosen by abundance: no second subsetting.
     let params = CoxReidParams {
         subset: None,
         ..Default::default()
@@ -322,7 +305,7 @@ fn resolve_dispersion<T: EdgeFloat>(
 ) -> Result<(Recycled<f64>, Option<f64>), EdgeErrors> {
     if let Some(d) = dispersion {
         d.validate(n_genes, n_samples)?;
-        // The current pipeline clamps; the legacy one takes what it is given.
+        // Only the current pipeline clamps.
         let resolved = if params.legacy {
             d.clone()
         } else {
@@ -449,8 +432,8 @@ pub fn glm_ql_fit<T: EdgeFloat>(
         params.prior_count,
     )?;
 
-    // Which residual variance gets squeezed, and on which degrees of freedom,
-    // is the whole difference between the two pipelines.
+    // The pipelines differ in which residual variance is squeezed and on which
+    // degrees of freedom.
     let (fit, s2, df, extras) = if params.legacy {
         let zeros = residual_df(counts, &fit.fitted, n_genes, n_samples, design, n_coef)?;
         let s2: Vec<f64> = fit
@@ -474,8 +457,7 @@ pub fn glm_ql_fit<T: EdgeFloat>(
             ave_log_cpm,
         )?;
 
-        // Refit with the negative binomial dispersion rescaled, so the two
-        // dispersion layers do not describe the same variation twice.
+        // Refit at the rescaled NB dispersion.
         let scaled = dispersion.map(|v| v / average[0]);
         let refit = glm_fit(
             counts,
@@ -660,15 +642,10 @@ mod tests {
             assert_relative_eq!(got, want, max_relative = 1e-9);
         }
 
-        // The reference here is `glmQLFit` given a *vector* offset, not the
-        // matrix form used for the deviances above. The two describe the same
-        // model and edgeR agrees with itself on everything up to this point,
-        // but its internal `aveLogCPM` corrupts the first gene when the offset
-        // arrives as a matrix (`UPSTREAM_DEVIATIONS.md` B1), which throws
-        // the trended prior for every gene. Feeding limma's own `squeezeVar`
-        // the matrix-offset covariate reproduces edgeR's wrong answer exactly,
-        // and the vector-offset covariate reproduces this one, which is what
-        // pins the cause.
+        // The reference is `glmQLFit` given a *vector* offset, not the matrix
+        // form used for the deviances above: edgeR's `aveLogCPM` corrupts the
+        // first gene for a matrix offset, which moves the trended prior for every
+        // gene. See `UPSTREAM_DEVIATIONS.md` B1.
         #[rustfmt::skip]
         let expected_s2_post = [
             2.345_460_198_842_870_3, 0.445_691_045_010_048_86, 0.00006973623748113801,
@@ -692,8 +669,7 @@ mod tests {
         assert_relative_eq!(fit.df_prior[0], 2.000_419_894_664_604, max_relative = 1e-9);
     }
 
-    /// The coefficients come from the rescaled refit, not the first fit, so they
-    /// pin that the rescaling actually happened.
+    /// Coefficients come from the rescaled refit, which pins that the rescaling ran.
     #[test]
     fn test_coefficients_match_edger() {
         let (counts, design, ave_log_cpm, offset) = fixture();
@@ -727,9 +703,8 @@ mod tests {
         }
     }
 
-    /// The legacy pipeline squeezes the raw deviance on the zero-adjusted
-    /// degrees of freedom, so it must produce different numbers and fill the
-    /// other set of optional fields.
+    /// The legacy pipeline must give different numbers and fill the other set of
+    /// optional fields.
     #[test]
     fn test_legacy_pipeline_takes_the_other_route() {
         let (counts, design, ave_log_cpm, offset) = fixture();
@@ -755,8 +730,7 @@ mod tests {
         assert!(fit.deviance_adj.is_none());
         assert!(fit.df_residual_adj.is_none());
         assert!(fit.average_ql_dispersion.is_none());
-        // Every gene here is fully observed, so the zero adjustment leaves the
-        // nominal residual degrees of freedom alone.
+        // Every gene is fully observed: the nominal residual df is unchanged.
         for d in fit.df_residual_zeros.as_ref().unwrap() {
             assert_relative_eq!(d, &4.0, max_relative = 1e-12);
         }
@@ -804,8 +778,8 @@ mod tests {
         assert_eq!(fit.dispersion, Recycled::Scalar(9.0));
     }
 
-    /// With no dispersion supplied the current pipeline estimates one from the
-    /// most abundant genes and records the proportion it used.
+    /// With no dispersion supplied, one is estimated from the most abundant
+    /// genes and the proportion used is recorded.
     #[test]
     fn test_estimates_a_dispersion_when_none_is_given() {
         let (counts, design, ave_log_cpm, offset) = fixture();
@@ -901,8 +875,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::LengthMismatch { .. }));
     }
 
-    /// Turning the abundance trend off shares one prior across all genes, so
-    /// `s2_prior` collapses to a single value.
+    /// Without the abundance trend `s2_prior` collapses to a single value.
     #[test]
     fn test_untrended_prior_is_shared() {
         let (counts, design, ave_log_cpm, offset) = fixture();

@@ -1,15 +1,11 @@
 //! The `glmFit` front door.
 //!
-//! Resolves offsets and dispersions, picks between the closed-form one-way fit
-//! and the general Levenberg fit, and optionally shrinks the coefficients
-//! towards zero with a prior count.
+//! Picks between the closed-form one-way fit and the general Levenberg fit, and
+//! optionally shrinks the coefficients with a prior count.
 //!
-//! The dispatch is edgeR's: if the number of distinct design rows equals the
-//! number of coefficients, the design is a one-way layout and
-//! [`crate::glm::one_way`] can fit it in closed form. Otherwise
-//! [`crate::glm::levenberg`] runs, with a larger iteration budget than its own
-//! default because it is now the only thing standing between the caller and a
-//! failed fit.
+//! Dispatch is edgeR's: if the number of distinct design rows equals the number
+//! of coefficients, [`crate::glm::one_way`] fits it in closed form. Otherwise
+//! [`crate::glm::levenberg`] runs with a larger iteration budget.
 
 use crate::core::dgelist::DgeList;
 use crate::core::expression::{augment_counts, resolve_lib_sizes};
@@ -25,20 +21,16 @@ use crate::utils::design::{design_as_factor, non_estimable};
 
 /// Iteration budget for the general path.
 ///
-/// `mglmLevenberg` defaults to 200, but `glmFit` raises it: at this point there
-/// is no fallback left, so it is worth spending more iterations on the awkward
-/// genes rather than reporting them unconverged.
+/// `mglmLevenberg` defaults to 200, but `glmFit` raises it as there is no
+/// fallback left.
 ///
-/// `adjustedProfileLik` reaches the fitter through `glmFit` rather than calling
-/// `mglmLevenberg` itself, so [`crate::dispersion::apl`] shares this budget. A
-/// gene with an empty group never converges and stops on the cap, so the two
-/// paths give different answers if they disagree on it.
+/// [`crate::dispersion::apl`] shares this budget: a gene with an empty group
+/// never converges and stops on the cap, so the two paths must agree on it.
 pub(crate) const GLM_FIT_MAX_ITER: usize = 250;
 
 /// Default prior count used to shrink log-fold-changes.
 ///
-/// edgeR's default. Small enough not to move a well-powered gene, large enough
-/// to stop a gene with a zero in one group reporting an infinite fold change.
+/// edgeR's default.
 pub const DEFAULT_PRIOR_COUNT: f64 = 0.125;
 
 ///////////////
@@ -190,14 +182,10 @@ fn residual_deviance<T: EdgeFloat>(
 
 /// Adds library-size-scaled prior counts to the data.
 ///
-/// edgeR's `addPriorCount`. The prior is scaled by each library's size relative
-/// to the average, so it perturbs every sample by the same relative amount
-/// rather than penalising small libraries.
-///
-/// Note that edgePython's version takes a different branch when the offsets
-/// arrive as a matrix, which is exactly how `glmFit` passes them, and ends up
-/// with `log(lib + 2 * prior)` instead of `log(lib + 2 * prior * lib / mean)`.
-/// See `UPSTREAM_DEVIATIONS.md` A5. This follows edgeR.
+/// Ports edgeR's `addPriorCount`. The prior is scaled by each library's size
+/// relative to the average, so every sample is perturbed by the same relative
+/// amount. edgePython drops that scaling for matrix offsets; this follows
+/// edgeR. See `UPSTREAM_DEVIATIONS.md` A5.
 ///
 /// ### Params
 ///
@@ -226,8 +214,7 @@ pub fn add_prior_count<T: EdgeFloat>(
     }
 
     let average: f64 = library_sizes.iter().sum::<f64>() / n_samples as f64;
-    // Explicit rather than a negated comparison, so a NaN library size is
-    // rejected instead of slipping through.
+    // `<=` alone would let a NaN through.
     if average <= 0.0 || average.is_nan() {
         return Err(EdgeErrors::InvalidArgument(
             "average library size must be positive".to_string(),
@@ -308,12 +295,10 @@ pub fn glm_fit<T: EdgeFloat>(
 
     let deviance = residual_deviance(counts, n_genes, n_samples, &fitted, dispersion, weights);
 
-    // Shrinkage refits the augmented data and replaces the coefficients, but
-    // keeps the fitted values and deviance from the unshrunk fit, as edgeR does.
+    // Shrinkage refits the augmented data and replaces the coefficients only;
+    // fitted values and deviance stay from the unshrunk fit, as in edgeR.
     let (coefficients, unshrunk) = if prior_count > 0.0 {
-        // Per gene, off the compressed offsets: a gene-varying offset gives a
-        // gene-varying library size, and collapsing it to one row would scale
-        // every gene's prior by the wrong libraries.
+        // Per gene: a gene-varying offset gives gene-varying library sizes.
         let library_sizes = resolve_lib_sizes(counts, n_genes, n_samples, None, Some(offset))?;
         let (augmented, augmented_offsets) =
             augment_counts(counts, n_genes, n_samples, &library_sizes, prior_count)?;
@@ -458,9 +443,8 @@ mod tests {
     /// glmFit(y, X, dispersion = 0.1, offset = off, prior.count = 0.125)
     /// ```
     ///
-    /// The library sizes the prior is scaled by vary by gene here, so a fit that
-    /// took them from one offset row would still get the unshrunk coefficients
-    /// right and the shrunk ones wrong by up to 0.6 on the natural log scale.
+    /// Library sizes vary by gene here, so taking them from one offset row
+    /// gets the shrunk coefficients wrong (by up to 0.6 on the natural log scale).
     #[test]
     fn test_matches_edger_glmfit_with_shrinkage_and_a_gene_varying_offset() {
         let counts = vec![
@@ -629,9 +613,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::InvalidArgument(_)));
     }
 
-    /// The prior is scaled by library size, so a sample with twice the library
-    /// receives twice the prior. That is the property edgePython's matrix branch
-    /// loses.
+    /// A sample with twice the library receives twice the prior.
     #[test]
     fn test_prior_count_scales_with_library_size() {
         let counts = vec![0.0, 0.0, 0.0, 0.0];

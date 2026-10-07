@@ -1,15 +1,14 @@
 //! Common dispersion by maximising the summed Cox-Reid adjusted profile
 //! likelihood.
 //!
-//! edgeR's `dispCoxReid`, reached through `estimateGLMCommonDisp`. Unlike
-//! [`crate::dispersion::estimate`], which reads a precomputed grid, this
-//! optimises the dispersion directly with a bounded scalar search.
+//! Ports edgeR's `dispCoxReid` (via `estimateGLMCommonDisp`). Unlike
+//! [`crate::dispersion::estimate`], which reads a precomputed grid, this runs a
+//! bounded Brent search directly.
 //!
-//! The search runs over the fourth root of the dispersion, which spreads the
-//! interval so a bounded Brent search resolves small dispersions as well as
-//! large ones. And on large experiments a systematic subset of genes stratified
-//! by abundance stands in for the whole set, which changes the answer, so it
-//! has to be reproduced rather than skipped.
+//! The search is over the fourth root of the dispersion, so small and large
+//! dispersions are both resolved. On large experiments a systematic subset
+//! stratified by abundance stands in for all genes, as in edgeR; it changes the
+//! answer.
 
 use crate::dispersion::apl::apl_at;
 use crate::numeric::optimise::brent_fmin;
@@ -21,8 +20,8 @@ use crate::prelude::*;
 
 /// Lower end of the search interval when the caller asks for zero.
 ///
-/// The objective is optimised over `dispersion^(1/4)`, and a true zero would put
-/// the search on the boundary where the derivative is undefined.
+/// The search is over `dispersion^(1/4)`; a true zero is on the boundary where
+/// the derivative is undefined.
 const MIN_ROOT: f64 = 1e-10;
 
 ///////////////////
@@ -34,16 +33,15 @@ const MIN_ROOT: f64 = 1e-10;
 pub struct CoxReidParams {
     /// Search interval for the dispersion itself, not its fourth root.
     pub interval: (f64, f64),
-    /// Convergence tolerance passed to R's `optimize`, on the fourth root of
-    /// the dispersion. edgeR's default is 1e-5.
+    /// Tolerance of the Brent search (R's `optimize`), on the fourth root of the
+    /// dispersion. edgeR's default is 1e-5.
     pub tol: f64,
     /// Genes whose total count falls below this are excluded.
     pub min_row_sum: f64,
     /// Number of genes to subsample on large experiments.
     ///
-    /// Subsetting only kicks in when there are at least twice this many genes,
-    /// matching edgeR. `None` disables it and uses every gene, which is more
-    /// accurate and slower.
+    /// Only applies with at least twice this many genes, as in edgeR. `None` uses
+    /// every gene: slower, more accurate.
     pub subset: Option<usize>,
 }
 
@@ -65,11 +63,9 @@ impl Default for CoxReidParams {
 
 /// A systematic subset of indices stratified by a ranking variable.
 ///
-/// Sorts by the ranking variable, then takes every `n_total / n`th element
-/// starting from the middle of the first stratum. That spreads the subset evenly
-/// across the abundance range instead of sampling it at random, so the estimate
-/// is reproducible and not dominated by the low-count genes that make up most of
-/// a typical experiment.
+/// Sorts by the ranking variable, then takes every `n_total / n`th element from
+/// the middle of the first stratum. This spreads the subset evenly across the
+/// abundance range, deterministically.
 ///
 /// ### Params
 ///
@@ -78,8 +74,8 @@ impl Default for CoxReidParams {
 ///
 /// ### Returns
 ///
-/// Indices into `order_by`, in ascending order of the ranking variable. Returns
-/// everything when the requested size is not smaller than the input.
+/// Indices into `order_by`, in ascending order of the ranking variable. All
+/// indices when `n` is not smaller than the input.
 pub fn systematic_subset(n: usize, order_by: &[f64]) -> Vec<usize> {
     let total = order_by.len();
     if n == 0 || total == 0 {
@@ -149,11 +145,10 @@ pub fn common_dispersion_cox_reid<T: EdgeFloat>(
         )));
     }
 
-    // Drop genes carrying no information about the dispersion.
     let kept =
         crate::dispersion::filter_by_min_row_sum(counts, n_genes, n_samples, params.min_row_sum)?;
 
-    // Subsample on large experiments, exactly as edgeR does.
+    // Subsample on large experiments, as edgeR does.
     let chosen: Vec<usize> = match params.subset {
         Some(target) if target <= kept.len() / 2 => {
             let abundance = ave_log_cpm.ok_or_else(|| {
@@ -266,8 +261,7 @@ mod tests {
         assert_relative_eq!(got, 0.013_404_409_326_629_5, max_relative = 1e-9);
     }
 
-    /// The optimiser should land where the summed adjusted profile likelihood
-    /// actually peaks, so a coarse grid search must agree with it.
+    /// The optimum must beat a coarse grid around it.
     #[test]
     fn test_agrees_with_a_grid_search() {
         let (counts, design, offset) = fixture();

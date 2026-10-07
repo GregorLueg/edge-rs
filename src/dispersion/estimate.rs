@@ -1,20 +1,17 @@
 //! `estimateDisp`: common, trended and tagwise dispersions.
 //!
-//! Everything runs off one object: the adjusted profile likelihood of every gene
-//! evaluated on a shared grid of dispersions, from [`crate::dispersion::apl`].
-//! The three estimates are three different ways of reading that grid.
+//! Evaluates the adjusted profile likelihood of every gene on a shared grid of
+//! dispersions ([`crate::dispersion::apl`]) and reads it three ways:
 //!
-//! * The **common** dispersion maximises the likelihood summed over all genes.
-//! * The **trended** dispersion smooths the per-gene curves against abundance,
-//!   then maximises each smoothed curve.
-//! * The **tagwise** dispersion adds `prior_n` times the smoothed curve to each
-//!   gene's own curve before maximising, which is the weighted likelihood
-//!   empirical Bayes step. A large `prior_n` pulls a gene onto the trend, a
-//!   small one lets it speak for itself.
+//! * **Common**: maximise the likelihood summed over genes.
+//! * **Trended**: smooth the per-gene curves against abundance, then maximise
+//!   each smoothed curve.
+//! * **Tagwise**: add `prior_n` times the smoothed curve to each gene's own curve
+//!   before maximising (weighted likelihood empirical Bayes). A large `prior_n`
+//!   pulls a gene onto the trend.
 //!
-//! The grid is uniform in `log2(dispersion / 0.1)`, and the maximisation happens
-//! in that coordinate, not in the dispersion itself. That is what makes a
-//! twenty-one point grid enough to cover four orders of magnitude.
+//! The grid is uniform in `log2(dispersion / 0.1)` and the maximisation runs in
+//! that coordinate, so 21 points cover four orders of magnitude.
 //!
 //! ### References
 //!
@@ -37,15 +34,13 @@ use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, matrix_ran
 
 /// Reference dispersion the grid is centred on.
 ///
-/// The grid runs over `0.1 * 2^t`, so `t = 0` is a dispersion of 0.1, a typical
-/// value for a well-behaved bulk RNA-seq experiment. edgeR's choice.
+/// The grid runs over `0.1 * 2^t`, so `t = 0` is a dispersion of 0.1. edgeR's choice.
 const GRID_CENTRE: f64 = 0.1;
 
-/// Prior sample size above which shrinkage is treated as total.
+/// Prior sample size above which shrinkage is total.
 ///
-/// Past this the tagwise estimate is indistinguishable from the trend, and the
-/// weighted likelihood is dominated by the prior to the point where the
-/// arithmetic stops being meaningful. edgeR clamps here.
+/// Past this the tagwise estimate equals the trend and the prior swamps the
+/// weighted likelihood. edgeR clamps here.
 const MAX_PRIOR_N: f64 = 1e6;
 
 /// Count below which an observation is treated as a structural zero when
@@ -54,8 +49,7 @@ const ZERO_TOLERANCE: f64 = 1e-4;
 
 /// Prior count used when the trend covariate is recomputed internally.
 ///
-/// `aveLogCPM`'s own default, which is what `estimateDisp.default` calls it
-/// with.
+/// `aveLogCPM`'s own default, as `estimateDisp.default` calls it.
 const AVE_LOG_CPM_PRIOR_COUNT: f64 = 2.0;
 
 /////////////////
@@ -73,8 +67,8 @@ pub enum TrendMethod {
     Loess,
     /// Local constant regression, edgeR's default.
     Locfit,
-    /// A beta-weighted blend of local constant and local linear, which behaves
-    /// better at the ends of the abundance range.
+    /// A beta-weighted blend of local constant and local linear, better behaved
+    /// at the ends of the abundance range.
     LocfitMixed,
 }
 
@@ -158,16 +152,13 @@ pub struct WlebResult {
 
 /// Default smoothing span for a given number of genes.
 ///
-/// Wider for small experiments, since there is less to average over. This is
-/// `chooseLowessSpan(ntags)` at limma's defaults, which is what edgeR's `WLEB`
-/// reaches for when `span` is `NULL`.
+/// `chooseLowessSpan(ntags)` at limma's defaults, as edgeR's `WLEB` uses when
+/// `span` is `NULL` (see `UPSTREAM_DEVIATIONS.md` A8).
 ///
-/// edgeR keeps a second rule behind `legacy.span = TRUE`, namely
-/// `chooseLowessSpan(ntags, small.n = 50, min.span = 0.25, power = 0.5)`. That
-/// was the default before edgeR 4.0 and is not the default now. The two agree
-/// only below fifty genes, where both return 1, so a small fixture cannot tell
-/// them apart: at 890 genes they are 0.568 and 0.428, and the gap lands on every
-/// trended and tagwise dispersion. Pass an explicit `span` to get the old rule.
+/// The pre-4.0 rule (`legacy.span = TRUE`) is
+/// `chooseLowessSpan(ntags, small.n = 50, min.span = 0.25, power = 0.5)`. Both
+/// return 1 below fifty genes; at 890 genes they give 0.568 and 0.428. Pass an
+/// explicit `span` to get the old rule.
 ///
 /// ### Params
 ///
@@ -254,9 +245,8 @@ fn smooth_surface(
             let degree0 = locfit_by_col(loglik, n_genes, n_grid, Some(covariate), None, span, 0)?;
             let degree1 = locfit_by_col(loglik, n_genes, n_grid, Some(covariate), None, span, 1)?;
 
-            // Blend by a beta(2, 2) weight on the abundance range, so the local
-            // constant fit dominates at the ends where the linear one is least
-            // stable.
+            // Beta(2, 2) weight on the abundance range: the local constant fit
+            // dominates at the ends, where the linear one is least stable.
             let lo = covariate.iter().cloned().fold(f64::INFINITY, f64::min);
             let hi = covariate.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
@@ -290,8 +280,8 @@ fn smooth_surface(
 /// * `n_genes` - Number of genes
 /// * `covariate` - Abundance per gene, required for any trend method but
 ///   [`TrendMethod::None`]
-/// * `m0` - Precomputed smoothed surface. Supplying it skips the smoothing,
-///   which is how `estimate_disp` avoids smoothing twice.
+/// * `m0` - Precomputed smoothed surface. Skips the smoothing, so `estimate_disp`
+///   does not smooth twice.
 /// * `params` - What to compute and how, or [`WlebParams::default`]
 ///
 /// ### Returns
@@ -422,10 +412,10 @@ pub struct EstimateDispParams {
     /// Grid range in `log2(dispersion / 0.1)`.
     pub grid_range: (f64, f64),
     /// Prior degrees of freedom. `None` derives it from the residual variances
-    /// with [`crate::limma::squeeze_var`], which is what edgeR does.
+    /// with [`crate::limma::squeeze_var`], as edgeR does.
     pub prior_df: Option<f64>,
     /// Use the robust empirical Bayes fit when deriving the prior degrees of
-    /// freedom, which gives outlier genes their own, smaller prior.
+    /// freedom (outlier genes get a smaller prior).
     pub robust: bool,
     /// Winsorising tail proportions for the robust fit.
     pub winsor_tail_p: (f64, f64),
@@ -475,9 +465,8 @@ pub struct DispersionEstimates {
 /// Derives the prior degrees of freedom from the residual variances.
 ///
 /// Fits the GLM at the working dispersion, turns each gene's residual deviance
-/// into a variance on its residual degrees of freedom, then hands those to
-/// limma's empirical Bayes fit. This is what edgeR's `estimateDisp` does when
-/// the caller does not supply `prior.df`.
+/// into a variance on its residual degrees of freedom, and squeezes those with
+/// limma's empirical Bayes. This is `estimateDisp` without a `prior.df`.
 ///
 /// ### Params
 ///
@@ -516,8 +505,7 @@ fn derive_prior_df<T: EdgeFloat>(
 
     let df = residual_df(counts, &fit.fitted, n_genes, n_samples, design, n_coef)?;
 
-    // A gene with no residual degrees of freedom carries no variance
-    // information, and limma drops it from the fit rather than dividing by zero.
+    // limma drops genes with no residual df rather than dividing by zero.
     let variance: Vec<f64> = fit
         .deviance
         .iter()
@@ -542,10 +530,8 @@ fn derive_prior_df<T: EdgeFloat>(
 
 /// Scatters per-gene values from the fitted subset back over all genes.
 ///
-/// Genes that were filtered out take the value belonging to the least abundant
-/// retained gene, as edgeR does, rather than the common dispersion: a gene too
-/// sparse to fit is more like the low-abundance end of the trend than like the
-/// average gene.
+/// Filtered-out genes take the value of the least abundant retained gene, as in
+/// edgeR, not the common dispersion.
 ///
 /// ### Params
 ///
@@ -588,10 +574,8 @@ fn expand_to_all_genes(
 
 /// Residual degrees of freedom per gene, reduced where the fit hit exact zeros.
 ///
-/// A gene with structural zeros has fewer effective observations than samples,
-/// and using the nominal residual degrees of freedom would inflate the
-/// quasi-likelihood dispersion. edgeR recomputes the rank of the design
-/// restricted to the non-zero samples.
+/// A gene with structural zeros has fewer effective observations than samples.
+/// Like edgeR, this recomputes the design rank on the non-zero samples.
 ///
 /// ### Params
 ///
@@ -664,13 +648,12 @@ pub fn residual_df<T: EdgeFloat>(
 /// * `n_coef` - Number of coefficients
 /// * `offset` - Log-scale offsets
 /// * `weights` - Optional observation weights
-/// * `ave_log_cpm` - Average log2 counts per million per gene, the trend
-///   covariate. `None` recomputes it internally once the common dispersion is
-///   known, which is what `estimateDisp.default` does; anything supplied here
-///   overrides that. The recomputed covariate ignores `weights`, which
-///   [`crate::core::expression::ave_log_cpm`] does not take.
+/// * `ave_log_cpm` - Average log2 CPM per gene, the trend covariate. `None`
+///   recomputes it once the common dispersion is known, as
+///   `estimateDisp.default` does, ignoring `weights`
+///   ([`crate::core::expression::ave_log_cpm`] takes none).
 /// * `prior_df` - Prior degrees of freedom for the tagwise shrinkage. Supply
-///   `None` in `params` to let the caller pass it here instead.
+///   `None` in `params` to pass it here instead.
 /// * `params` - Tuning knobs, or [`EstimateDispParams::default`]
 ///
 /// ### Returns
@@ -719,8 +702,7 @@ pub fn estimate_disp<T: EdgeFloat>(
         });
     }
 
-    // Genes with too few counts carry no information about the dispersion and
-    // would only add noise to the trend.
+    // Low-count genes carry no dispersion information.
     let kept =
         crate::dispersion::filter_by_min_row_sum(counts, n_genes, n_samples, params.min_row_sum)?;
 
@@ -731,7 +713,6 @@ pub fn estimate_disp<T: EdgeFloat>(
     let selected_offset = offset.subset(&kept, n_samples);
     let selected_weights = weights.map(|w| w.subset(&kept, n_samples));
 
-    // The grid is uniform in log2(dispersion / 0.1).
     let n_grid = params.grid_length;
     let (lo, hi) = params.grid_range;
     let spline_pts: Vec<f64> = (0..n_grid)
@@ -762,8 +743,8 @@ pub fn estimate_disp<T: EdgeFloat>(
     }
     let common = GRID_CENTRE * 2.0_f64.powf(maximize_interpolant(&spline_pts, &summed)?);
 
-    // edgeR recomputes the covariate here, at the dispersion it has just
-    // estimated, and over the full matrix before subsetting to the kept genes.
+    // As in edgeR: recomputed at the common dispersion, over the full matrix
+    // before subsetting to the kept genes.
     let recomputed: Option<Vec<f64>> = match (ave_log_cpm, params.trend_method) {
         (None, TrendMethod::None) => None,
         (None, _) => Some(crate::core::expression::ave_log_cpm(
@@ -904,9 +885,9 @@ mod tests {
     /// d <- estimateDisp(d, design = X, robust = FALSE)
     /// ```
     ///
-    /// Returns the counts, the design, edgeR's own `AveLogCPM` (passed in rather
-    /// than recomputed, so these tests isolate `estimate_disp` from
-    /// `ave_log_cpm`), the library sizes, and edgeR's trended dispersions.
+    /// Returns the counts, the design, edgeR's own `AveLogCPM` (so these tests
+    /// isolate `estimate_disp` from `ave_log_cpm`), the library sizes, and edgeR's
+    /// trended dispersions.
     #[allow(clippy::type_complexity)]
     fn edger_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>, [f64; 6], Vec<f64>) {
         #[rustfmt::skip]
@@ -984,13 +965,9 @@ mod tests {
     /// d <- estimateDisp(d, design = X, robust = FALSE)
     /// ```
     ///
-    /// edgeR returns `prior.df = Inf` here, so its tagwise dispersions are
-    /// exactly its trended ones. That is a real case rather than a degenerate
-    /// one: it happens whenever the residual variances are near constant, and it
-    /// exercises the whole trend path while pinning the shrinkage limit.
-    ///
-    /// The covariate is edgeR's own `AveLogCPM`, passed in rather than
-    /// recomputed, so this test isolates `estimate_disp` from `ave_log_cpm`.
+    /// edgeR returns `prior.df = Inf` here (near-constant residual variances), so
+    /// its tagwise dispersions equal its trended ones. This pins the shrinkage
+    /// limit. The covariate is edgeR's own `AveLogCPM`.
     #[test]
     fn test_matches_edger_estimate_disp() {
         let (counts, design, ave_log_cpm, libraries, expected_trended) = edger_fixture();
@@ -1029,12 +1006,9 @@ mod tests {
         }
     }
 
-    /// The same experiment again, but letting `estimate_disp` derive the prior
-    /// degrees of freedom through `squeeze_var` rather than being handed it.
-    ///
-    /// edgeR reports `prior.df = Inf` for this data, so the derivation must land
-    /// somewhere that produces total shrinkage, and the tagwise dispersions must
-    /// come back on the trend.
+    /// The same experiment, with `estimate_disp` deriving the prior degrees of
+    /// freedom through `squeeze_var`. The derivation must give total shrinkage,
+    /// with tagwise dispersions on the trend.
     #[test]
     fn test_derives_prior_df_without_being_told() {
         let (counts, design, ave_log_cpm, libraries, expected_trended) = edger_fixture();
@@ -1076,11 +1050,10 @@ mod tests {
     /// d <- estimateDisp(DGEList(counts = y), design = X, robust = FALSE)
     /// ```
     ///
-    /// This is the one test that does *not* hand in edgeR's own `AveLogCPM`, so
-    /// it is what pins the two-pass structure: edgeR recomputes the covariate at
-    /// the common dispersion before smoothing, and a covariate taken at any
-    /// other dispersion moves the trend by around 2e-3 relative and the prior
-    /// degrees of freedom by 7e-3.
+    /// The one test that does not pass edgeR's `AveLogCPM`, so it pins the
+    /// two-pass structure: a covariate taken at any dispersion other than the
+    /// common one moves the trend by around 2e-3 relative and the prior degrees of
+    /// freedom by 7e-3.
     #[test]
     fn test_matches_edger_estimate_disp_from_raw_counts() {
         #[rustfmt::skip]
@@ -1184,12 +1157,8 @@ mod tests {
         }
     }
 
-    /// The span rule, against edgeR's current default rather than its legacy one.
-    ///
-    /// `WLEB` takes `chooseLowessSpan(ntags)` when `legacy.span` is `FALSE`, which
-    /// it is by default, and only falls back to `min.span = 0.25, power = 0.5`
-    /// when asked. Both rules return 1 below fifty genes, so the sizes below are
-    /// chosen to separate them.
+    /// The span rule against edgeR's current default, not the legacy one.
+    /// Both return 1 below fifty genes, so the sizes below separate them.
     ///
     /// ```r
     /// # Rscript, limma 3.66
@@ -1221,9 +1190,8 @@ mod tests {
         assert!(parse_trend_method("lowess").is_none());
     }
 
-    /// Without a covariate the smoothed surface is the column mean repeated,
-    /// so every gene shares one trend and the individual estimates are pulled
-    /// towards it by `prior_n`.
+    /// Without a covariate the smoothed surface is the column mean repeated, so
+    /// every gene shares one trend, which `prior_n` pulls the estimates towards.
     #[test]
     fn test_wleb_without_a_covariate_shares_one_curve() {
         let theta = [-2.0, -1.0, 0.0, 1.0, 2.0];
@@ -1246,17 +1214,16 @@ mod tests {
         )
         .unwrap();
 
-        // With no prior weight the individual estimates are the raw maximisers.
+        // No prior weight: the raw maximisers.
         let individual = out.individual.unwrap();
         assert!(individual[0] < individual[1]);
-        // The shared curve is the mean of the two, so both genes see the same one.
+        // Both genes see the mean curve.
         let shared = out.shared_loglik;
         assert_relative_eq!(shared[0], -6.5, max_relative = 1e-12);
         assert_relative_eq!(shared[5], -6.5, max_relative = 1e-12);
     }
 
-    /// Increasing the prior sample size must pull both genes towards the shared
-    /// curve, which is the whole point of the weighting.
+    /// A larger prior sample size must pull both genes towards the shared curve.
     #[test]
     fn test_wleb_prior_weight_shrinks_towards_the_trend() {
         let theta = [-2.0, -1.0, 0.0, 1.0, 2.0];
