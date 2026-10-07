@@ -16,19 +16,3 @@
 pub mod nebula_gpu;
 pub mod pml_kernel;
 pub mod stage_two;
-
-////////////
-// Consts //
-////////////
-
-/// Workgroup width for the per-gene kernels.
-///
-/// Purely an occupancy knob, as threads share nothing. Sixty-four is two Apple
-/// Silicon planes; one plane loses more to memory latency than it saves.
-pub const GENE_WORKGROUP: u32 = 64;
-
-/// Largest design width the kernels are compiled for.
-///
-/// The per-thread `beta`-sized arrays live in registers, so their capacity is a
-/// compile-time constant. The `nb * nb` blocks grow quadratically in it.
-pub const MAX_BETA: u32 = 8;
