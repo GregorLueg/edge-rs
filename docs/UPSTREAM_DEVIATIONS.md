@@ -39,7 +39,7 @@ against a newer checkout.
 | [A15](#a15-the-deviance-and-small-p-rejection-regions-are-stubs) | Exact test regions are stubs | high | `exact/mod.rs` |
 | [A16](#a16-q2qnbinom-leaves-log-space) | `q2qnbinom` leaves log space | medium | `exact/mod.rs` |
 | [A17](#a17-splicevariants-is-a-different-test) | `spliceVariants` is a different test | high | `splicing.rs` |
-| [A18](#a18-diffsplicedge-does-not-exist-in-edger) | `diffSpliceDGE` is invented | high | `splicing.rs` |
+| [A18](#a18-diffsplicedge-is-not-edgers-procedure) | `diffSpliceDGE` is not edgeR's procedure | high | `splicing.rs` |
 | [A19](#a19-glm_sc_test-drops-the-off-diagonal-covariance) | Single-cell contrasts drop covariance | high | `sc/test.rs` |
 | [A20](#a20-nebula-has-no-marginal-likelihood-hessian) | NEBULA has no marginal Hessian | highest | `sc/ptmg.rs`, `sc/nebula.rs` |
 | [A21](#a21-_opt_pml_nb-adds-a-ridge-a-floor-and-a-clamp) | `_opt_pml_nb` ridge, floor and clamp | high | `sc/pml.rs` |
@@ -287,7 +287,11 @@ Five divergences from limma:
   them through with `log.p = TRUE`.
 
 `edge-rs` follows limma throughout, using the Cleveland `lowess` port in
-`src/limma/lowess.rs`, and agrees to 1e-12.
+`src/limma/lowess.rs`, and agrees to 1e-12. One residual gap: the spline is
+built over surviving genes as in limma, but dropped genes (zero `df1` or
+non-finite variance) are read off the fitted trend rather than via
+`predict.ns`, because the A6 basis exposes no knots. That costs about 1e-3 on
+those genes only.
 
 ### A11. `compute_prior` uses the wrong smoother
 
@@ -429,20 +433,24 @@ differential exon usage *between conditions*. edgePython runs a Pearson
 chi-squared homogeneity test on raw counts, with no dispersion and **no `group`
 argument**, so it tests exon-by-*sample* heterogeneity. `edge-rs` ports edgeR.
 
-### A18. `diffSpliceDGE` does not exist in edgeR
+### A18. `diffSpliceDGE` is not edgeR's procedure
 
-- **Upstream:** `edgepython/splicing.py:410` (`diff_splice_dge`)
-- **Ported to:** `src/splicing.rs`, `diff_splice_dge`
-- **Severity:** an invented function presented as a port
-- **Test:** `test_dge_wrapper_matches_the_explicit_call`, `test_gene_grouping_is_independent_of_row_order`
+- **Upstream:** `edgepython/splicing.py:410` (`diff_splice_dge`), against edgeR's `diffSpliceDGE`
+- **Ported to:** `src/splicing.rs`, `diff_splice` and `diff_splice_dge`
+- **Severity:** a different test under the same name
+- **Test:** `test_matches_edger_lrt_on_the_gate_fixture`, `test_matches_edger_quasi_likelihood_f_tests`
 
-edgeR has no `diffSpliceDGE`; limma's `diffSplice` takes an `MArrayLM`.
-edgePython runs `exact_test` on exon counts and aggregates by Simes, neither
-package's procedure.
+edgeR's `diffSpliceDGE` takes a fitted `DGEGLM`, folds the gene-level fold change
+into the offsets, refits, and tests each exon against the rest of its gene: a
+likelihood ratio test, or a QL F-test with `squeezeVar` on the gene variances
+when the fit is quasi-likelihood. Gene-level p-values come from the summed test
+and from Simes. edgePython runs `exact_test` on the exon counts and aggregates
+by Simes, with no GLM and no offset adjustment.
 
-`edge-rs` keeps the name as the `DgeList` wrapper around `diff_splice` (as
-`glm_fit_dge` wraps `glm_fit`) and runs the edgeR procedure underneath. Genes
-keep first-appearance order; edgePython's `np.unique` sorts them.
+`edge-rs` ports edgeR as `diff_splice`; `diff_splice_dge` is the `DgeList`
+wrapper that fits first (as `glm_fit_dge` wraps `glm_fit`). Genes come out in
+first-appearance order. edgeR sorts by gene id, so the two agree on sorted
+input; edgePython's `np.unique` always sorts.
 
 ## Single cell (NEBULA)
 
