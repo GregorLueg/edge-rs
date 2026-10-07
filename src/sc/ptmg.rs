@@ -897,64 +897,61 @@ fn evaluate_hessian(
     let mut hb2_f = vec![0.0; k];
     let mut b2f = vec![0.0; k];
     let mut d42c = vec![0.0; k];
-    let mut slpey = 0.0;
-    let mut gstar_sum = 0.0;
-    let mut sum_tempa = 0.0;
-    let mut sum_gt = 0.0;
+    let mut scalars = HessianScalars {
+        total,
+        slpey: 0.0,
+        gstar_sum: 0.0,
+        sum_tempa: 0.0,
+        sum_gt: 0.0,
+    };
     for s in 0..k {
-        let ym = ymustar[s];
         let v = s * nb..(s + 1) * nb;
         let m = s * nn..(s + 1) * nn;
-        let (xf, d41) = (&mut xexb_f[v.clone()], &mut dbeta_41[v.clone()]);
-        let (t1, t2) = (&mut tmp1_f[v.clone()], &mut tmp2_f[v]);
-        let (bp, bg, bgte) = (
-            &mut block_plain[m.clone()],
-            &mut block_g[m.clone()],
-            &mut block_gte[m],
-        );
-        let mut acc = 0.0;
-        let mut hb2 = 0.0;
-        let mut b2 = 0.0;
-        for i in fid[s]..fid[s + 1] {
-            let e = extb[i];
-            let y = y_cell[i];
-            let we = ym * e;
-            let w = we + gamma;
-            let log_w = w.ln();
-            let inv_w = 1.0 / w;
-            total += we;
-            total -= (gamma + y) * log_w;
-            slpey += log_w;
-            let g = (gamma + y) * inv_w;
-            gstar_sum += g;
-            let gt = g * inv_w;
-            let gte = gt * e;
-            sum_tempa += inv_w;
-            sum_gt += gt;
-            acc += g * e;
-            hb2 += gte - e * inv_w;
-            b2 += gte * e;
-            let f1 = gt - inv_w;
-
-            let row = &data.design[i * nb..(i + 1) * nb];
-            for a in 0..nb {
-                let xe = row[a] * e;
-                xf[a] += xe;
-                d41[a] += g * xe;
-                t1[a] += xe * f1;
-                t2[a] += xe * gte;
-                for b in a..nb {
-                    let c = xe * row[b];
-                    bp[a * nb + b] += c;
-                    bg[a * nb + b] += c * g;
-                    bgte[a * nb + b] += c * gte;
-                }
-            }
+        let block = SubjectBlock {
+            xf: &mut xexb_f[v.clone()],
+            d41: &mut dbeta_41[v.clone()],
+            t1: &mut tmp1_f[v.clone()],
+            t2: &mut tmp2_f[v],
+            plain: &mut block_plain[m.clone()],
+            g: &mut block_g[m.clone()],
+            gte: &mut block_gte[m],
+        };
+        macro_rules! width {
+            ($nb:literal) => {
+                hessian_subject::<$nb>(
+                    data,
+                    fid[s]..fid[s + 1],
+                    extb,
+                    y_cell,
+                    ymustar[s],
+                    gamma,
+                    block,
+                    &mut scalars,
+                )
+            };
         }
+        let (acc, hb2, b2) = match nb {
+            1 => width!(1),
+            2 => width!(2),
+            3 => width!(3),
+            4 => width!(4),
+            5 => width!(5),
+            6 => width!(6),
+            7 => width!(7),
+            8 => width!(8),
+            _ => width!(0),
+        };
         hb2_f[s] = hb2;
         b2f[s] = b2;
         d42c[s] = acc - cumsumxtb[s];
     }
+    let HessianScalars {
+        total,
+        slpey,
+        gstar_sum,
+        sum_tempa,
+        sum_gt,
+    } = scalars;
 
     // Gradient, as in `evaluate`.
     let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
@@ -1098,6 +1095,178 @@ fn evaluate_hessian(
     hessian[(nb + 1) * n_params + nb + 1] -= extra.cell_trigamma;
 
     (value, gradient, hessian)
+}
+
+/// Running scalars of [`evaluate_hessian`]'s sweep over the cells.
+struct HessianScalars {
+    /// The log-likelihood so far.
+    total: f64,
+    /// `sum log w`.
+    slpey: f64,
+    /// `sum g`.
+    gstar_sum: f64,
+    /// `sum 1 / w`.
+    sum_tempa: f64,
+    /// `sum g / w`.
+    sum_gt: f64,
+}
+
+/// One subject's slices of [`evaluate_hessian`]'s per-subject sums.
+struct SubjectBlock<'a> {
+    /// `sum x e`, length `nb`.
+    xf: &'a mut [f64],
+    /// `sum g x e`, length `nb`.
+    d41: &'a mut [f64],
+    /// `sum x e (g / w - 1 / w)`, length `nb`.
+    t1: &'a mut [f64],
+    /// `sum x e g e / w`, length `nb`.
+    t2: &'a mut [f64],
+    /// `sum x x' e`, row-major `nb * nb`, upper triangle.
+    plain: &'a mut [f64],
+    /// `sum x x' e g`, upper triangle.
+    g: &'a mut [f64],
+    /// `sum x x' e g e / w`, upper triangle.
+    gte: &'a mut [f64],
+}
+
+/// Widest design whose per-subject Hessian sums live on the stack.
+const HESSIAN_LOCAL_COEF: usize = 8;
+
+/// One subject's sweep for [`evaluate_hessian`], at a compile-time design
+/// width (`NB == 0` reads it from `data`).
+///
+/// With the width a constant the loops over columns unroll and the sums sit in
+/// stack arrays the compiler keeps in registers; they are written to `block`
+/// once at the end.
+///
+/// ### Params
+///
+/// * `data` - The gene
+/// * `cells` - The subject's cells
+/// * `extb` - `exp(eta)` per cell
+/// * `y_cell` - Count per cell
+/// * `ym` - The subject's `ystar / mustar`
+/// * `gamma` - Cell-level gamma shape
+/// * `block` - The subject's sums, written
+/// * `scalars` - Running scalars, updated
+///
+/// ### Returns
+///
+/// `sum g e`, `sum (g e / w - e / w)` and `sum g e^2 / w` over the subject.
+#[allow(clippy::too_many_arguments)]
+fn hessian_subject<const NB: usize>(
+    data: &GeneData<'_>,
+    cells: std::ops::Range<usize>,
+    extb: &[f64],
+    y_cell: &[f64],
+    ym: f64,
+    gamma: f64,
+    block: SubjectBlock<'_>,
+    scalars: &mut HessianScalars,
+) -> (f64, f64, f64) {
+    let nb = if NB == 0 { data.n_coef } else { NB };
+    const V: usize = HESSIAN_LOCAL_COEF;
+    let mut vecs = [[0.0f64; V]; 4];
+    let mut blocks = [[0.0f64; V * V]; 3];
+    let local = NB != 0;
+    let SubjectBlock {
+        xf,
+        d41,
+        t1,
+        t2,
+        plain,
+        g: bg,
+        gte: bgte,
+    } = block;
+    let mut acc = 0.0;
+    let mut hb2 = 0.0;
+    let mut b2 = 0.0;
+    let HessianScalars {
+        total,
+        slpey,
+        gstar_sum,
+        sum_tempa,
+        sum_gt,
+    } = scalars;
+    {
+        let [lxf, ld41, lt1, lt2] = &mut vecs;
+        let [lbp, lbg, lbgte] = &mut blocks;
+        let SubjectBlock {
+            xf,
+            d41,
+            t1,
+            t2,
+            plain: bp,
+            g: bg,
+            gte: bgte,
+        } = if local {
+            SubjectBlock {
+                xf: &mut lxf[..nb],
+                d41: &mut ld41[..nb],
+                t1: &mut lt1[..nb],
+                t2: &mut lt2[..nb],
+                plain: &mut lbp[..nb * nb],
+                g: &mut lbg[..nb * nb],
+                gte: &mut lbgte[..nb * nb],
+            }
+        } else {
+            SubjectBlock {
+                xf: &mut *xf,
+                d41: &mut *d41,
+                t1: &mut *t1,
+                t2: &mut *t2,
+                plain: &mut *plain,
+                g: &mut *bg,
+                gte: &mut *bgte,
+            }
+        };
+        for i in cells {
+            let e = extb[i];
+            let y = y_cell[i];
+            let we = ym * e;
+            let w = we + gamma;
+            let log_w = w.ln();
+            let inv_w = 1.0 / w;
+            *total += we;
+            *total -= (gamma + y) * log_w;
+            *slpey += log_w;
+            let g = (gamma + y) * inv_w;
+            *gstar_sum += g;
+            let gt = g * inv_w;
+            let gte = gt * e;
+            *sum_tempa += inv_w;
+            *sum_gt += gt;
+            acc += g * e;
+            hb2 += gte - e * inv_w;
+            b2 += gte * e;
+            let f1 = gt - inv_w;
+
+            let row = &data.design[i * nb..(i + 1) * nb];
+            for a in 0..nb {
+                let xe = row[a] * e;
+                xf[a] += xe;
+                d41[a] += g * xe;
+                t1[a] += xe * f1;
+                t2[a] += xe * gte;
+                for b in a..nb {
+                    let c = xe * row[b];
+                    bp[a * nb + b] += c;
+                    bg[a * nb + b] += c * g;
+                    bgte[a * nb + b] += c * gte;
+                }
+            }
+        }
+    }
+    if local {
+        xf.copy_from_slice(&vecs[0][..nb]);
+        d41.copy_from_slice(&vecs[1][..nb]);
+        t1.copy_from_slice(&vecs[2][..nb]);
+        t2.copy_from_slice(&vecs[3][..nb]);
+        plain.copy_from_slice(&blocks[0][..nb * nb]);
+        bg.copy_from_slice(&blocks[1][..nb * nb]);
+        bgte.copy_from_slice(&blocks[2][..nb * nb]);
+    }
+    (acc, hb2, b2)
 }
 
 /// Value and gradient with the zero counts summed from the run's tables.
