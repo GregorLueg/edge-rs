@@ -1254,5 +1254,43 @@ if (requireNamespace("nebula", quietly = TRUE)) {
   cat("nebula not installed, skipping single-cell fixtures\n")
 }
 
+############
+# BOBYQA #
+############
+
+# nebula's stage two runs `nloptr::bobyqa`, NLopt 2.7.1 inside nloptr 2.2.1.
+# Every point the optimiser evaluates is recorded on four bounded problems, so
+# src/numeric/bobyqa.rs can be held to the same sequence. nloptr evaluates the
+# start twice itself before NLopt runs; those two rows are dropped. The powers
+# are written as R evaluates them: `^2` is `x * x`, `^4` is libm `pow`.
+if (requireNamespace("nloptr", quietly = TRUE)) {
+  bobyqa_cases <- list(
+    list(tag = "rosen", f = function(x) 100 * (x[2] - x[1]^2)^2 + (1 - x[1])^2,
+         x0 = c(-1.2, 1), lo = c(-2, -1), hi = c(2, 3)),
+    list(tag = "rosen_edge", f = function(x) 100 * (x[2] - x[1]^2)^2 + (1 - x[1])^2,
+         x0 = c(0.4001, 0.2), lo = c(0.4, 0.2), hi = c(2, 2)),
+    list(tag = "corner", f = function(x) (x[1] - 3)^2 + 10 * (x[2] + 1)^2 + x[1] * x[2],
+         x0 = c(1, 1), lo = c(0, 0), hi = c(2, 2)),
+    list(tag = "chain3",
+         f = function(x) (x[1] - 1)^2 + 100 * (x[2] - x[1]^2)^2 + (x[3] - x[2])^2 + 0.5 * x[3]^4,
+         x0 = c(0.5, 2, -1), lo = c(-3, -3, -3), hi = c(3, 3, 3))
+  )
+  for (cs in bobyqa_cases) {
+    trace <- list()
+    fn <- function(x) {
+      v <- cs$f(x)
+      trace[[length(trace) + 1]] <<- c(x, v)
+      v
+    }
+    invisible(nloptr::bobyqa(cs$x0, fn, lower = cs$lo, upper = cs$hi))
+    m <- do.call(rbind, trace)[-(1:2), , drop = FALSE]
+    write.table(format(m, digits = 17), file.path(DATA_DIR, paste0("bobyqa_", cs$tag, ".csv")),
+                sep = ",", row.names = FALSE, col.names = FALSE, quote = FALSE)
+    cat(sprintf("bobyqa_%s: %d evaluations\n", cs$tag, nrow(m)))
+  }
+} else {
+  cat("nloptr not installed, skipping BOBYQA traces\n")
+}
+
 flush_scalars()
 cat("done\n")

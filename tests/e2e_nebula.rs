@@ -68,8 +68,11 @@ const TOL_SE: Tol = Tol::rel(1e-4);
 const TOL_COV: Tol = Tol::new(1e-3, 1e-12);
 
 /// Subject-level overdispersion. The profile likelihood is flatter in this
-/// direction than in the cell-level one. Needs `3.8e-5`.
-const TOL_SUBJECT: Tol = Tol::rel(2e-4);
+/// direction than in the cell-level one. Needs `3.8e-5` relative, except near
+/// the lower bound: BOBYQA stops at a radius of `1e-6` times its first step,
+/// so a `sigma^2` of `1e-3` is resolved to about `3e-7` absolute, by nebula as
+/// by this crate (`sc_small`, `3.0e-7` measured).
+const TOL_SUBJECT: Tol = Tol::new(2e-4, 1e-6);
 
 /// Cell-level overdispersion. Needs `2.2e-5`.
 const TOL_CELL: Tol = Tol::rel(1e-4);
@@ -198,8 +201,8 @@ const CPU_TOLS: NebulaTols = NebulaTols {
 /// * `sc_cat_ln`: the same planted near-Poisson gene, `gene_id` 29, where R
 ///   stops at `phi = 322`. Needs `5.6e-4` on the coefficients and on
 ///   `sigma^2`, and `2.1e-3` absolute on the cell overdispersion.
-/// * `sc_high`: means of `1e3` to `1e4`. Needs `1.7e-4` on the coefficients,
-///   `4.4e-4` on `sigma^2` and `2.2e-3` on a covariance entry of `2.7e-7`.
+/// * `sc_high`: means of `1e3` to `1e4`. Needs `7.6e-5` on the coefficients,
+///   `4.0e-4` on `sigma^2` and `3.3e-3` on a covariance entry of `1.2e-7`.
 ///
 /// The `sc_blocks` and `sc_cat_ln` gene is not settled as a port fault or an R
 /// one.
@@ -229,7 +232,7 @@ fn tols(tag: &str, base: NebulaTols) -> NebulaTols {
         "sc_high" => NebulaTols {
             coef: Tol::new(base.coef.max_relative.max(5e-4), base.coef.epsilon),
             subject: Tol::new(base.subject.max_relative.max(5e-4), base.subject.epsilon),
-            cov: Tol::new(base.cov.max_relative.max(3e-3), base.cov.epsilon),
+            cov: Tol::new(base.cov.max_relative.max(5e-3), base.cov.epsilon),
             ..base
         },
         _ => base,
@@ -431,7 +434,8 @@ fn load(d: &Dataset) -> Loaded {
 ///
 /// The fit.
 fn cpu_fit(i: usize) -> &'static NebulaFit {
-    static FITS: [OnceLock<NebulaFit>; DATASETS.len()] = [const { OnceLock::new() }; DATASETS.len()];
+    static FITS: [OnceLock<NebulaFit>; DATASETS.len()] =
+        [const { OnceLock::new() }; DATASETS.len()];
     FITS[i].get_or_init(|| {
         let d = &DATASETS[i];
         let l = load(d);

@@ -13,8 +13,9 @@
 //!   CPU path drives. Each round, every live search asks for its next points
 //!   and all of them go out as one [`ResidentBatch::submit`] launch. The device
 //!   finds each penalised fit's optimum; the host finishes that fit in `f64`
-//!   from the device's point and assembles the profile objective. Nelder-Mead,
-//!   the polish least squares and the objective never leave the host.
+//!   from the device's point and assembles the profile objective. BOBYQA,
+//!   Nelder-Mead, the polish least squares and the objective never leave the
+//!   host.
 //! * **Stage three**, the final fit whose information gives the standard
 //!   errors, stays on the CPU in `f64`.
 //!
@@ -81,7 +82,7 @@
 //!
 //! ### Why lockstep rounds
 //!
-//! Nelder-Mead is sequential within a gene, so the round count is set by the
+//! The search is sequential within a gene, so the round count is set by the
 //! slowest gene, about three times the median on the R fixtures. Only live
 //! searches send requests, so rounds thin out and the total device work is the
 //! total number of evaluations. A polish stencil goes out as all its points in
@@ -383,9 +384,9 @@ fn search_all<R: Runtime>(
     kept: &[usize],
     client: &ComputeClient<R>,
     mut timing: Option<&mut Timing>,
-) -> Result<(Vec<Option<Option<Vec<f64>>>>, Option<SolveTiming>), EdgeErrors> {
+) -> Result<(Vec<Option<Option<(Vec<f64>, bool)>>>, Option<SolveTiming>), EdgeErrors> {
     let k = shared.n_subjects;
-    let mut refits: Vec<Option<Option<Vec<f64>>>> = vec![None; genes.len()];
+    let mut refits: Vec<Option<Option<(Vec<f64>, bool)>>> = vec![None; genes.len()];
 
     let mut live: Vec<Live<'_>> = Vec::new();
     for (index, (counts, plan)) in genes.iter().enumerate() {

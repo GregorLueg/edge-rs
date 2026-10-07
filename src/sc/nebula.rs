@@ -20,27 +20,25 @@
 //!
 //! ### Deviations from the R package
 //!
-//! nebula drives stages one and two with `nloptr` (`NLOPT_LD_LBFGS` with
-//! `ftol_abs = 1e-6`, `NLOPT_LN_BOBYQA` with `xtol_rel = 1e-6`). Neither is in
-//! this crate. The stage-two objective is discontinuous at the `1e-6` level:
-//! [`opt_pml`](crate::sc::pml::opt_pml) stops on an absolute improvement of `eps = 1e-6`, so its Newton
-//! count flips as the variances move. BOBYQA cannot resolve the minimum past
-//! that floor, and two of its own runs from different starts disagree by up to
-//! `1e-6` in the standard errors.
+//! nebula drives stage one with `nloptr`'s `NLOPT_LD_LBFGS` (`ftol_abs =
+//! 1e-6`), which is not in this crate. Stage two over both variance components
+//! is `nloptr::bobyqa` here as there: [`crate::numeric::bobyqa`] is NLopt
+//! 2.7.1's BOBYQA, set-up included, and retraces it point for point. The
+//! two evaluations nloptr itself makes at the start before NLopt runs are
+//! skipped. The objective is not bit-identical to nebula's (the inner fit sums
+//! in a different order), and it jitters at the `1e-6` level because
+//! [`opt_pml`](crate::sc::pml::opt_pml) stops on an absolute improvement of
+//! `eps = 1e-6`, so the two searches part company once a step lands on a
+//! different side of a jitter. They then stop within BOBYQA's own resolution
+//! of each other.
 //!
-//! Stage two therefore uses a bounded Nelder-Mead followed by a local quadratic
-//! least-squares polish. A stencil wide compared with the noise averages the
-//! jitter out, which a simplex chasing individual values cannot. Against
-//! nebula 1.5.8 (two- and three-coefficient designs, LN and HL), the worst
-//! relative disagreement is `1.0e-6` on coefficients, `2.1e-6` on standard
-//! errors and `4.4e-6` on overdispersions. That is the reference's own
-//! reproducibility floor: re-running nebula's optimisers to a tolerance of
-//! `1e-14` moves its answers by as much.
-//!
-//! Clamping a simplex into the box can collapse it onto a bound it cannot
-//! leave, where BOBYQA would come back. A simplex that ends on a bound the start
-//! was inside is therefore restarted once from between the two, and the better
-//! minimiser kept.
+//! The one-component restriction NEBULA-LN refits (nebula's `nlminb`) runs a
+//! bounded Nelder-Mead followed by a local quadratic least-squares polish. A
+//! stencil wide compared with the noise averages the jitter out, which a
+//! simplex chasing individual values cannot. Clamping a simplex into the box
+//! can collapse it onto a bound it cannot leave, so a simplex that ends on a
+//! bound the start was inside is restarted once from between the two, and the
+//! better minimiser kept.
 //!
 //! Stage one has an exact gradient and no jitter, so it is one call to
 //! [`minimise`] and lands on the reference optimum.
@@ -56,6 +54,7 @@
 
 use rayon::prelude::*;
 
+use crate::numeric::bobyqa::{BobyqaStatus, BobyqaStepper};
 use crate::numeric::gamma::ln_gamma;
 use crate::numeric::lbfgsb::{LbfgsbParams, minimise};
 use crate::numeric::optimise::{NelderMeadParams, NelderMeadStepper};
@@ -884,7 +883,7 @@ pub(crate) fn finish_gene(
     counts: &crate::sc::ptmg::GeneCounts,
     subject_totals: &[f64],
     plan: GenePlan,
-    refit: Option<Option<Vec<f64>>>,
+    refit: Option<Option<(Vec<f64>, bool)>>,
 ) -> Result<GeneOutcome, EdgeErrors> {
     let n_coef = shared.n_coef;
     let params = &shared.params;
@@ -894,17 +893,25 @@ pub(crate) fn finish_gene(
 
     match (plan.refit, refit) {
         (Refit::Both, Some(found)) => match found {
-            Some(v) => {
+            Some((v, failed)) => {
                 sigma = v[0];
                 gamma = v[1];
-                convergence = CONV_SUCCESS;
+                convergence = if failed {
+                    CONV_OUTER_FAILED
+                } else {
+                    CONV_SUCCESS
+                };
             }
             None => convergence = CONV_OUTER_FAILED,
         },
         (Refit::SubjectOnly, Some(found)) => match found {
-            Some(v) => {
+            Some((v, failed)) => {
                 sigma = v[0];
-                convergence = CONV_SUCCESS;
+                convergence = if failed {
+                    CONV_OUTER_FAILED
+                } else {
+                    CONV_SUCCESS
+                };
             }
             None => convergence = CONV_OUTER_FAILED,
         },
@@ -1261,6 +1268,8 @@ enum SearchStage {
     Check,
     /// A quadratic polish stencil, all `3^n` points at once.
     Polish,
+    /// A BOBYQA evaluation, the two-component search.
+    Bobyqa,
     /// Finished.
     Done,
 }
@@ -1294,12 +1303,14 @@ fn variance_simplex(x0: &[f64]) -> NelderMeadStepper {
 /// each round batched onto one device launch. The CPU path evaluates
 /// immediately, so both paths share control flow.
 ///
-/// Sequence: the clamped start; bounded Nelder-Mead, every point clamped into
-/// the box so a component can settle on its bound; the clamped minimiser once
-/// more; then three quadratic polish stencils at shrinking widths. If a pass at
-/// a raised Laplace order hit an evaluation the expansion could not support, the
-/// whole pass is repeated at the leading order, as the R package's `tryCatch`
-/// around `bobyqa` does.
+/// Two components run BOBYQA from the clamped start, as nebula's `bobyqa`;
+/// a rejected evaluation abandons the pass, as nebula's `pql_ll` stops. One
+/// component runs the clamped start; bounded Nelder-Mead, every point clamped
+/// into the box so a component can settle on its bound; the clamped minimiser
+/// once more; then three quadratic polish stencils at shrinking widths. If a
+/// pass at a raised Laplace order hit an evaluation the expansion could not
+/// support, the whole pass is repeated at the leading order, as the R package's
+/// `tryCatch` around `bobyqa` does.
 ///
 /// A polish stencil asks for all its points at once; an infinite value discards
 /// the stencil either way.
@@ -1335,6 +1346,11 @@ pub(crate) struct StageTwoSearch {
     /// The first simplex's clamped minimiser and its value, while the restart
     /// runs.
     pinned: Option<(Vec<f64>, f64)>,
+    /// The two-component search, during [`SearchStage::Bobyqa`].
+    bobyqa: Option<BobyqaStepper>,
+    /// Whether BOBYQA ended with a negative NLopt status, which nebula records
+    /// as a failed outer fit while keeping the point.
+    failed: bool,
 }
 
 impl StageTwoSearch {
@@ -1367,6 +1383,8 @@ impl StageTwoSearch {
             found: None,
             restarted: false,
             pinned: None,
+            bobyqa: None,
+            failed: false,
         };
         search.begin_pass();
         search
@@ -1437,6 +1455,17 @@ impl StageTwoSearch {
                 self.width += 1;
                 self.begin_polish();
             }
+            SearchStage::Bobyqa => {
+                // nebula's `pql_ll` stops on a rejected fit, which aborts
+                // `bobyqa` into the leading-order retry.
+                if !values[0].is_finite() {
+                    self.end_pass(None);
+                    return;
+                }
+                let stepper = self.bobyqa.as_mut().expect("in the BOBYQA stage");
+                stepper.tell(values[0]);
+                self.ask_bobyqa();
+            }
             SearchStage::Done => {}
         }
     }
@@ -1445,10 +1474,11 @@ impl StageTwoSearch {
     ///
     /// ### Returns
     ///
-    /// The minimiser, clamped into the box, or `None` if nothing finite was
-    /// found.
-    pub(crate) fn result(self) -> Option<Vec<f64>> {
-        self.found
+    /// The minimiser, inside the box, and whether the optimiser reported
+    /// failure; `None` if the search was abandoned.
+    pub(crate) fn result(self) -> Option<(Vec<f64>, bool)> {
+        let failed = self.failed;
+        self.found.map(|x| (x, failed))
     }
 
     /// Clamps a point into the box.
@@ -1472,8 +1502,34 @@ impl StageTwoSearch {
         self.restarted = false;
         self.pinned = None;
         self.simplex = None;
+        self.failed = false;
+        if self.start.len() == 2 {
+            let x0 = self.clamped(&self.start);
+            match BobyqaStepper::new(&x0, &self.lower, &self.upper, None) {
+                Ok(stepper) => {
+                    self.bobyqa = Some(stepper);
+                    self.stage = SearchStage::Bobyqa;
+                    self.ask_bobyqa();
+                }
+                Err(_) => self.end_pass(None),
+            }
+            return;
+        }
         self.stage = SearchStage::Start;
         self.asked = vec![self.clamped(&self.start)];
+    }
+
+    /// Asks for BOBYQA's next point, or ends the pass with its minimiser.
+    fn ask_bobyqa(&mut self) {
+        let stepper = self.bobyqa.as_ref().expect("in the BOBYQA stage");
+        if let Some(x) = stepper.ask() {
+            self.asked = vec![x.to_vec()];
+            return;
+        }
+        let result = stepper.result();
+        self.bobyqa = None;
+        self.failed = result.status == BobyqaStatus::RoundoffLimited;
+        self.end_pass(Some(result.x));
     }
 
     /// Ends a pass, retrying at the leading order where nebula would.
@@ -1697,7 +1753,8 @@ impl StageTwoSearch {
 ///
 /// ### Returns
 ///
-/// The minimiser, or `None` if no evaluation of the objective was finite.
+/// The minimiser and whether the optimiser reported failure, or `None` if the
+/// search was abandoned.
 fn refine_variance(
     shared: &Shared<'_>,
     pml: &PmlData<'_>,
@@ -1706,7 +1763,7 @@ fn refine_variance(
     ord: u32,
     start: &[f64],
     fixed_cell: Option<f64>,
-) -> Option<Vec<f64>> {
+) -> Option<(Vec<f64>, bool)> {
     debug_assert_eq!(start.len(), if fixed_cell.is_some() { 1 } else { 2 });
     let (lower, upper) = variance_bounds(&shared.params, fixed_cell);
     let mut search = StageTwoSearch::new(start, &lower, &upper, ord);
