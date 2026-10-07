@@ -1,17 +1,16 @@
 //! End-to-end parity for `voomLmFit` and `squeezeVar`.
 //!
-//! The crate has no `eBayes` and no limma `topTable`, so the chain stops at the
-//! moderated variances rather than at a moderated t table. What is gated is the
-//! log-CPM matrix, the precision weights, the fitted linear model and the
-//! empirical Bayes squeeze on its residual variances.
+//! The crate has no `eBayes` or `topTable`, so the chain stops at the moderated
+//! variances. Gated: log-CPM, precision weights, the linear model fit and the
+//! empirical Bayes squeeze of its residual variances.
 //!
-//! Both datasets here have non-constant residual degrees of freedom, {4, 9} on
-//! the factorial set and {4, 5} on the unbalanced one, because the planted
-//! genes with an empty group lose observations to `voomLmFit`'s structural-zero
-//! masking. That is the branch where the trend switches from `stats::lowess` to
-//! `weightedLowess`, and it would never fire on plain random counts.
+//! Both datasets have non-constant residual df, {4, 9} on the factorial set and
+//! {4, 5} on the unbalanced one: planted genes with an empty group lose
+//! observations to `voomLmFit`'s structural-zero masking. That switches the
+//! trend from `stats::lowess` to `weightedLowess`, a branch plain random counts
+//! never reach.
 //!
-//! Tolerances are measured, not guessed:
+//! Tolerances come from
 //! `EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_voom -- --nocapture`.
 
 mod common;
@@ -28,16 +27,13 @@ use edge_rs::limma::voom::voom_lmfit;
 // Figures are `NEEDS rel` from:
 //   EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_voom -- --nocapture
 
-/// The log-CPM matrix. Arithmetic only: `log2((count + 0.5) / (lib + 1) * 1e6)`.
-/// Needs `0` beyond a `1e-13` absolute floor, which covers the entries whose
-/// log lands near zero.
+/// The log-CPM matrix: `log2((count + 0.5) / (lib + 1) * 1e6)`. Needs `0` beyond
+/// a `1e-13` absolute floor, which covers logs near zero.
 const TOL_E: Tol = Tol::new(1e-12, 1e-13);
 
-/// Precision weights, the reciprocal fourth power of a lowess fit read back at
-/// the fitted values. Needs `7.8e-15`, which is far better than the smoother's
-/// sensitivity would suggest and worth knowing: a one-ULP wobble in a residual
-/// can move which points sit inside a neighbourhood, and on this data it does
-/// not happen.
+/// Precision weights: the reciprocal fourth power of a lowess fit read back at
+/// the fitted values. Needs `7.8e-15`. A one-ULP wobble in a residual could move
+/// which points sit in a neighbourhood; on this data it does not.
 const TOL_WEIGHTS: Tol = Tol::rel(1e-13);
 
 /// Coefficients and unscaled standard errors from the weighted least squares.
@@ -50,16 +46,15 @@ const TOL_SIGMA: Tol = Tol::rel(1e-13);
 /// The fitted mean-variance trend. Needs `0` beyond a `1e-12` absolute floor.
 const TOL_TREND: Tol = Tol::new(1e-10, 1e-12);
 
-/// Squeezed variances from `squeezeVar`. With non-constant residual degrees of
-/// freedom this runs through `fitFDistUnequalDF1`, whose `optimize` call sits at
-/// R's default `tol` of `1.2e-4` on a very flat likelihood, and through
-/// statmod's `logmdigamma`, which is off in the fourteenth digit and gets
-/// exponentiated. `src/limma/squeeze_var.rs` documents both. Needs `5.6e-9`.
+/// Squeezed variances from `squeezeVar`. With non-constant residual df this runs
+/// through `fitFDistUnequalDF1`, whose `optimize` call stops at R's default `tol`
+/// of `1.2e-4` on a flat likelihood, and statmod's `logmdigamma`, which is off in
+/// the fourteenth digit and gets exponentiated (see `src/limma/squeeze_var.rs`).
+/// Needs `5.6e-9`.
 const TOL_SQUEEZE: Tol = Tol::rel(2e-8);
 
-/// The prior degrees of freedom `squeezeVar` fits, which is the quantity
-/// `optimize` actually searches over and so the loosest thing it produces.
-/// Needs `1.4e-8`.
+/// The prior degrees of freedom `squeezeVar` fits. This is what `optimize`
+/// searches over, so it is the loosest output. Needs `1.4e-8`.
 const TOL_SQUEEZE_DF: Tol = Tol::rel(5e-8);
 
 /////////////
@@ -74,8 +69,8 @@ struct Dataset {
     n_coef: usize,
 }
 
-/// The two datasets voom runs on. The near-Poisson set is left out: its counts
-/// are too low for a mean-variance trend to mean anything.
+/// The two datasets voom runs on. The near-Poisson set is left out: counts too
+/// low for a mean-variance trend.
 const DATASETS: [Dataset; 2] = [
     Dataset {
         tag: "fac",
@@ -222,11 +217,8 @@ fn test_voom_lmfit_matches_edger() {
 
 #[test]
 fn test_voom_structural_zeros_reduce_the_residual_df() {
-    // The planted genes with an entirely empty group lose those observations to
-    // voomLmFit's masking, so the residual degrees of freedom are not constant.
-    // That is the branch where the trend switches to weightedLowess, and if the
-    // dataset ever stopped triggering it this file would quietly become a much
-    // weaker test.
+    // Guards the weightedLowess branch: planted empty-group genes must keep the
+    // residual df non-constant.
     let s = common::scalars();
     for d in &DATASETS {
         let l = load(d);
@@ -259,9 +251,9 @@ fn test_voom_structural_zeros_reduce_the_residual_df() {
     }
 }
 
-///////////////
+////////////////
 // squeezeVar //
-///////////////
+////////////////
 
 #[test]
 fn test_squeeze_var_on_voom_variances_matches_limma() {
@@ -286,8 +278,8 @@ fn test_squeeze_var_on_voom_variances_matches_limma() {
 
         let var: Vec<f64> = fit.sigma.iter().map(|s| s * s).collect();
 
-        // Untrended. The residual df vary, so limma auto-resolves legacy to
-        // FALSE and this goes through fitFDistUnequalDF1.
+        // Untrended. Residual df vary, so limma resolves legacy to FALSE and
+        // this goes through fitFDistUnequalDF1.
         let got = squeeze_var(&var, &fit.df_residual, None, None).expect("squeeze_var failed");
         assert_close(
             &got.var_post,
@@ -325,9 +317,9 @@ fn test_squeeze_var_on_voom_variances_matches_limma() {
             &format!("{}/squeeze_trend_df_prior", d.tag),
         );
 
-        // Robust. The reference is limma with its uniroot converged past its own
-        // default, per UPSTREAM_DEVIATIONS.md B2; on this data the branch
-        // that uses uniroot is not reached, which the generator records.
+        // Robust. The reference converges uniroot past limma's default
+        // (UPSTREAM_DEVIATIONS.md B2); this data never reaches that branch, as the
+        // generator records.
         let params = SqueezeVarParams {
             robust: true,
             ..Default::default()
@@ -347,8 +339,8 @@ fn test_squeeze_var_on_voom_variances_matches_limma() {
             d.tag
         );
 
-        // A scalar df forces limma's legacy branch, which is the only route to
-        // fitFDistRobustly and the one the converged-uniroot override exists for.
+        // A scalar df forces limma's legacy branch, the only route to
+        // fitFDistRobustly (where the B2 override applies).
         let df_one = s.get(&key, "legacy_df_one");
         let got = squeeze_var(&var, &[df_one], None, None).expect("squeeze_var failed");
         assert_close(

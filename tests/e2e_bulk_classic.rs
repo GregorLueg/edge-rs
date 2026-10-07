@@ -1,18 +1,16 @@
 //! End-to-end parity for the classic edgeR chain: filter, normalise, transform,
 //! estimate dispersions, exact test, rank.
 //!
-//! Every reference comes from `tests/r/generate_fixtures.R` against edgeR
-//! 4.8.2. Three datasets run the same assertions, chosen to differ in structure
-//! rather than in seed:
+//! References come from `tests/r/generate_fixtures.R` (edgeR 4.8.2). Three
+//! datasets run the same assertions:
 //!
 //! * `fac`, 1000 genes by 12 samples, balanced two-by-two factorial, abundances
 //!   over sixteen log2 units, ten planted edge-case rows.
 //! * `unbal`, 600 by 9, three groups of two, three and four plus a continuous
 //!   covariate, five residual degrees of freedom, high dispersion.
-//! * `pois`, 300 by 8, near-Poisson counts between roughly 0.5 and 40.
+//! * `pois`, 300 by 8, near-Poisson counts between 0.5 and 40.
 //!
-//! Tolerances are measured rather than guessed. Each constant carries the worst
-//! case actually observed across all three datasets, from
+//! Each tolerance records the worst case observed across all three, from
 //!
 //! ```text
 //! EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_classic -- --nocapture
@@ -35,59 +33,51 @@ use edge_rs::results::{SortBy, top_tags};
 // Tolerances //
 ////////////////
 
-/// Normalisation factors. Trimmed means over logs, no iteration anywhere, so
-/// the only cost is summation order. Needs `2.0e-15`.
+/// Normalisation factors. No iteration, so only summation order matters. Needs
+/// `2.0e-15`.
 const TOL_NORM: Tol = Tol::rel(1e-13);
 
 /// CPM. Pure arithmetic on the counts and library sizes. Needs `2.2e-16`.
 const TOL_CPM: Tol = Tol::rel(1e-13);
 
-/// log-CPM. The same arithmetic wrapped in a logarithm, so a gene whose CPM
-/// lands near one gives a log near zero and the relative test stops meaning
-/// anything. The epsilon covers those; beyond it nothing disagrees at all.
-/// Needs `0` at `1e-13` absolute.
+/// log-CPM. A CPM near one gives a log near zero, where a relative test is
+/// meaningless; the epsilon covers those. Needs `0` at `1e-13` absolute.
 const TOL_LOG_CPM: Tol = Tol::new(1e-12, 1e-13);
 
-/// `aveLogCPM`, which fits an intercept-only negative binomial per gene with
-/// edgeR's own Newton stopping rule, so it is converged but not to machine
-/// precision. Needs `4.9e-10`.
+/// `aveLogCPM`: per-gene intercept-only NB fit with edgeR's Newton stopping rule,
+/// so converged but not to machine precision. Needs `4.9e-10`.
 const TOL_AVE_LOG_CPM: Tol = Tol::rel(2e-9);
 
 /// Common dispersion, maximised over the 21-point grid and then interpolated.
 /// Needs `7.8e-6` on the unbalanced set, `2.9e-6` on the factorial one and
 /// `4.4e-10` on the near-Poisson one.
 ///
-/// The floor is not the interpolation. It is the two genes per dataset with an
-/// entirely empty group, whose adjusted profile likelihood is arbitrary; see
-/// [`TOL_DISPERSION`]. The common dispersion sums the APL over every gene, so
-/// their disagreement lands on it directly, which is also why the near-Poisson
-/// set, which has no such gene, is four orders of magnitude better.
+/// The floor is the two genes per dataset with an entirely empty group, whose
+/// adjusted profile likelihood is arbitrary (see [`TOL_DISPERSION`]). The common
+/// dispersion sums the APL over every gene, so their disagreement lands on it
+/// directly. The near-Poisson set has no such gene.
 const TOL_COMMON: Tol = Tol::rel(3e-5);
 
 /// Prior degrees of freedom from the empirical Bayes fit. Needs `1.9e-5` on the
 /// factorial set, `1.8e-10` on the near-Poisson one. Same cause as
-/// [`TOL_DISPERSION`], one step further on.
+/// [`TOL_DISPERSION`].
 const TOL_PRIOR_DF: Tol = Tol::rel(1e-4);
 
 /// Trended and tagwise dispersions. Needs `8.8e-4` tagwise and `5.9e-5`
-/// trended on the default fit, and `9.1e-3` on the fixed-`prior_df` variant,
-/// where less shrinkage leaves an empty-group gene closer to its own runaway
-/// estimate. All three are driven by those genes; the near-Poisson set, which
-/// has none, needs `2.7e-7` and `4.2e-8`.
+/// trended on the default fit, and `9.1e-3` on the fixed-`prior_df` variant. The
+/// near-Poisson set needs `2.7e-7` and `4.2e-8`.
 ///
-/// The gap is one specific, deliberately planted situation: a gene whose counts
-/// are entirely zero in one group. Its coefficient MLE is negative infinity,
-/// the deviance is flat along that ridge, and the Cox-Reid term is a log
-/// determinant of weights that keep shrinking as the intercept runs away, so
-/// the adjusted profile likelihood depends on exactly where the damped
+/// The gap comes from planted genes whose counts are entirely zero in one group.
+/// Their coefficient MLE is negative infinity, the deviance is flat along that
+/// ridge, and the Cox-Reid log determinant keeps shrinking as the intercept runs
+/// away, so the adjusted profile likelihood depends on where the damped
 /// iteration stops.
 ///
-/// edgeR is no more settled than the crate about where that is. On the same
-/// gene it returns an intercept of -34.90 from a null start, -33.30 when started
-/// from the crate's own answer, and -45.39 at `tol = 1e-14`, with the deviance
-/// agreeing to nine figures throughout. Neither implementation is wrong; the
-/// quantity is not identified. Two such genes in 890 move the smoothed trend by
-/// the amounts above.
+/// edgeR is equally unsettled: on the same gene it returns an intercept of
+/// -34.90 from a null start, -33.30 from the crate's answer, and -45.39 at
+/// `tol = 1e-14`, with the deviance agreeing to nine figures. The quantity is
+/// not identified. Two such genes in 890 move the smoothed trend by the amounts
+/// above.
 const TOL_DISPERSION: Tol = Tol::rel(3e-2);
 
 /// Exact test fold changes and abundances. Needs `3.9e-9` beyond a `1e-12`
@@ -96,23 +86,21 @@ const TOL_EXACT_FC: Tol = Tol::new(2e-8, 1e-12);
 
 /// Exact test p-values on the natural scale. Needs `2.8e-10` beyond the floor.
 ///
-/// The floor has to swallow the empty-group genes, where the crate underflows to
-/// exactly zero and edgeR reports `1.4e-28`. That makes the natural-scale check
-/// blind below `1e-25`, which is why [`TOL_EXACT_LOG_P`] exists: the log scale
-/// is what actually gates the significant end.
+/// The floor swallows the empty-group genes, where the crate underflows to zero
+/// and edgeR reports `1.4e-28`. The natural-scale check is therefore blind below
+/// `1e-25`; [`TOL_EXACT_LOG_P`] gates the significant end.
 const TOL_EXACT_P: Tol = Tol::new(1e-8, 1e-25);
 
-/// Exact test p-values as `log(p)`, which is the check with resolution where it
-/// matters. Needs `2.6e-10`.
+/// Exact test p-values as `log(p)`. Needs `2.6e-10`.
 const TOL_EXACT_LOG_P: Tol = Tol::new(1e-8, 1e-9);
 
 /// Benjamini-Hochberg adjusted p-values, a cumulative minimum over a sort.
 /// Needs `0`: these agree exactly.
 const TOL_FDR: Tol = Tol::rel(1e-12);
 
-////////////
-// Datasets   //
-////////////////
+//////////////
+// Datasets //
+//////////////
 
 /// One dataset's inputs, as the fixtures hold them.
 struct Dataset {
@@ -224,15 +212,12 @@ fn load(d: &Dataset) -> Loaded {
     }
 }
 
-/// Pairs up the log p-values the crate can actually report.
+/// Pairs up the log p-values the crate can report.
 ///
-/// The crate's exact test underflows to exactly zero on a gene whose counts are
-/// entirely zero in one group, where edgeR still carries `1.4e-28`. Both are
-/// "certainly significant" and the difference matters to nobody, but taking the
-/// log turns it into `-inf` against `-64.1`, which no tolerance can absorb and
-/// none should try to. Those genes are dropped here and counted by the caller
-/// instead, so that the comparison keeps its resolution everywhere else and a
-/// change in how much underflows still fails the suite.
+/// A gene with an empty group underflows to zero here while edgeR carries
+/// `1.4e-28`; the log gives `-inf` against `-64.1`, which no tolerance should
+/// absorb. Those genes are dropped and counted by the caller, so a change in how
+/// much underflows still fails.
 ///
 /// ### Params
 ///
@@ -257,8 +242,7 @@ fn finite_log_pairs(p: &[f64], want_log: &[f64]) -> (Vec<f64>, Vec<f64>) {
 
 /// How many exact-test p-values underflow to zero on each dataset.
 ///
-/// One gene on the factorial set, none elsewhere. Recorded rather than tolerated:
-/// if the crate starts losing more of the tail this fails.
+/// One gene on the factorial set, none elsewhere.
 ///
 /// ### Params
 ///
@@ -293,12 +277,9 @@ fn test_filter_by_expr_matches_edger() {
         let l = load(d);
         let want = common::table(&format!("{}_filter.csv", d.tag));
 
-        // The group path. edgeR takes the group off the DGEList when neither a
-        // group nor a design is given, and the generator built that object with
-        // `DGEList(counts, group = grp)`, so its `default` and `group` columns
-        // are the same computation. They are checked as one rather than looped
-        // over, which would have read as covering two API paths while issuing
-        // one call.
+        // The generator built the DGEList with `DGEList(counts, group = grp)`, so
+        // edgeR's `default` and `group` columns are the same computation. Checked
+        // as one call.
         let want_default = want.column_bool("default");
         let want_group = want.column_bool("group");
         assert_eq!(
@@ -328,8 +309,7 @@ fn test_filter_by_expr_matches_edger() {
             diffs[0]
         );
 
-        // The design path. A disagreement here is a different gene set rather
-        // than a numeric drift, which is why it is compared exactly.
+        // Design path, compared exactly: a disagreement is a different gene set.
         let got = filter_by_expr(
             &l.counts,
             l.n_genes,
@@ -354,10 +334,9 @@ fn test_filter_by_expr_matches_edger() {
 
 #[test]
 fn test_filter_by_expr_after_normalisation_uses_effective_libraries() {
-    // edgeR's DGEList method filters on lib.size * norm.factors. That is a no-op
-    // in the usual filter-then-normalise order, and not a no-op the other way
-    // round, so both orderings are pinned. The crate takes the library sizes
-    // explicitly and has no opinion, which is exactly why this is worth a test.
+    // edgeR's DGEList method filters on lib.size * norm.factors: a no-op in the
+    // usual filter-then-normalise order, not the other way round. The crate takes
+    // library sizes explicitly, so both orderings are pinned.
     for d in &DATASETS {
         let l = load(d);
         let want = common::table(&format!("{}_filter.csv", d.tag));
@@ -572,10 +551,9 @@ fn test_estimate_disp_matches_edger() {
         let want = common::table(&format!("{}_disp.csv", d.tag));
         let offset = Recycled::by_sample(l.offset.clone());
 
-        // edgeR computes its own AveLogCPM inside estimateDisp, at the first-pass
-        // common dispersion rather than the 0.05 default, so the two differ by
-        // up to a hundredth of a log2 unit. Passing R's value in isolates the
-        // dispersion estimation from that difference.
+        // estimateDisp computes AveLogCPM at the first-pass common dispersion, not
+        // the 0.05 default (up to 0.01 log2 units apart). R's value is passed in
+        // to isolate the dispersion estimation.
         let got = estimate_disp(
             &l.kept_counts,
             l.n_kept,
@@ -636,8 +614,7 @@ fn test_estimate_disp_matches_edger() {
 
 #[test]
 fn test_estimate_disp_without_tagwise_matches_edger() {
-    // The factorial set is the one with enough abundance range for the trend to
-    // be interesting, so the parameter sweeps run there only.
+    // Parameter sweeps run on the factorial set only (widest abundance range).
     let s = common::scalars();
     let l = load(&DATASETS[0]);
     let disp = common::table("fac_disp.csv");
@@ -711,9 +688,9 @@ fn test_estimate_disp_with_a_fixed_prior_df_matches_edger() {
     );
 }
 
-////////////////
-// exactTest  //
-////////////////
+///////////////
+// exactTest //
+///////////////
 
 #[test]
 fn test_exact_test_matches_edger() {
@@ -730,11 +707,8 @@ fn test_exact_test_matches_edger() {
         .expect("DgeList::new failed");
         dge.lib_size = l.lib_size.clone();
         dge.norm_factors = l.norm_factors.clone();
-        // edgeR's exactTest reuses whatever AveLogCPM the DGEList already
-        // carries rather than recomputing one, and estimateDisp put a value
-        // there computed at its own common dispersion rather than aveLogCPM's
-        // 0.05 default. The crate honours the stored field the same way, so it
-        // has to be populated or the two are computing different things.
+        // exactTest reuses the DGEList's stored AveLogCPM (set by estimateDisp at
+        // its own common dispersion). The crate does the same, so populate it.
         dge.ave_log_cpm = Some(want.column("ave_log_cpm").to_vec());
 
         let dispersion = Recycled::by_gene(want.column("tagwise").to_vec());
@@ -758,12 +732,8 @@ fn test_exact_test_matches_edger() {
             TOL_EXACT_P,
             &format!("{}/exact_PValue", d.tag),
         );
-        // The natural-scale check above is blind below its absolute floor, and
-        // the floor has to be there because a p-value that underflowed to zero
-        // in one implementation and not the other cannot be compared relatively.
-        // So the significant end is gated on the log instead, over the genes
-        // where the crate did not underflow, with the underflow itself counted
-        // rather than swallowed.
+        // The natural-scale check is blind below its absolute floor, so the
+        // significant end is gated on the log, with underflows counted.
         let (log_got, log_want) = finite_log_pairs(&got.p_value, want.column("logPValue"));
         assert_close(
             &log_got,
@@ -809,9 +779,9 @@ fn test_exact_test_matches_edger() {
     }
 }
 
-//////////////
-// topTags  //
-//////////////
+/////////////
+// topTags //
+/////////////
 
 #[test]
 fn test_top_tags_matches_edger() {
@@ -839,9 +809,8 @@ fn test_top_tags_matches_edger() {
                 d.tag
             );
 
-            // R's index column is one-based. edgeR orders with a stable radix
-            // sort and the crate documents that it matches, so this is compared
-            // exactly rather than as a set.
+            // R's index is one-based. edgeR uses a stable radix sort, so compare
+            // exactly, not as a set.
             let want_index: Vec<usize> = want.column_usize("index").iter().map(|i| i - 1).collect();
             common::assert_eq_usize(
                 &got.index,
@@ -867,8 +836,7 @@ fn test_top_tags_matches_edger() {
 
 #[test]
 fn test_top_tags_fdr_is_computed_over_the_whole_table() {
-    // edgeR adjusts before it truncates, so the FDR column does not move with
-    // `n`. Asking for ten rows and for everything has to give the same numbers.
+    // edgeR adjusts before it truncates: FDR must not move with `n`.
     let d = &DATASETS[0];
     let lrt = common::table(&format!("{}_lrt.csv", d.tag));
     let n = lrt.n_rows();

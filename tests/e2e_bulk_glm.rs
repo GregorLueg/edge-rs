@@ -1,12 +1,10 @@
 //! End-to-end parity for the GLM chain: `glmFit`, `glmLRT`, `glmTreat`.
 //!
-//! Runs over the same three datasets as `e2e_bulk_classic.rs`, so the
-//! likelihood ratio test is exercised on a balanced factorial, on an unbalanced
-//! design with a continuous covariate and five residual degrees of freedom, and
-//! on near-Poisson counts where the fit dispatches one-way instead of
-//! Levenberg.
+//! Runs over the three datasets of `e2e_bulk_classic.rs`: balanced factorial,
+//! unbalanced with a continuous covariate, and near-Poisson (where the fit
+//! dispatches one-way instead of Levenberg).
 //!
-//! Tolerances are measured, not guessed:
+//! Tolerances come from
 //! `EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_glm -- --nocapture`.
 
 mod common;
@@ -28,38 +26,33 @@ const TOL_COEF: Tol = Tol::new(1e-5, 2e-3);
 /// Fitted means, which inherit the coefficient slack through `exp(X beta)`.
 /// Needs `1.8e-3` beyond a `1e-4` absolute floor.
 ///
-/// The floor covers the empty-group genes, whose fitted counts on the empty
-/// side sit around `1e-7` and differ only because the runaway coefficient
-/// stopped in a different place. No real fitted count is anywhere near that
-/// small.
+/// The floor covers the empty-group genes, whose fitted counts on the empty side
+/// sit around `1e-7` and differ only because the runaway coefficient stopped
+/// elsewhere.
 const TOL_FITTED: Tol = Tol::new(5e-3, 1e-4);
 
-/// Residual deviance, which unlike the coefficients is well determined. Needs
-/// `6.6e-7`, against edgeR's own `2.9e-7` self-movement.
+/// Residual deviance (well determined, unlike the coefficients). Needs `6.6e-7`,
+/// against edgeR's own `2.9e-7` self-movement.
 const TOL_DEVIANCE: Tol = Tol::new(2e-6, 1e-9);
 
 /// Log fold changes, a coefficient over `ln 2`, so they inherit [`TOL_COEF`].
 /// Needs `0` beyond a `3e-3` absolute floor.
 const TOL_LOG_FC: Tol = Tol::new(1e-5, 3e-3);
 
-/// Likelihood ratio statistics. These are deviance differences, so they are far
-/// better determined than the coefficients. Needs `0` beyond a `1e-5` absolute
-/// floor, which covers genes whose statistic is around `1e-8`, where a
-/// chi-squared that small is a p-value of one either way.
+/// Likelihood ratio statistics (deviance differences). Needs `0` beyond a `1e-5`
+/// absolute floor, which covers statistics around `1e-8`, where the p-value is
+/// one either way.
 const TOL_STATISTIC: Tol = Tol::new(1e-5, 1e-5);
 
 /// P-values on the natural scale. Needs `3.4e-5`.
 ///
-/// The absolute floor stops a p-value that underflowed to zero in one
-/// implementation and not the other from failing a relative test. The log-scale
-/// check below is the one with teeth down there.
+/// The absolute floor stops a p-value that underflowed in only one implementation
+/// from failing. The log-scale check gates that end.
 const TOL_P_VALUE: Tol = Tol::new(1e-4, 1e-300);
 
 /// P-values as `log(p)`. Needs `0` beyond a `1e-4` absolute floor.
 ///
-/// The floor matters at the *other* end from the one this check is for: a gene
-/// with `p` near one has `log p` near zero, where the relative test is as
-/// meaningless as the natural-scale test is for a `p` near zero.
+/// The floor covers `p` near one, where `log p` is near zero.
 const TOL_LOG_P: Tol = Tol::new(1e-5, 1e-4);
 
 /////////////
@@ -118,8 +111,8 @@ struct Loaded {
 ///
 /// ### Returns
 ///
-/// Everything `glm_fit` needs, taken from the fixtures rather than recomputed,
-/// so that this file tests the GLM rather than the dispersion estimation.
+/// Everything `glm_fit` needs, taken from the fixtures so the GLM is tested in
+/// isolation from dispersion estimation.
 fn load(d: &Dataset) -> Loaded {
     let counts_t = common::table(&format!("{}_kept_counts.csv", d.tag));
     let n_genes = counts_t.n_rows();
@@ -144,21 +137,17 @@ fn load(d: &Dataset) -> Loaded {
     }
 }
 
-/// Largest coefficient magnitude, on the natural log scale, that counts as
-/// identified.
+/// Largest natural-log coefficient magnitude that counts as identified.
 ///
-/// A gene with an entirely empty group has a coefficient whose maximum
-/// likelihood estimate is infinite. Both implementations stop somewhere
-/// arbitrary on a flat ridge, and edgeR moves by fourteen log units itself when
-/// its tolerance changes, so those genes carry no information about parity.
-/// Nothing real sits above this: a coefficient of 20 is a fold change of 5e8.
+/// A gene with an entirely empty group has an infinite MLE. Both implementations
+/// stop arbitrarily on a flat ridge (edgeR moves by fourteen log units when its
+/// tolerance changes), so those genes say nothing about parity.
 const IDENTIFIED_COEF_LIMIT: f64 = 20.0;
 
-/// Genes whose coefficients are identified, judged from edgeR's own unshrunk
-/// fit.
+/// Genes whose coefficients are identified, judged from edgeR's unshrunk fit.
 ///
-/// The deviance stays comparable on every gene and is checked everywhere; only
-/// the coefficients and the fold changes are restricted to this mask.
+/// Only coefficients and fold changes use this mask; the deviance is checked on
+/// every gene.
 ///
 /// ### Params
 ///
@@ -182,10 +171,9 @@ fn identified(want: &common::Table, n_genes: usize, n_coef: usize) -> Vec<bool> 
 
 /// Keeps the rows of `v` where `mask` is true.
 ///
-/// The mask is per gene, not per element, so `stride` says how many values each
-/// gene occupies: one for a per-gene vector, `n_coef` for a coefficient matrix.
-/// Passing the wrong stride silently compares the wrong genes, so it is always
-/// given explicitly rather than inferred.
+/// The mask is per gene, so `stride` is the values per gene: one for a per-gene
+/// vector, `n_coef` for a coefficient matrix. A wrong stride silently compares
+/// the wrong genes.
 ///
 /// ### Params
 ///
@@ -301,8 +289,7 @@ fn test_glm_fit_matches_edger() {
 
 #[test]
 fn test_glm_fit_without_a_prior_count_drops_the_unshrunk_copy() {
-    // edgeR returns unshrunk.coefficients only when it actually shrank
-    // something, and the crate mirrors that with an Option.
+    // edgeR returns unshrunk.coefficients only when it shrank something.
     let l = load(&DATASETS[0]);
     let fit = glm_fit(
         &l.counts,
@@ -328,9 +315,7 @@ fn test_glm_fit_without_a_prior_count_drops_the_unshrunk_copy() {
 
 /// Builds the test input for one dataset.
 ///
-/// The dispersion and offsets are the ones the R fit used, taken from the
-/// fixtures, so that a failure here is the test rather than the dispersion
-/// estimation upstream of it.
+/// Dispersion and offsets are the ones the R fit used.
 ///
 /// ### Params
 ///
@@ -400,8 +385,8 @@ fn test_glm_lrt_matches_edger() {
             &format!("{}/lrt_PValue", d.tag),
         );
 
-        // The log scale is where the small p-values are actually checked. R
-        // writes these through pchisq(log.p = TRUE), which does not underflow.
+        // Log scale gates the small p-values; R writes it via
+        // pchisq(log.p = TRUE), which does not underflow.
         let got_log: Vec<f64> = got.p_value.iter().map(|p| p.ln()).collect();
         assert_close(
             &got_log,
@@ -467,9 +452,8 @@ fn test_glm_lrt_on_several_coefficients_matches_edger() {
 
 #[test]
 fn test_glm_lrt_with_a_contrast_matches_edger() {
-    // Contrasts arrive column-major, `n_coef * n_contrasts`. The fixture holds
-    // the transpose of R's makeContrasts matrix, one contrast per row, so
-    // reading a row row-major gives exactly that layout for a single contrast.
+    // Contrasts are column-major, `n_coef * n_contrasts`. The fixture holds the
+    // transpose of makeContrasts, so one row read is one contrast.
     let l = load(&DATASETS[0]);
     let con = common::table("fac_contrasts.csv");
     let want = common::table("fac_lrt_contrast.csv");
@@ -527,8 +511,7 @@ fn test_glm_lrt_with_a_contrast_matches_edger() {
 
 /// Column name of the factorial design's `c`-th coefficient.
 ///
-/// The contrast fixture is headed with the design's column names, so reading a
-/// contrast back needs the mapping from position to name.
+/// The contrast fixture is headed with the design's column names.
 ///
 /// ### Params
 ///
@@ -540,7 +523,7 @@ fn test_glm_lrt_with_a_contrast_matches_edger() {
 ///
 /// ### Panics
 ///
-/// If `c` is past the third column, since only the factorial design is read here.
+/// If `c` is past the third column (only the factorial design is read here).
 fn con_name(c: usize) -> &'static str {
     match c {
         0 => "Int",
@@ -556,8 +539,7 @@ fn con_name(c: usize) -> &'static str {
 
 #[test]
 fn test_glm_treat_matches_edger() {
-    // edgeR's glmTreat reports no statistic column at all, so only the fold
-    // change and the p-value are gated.
+    // glmTreat reports no statistic column: only fold change and p-value are gated.
     let l = load(&DATASETS[0]);
     let want = common::table("fac_treat.csv");
 
