@@ -1,29 +1,25 @@
 //! Host side of the GPU NEBULA path: staging, launch and read-back.
 //!
-//! The CPU fits one gene at a time; the device fits a batch of *requests* at
-//! once, where a request is one penalised fit of one gene at one pair of
-//! variance components. A gene can carry several requests in the same launch,
-//! which is what lets a stage-two polish stencil go out as one batch.
+//! The device fits a batch of *requests*: one penalised fit of one gene at one
+//! pair of variance components. A gene can carry several requests in a launch,
+//! so a stage-two polish stencil goes out as one batch.
 //!
 //! ### Layout
 //!
-//! The per-gene data is uploaded once and stays resident: the positive counts of
-//! every gene concatenated, indexed by where each subject's run starts within
-//! each gene, and the per-subject count totals gene-minor. The subject index is
-//! what lets each lane of a plane find its own first count by a short binary
-//! search instead of walking the gene from the start. The
-//! shared design, offsets and subject boundaries stay in their natural order,
-//! because every thread walks them identically and the traffic is served once
-//! from cache.
+//! Per-gene data is uploaded once and stays resident: the positive counts of
+//! every gene concatenated, the start of each subject's run within each gene
+//! (so a lane finds its first count by binary search), and the per-subject
+//! count totals gene-minor. The shared design, offsets and subject boundaries
+//! keep their natural order, as every thread walks them identically.
 //!
 //! Everything per request is **request-minor**: entry `i` of request `q` lives
 //! at `i * n_req + q`, so consecutive threads touch consecutive addresses.
 //!
 //! ### Precision
 //!
-//! The device is `f32`. Everything derived on the host, in particular the gamma
-//! prior's `alpha` and `lambda`, is computed in `f64` and cast once, because
-//! `alpha = 1 / (e^s - 1)` cancels badly for the small `s` most genes land on.
+//! The device is `f32`. Host-derived values, in particular the gamma prior's
+//! `alpha` and `lambda`, are computed in `f64` and cast once, as
+//! `alpha = 1 / (e^s - 1)` cancels badly for the small `s` most genes have.
 
 use std::time::{Duration, Instant};
 
@@ -45,9 +41,9 @@ use crate::gpu::pml_kernel::{OUT_HEADER, PmlGpuTensors, SUBJECT_SLOTS, launch_op
 
 /// One gene's sparse counts, as the batch builder wants them.
 ///
-/// The same three slices [`crate::sc::pml::PmlData`] borrows, minus the shared
-/// design and offsets, plus the variance components and starting point for the
-/// one-request-per-gene convenience in [`opt_pml_batch`].
+/// The slices [`crate::sc::pml::PmlData`] borrows, minus the shared design and
+/// offsets, plus the variance components and starting point used by
+/// [`opt_pml_batch`].
 #[derive(Clone, Copy, Debug)]
 pub struct GpuGene<'a> {
     /// The positive counts, in increasing cell order.
@@ -104,10 +100,9 @@ pub struct PmlReply {
     pub log_w: Vec<f64>,
     /// Schur complement, row-major `nb * nb`; empty unless read back in full.
     ///
-    /// At the returned point when [`GpuSolveParams::information`] is set. Without
-    /// it this, [`Self::subject_curvature`] and [`Self::cross_block`] are the
-    /// last Newton step's, one converged step behind the returned point: not the
-    /// fit's information, but as good a Hessian for one more step from there.
+    /// At the returned point when [`GpuSolveParams::information`] is set.
+    /// Without it this, [`Self::subject_curvature`] and [`Self::cross_block`]
+    /// are the last Newton step's, one converged step behind the returned point.
     pub information: Vec<f64>,
     /// Curvature of each random effect, nebula's `vw`, length `k`; empty unless
     /// read back in full.
@@ -151,10 +146,9 @@ pub struct GpuSolveParams {
     /// Whether to read back the fitted point (coefficients and random effects)
     /// and the information as well as the scalars.
     pub full: bool,
-    /// Whether the information and the log-determinant are wanted. They cost the
-    /// device one more sweep over the cells, at the point the fit returns;
-    /// without it [`PmlReply::information`] is the last Newton step's and
-    /// [`PmlReply::log_det`] is NaN.
+    /// Whether the information and the log-determinant are wanted. They cost one
+    /// more sweep over the cells; without it [`PmlReply::information`] is the
+    /// last Newton step's and [`PmlReply::log_det`] is NaN.
     pub information: bool,
 }
 
@@ -173,9 +167,8 @@ pub struct SolveTiming {
 /// A launch in flight: what [`ResidentBatch::submit`] hands back and
 /// [`ResidentBatch::collect`] redeems.
 ///
-/// The read-back is already queued behind the kernel, so a later launch does
-/// not hold this one's results up and the host can finish one batch while the
-/// device runs the next.
+/// The read-back is already queued behind the kernel, so the host can finish
+/// one batch while the device runs the next.
 pub struct PendingSolve<'a> {
     /// The packed output on its way back. The read borrows the client it was
     /// queued on.
@@ -194,13 +187,10 @@ pub struct PendingSolve<'a> {
 
 /// A set of genes whose data stays on the device between launches.
 ///
-/// The counts and their cell indices are by far the largest upload, running to
-/// hundreds of megabytes on a real batch, and NEBULA's stage two fits every
-/// gene on the order of a hundred times with only the variance components
-/// changed. Uploading once and solving many times is what makes that
-/// affordable: measured at 16384 genes and 20000 cells, a one-shot solve spent
-/// 1.5 of its 4.0 seconds on staging, and every solve after the first pays
-/// none of it.
+/// The counts and cell indices are the largest upload (hundreds of megabytes),
+/// and stage two fits every gene about a hundred times with only the variance
+/// components changed. Measured at 16384 genes and 20000 cells, a one-shot solve
+/// spent 1.5 of its 4.0 seconds on staging; later solves pay none of it.
 pub struct ResidentBatch<R: Runtime> {
     /// Shared design, row-major `n_cells * nb`.
     design: GpuTensor<R, f32>,
@@ -298,9 +288,8 @@ impl<R: Runtime> ResidentBatch<R> {
             }
         }
 
-        // The narrowing to f32 is over `n_cells * nb` and `nnz`, both of which
-        // run to tens of millions on a real batch. Left sequential it is a
-        // serial third of the staging time.
+        // The f32 narrowing runs over tens of millions of values; sequential it
+        // is a third of the staging time.
         let design_f32: Vec<f32> = design.par_iter().map(|&v| v as f32).collect();
         let offset_f32: Vec<f32> = log_offset.par_iter().map(|&v| v as f32).collect();
         let start_u32: Vec<u32> = subject_start.iter().map(|&v| v as u32).collect();
@@ -317,8 +306,8 @@ impl<R: Runtime> ResidentBatch<R> {
         let mut counts_f32 = vec![0.0f32; nnz];
         let mut cells_u32 = vec![0u32; nnz];
         {
-            // Split once into the per-gene runs `gene_ptr` already describes,
-            // then fill them in parallel; the runs are disjoint.
+            // Split into the disjoint per-gene runs `gene_ptr` describes, then
+            // fill in parallel.
             let mut count_runs: Vec<&mut [f32]> = Vec::with_capacity(n_genes);
             let mut cell_runs: Vec<&mut [u32]> = Vec::with_capacity(n_genes);
             let mut count_rest = counts_f32.as_mut_slice();
@@ -345,9 +334,9 @@ impl<R: Runtime> ResidentBatch<R> {
                 });
         }
 
-        // Where each subject's run starts within each gene's counts, as an
-        // absolute index into the concatenated buffer. The counts are in cell
-        // order and so are the subjects, so one merge per gene does it.
+        // Start of each subject's run within each gene's counts, as an absolute
+        // index into the concatenated buffer. Counts and subjects are both in
+        // cell order, so one merge per gene does it.
         let mut subject_ptr = vec![0u32; n_genes * (k + 1)];
         for (g, gene) in genes.iter().enumerate() {
             let base = gene_ptr[g] as usize;
@@ -367,11 +356,10 @@ impl<R: Runtime> ResidentBatch<R> {
             }
         }
 
-        // The anchor the kernel takes each subject's curvature moments about. A
-        // column constant within a subject is anchored on its value, not on a
-        // mean that may round an ulp away from it, so its deviation is exactly
-        // zero; a column constant within every subject is left out of the
-        // moments altogether.
+        // Anchor for each subject's curvature moments. A column constant within
+        // a subject is anchored on its value, not a mean that may round an ulp
+        // away, so its deviation is exactly zero. A column constant within every
+        // subject is left out of the moments.
         let mut subject_mean = vec![0.0f32; k * nb];
         let mut varies = vec![false; nb];
         for s in 0..k {
@@ -471,10 +459,9 @@ impl<R: Runtime> ResidentBatch<R> {
 
     /// Launches a batch of penalised fits and queues its read-back.
     ///
-    /// Only the per-request scalars and starting points are uploaded; the
-    /// counts, the design and the offsets stay where they are. Returns as soon
-    /// as the work is queued. Launches run in submission order on the device,
-    /// so several may be in flight against the one scratch.
+    /// Uploads only per-request scalars and starting points, and returns once
+    /// the work is queued. Launches run in submission order, so several may be
+    /// in flight against the one scratch.
     ///
     /// ### Params
     ///
@@ -602,8 +589,8 @@ impl<R: Runtime> ResidentBatch<R> {
             self.n_varying,
             client,
         )?;
-        // The read encodes its copy and submits the queue here, not when it is
-        // awaited, which is what lets the next launch go in behind it.
+        // The read encodes its copy and submits the queue here, not on await, so
+        // the next launch can go in behind it.
         let out = Box::pin(client.read_async(vec![tensors.out.handle().clone()]));
         if let Some(t) = self.timing.as_mut() {
             t.staging += started.elapsed();
@@ -688,8 +675,8 @@ impl<R: Runtime> ResidentBatch<R> {
 /// * `genes` - One entry per gene in the batch
 /// * `eps` - nebula's absolute stopping tolerance
 /// * `noise_scale` - Resolution floor on the objective, relative to its
-///   magnitude. [`crate::gpu::pml_kernel::F32_NOISE_SCALE`] is the default; it
-///   is a parameter because the right value scales with the cell count
+///   magnitude. [`crate::gpu::pml_kernel::F32_NOISE_SCALE`] is the default; the
+///   right value scales with the cell count
 /// * `max_iter` - Newton budget
 /// * `max_backtrack` - Backtracking budget within one step
 /// * `client` - CubeCL compute client

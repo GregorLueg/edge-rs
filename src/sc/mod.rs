@@ -1,8 +1,7 @@
 //! NEBULA: negative binomial mixed models for single cell.
 //!
-//! Ported from the `nebula` R package sources rather than from edgePython.
-//! edgePython implements only NEBULA-LN and its standard errors are 6 to 89 per
-//! cent away from the R package, which is not usable for inference.
+//! Ported from the `nebula` package sources, not edgePython, whose standard
+//! errors are 6 to 89 per cent off. See `UPSTREAM_DEVIATIONS.md` A20.
 
 pub mod nebula;
 pub mod pml;

@@ -1,27 +1,23 @@
 //! The marginal Poisson-gamma mixed model NEBULA starts from.
 //!
-//! `ptmg` is the model with the subject random effect integrated out
-//! analytically: each subject contributes one gamma-distributed frailty shared
-//! by all of its cells, and each cell carries its own gamma overdispersion. The
-//! result is a closed-form marginal likelihood in `(beta, sigma, phi)` that the
-//! R package minimises with L-BFGS-B to get the starting values every later
-//! stage of NEBULA refines.
+//! The subject random effect is integrated out analytically: each subject has
+//! one gamma frailty shared by its cells, and each cell has its own gamma
+//! overdispersion. The closed-form marginal likelihood in `(beta, sigma, phi)`
+//! is minimised with L-BFGS-B to give the starting values every later NEBULA
+//! stage refines. Ports `ptmg_*_eigen` from `nebula`'s C++ plus the R-level
+//! gamma corrections. `ptmg_value_gradient_hessian` supplies the marginal
+//! Hessian edgePython lacks; see `UPSTREAM_DEVIATIONS.md` A20.
 //!
-//! ### Layout and conventions
+//! ### Layout
 //!
-//! Cells are sorted by subject and [`GeneData::fid`] holds the boundaries, so
-//! subject `s` owns cells `fid[s]..fid[s + 1]`. Every inner loop walks that
-//! structure. The design is row-major `n_cells * n_coef`, one contiguous row
-//! per cell, which is the orientation all the per-cell accumulations want. The
-//! parameter vector is `[beta (n_coef), sigma, phi]`.
+//! Cells are sorted by subject and [`GeneData::fid`] holds the boundaries:
+//! subject `s` owns cells `fid[s]..fid[s + 1]`. The design is row-major
+//! `n_cells * n_coef`. The parameter vector is `[beta (n_coef), sigma, phi]`.
 //!
-//! One gene is the unit of work here and everything is sequential; genes are
-//! the parallel axis and belong to the caller. The only exception is
-//! [`cumsum_y`], which sees the whole matrix and fans out over genes itself.
-//!
-//! The public kernels allocate their scratch per call. Stage one's optimiser
-//! evaluates one gene tens to hundreds of times, so it holds a `PtmgScratch`
-//! per gene and goes through `ptmg_value_and_gradient_with` instead.
+//! One gene is the unit of work and kernels are sequential; the caller
+//! parallelises over genes. The exception is [`cumsum_y`], which fans out over
+//! genes itself. Public kernels allocate scratch per call; the optimiser holds
+//! a `PtmgScratch` per gene and uses `ptmg_value_and_gradient_with`.
 //!
 //! ### References
 //!
@@ -38,12 +34,9 @@ use crate::prelude::*;
 
 /// Per-gene data laid out the way the kernels want it.
 ///
-/// Counts are held sparsely: only the non-zero entries, with the cell each one
-/// belongs to. That is how NEBULA stores single-cell counts and how
-/// [`positive_indices`] hands them over.
-///
-/// Build with [`GeneData::new`], which is the only thing that checks the
-/// invariants the kernels rely on.
+/// Counts are sparse: non-zero entries plus their cells, as
+/// [`positive_indices`] returns them. Build with [`GeneData::new`], the only
+/// place the kernels' invariants are checked.
 #[derive(Clone, Copy, Debug)]
 pub struct GeneData<'a> {
     /// Design matrix, row-major `n_cells * n_coef`, one row per cell.
@@ -198,12 +191,9 @@ impl<'a> GeneData<'a> {
     }
 }
 
-/// Widest design whose per-subject sums in the gradient pass are held on the
-/// stack.
-///
-/// Heap accumulators cost a store-to-load round trip per cell; on the stack the
-/// compiler keeps them in registers. Measured on one 20000-cell gene at three
-/// coefficients, 258 against 236 us per evaluation. Wider designs take the heap.
+/// Widest design whose per-subject gradient sums live on the stack, where the
+/// compiler keeps them in registers (236 against 258 us per evaluation on a
+/// 20000-cell, three-coefficient gene). Wider designs use the heap.
 const LOCAL_COEF: usize = 8;
 
 /// Per-gene buffers for the kernels, so repeated evaluations of one gene
@@ -247,10 +237,10 @@ impl PtmgScratch {
 
 /// The scalars every kernel derives from `(sigma, phi)`, and their derivatives.
 ///
-/// `sigma` is the log of one plus the subject-level variance, so the gamma
-/// frailty has shape `alpha = 1 / (exp(sigma) - 1)` and rate
-/// `lambda = alpha / sqrt(exp(sigma))`. `phi` is the cell-level gamma shape and
-/// enters the likelihood directly, so it needs no reparametrisation.
+/// `sigma` is the log of one plus the subject-level variance: the gamma frailty
+/// has shape `alpha = 1 / (exp(sigma) - 1)` and rate
+/// `lambda = alpha / sqrt(exp(sigma))`. `phi`, the cell-level gamma shape,
+/// enters directly.
 #[derive(Clone, Copy, Debug)]
 struct Terms {
     /// `sqrt(exp(sigma))`, which is also `alpha / lambda`.
@@ -331,11 +321,10 @@ enum GammaOrder {
 
 /// The gamma-function terms the C++ kernels leave to the R wrappers.
 ///
-/// Two blocks, one per random effect. The subject block is
-/// `sum lgamma(cumsumy + alpha) - lgamma(alpha)` over subjects with a non-zero
-/// total, differentiated through `alpha`. The cell block is
+/// Subject block: `sum lgamma(cumsumy + alpha) - lgamma(alpha)` over subjects
+/// with a non-zero total, differentiated through `alpha`. Cell block:
 /// `sum lgamma(y + phi) - lgamma(phi)` over cells with a non-zero count,
-/// differentiated in `phi` directly.
+/// differentiated in `phi`.
 #[derive(Clone, Copy, Debug, Default)]
 struct GammaTerms {
     /// Subject block, evaluated.
@@ -354,14 +343,10 @@ struct GammaTerms {
 
 /// Evaluates the gamma-function terms and, on request, their derivatives.
 ///
-/// Counts of one and two are handled in closed form, as the reference does:
+/// Counts of one and two use closed forms, as the reference does:
 /// `lgamma(1 + g) - lgamma(g) = log(g)` and
 /// `lgamma(2 + g) - lgamma(g) = log(g) + log(g + 1)`. Only counts of three and
-/// above pay for a `lgamma` call, which is most of the saving on single-cell
-/// data where nearly every non-zero count is a one or a two.
-///
-/// Subjects whose total is zero contribute exactly nothing and are skipped,
-/// which is what the reference's `posind` index does.
+/// above call `lgamma`. Subjects with a zero total are skipped (`posind`).
 ///
 /// ### Params
 ///
@@ -372,12 +357,13 @@ struct GammaTerms {
 ///
 /// ### Returns
 ///
-/// The two blocks and whichever derivatives `order` asked for; the rest stay at
-/// zero.
+/// The two blocks and the derivatives `order` asks for; the rest stay zero.
 fn gamma_terms(data: &GeneData<'_>, alpha: f64, gamma: f64, order: GammaOrder) -> GammaTerms {
     let mut out = GammaTerms::default();
 
-    // -- subject block --
+    // ------------- //
+    // subject block //
+    // ------------- //
     let mut n_positive = 0.0;
     let mut ln_sum = 0.0;
     let mut di_sum = 0.0;
@@ -402,7 +388,9 @@ fn gamma_terms(data: &GeneData<'_>, alpha: f64, gamma: f64, order: GammaOrder) -
         out.subject_trigamma = tri_sum - n_positive * trigamma(alpha);
     }
 
-    // -- cell block --
+    // ---------- //
+    // cell block //
+    // ---------- //
     let mut n_one = 0.0;
     let mut n_two = 0.0;
     let mut n_big = 0.0;
@@ -504,10 +492,9 @@ pub fn ptmg_neg_log_likelihood(data: &GeneData<'_>, params: &[f64]) -> f64 {
 
 /// Gradient of the marginal negative log-likelihood.
 ///
-/// Port of `ptmg_der_eigen` plus the R-level corrections, so this equals
-/// `nebula:::ptmg_der`. It runs the same code as
-/// [`ptmg_value_and_gradient`] and throws the value away; prefer that when both
-/// are wanted, which for an optimiser is always.
+/// Port of `ptmg_der_eigen` plus the R-level corrections, equal to
+/// `nebula:::ptmg_der`. Runs [`ptmg_value_and_gradient`] and drops the value;
+/// prefer that when both are needed.
 ///
 /// ### Params
 ///
@@ -524,7 +511,7 @@ pub fn ptmg_gradient(data: &GeneData<'_>, params: &[f64]) -> Vec<f64> {
 /// Value and gradient of the marginal negative log-likelihood together.
 ///
 /// Port of `ptmg_ll_der_eigen` plus the R-level corrections, so this equals
-/// `nebula:::ptmg_ll_der`. This is the objective the bounded optimiser drives.
+/// `nebula:::ptmg_ll_der`. This is the optimiser's objective.
 ///
 /// ### Params
 ///
@@ -562,16 +549,13 @@ pub(crate) fn ptmg_value_and_gradient_with(
 
 /// Value, gradient and Hessian of the marginal negative log-likelihood.
 ///
-/// Port of `ptmg_ll_der_hes_eigen` plus the R-level corrections. This is the
-/// function edgePython does not have, and the reason its standard errors drift
-/// from the R package: the observed information of the marginal likelihood is
-/// what the covariance of `beta` is read off.
+/// Port of `ptmg_ll_der_hes_eigen` plus the R-level corrections. The covariance
+/// of `beta` is read off this observed information; edgePython has no
+/// equivalent (A20).
 ///
-/// The Hessian is in the direct parametrisation `[beta, sigma, phi]`, matching
-/// the gradient. The R package's `ptmg_ll_der_hes2` and `ptmg_ll_der_hes3`
-/// additionally push it through `sigma -> exp(sigma)` for the `trust`
-/// optimiser; that chain rule belongs to whichever driver wants the log scale,
-/// not here.
+/// The Hessian is in the direct parametrisation `[beta, sigma, phi]`. The R
+/// package's `ptmg_ll_der_hes2` and `ptmg_ll_der_hes3` also apply
+/// `sigma -> exp(sigma)` for `trust`; that chain rule is the driver's job.
 ///
 /// ### Params
 ///
@@ -634,12 +618,10 @@ fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch
 
 /// Value, gradient and optionally Hessian, in one pass over the gene.
 ///
-/// The shared body of [`ptmg_value_and_gradient`] and
-/// [`ptmg_value_gradient_hessian`], mirroring how `ptmg_ll_der_eigen` and
-/// `ptmg_ll_der_hes_eigen` share theirs. Everything is accumulated in
-/// log-likelihood sign, exactly as the reference does, and negated once at the
-/// end; the gamma-function corrections are then subtracted from the negated
-/// quantities, which is the order `R/ptmg.R` uses.
+/// Shared body of [`ptmg_value_and_gradient`] and
+/// [`ptmg_value_gradient_hessian`]. Accumulates in log-likelihood sign and
+/// negates once at the end; the gamma corrections are then subtracted from the
+/// negated quantities, the order `R/ptmg.R` uses.
 ///
 /// ### Params
 ///
@@ -696,9 +678,8 @@ fn evaluate(
     total += (k as f64) * terms.alpha * terms.log_lambda;
     total += (n_cells as f64) * gamma * terms.log_gamma;
 
-    // One pass per cell for the value and the gradient. The Hessian's per-cell
-    // buffers are only kept when it is wanted. Every sum runs in the same order
-    // as the two passes this was, so the result is unchanged to the bit.
+    // One pass per cell for value and gradient; the Hessian's per-cell buffers
+    // are kept only when wanted. Sum order matches the reference.
     let per_cell = |len: usize| {
         if with_hessian {
             vec![0.0; len]
@@ -713,8 +694,8 @@ fn evaluate(
     let mut dbeta_41 = vec![0.0; k * nb];
     let mut d42c = vec![0.0; k];
     // One subject's cells, adding into its rows of `xexb_f` and `dbeta_41`.
-    // The running sums go in and come back by value so they stay in registers;
-    // returns them with the subject's `sum gstar * extb`.
+    // Running sums pass by value to stay in registers; returns them with the
+    // subject's `sum gstar * extb`.
     let mut cells = |s: usize, sums: [f64; 3], xf: &mut [f64], d41: &mut [f64]| {
         let [mut total, mut slpey, mut gstar_sum] = sums;
         let ym = ymustar[s];
@@ -808,7 +789,9 @@ fn evaluate(
         return (value, gradient, Vec::new());
     }
 
-    // -- Hessian, still in log-likelihood sign --
+    // ------------------------------------- //
+    // Hessian, still in log-likelihood sign //
+    // ------------------------------------- //
     let mut hessian = vec![0.0; n_params * n_params];
     let lam_ratio = terms.lambda_pr / terms.lambda;
     let mut hes_sigma = (terms.alpha_dpr * terms.log_lambda + 2.0 * terms.alpha_pr * lam_ratio
@@ -899,7 +882,9 @@ fn evaluate(
     }
     hes_sigma += (0..k).map(|s| b2f[s] * apm[s] * apm[s]).sum::<f64>();
 
-    // -- beta block --
+    // ---------- //
+    // beta block //
+    // ---------- //
     let ymu2: Vec<f64> = ymustar.iter().map(|v| v * v).collect();
     let ymuymuimu: Vec<f64> = (0..k).map(|s| ymu2[s] * imustar[s]).collect();
     let b2f_scaled: Vec<f64> = (0..k).map(|s| b2f[s] * ymuymuimu[s] * imustar[s]).collect();
@@ -968,11 +953,8 @@ fn evaluate(
 
 /// Per-subject count totals for every gene.
 ///
-/// Port of `call_cumsumy`. The reference walks the sparse matrix cell by cell
-/// and dumps an accumulator at each subject boundary, because its counts are
-/// cell-major. Ours are gene-major, so each gene's non-zeros are contiguous and
-/// the subject is looked up per entry instead. Same result, one pass, and genes
-/// fan out over rayon.
+/// Port of `call_cumsumy`. Counts are gene-major here (the reference is
+/// cell-major), so the subject is looked up per non-zero entry.
 ///
 /// ### Params
 ///
@@ -1056,9 +1038,8 @@ pub struct GeneCounts {
 
 /// Extracts one gene's non-zero counts.
 ///
-/// Port of `call_posindy`. The counts of one and two are tallied separately
-/// because the gamma-function part of the likelihood has a closed form for them,
-/// which is where most of the entries in a single-cell matrix land.
+/// Port of `call_posindy`. Counts of one and two are tallied separately for the
+/// closed forms in the gamma terms.
 ///
 /// ### Params
 ///
@@ -1121,10 +1102,9 @@ pub fn positive_indices(
 
 /// Centres and scales a design matrix.
 ///
-/// Port of `center_m`. Each column is centred, then divided by its population
-/// standard deviation. A column with no spread is not scaled: if its first
-/// entry is non-zero it becomes a column of ones, which is how the intercept
-/// survives centring, and otherwise it is left at zero and flagged with a
+/// Port of `center_m`. Each column is centred and divided by its population
+/// standard deviation. A column with no spread is not scaled: it becomes ones if
+/// its first entry is non-zero (the intercept), otherwise it stays zero with a
 /// standard deviation of `-1` so the caller can drop it.
 ///
 /// ### Params
@@ -1204,9 +1184,9 @@ pub struct OffsetSummary {
 
 /// Prepares the offsets and measures their spread.
 ///
-/// Port of `cv_offset`. With no offset every cell gets one, which logs to zero
-/// and has no spread. The coefficient of variation is what decides later
-/// whether NEBULA-LN's approximation is safe for this dataset.
+/// Port of `cv_offset`. With no offset every cell gets one (log zero, no
+/// spread). The coefficient of variation decides whether NEBULA-LN's
+/// approximation is safe.
 ///
 /// ### Params
 ///
@@ -1262,10 +1242,8 @@ pub fn offset_summary(offset: Option<&[f64]>, n_cells: usize) -> Result<OffsetSu
 
 /// Squared coefficient of variation of the fitted cell-level means.
 ///
-/// Port of `get_cv`. Only the cell-level columns of the design contribute,
-/// since subject-level columns are constant within a subject and cannot make
-/// the means vary across cells within one. Note this is the squared CV, unlike
-/// [`offset_summary`]'s `cv`, which is the reference's own asymmetry.
+/// Port of `get_cv`. Only cell-level columns contribute. This is the squared CV,
+/// unlike [`offset_summary`]'s `cv` (the reference's own asymmetry).
 ///
 /// ### Params
 ///
@@ -1340,9 +1318,8 @@ pub fn design_cv(
 
 /// Flags the design columns that vary within a subject.
 ///
-/// Port of `get_cell`. A column constant across every subject's cells is a
-/// subject-level covariate and is absorbed by the random effect; only the
-/// varying ones are cell-level.
+/// Port of `get_cell`. A column constant within every subject is subject-level
+/// and absorbed by the random effect; the rest are cell-level.
 ///
 /// ### Params
 ///
@@ -1404,8 +1381,7 @@ pub fn cell_level_columns(
 // Tests //
 ///////////
 
-// The reference literals are R's `%.17e` output pasted verbatim. Trimming them
-// to the shortest round-tripping form would hide where they came from.
+// Reference literals are R's `%.17e` output, pasted verbatim.
 #[cfg(test)]
 #[allow(clippy::excessive_precision)]
 mod tests {
@@ -1539,28 +1515,22 @@ mod tests {
     // Reference values from nebula 1.5.8, via
     //   Rscript -e 'library(nebula); nebula:::ptmg_ll_der_hes_eigen(X, offset, Y,
     //     fid-1, cumsumy, posind-1, posindy, nb, nind, k, beta, sigma)'
-    // with the gamma-function corrections of R/ptmg.R applied, i.e. the same
-    // arithmetic as nebula:::ptmg_ll_der plus the Hessian lines of
-    // nebula:::ptmg_ll_der_hes2 without its log-scale chain rule. Cross-checked
-    // against nebula:::ptmg_ll and nebula:::ptmg_ll_der.
+    // with the gamma-function corrections of R/ptmg.R applied (the arithmetic of
+    // nebula:::ptmg_ll_der plus the Hessian lines of nebula:::ptmg_ll_der_hes2,
+    // without its log-scale chain rule).
     //
-    // One deliberate departure: the corrections here call base R's lgamma,
-    // digamma and trigamma, where R/ptmg.R calls Rfast's. Rfast::Digamma is
-    // about 5e-11 absolute off base R and Rfast::Trigamma about 1.4e-9, and
-    // `alpha_pr` multiplies those by up to 1e8 at the lower bound on sigma. Our
-    // gamma.rs tracks base R, so comparing against Rfast would be measuring
-    // Rfast's error. Against the package's own Rfast path these references move
-    // the gradient by at most 1e-8 relative.
+    // Deliberate departure: the corrections call base R's lgamma, digamma and
+    // trigamma, where R/ptmg.R calls Rfast's. Rfast::Digamma is ~5e-11 off base
+    // R and Rfast::Trigamma ~1.4e-9, and `alpha_pr` multiplies that by up to 1e8
+    // at the lower bound on sigma. gamma.rs tracks base R. Against the Rfast
+    // path these references move the gradient by at most 1e-8 relative.
     //
-    // Tolerances are 1e-10 on value and gradient and 1e-8 on the Hessian, except
-    // at `sigma = 1e-4`, its lower bound, where they drop to 1e-8 and 1e-6. That
-    // is not slack in the port: there `alpha_pr` is of order 1e8 and `alpha_pr^2`
-    // of order 1e16, and the sigma derivatives are differences of quantities that
-    // large collapsing to order 1e2 and 1e3. Six digits go in the cancellation,
-    // so the last few are set by summation order and by the last bit of
-    // `digamma`, not by the maths. What is actually achieved is 8e-13 on the
-    // value, 1.4e-14 on the gradient and 9e-13 on the Hessian away from that
-    // bound, and 4e-9 and 2e-7 at it.
+    // Tolerances: 1e-10 on value and gradient, 1e-8 on the Hessian; at the
+    // `sigma = 1e-4` lower bound 1e-8 and 1e-6. There `alpha_pr` is ~1e8 and
+    // `alpha_pr^2` ~1e16, and the sigma derivatives cancel down to ~1e2 and 1e3,
+    // so the last digits are set by summation order and the last bit of
+    // `digamma`. Achieved: 8e-13 (value), 1.4e-14 (gradient), 9e-13 (Hessian)
+    // away from the bound; 4e-9 and 2e-7 at it.
 
     #[test]
     fn test_matches_nebula_at_an_interior_point() {
@@ -2002,7 +1972,9 @@ mod tests {
         assert!(matches!(err, EdgeErrors::InvalidArgument(_)));
     }
 
-    // -- helpers --
+    // ------- //
+    // helpers //
+    // ------- //
 
     /// A three-gene, six-cell count matrix in gene-major CSR form.
     ///

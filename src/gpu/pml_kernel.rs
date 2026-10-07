@@ -1,81 +1,75 @@
 //! NEBULA's penalised maximum likelihood inner solver, one fit per plane.
 //!
 //! A port of [`crate::sc::pml`]'s Newton loop to CubeCL. The CPU module is the
-//! reference for every formula; this file changes where the work happens, what
-//! precision it happens in, and — because of that precision — how three of the
-//! quantities are arranged.
+//! reference for every formula; this file changes where the work happens, the
+//! precision, and how three quantities are arranged because of that precision.
 //!
 //! ### Mapping
 //!
 //! One plane owns one fit and every lane runs the whole Newton loop,
 //! backtracking included, on the same values. Only the passes over cells are
-//! split: each lane takes a contiguous chunk of every subject block, and the
-//! partial sums are recombined with plane reductions, so the quantities the
-//! Newton step and the stopping tests read are identical in every lane and the
-//! lanes never disagree about what to do next. No barrier, no shared memory.
+//! split: each lane takes a chunk of every subject block and the partial sums
+//! are recombined with plane reductions. Every quantity the Newton step and the
+//! stopping tests read is therefore identical in every lane, so the lanes never
+//! disagree about what to do next. No barrier, no shared memory.
 //!
-//! The first version put one fit on one thread. That made a launch cost one
-//! thread's serial walk over every cell whatever the batch size: measured at
-//! 20000 cells, 455 fits took 152 ms and 3644 took 202 ms, and stage two's
-//! lockstep rounds carry a few thousand fits at most. Spreading each fit over a
-//! plane measured 15x faster at 455 fits and 4.2x at 3644 on the likelihood
-//! pass.
+//! One fit per thread cost one thread's serial walk over every cell whatever
+//! the batch size (20000 cells: 455 fits took 152 ms, 3644 took 202 ms). A
+//! plane per fit measured 15x faster at 455 fits and 4.2x at 3644 on the
+//! likelihood pass.
 //!
 //! ### Precision: the part better summation cannot fix
 //!
-//! wgpu exposes no `f64`, so the device arithmetic is `f32`. The obvious
-//! defence is compensated summation, and on this backend it **does not work**.
-//! wgpu-hal compiles every Metal shader with fast-math left on (it builds
-//! `MTLCompileOptions` and sets only the language version and invariance,
-//! `wgpu-hal-29.0.4/src/metal/device.rs:227`), which licenses reassociation.
-//! Kahan and double-single both recover a rounding error through a `two_sum`
-//! whose exact-algebra value is zero, so the compiler folds them away. Measured:
-//! scaling the recovered low part by a thousand changed not one digit, and a
-//! bit-level round-trip, a multiply by a runtime one read from a buffer and a
-//! trip through global memory are all folded too. Integer fixed-point
-//! accumulation is exact and costs nothing measurable, but see below for why
-//! exact summation would not be enough.
+//! wgpu exposes no `f64`, so the device arithmetic is `f32`. Compensated
+//! summation **does not work** here: wgpu-hal compiles every Metal shader with
+//! fast-math on (`wgpu-hal-29.0.4/src/metal/device.rs:227`), which licenses
+//! reassociation. Kahan and double-single recover the rounding error through a
+//! `two_sum` whose exact-algebra value is zero, so the compiler folds them
+//! away. Measured: scaling the recovered low part by a thousand changed not one
+//! digit, and a bit-level round-trip, a multiply by a runtime one read from a
+//! buffer and a trip through global memory are all folded too. Integer
+//! fixed-point accumulation is exact and free, but exact summation would not be
+//! enough either (see below).
 //!
-//! So the arithmetic has to be arranged so that nothing cancels, and three
-//! places needed it. All three are exact rewrites, not approximations.
+//! So the arithmetic is arranged so that nothing cancels. Three places needed
+//! it, all exact rewrites.
 //!
-//! * **The fixed-effect gradient.** The CPU forms `db = X'y - X'phi`, two sums
-//!   of order `1e4` whose difference near the optimum is of order `1e-3`. Here
-//!   it is `db = X'(y - phi)`, a sum of residuals. `X'y` is never formed.
-//! * **The random-effect gradient.** Likewise `dw = cumsumy - sum phi` becomes
+//! * **Fixed-effect gradient.** The CPU forms `db = X'y - X'phi`, two sums of
+//!   order `1e4` whose difference near the optimum is of order `1e-3`. Here it
+//!   is `db = X'(y - phi)`; `X'y` is never formed.
+//! * **Random-effect gradient.** Likewise `dw = cumsumy - sum phi` becomes
 //!   `dw = sum (y - phi)` over the subject's cells.
-//! * **The Schur complement.** `vb - vwb' vw^-1 vwb` cancels because the
-//!   subject random effects absorb almost all of the intercept. Per subject,
-//!   with `p` the curvature weight, `P = sum p`, `A_j = sum x_j p` and
+//! * **Schur complement.** `vb - vwb' vw^-1 vwb` cancels because the subject
+//!   random effects absorb almost all of the intercept. Per subject, with `p`
+//!   the curvature weight, `P = sum p`, `A_j = sum x_j p` and
 //!   `M_ij = sum x_i x_j p`, the contribution
 //!   `gamma M_ij - gamma^2 A_i A_j / (gamma P + lambda w)` rearranges exactly to
 //!   `gamma [ C_ij + (A_i A_j / P) lambda w / (gamma P + lambda w) ]`, where
 //!   `C_ij = sum p (x_i - A_i/P)(x_j - A_j/P)` is a weighted within-subject
-//!   covariance. Neither term cancels. The centred sum needs the centre, which
-//!   would mean a second pass over each subject block and a second `exp` per
-//!   cell. So the moments are taken about an anchor known up front, the
-//!   subject's unweighted mean design row, and moved to the weighted centre
-//!   afterwards: `C_ij = S_ij - A_i A_j / P` with `S` and `A` about the anchor.
-//!   That subtraction is the square of the gap between two means of the same
-//!   cells against the spread, where about the origin it was the whole of the
-//!   intercept; columns constant within a subject come out exactly zero. A
-//!   Welford online update does the same job with no subtraction at all, but
-//!   costs two divisions and a branch per cell and a pairwise merge across the
-//!   plane, and measured 1.3x to 1.45x slower on the whole kernel.
+//!   covariance. Neither term cancels. Centring needs the weighted centre,
+//!   which would cost a second pass and a second `exp` per cell. So the moments
+//!   are taken about an anchor known up front (the subject's unweighted mean
+//!   design row) and moved afterwards: `C_ij = S_ij - A_i A_j / P` with `S` and
+//!   `A` about the anchor. That subtraction is the square of the gap between
+//!   two means against the spread, where about the origin it was the whole
+//!   intercept. Columns constant within a subject come out exactly zero. A
+//!   Welford update avoids the subtraction but costs two divisions and a branch
+//!   per cell plus a pairwise merge across the plane, and measured 1.3x to 1.45x
+//!   slower on the whole kernel.
 //!
-//! What is left is the `f32` rounding of one `exp` and one `ln` per cell, which
-//! nothing here can undo: it leaves the value of the objective off by about
-//! `2e-3` at 20000 cells and jittering by `2e-5` to `2e-4` between nearby
-//! variance components, even with exact summation. That, not the summation, is
-//! why the host finishes every fit in `f64` (see [`crate::gpu::stage_two`]).
-//! Long sums run as a three-level tree (within a lane, across the plane, over
-//! the subjects), a change of association the compiler cannot fold.
+//! What remains is the `f32` rounding of one `exp` and one `ln` per cell, which
+//! nothing here can undo: the objective is off by about `2e-3` at 20000 cells
+//! and jitters by `2e-5` to `2e-4` between nearby variance components, even
+//! with exact summation. That, not the summation, is why the host finishes
+//! every fit in `f64` (see [`crate::gpu::stage_two`]). Long sums run as a
+//! three-level tree (within a lane, across the plane, over the subjects), a
+//! change of association the compiler cannot fold.
 //!
 //! ### Consequence
 //!
-//! This path does not reproduce the CPU's iteration count and must not be held
-//! to the `1e-6` parity gate in `tests/e2e_nebula.rs`. It carries its own
-//! measured tolerance, swept in `tests/e2e_nebula_gpu.rs`.
+//! The iteration count differs from the CPU's, so this path is not held to the
+//! `1e-6` parity gate in `tests/e2e_nebula.rs`. Its own measured tolerance is
+//! swept in `tests/e2e_nebula_gpu.rs`.
 //!
 //! ### References
 //!
@@ -103,26 +97,24 @@ const STEP_CUTOFF: f32 = 40.0;
 /// Largest gradient component still called a critical point, nebula's `convd`.
 const GRADIENT_TOLERANCE: f32 = 0.01;
 
-/// Widest-plane requests per workgroup, one plane each.
+/// Requests per workgroup, one plane each.
 ///
-/// The planes share nothing, so this is purely an occupancy knob: two 32-lane
-/// planes make a 64-thread workgroup, which is what the per-thread kernel
-/// measured best at and no worse than wider. The workgroup is sized for the
-/// device's widest plane, so a driver that picks a narrower one fits more
-/// requests into it and the surplus cubes at the end of the grid exit at once.
+/// An occupancy knob, as planes share nothing: two 32-lane planes make a
+/// 64-thread workgroup. The workgroup is sized for the device's widest plane, so
+/// a driver that picks a narrower one fits more requests into it and surplus
+/// cubes at the end of the grid exit at once.
 const PLANES_PER_CUBE: u32 = 2;
 
 /// Default resolution floor on the objective, relative to its magnitude.
 ///
-/// Swept rather than guessed; see `tests/e2e_nebula_gpu.rs`. Overridable per
-/// call because the right value scales with the cell count.
+/// Swept in `tests/e2e_nebula_gpu.rs`. Overridable per call, as the right value
+/// scales with the cell count.
 pub const F32_NOISE_SCALE: f32 = 1e-6;
 
 /// Number of per-subject scratch slots the kernel keeps in global memory.
 ///
 /// `log_w`, `new_log_w`, `step_log_w`, `damp_log_w`, `w`, `dw`, `vw` and
-/// `dwvw`. They are too large for registers at NEBULA's subject counts and too
-/// small to be worth staging in shared memory.
+/// `dwvw`. Too large for registers at NEBULA's subject counts.
 pub const SUBJECT_SLOTS: u32 = 8;
 
 /// Slot index of `log_w` within the per-subject scratch.
@@ -153,19 +145,18 @@ const SLOT_DWVW: u32 = 7;
 /// the previous one, the log-determinant, the final improvement, the Newton
 /// steps taken and the backtracks used.
 ///
-/// Everything a request brings back sits in one buffer so the host pays one
-/// read-back per launch; each read is a round trip to the device whatever its
-/// size. The two counts ride along as floats, which is exact at their size.
+/// Everything a request brings back sits in one buffer, so the host pays one
+/// read-back round trip per launch. The two counts ride along as floats, which
+/// is exact at their size.
 pub const OUT_HEADER: u32 = 6;
 
 /// Largest design width the kernel is compiled for.
 ///
 /// The `n_beta`-sized and `n_beta`-squared working arrays are registers, so
-/// their capacity is a compile-time constant. The dispatch compiles one shader
-/// per width rather than rounding up to a tier: register pressure is what bounds
-/// occupancy here, and at the common `n_beta` of three a padded capacity of four
-/// wastes seven registers on the quadratic block alone. Measured, dropping three
-/// such arrays moved the kernel 18 per cent.
+/// their capacity is a compile-time constant. Dispatch compiles one shader per
+/// width, not per tier: register pressure bounds occupancy, and at the common
+/// `n_beta` of three a capacity of four wastes seven registers on the quadratic
+/// block alone. Dropping three such arrays moved the kernel 18 per cent.
 pub const MAX_BETA_CAP: usize = 8;
 
 ////////////
@@ -174,16 +165,14 @@ pub const MAX_BETA_CAP: usize = 8;
 
 /// Fits one request per plane by penalised maximum likelihood.
 ///
-/// Mirrors `optimise` in [`crate::sc::pml`] with the gamma penalty, NEBULA's
-/// NBGMM, at Laplace order one. Higher orders are left to the host, which has
-/// the `f64` path for them.
+/// Mirrors `optimise` in [`crate::sc::pml`] with the gamma penalty (NEBULA's
+/// NBGMM) at Laplace order one; higher orders stay on the host.
 ///
-/// Every lane of a plane runs the same control flow on the same request. The
-/// passes over cells are split across the lanes, each lane taking a contiguous
-/// chunk of every subject block, and recombined with plane reductions, so every
-/// quantity the Newton step and the backtracking search read is bit-identical
-/// in every lane and their decisions agree without a barrier. The plane width
-/// is read at run time, so any width the driver picks is correct.
+/// Every lane runs the same control flow on the same request. Cell passes are
+/// split across the lanes and recombined with plane reductions, so everything
+/// the Newton step and the backtracking read is bit-identical in every lane and
+/// their decisions agree without a barrier. The plane width is read at run
+/// time, so any width is correct.
 ///
 /// ### Params
 ///
@@ -197,10 +186,9 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `subject_total` - Count total per subject, `[s * n_genes + gene]`
 /// * `subject_mean` - Unweighted mean design row per subject, `[s * nb + j]`
 /// * `varying` - The design columns that vary within some subject, first
-///   `n_varying` entries of `nb`. The others are constant within every subject,
-///   so their deviation from the anchor is exactly zero and they drop out of
-///   the curvature moments: an intercept and donor-level covariates cost the
-///   sweep nothing
+///   `n_varying` entries of `nb`. The others are constant within every subject
+///   and drop out of the curvature moments, so an intercept and donor-level
+///   covariates cost the sweep nothing
 /// * `request_gene` - The gene each request is for
 /// * `request_params` - Three per request: the gamma prior's `alpha` and
 ///   `lambda`, then the cell-level size `gamma`
@@ -208,8 +196,7 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `log_w_init` - Starting random effects on the log scale, `[s * n_req + q]`
 /// * `tolerance` - Two elements: nebula's absolute stopping tolerance, then the
 ///   resolution floor relative to the objective ([`F32_NOISE_SCALE`]). A buffer
-///   rather than scalar arguments because a runtime float scalar would need a
-///   `ScalarArgSettings` bound this module otherwise has no use for
+///   because a runtime float scalar would need a `ScalarArgSettings` bound
 /// * `subject_scratch` - Per-subject working store,
 ///   `[(slot * k + s) * n_req + q]`, [`SUBJECT_SLOTS`] slots
 /// * `vwb_scratch` - Cross block of the information, `[(s * nb + j) * n_req + q]`
@@ -223,10 +210,9 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `nb` - Design width
 /// * `max_iter` - Newton budget
 /// * `max_backtrack` - Backtracking budget within one step
-/// * `final_assembly` - Non-zero to assemble once more at the point the fit
-///   returns, which is what makes the reported information and log-determinant
-///   belong to it. Zero skips that pass, a whole sweep over the cells, and
-///   leaves both rows of the output at the last Newton step's values
+/// * `final_assembly` - Non-zero to assemble once more at the returned point, so
+///   the reported information and log-determinant belong to it. Zero skips that
+///   sweep over the cells and leaves both at the last Newton step's values
 /// * `n_varying` - How many entries of `varying` are live
 /// * `nb_cap` - Comptime capacity of the `n_beta`-sized register arrays
 ///
@@ -265,8 +251,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     n_varying: u32,
     #[comptime] nb_cap: u32,
 ) {
-    // The plane's own id, never `UNIT_POS_X / PLANE_DIM`: nothing obliges a
-    // driver to lay subgroups out contiguously.
+    // Use the plane's own id, never `UNIT_POS_X / PLANE_DIM`: drivers need not
+    // lay subgroups out contiguously.
     let q = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * (CUBE_DIM_X / PLANE_DIM) + PLANE_POS;
     if q >= n_req {
         terminate!();
@@ -278,9 +264,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let one = F::new(1.0_f32);
     let two = F::new(2.0_f32);
     let cutoff = F::new(STEP_CUTOFF);
-    // `is_infinite` has no device counterpart. Anything past the largest finite
-    // `f32` either way is an infinity, and a NaN compares false on both sides,
-    // which is what the CPU's test does too.
+    // `is_infinite` has no device counterpart. Past the largest finite `f32`
+    // either way is an infinity; NaN compares false on both sides, as on the CPU.
     let huge = F::new(f32::MAX);
 
     let eps = tolerance[0];
@@ -296,9 +281,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let mut damp_beta = Array::<F>::new(nb_cap as usize);
     let mut db = Array::<F>::new(nb_cap as usize);
     let mut db_lane = Array::<F>::new(nb_cap as usize);
-    // The cell's design row. Every use below reads it from here: left in
-    // global memory the row is re-read once per use, which is quadratic in
-    // `nb` through the cross-products.
+    // The cell's design row. Left in global memory it is re-read once per use,
+    // quadratic in `nb` through the cross-products.
     let mut x = Array::<F>::new(nb_cap as usize);
     let mut centre = Array::<F>::new(nb_cap as usize);
     let mut anchor = Array::<F>::new(nb_cap as usize);
@@ -352,12 +336,11 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let mut likdif = zero;
     let mut step = 0u32;
     let mut backtracks = 0u32;
-    // The loop assembles first and steps second, so the assembly runs once more
-    // after the final update and the reported information belongs to the point
-    // the fit actually returns. See the module doc for why this departs from
-    // nebula, which reports the penultimate iterate's.
+    // Assemble first, step second, so one more assembly runs after the final
+    // update and the information belongs to the returned point. nebula reports
+    // the penultimate iterate's.
     let mut settled = false;
-    // Whether the stopping test has passed once already. See below.
+    // Whether the stopping test has passed once already.
     let mut confirmed = false;
     let mut running = true;
 
@@ -394,17 +377,16 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             let sp_lo = subject_ptr[(gene * (k + 1u32) + s) as usize];
             let sp_hi = subject_ptr[(gene * (k + 1u32) + s + 1u32) as usize];
 
-            // Every quantity here is linear in the count `y`: with
+            // Every quantity is linear in the count `y`: with
             // `u = 1 / (1 + gamma / extb)` and `h = u / (extb + gamma)`, the
             // gradient weight is `(gamma + y) u`, the residual is
             // `-gamma u + y (1 - u)` and the curvature weight is `(gamma + y) h`.
             // So each subject is a dense pass over every cell at `y = 0`, then a
-            // sparse pass over the subject's positive counts adding the `y`
-            // parts. Both stride across the lanes, so a plane's loads fall on
-            // consecutive cells: a contiguous chunk per lane, which walked the
-            // counts with one pointer, measured 2.4x slower for the scattered
-            // loads alone. The moments are order-free sums, so a count's
-            // curvature enters as one more observation at its cell's covariates.
+            // sparse pass over its positive counts adding the `y` parts. Both
+            // stride across the lanes so a plane's loads fall on consecutive
+            // cells; a contiguous chunk per lane measured 2.4x slower on the
+            // scattered loads alone. The moments are order-free sums, so a
+            // count's curvature enters as one more observation at its cell.
             let mut resid = zero;
             let mut weight = zero;
             j = 0u32;
@@ -484,8 +466,11 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 p += PLANE_DIM;
             }
 
-            // -- Across the plane. Every moment is taken about the same anchor in
-            //    every lane, so all of them are plain sums. --
+            // ---------------- //
+            // Across the plane //
+            // ---------------- //
+            // Every moment is about the same anchor in every lane, so all are
+            // plain sums.
             let resid_s = plane_sum(resid);
             j = 0u32;
             while j < nb {
@@ -506,10 +491,9 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 va += 1u32;
             }
 
-            // Move the moments from the anchor to the weighted centre. The
-            // anchor is the subject's unweighted mean, so what is subtracted is
-            // the square of the gap between two means, small against the
-            // spread; about the origin it would be the whole of the intercept.
+            // Move the moments from the anchor to the weighted centre. What is
+            // subtracted is the square of the gap between two means, small
+            // against the spread.
             j = 0u32;
             while j < nb {
                 centre[j as usize] = anchor[j as usize];
@@ -543,8 +527,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 j += 1u32;
             }
 
-            // The centred covariance, then what the centring leaves over, which
-            // the prior's share of the subject curvature keeps from cancelling.
+            // The centred covariance, then the remainder, which the prior's share
+            // of the subject curvature keeps from cancelling.
             let shrink = lambda * w_s / vw_s;
             let mut a = 0u32;
             while a < nb {
@@ -575,8 +559,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         /////////////////
 
         if settled {
-            // The assembly above ran at the point the fit returns, which is
-            // what the outputs want; nothing further to do.
+            // The assembly above ran at the returned point; nothing further to do.
             running = false;
         } else {
             step += 1u32;
@@ -603,8 +586,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             }
 
             // The solve destroys its matrix, so the Schur complement goes out
-            // first. With a final assembly these rows are overwritten by the one
-            // at the returned point; without, they are what the host gets.
+            // first. A final assembly overwrites these rows; without one they
+            // are what the host gets.
             i = 0u32;
             while i < nb * nb {
                 out[((OUT_HEADER + nb + i) * n_req + q) as usize] = vb2[i as usize];
@@ -669,8 +652,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             // Backtracking search //
             /////////////////////////
 
-            // The floor is read off the previous iterate so it does not move while
-            // the search damps.
+            // The floor comes from the previous iterate so it is fixed while the
+            // search damps.
             let noise = F::abs(ll_prev) * noise_scale;
             backtracks = 0u32;
             let mut min_step = cutoff;
@@ -774,13 +757,13 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 s += 1u32;
             }
 
-            // In `f32` the improvement near the optimum is rounding, so the
-            // stopping test passes as soon as one step happens not to improve,
-            // which is early. The value the host reads off is insensitive to
-            // that at first order, but the log-determinant is not stationary at
-            // the optimum and carries the location error straight into the
-            // profile objective. So the test has to pass twice: the second
-            // pass is one more Newton step, which squares the location error.
+            // In `f32` the improvement near the optimum is rounding, so the test
+            // passes early, at the first step that happens not to improve. The
+            // value is insensitive to that at first order, but the
+            // log-determinant is not stationary at the optimum and carries the
+            // location error into the profile objective. So the test must pass
+            // twice: the second pass is one more Newton step, which squares the
+            // location error.
             if step >= max_iter {
                 settled = true;
             } else if !(likdif > eps) {
@@ -812,8 +795,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     out[(3u32 * n_req + q) as usize] = likdif;
     out[(4u32 * n_req + q) as usize] = F::cast_from(step);
     out[(5u32 * n_req + q) as usize] = F::cast_from(backtracks);
-    // The rows are indexed rather than counted: a counter started from the
-    // comptime header is itself comptime and cannot be advanced.
+    // Index the rows: a counter started from the comptime header is itself
+    // comptime and cannot be advanced.
     j = 0u32;
     while j < nb {
         out[((OUT_HEADER + j) * n_req + q) as usize] = beta[j as usize];
@@ -826,8 +809,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             idx += 1u32;
         }
     }
-    // The random-effect block and the cross block ride along from the same
-    // assembly as the Schur complement, whichever that was.
+    // The random-effect and cross blocks come from the same assembly as the
+    // Schur complement.
     s = 0u32;
     while s < k {
         out[((OUT_HEADER + nb + nb * nb + s) * n_req + q) as usize] =
@@ -850,13 +833,13 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 
 /// The penalised log-likelihood at `(beta, log_w)`, reduced across the plane.
 ///
-/// Accumulates the four terms of the CPU's `Workspace::evaluate`: the linear
-/// term over the positive counts, the subject term, `-gamma` times the sum of
+/// The four terms of the CPU's `Workspace::evaluate`: the linear term over the
+/// positive counts, the subject term, `-gamma` times the sum of
 /// `log(extb + gamma)` over all cells, and the count-weighted sum of the same
 /// logs over the positive counts. One pass per subject covers the first, third
-/// and fourth, each lane summing its own chunk, then the plane, then the
-/// subjects: a three-level tree, which is what keeps a long `f32` sum honest
-/// here without compensation.
+/// and fourth, summed per lane, then across the plane, then over the subjects:
+/// the three-level tree that keeps a long `f32` sum accurate without
+/// compensation.
 ///
 /// ### Params
 ///
@@ -931,15 +914,14 @@ fn evaluate_pass<F: Float>(
 
         // Dense over every cell for `log(extb + gamma)`, then sparse over the
         // positive counts for the two count-weighted terms; both strided across
-        // the lanes. See the assembly in `opt_pml_gpu` for why.
+        // the lanes, as in the assembly in `opt_pml_gpu`.
         let mut lin_lane = zero;
         let mut phil_lane = zero;
         let mut weighted_lane = zero;
-        // Four of the lane's cells per trip, every load ahead of its use: the
-        // sweep waits on memory, not arithmetic, and four loads in flight hide
-        // most of that wait. The logarithms are taken on products of two, which
-        // halves them; each term is at least `gamma` and a product of two stays
-        // far inside the `f32` range for any count a fit can reach.
+        // Four of the lane's cells per trip, loads ahead of use: the sweep is
+        // memory-bound. Logarithms are taken on products of two, which halves
+        // them; each term is at least `gamma`, so a product stays far inside the
+        // `f32` range for any reachable count.
         let mut r = begin + lane;
         while r + 3u32 * PLANE_DIM < end {
             let r1 = r + PLANE_DIM;
@@ -985,8 +967,8 @@ fn evaluate_pass<F: Float>(
                 eta += design[(c * nb + j) as usize] * beta[j as usize];
                 j += 1u32;
             }
-            // The linear term takes the predictor without the random effect,
-            // which the subject term adds back.
+            // The linear term uses the predictor without the random effect, which
+            // the subject term adds back.
             lin_lane += eta * y;
             weighted_lane += y * F::ln(F::exp(eta + log_w_s) + gamma);
             p += PLANE_DIM;
@@ -1005,9 +987,9 @@ fn evaluate_pass<F: Float>(
 
 /// Folds one observation into a lane's residual and weighted moments.
 ///
-/// The per-cell body of the assembly, shared by the dense and the sparse pass.
-/// The moments are taken about a fixed anchor, so they are order-free sums with
-/// no division and no branch per cell.
+/// The per-cell body of the assembly, shared by the dense and sparse passes.
+/// Moments are about a fixed anchor, so they are order-free sums with no
+/// division or branch per cell.
 ///
 /// ### Params
 ///
@@ -1077,8 +1059,7 @@ fn moment_step<F: Float>(
 /// Pivoted `LDL'` solve of a small symmetric system, in place.
 ///
 /// A transcription of `ldlt_solve` in [`crate::sc::pml`], which follows Eigen's
-/// `LDLT`. Indefinite iterates are expected here, which is why the pivoting is
-/// worth its cost on a matrix this small.
+/// `LDLT`. Pivoting handles the indefinite iterates.
 ///
 /// ### Params
 ///
@@ -1231,7 +1212,7 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
 ///
 /// * `tensors` - Every device buffer the kernel reads or writes
 /// * `n_genes` - Genes resident on the device
-/// * `n_req` - Requests in this launch, which is the thread count
+/// * `n_req` - Requests in this launch, one plane each
 /// * `k` - Subjects
 /// * `nb` - Design width
 /// * `max_iter` - Newton budget
@@ -1277,8 +1258,7 @@ where
     }
 
     let limits = GpuLimits::from_client(client);
-    // Every plane width is a power of two, so a workgroup this wide splits into
-    // whole planes whichever width the driver picks.
+    // Plane widths are powers of two, so this splits into whole planes.
     let cube_width = PLANES_PER_CUBE * limits.plane_size_max;
     if limits.plane_size_max == 0 || cube_width > limits.max_units_per_cube {
         return Err(EdgeErrors::Gpu(format!(
@@ -1345,12 +1325,10 @@ where
 
 /// Every device buffer [`launch_opt_pml`] binds.
 ///
-/// Two kinds, with two strides. The gene-resident buffers (the design, the
-/// offsets, the subject boundaries, the counts and the per-gene totals) are
-/// uploaded once and indexed through a request's gene. The request buffers are
-/// rewritten per launch and indexed by request, request-minor: entry `i` of
-/// request `q` lives at `i * n_req + q`, so consecutive threads touch
-/// consecutive addresses.
+/// Gene-resident buffers (design, offsets, subject boundaries, counts, per-gene
+/// totals) are uploaded once and indexed through a request's gene. Request
+/// buffers are rewritten per launch and are request-minor: entry `i` of request
+/// `q` lives at `i * n_req + q`.
 pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
     /// Shared design, row-major `n_cells * nb`.
     pub design: GpuTensor<R, F>,

@@ -1,47 +1,35 @@
 //! NEBULA's penalised maximum likelihood inner solver.
 //!
-//! Given fixed variance components, this profiles out the subject random
-//! effects and the fixed effects jointly. The parameter vector is
-//! `(beta, log_w)` with `beta` the `n_beta` fixed effects and `log_w` one
-//! random effect per subject, so the Hessian is `(n_beta + k)` square. It is
-//! never formed: the random-effect block is diagonal, because subjects are
-//! independent and the cells of one subject are contiguous, so a Schur
-//! complement reduces every Newton step to an `n_beta` system plus `k`
-//! divisions.
+//! Given fixed variance components, profiles out the fixed and subject random
+//! effects jointly. The parameters are `(beta, log_w)`: `n_beta` fixed effects
+//! and one random effect per subject. The `(n_beta + k)` Hessian is never
+//! formed. The random-effect block is diagonal (independent subjects, contiguous
+//! cells), so a Schur complement reduces each Newton step to an `n_beta` system
+//! plus `k` divisions.
 //!
-//! Two random-effect distributions share the loop:
-//!
-//! * [`opt_pml`] puts a gamma prior on `w`, which is NEBULA's NBGMM. The
-//!   penalty is `alpha log w - lambda w` with `alpha` and `lambda` derived from
-//!   `sigma[0]`, and the Laplace approximation to the marginal likelihood can
-//!   be pushed past its leading term via `ord`.
-//! * [`opt_pml_nbm`] puts a normal prior on `log w`, which is NEBULA's NBLMM.
-//!   The penalty is `-log_w'log_w / (2 alpha) - (k/2) log alpha`, and no
-//!   higher-order correction is defined.
+//! * [`opt_pml`]: gamma prior on `w` (NBGMM). The penalty is
+//!   `alpha log w - lambda w` with `alpha`, `lambda` derived from `sigma[0]`;
+//!   `ord` extends the Laplace approximation past its leading term.
+//! * [`opt_pml_nbm`]: normal prior on `log w` (NBLMM). The penalty is
+//!   `-log_w'log_w / (2 alpha) - (k/2) log alpha`; no higher-order correction.
 //!
 //! ### Layout
 //!
-//! Row-major throughout, `f64` throughout. The design is `n_cells * n_beta`,
-//! counts are stored as the positive entries only with their cell indices
-//! alongside, and subjects are half-open `[start, end)` blocks of cells.
+//! The design is row-major `n_cells * n_beta`. Counts are the positive entries
+//! with their cell indices, and subjects are half-open `[start, end)` blocks.
 //!
 //! ### Parallelism
 //!
-//! Sequential, deliberately. The parallel axis for NEBULA is genes, and one
-//! call here is one gene; fanning out inside would oversubscribe against that.
-//! The second reason is reproducibility: the outer loop stops on an absolute
-//! improvement in the log-likelihood, so a rayon reduction that reassociates
-//! the sums can flip the last iteration on or off and move `beta` by far more
-//! than the reassociation itself.
+//! Sequential by design: one call is one gene, and the caller parallelises over
+//! genes. The outer loop also stops on an absolute improvement in the
+//! log-likelihood, so a reassociating reduction can flip the last iteration and
+//! move `beta` by more than the reassociation itself.
 //!
 //! ### Deviations from edgePython
 //!
-//! This is a port of `nebula`'s own `src/optimization.cpp`, not of
-//! edgePython's `_opt_pml_nb`. edgePython clamps the linear predictor at 500,
-//! floors `vw` at `1e-15`, adds `1e-8` to any diagonal of the information
-//! matrix below `1e-10`, and drops the REML term from the log-determinant.
-//! None of those appear in the C++, and each moves the returned information
-//! matrix, which is exactly the standard error. They are not reproduced here.
+//! Ported from `nebula`'s `src/optimization.cpp`, not edgePython's
+//! `_opt_pml_nb`, which adds a ridge, a `vw` floor, a linear-predictor clamp and
+//! drops REML. See `UPSTREAM_DEVIATIONS.md` A21.
 //!
 //! ### References
 //!
@@ -51,14 +39,13 @@
 
 use crate::errors::EdgeErrors;
 
-////////////////////////
-// Tuning and codes   //
-////////////////////////
+//////////////////////
+// Tuning and codes //
+//////////////////////
 
 /// Newton iteration budget, matching nebula's hard-coded `maxstep`.
 ///
-/// nebula flags a fit that reaches this as `-20`, so the number is part of the
-/// contract rather than a free tuning knob.
+/// nebula flags a fit that reaches this as `-20`, so the value is fixed.
 const DEFAULT_MAX_ITER: usize = 50;
 
 /// Backtracking budget inside one Newton step, nebula's `maxstd`.
@@ -79,10 +66,8 @@ const GRADIENT_TOLERANCE: f64 = 0.01;
 /// Magnitude past which a Newton component is treated as unbounded rather than
 /// damped.
 ///
-/// A step of `exp(40)` on the log scale is not a step, it is an overflow, so
-/// nebula replaces it with a fixed displacement instead of halving it forty
-/// times. The same constant seeds that displacement, which is then halved once
-/// per backtrack.
+/// nebula replaces such a step with a fixed displacement, seeded by the same
+/// constant and halved once per backtrack, instead of halving it forty times.
 const STEP_CUTOFF: f64 = 40.0;
 
 /// Smallest eigenvalue of the information matrix nebula will invert.
@@ -93,9 +78,8 @@ const EIGENVALUE_CUTOFF: f64 = 1e-8;
 
 /// Jacobi sweep budget for the smallest-eigenvalue check.
 ///
-/// Cyclic Jacobi converges cubically once the off-diagonal is small; on the
-/// handful-of-columns matrices seen here it is done in three or four sweeps and
-/// thirty is pure slack.
+/// Cyclic Jacobi needs three or four sweeps on these small matrices; thirty is
+/// slack.
 const JACOBI_SWEEPS: usize = 30;
 
 /// Converged, by a sufficiently small improvement in the objective.
@@ -249,9 +233,8 @@ impl PmlData<'_> {
 
 /// The two variance components, held on nebula's own scale.
 ///
-/// The meaning of `subject` differs between the two solvers, which is nebula's
-/// convention, not a slip: the C++ reads the same `sigma[0]` slot differently
-/// in `opt_pml` and `opt_pml_nbm`.
+/// `subject` means different things in the two solvers: the C++ reads the same
+/// `sigma[0]` slot differently in `opt_pml` and `opt_pml_nbm`.
 #[derive(Clone, Copy, Debug)]
 pub struct PmlVariance {
     /// nebula's `sigma[0]`.
@@ -276,20 +259,17 @@ pub struct PmlVariance {
 pub struct PmlParams {
     /// Add `log|det(information)|` to the log-determinant.
     ///
-    /// nebula's `reml`, which switches the outer overdispersion estimate from
-    /// maximum likelihood to restricted maximum likelihood. Off by default,
-    /// matching `nebula(..., reml = 0)`.
+    /// nebula's `reml`: restricted instead of plain maximum likelihood for the
+    /// outer overdispersion estimate. Off by default, as `nebula(..., reml = 0)`.
     pub reml: bool,
     /// Stop once a Newton step improves the penalised log-likelihood by less
-    /// than this. Absolute, not relative, exactly as nebula.
+    /// than this (absolute, as in nebula).
     pub eps: f64,
     /// Order of the Laplace expansion of the marginal likelihood.
     ///
-    /// `1` uses the leading term only and leaves
-    /// [`PmlResult::second_order`] at zero. `2` adds the third-derivative term,
-    /// `3` the fourth-derivative terms. nebula raises this to `3` for genes
-    /// whose expected count per subject is below three, where the leading term
-    /// alone is biased. Ignored by [`opt_pml_nbm`].
+    /// `1`: leading term only ([`PmlResult::second_order`] stays zero). `2` adds
+    /// the third-derivative term, `3` the fourth. nebula uses `3` for genes with
+    /// an expected count per subject below three. Ignored by [`opt_pml_nbm`].
     pub ord: u32,
     /// Newton iteration budget.
     pub max_iter: usize,
@@ -324,8 +304,8 @@ pub struct PmlResult {
     /// Observed information for the fixed effects, row-major `nb * nb`.
     ///
     /// nebula's `var`: the Schur complement of the joint observed information
-    /// after the random-effect block has been eliminated. Its inverse is the
-    /// covariance matrix of `beta`.
+    /// after eliminating the random-effect block. Its inverse is the covariance
+    /// of `beta`.
     pub information: Vec<f64>,
     /// Value of the penalised log-likelihood at the optimum.
     pub log_likelihood: f64,
@@ -336,8 +316,7 @@ pub struct PmlResult {
     /// Log-determinant of the observed information.
     ///
     /// `sum log|vw|` over subjects, plus `log|det(information)|` when
-    /// [`PmlParams::reml`] is set. The outer overdispersion objective subtracts
-    /// half of this.
+    /// [`PmlParams::reml`] is set. The outer objective subtracts half of it.
     pub log_det: f64,
     /// Higher-order Laplace correction, nebula's `second`.
     ///
@@ -352,16 +331,15 @@ pub struct PmlResult {
     pub convergence: i32,
     /// Newton steps taken.
     pub iterations: usize,
-    /// Backtracking halvings used inside the final Newton step, nebula's
-    /// `damp`. Eleven means the step stalled at a critical point, twelve means
-    /// it stalled with a live gradient.
+    /// Backtracking halvings in the final Newton step, nebula's `damp`. Eleven:
+    /// stalled at a critical point; twelve: stalled with a live gradient.
     pub backtracks: usize,
 }
 
 /// The penalised log-likelihood and its gradient at a given point.
 ///
-/// Both are negated, matching nebula's `pml_ll_der_eigen`, because the R side
-/// hands them straight to a minimiser.
+/// Both are negated, as in nebula's `pml_ll_der_eigen`, for direct use by a
+/// minimiser.
 #[derive(Clone, Debug)]
 pub struct PmlObjective {
     /// Negative penalised log-likelihood.
@@ -395,9 +373,8 @@ enum Penalty {
 impl Penalty {
     /// Adds the prior's contribution to the log-likelihood.
     ///
-    /// The association order is the C++'s, per variant, because the outer loop
-    /// compares improvements against an absolute tolerance and a reassociated
-    /// sum can flip the last iteration.
+    /// The summation order is the C++'s per variant; reassociating can flip the
+    /// last iteration (see the module header).
     ///
     /// ### Params
     ///
@@ -471,15 +448,12 @@ impl Penalty {
 
 /// Penalised maximum likelihood fit with a gamma random effect, NEBULA's NBGMM.
 ///
-/// Joint Newton iteration over `beta` and `log_w` with the random-effect block
-/// eliminated by a Schur complement, per-coordinate backtracking on a rejected
-/// step, and the higher-order Laplace corrections selected by
-/// [`PmlParams::ord`].
+/// Joint Newton iteration over `beta` and `log_w` (Schur complement,
+/// per-coordinate backtracking, Laplace corrections per [`PmlParams::ord`]).
 ///
-/// The random effect `w` carries a `Gamma(alpha, lambda)` prior with
-/// `alpha = 1 / (e^s - 1)` and `lambda = 1 / (sqrt(e^s) (e^s - 1))`, where
-/// `s` is [`PmlVariance::subject`]. That parametrisation gives `w` mean
-/// `sqrt(e^s)` and squared coefficient of variation `e^s - 1`.
+/// `w` has a `Gamma(alpha, lambda)` prior with `alpha = 1 / (e^s - 1)` and
+/// `lambda = 1 / (sqrt(e^s) (e^s - 1))`, `s` being [`PmlVariance::subject`]: mean
+/// `sqrt(e^s)`, squared coefficient of variation `e^s - 1`.
 ///
 /// ### Params
 ///
@@ -527,11 +501,9 @@ pub fn opt_pml(
 /// Penalised maximum likelihood fit with a log-normal random effect, NEBULA's
 /// NBLMM.
 ///
-/// The same Newton loop as [`opt_pml`] with the gamma penalty replaced by
-/// `-log_w'log_w / (2 alpha) - (k/2) log alpha`, where `alpha` is
-/// [`PmlVariance::subject`] read as a variance. No higher-order Laplace
-/// correction is defined for this variant, so [`PmlResult::second_order`] is
-/// always zero and [`PmlParams::ord`] is ignored.
+/// The [`opt_pml`] loop with penalty `-log_w'log_w / (2 alpha) - (k/2) log alpha`,
+/// `alpha` being [`PmlVariance::subject`] read as a variance.
+/// [`PmlResult::second_order`] is always zero and [`PmlParams::ord`] is ignored.
 ///
 /// ### Params
 ///
@@ -572,11 +544,10 @@ pub fn opt_pml_nbm(
 /// Penalised log-likelihood and gradient at a point, nebula's
 /// `pml_ll_der_eigen`.
 ///
-/// This is the gradient-only entry the R side hands to `lbfgs` and `trust`, and
-/// it reads [`PmlVariance::subject`] differently again: as the shape of a
-/// `Gamma(alpha, alpha)` prior with mean one, so `alpha` plays the part of both
-/// the shape and the rate. That is nebula's own inconsistency with [`opt_pml`],
-/// reproduced rather than corrected.
+/// The entry the R side hands to `lbfgs` and `trust`. It reads
+/// [`PmlVariance::subject`] as the shape of a mean-one `Gamma(alpha, alpha)`
+/// prior (shape and rate both `alpha`), which is nebula's own inconsistency with
+/// [`opt_pml`], reproduced.
 ///
 /// ### Params
 ///
@@ -638,11 +609,9 @@ pub fn pml_log_likelihood_gradient(
 /// [`opt_pml`], started from a given point rather than from zero random effects.
 ///
 /// The GPU path finds the optimum in `f32` and finishes it here in `f64`. From a
-/// point already at the optimum this takes one Newton step and stops, which
-/// costs about four passes over the cells against the fourteen or so of a cold
-/// fit, and what it returns is exactly what [`opt_pml`] returns: the same
-/// value, and the log-determinant at the penultimate iterate, which is nebula's
-/// convention and the one the profile objective is calibrated against.
+/// point at the optimum this takes one Newton step (about four passes over the
+/// cells against fourteen for a cold fit) and returns what [`opt_pml`] returns,
+/// including the log-determinant at the penultimate iterate.
 ///
 /// ### Params
 ///
@@ -688,10 +657,9 @@ pub(crate) fn opt_pml_from(
 /// Largest move in a cell's linear predictor for which [`newton_finish`]
 /// updates the stored `exp` by series instead of taking it again.
 ///
-/// The second sweep of a step sits one converged Newton step from the first, so
-/// `exp(eta + z) = exp(eta) exp(z)` with `z` of order `1e-4`. To fifth order the
-/// truncation is `z^6 / 720`, `1.4e-21` relative at this bound and far under an
-/// ulp, for five multiply-adds against one `exp`.
+/// The second sweep is one converged Newton step from the first, so
+/// `exp(eta + z) = exp(eta) exp(z)` with `z` of order `1e-4`. The fifth-order
+/// truncation `z^6 / 720` is `1.4e-21` relative at this bound, under an ulp.
 #[cfg(feature = "gpu")]
 const EXP_SERIES_MAX: f64 = 1e-3;
 
@@ -699,11 +667,10 @@ const EXP_SERIES_MAX: f64 = 1e-3;
 /// rounding at a converged point rather than a step that went wrong.
 ///
 /// From the device's `f32` optimum the `f64` step gains less than the rounding
-/// of a sum over every cell, so its `likdif` comes out a few ulp negative on
-/// about 15 per cent of fits (S1: all 10804 of 73650 between `1e-16` and
-/// `1e-15` relative). Handing those to [`opt_pml_from`] only buys a backtracking
-/// search that ends at the same point. A step that genuinely overshoots loses
-/// orders of magnitude more than this.
+/// of a sum over all cells, so `likdif` is a few ulp negative on about 15 per
+/// cent of fits (S1: 10804 of 73650, between `1e-16` and `1e-15` relative).
+/// [`opt_pml_from`] would backtrack to the same point. A real overshoot loses
+/// orders of magnitude more.
 #[cfg(feature = "gpu")]
 const LIKDIF_ROUNDING: f64 = 1e-12;
 
@@ -724,10 +691,9 @@ fn exp_series(z: f64) -> f64 {
 
 /// Terms multiplied together before [`LogSum`] takes one logarithm.
 ///
-/// Each term is `extb + gamma`, bounded below by the cell-level size and in
-/// practice far inside `1e-38..1e38`, so eight of them cannot leave the `f64`
-/// range. A product that does overflow gives an infinite sum, which is what the
-/// per-term logarithm gives for the same input.
+/// Each term is `extb + gamma`, far inside `1e-38..1e38`, so eight cannot leave
+/// the `f64` range. An overflowing product gives an infinite sum, as the
+/// per-term logarithm would.
 #[cfg(feature = "gpu")]
 const LOG_PRODUCT_GROUP: u32 = 8;
 
@@ -735,9 +701,8 @@ const LOG_PRODUCT_GROUP: u32 = 8;
 /// [`LOG_PRODUCT_GROUP`] terms.
 ///
 /// The logarithm is the dearest operation in the dense sweep of
-/// [`newton_finish`], and the product costs a multiply. The rounding of a group
-/// is a few ulp relative on the product, so of order `1e-15` absolute on its
-/// logarithm, the same size as the per-term form's.
+/// [`newton_finish`]. Group rounding is `1e-15` absolute on the logarithm, the
+/// same as the per-term form.
 #[cfg(feature = "gpu")]
 struct LogSum {
     /// Logarithms of the finished groups.
@@ -816,22 +781,20 @@ pub(crate) struct NewtonFinish {
 /// Full `f64` Newton steps from a point already near the optimum, two fused
 /// passes over the cells per step.
 ///
-/// The common case of [`opt_pml_from`] on the GPU path: the device's point is
+/// The common case of [`opt_pml_from`] on the GPU path: the device point is
 /// converged to `f32`, one step settles it (two or three for a few per cent of
-/// fits), and no step needs damping. The loop in [`opt_pml`] is written for
-/// parity with nebula's C++: it allocates
-/// a workspace of `(5 + n_beta) * n_cells` per call and walks it in a dozen
-/// passes. Here the assembly is one pass per subject with nothing stored per
-/// cell, split as the device kernel splits it: a dense sweep over every cell at
-/// a count of zero, then a sparse sweep adding what the positive counts change.
-/// The sums therefore associate differently from [`opt_pml`] and agree with it
-/// to rounding, not to the bit.
+/// fits) and no step needs damping. [`opt_pml`] allocates
+/// `(5 + n_beta) * n_cells` per call and walks it in a dozen passes; here each
+/// step is two fused passes per subject with nothing stored per cell, split as
+/// the device kernel splits it: a dense sweep over every cell at a count of
+/// zero, then a sparse sweep adding what the positive counts change. Sums
+/// associate differently from [`opt_pml`], so results agree to rounding, not
+/// bitwise.
 ///
-/// The log-determinant is taken at the final iterate, where [`opt_pml`] follows
-/// nebula and reports the penultimate one. On the CPU the two iterates are both
-/// `f64` and a converged step apart. Here the penultimate iterate is the
-/// device's `f32` point, whose location error the log-determinant carries at
-/// first order, so the second pass accumulates the curvature weight as well.
+/// The log-determinant is taken at the final iterate, not the penultimate one as
+/// in [`opt_pml`]: here the penultimate iterate is the device's `f32` point,
+/// whose location error enters the log-determinant at first order, so the
+/// second pass also accumulates the curvature weight.
 ///
 /// ### Params
 ///
@@ -901,17 +864,14 @@ pub(crate) fn newton_finish(
 
 /// [`newton_finish`] for one design width.
 ///
-/// The sweeps spend their time in loops over the design columns, a handful of
-/// iterations each. With the width a run-time value those loops are never
-/// unrolled and every access is bounds-checked; with it a constant they
-/// disappear into straight-line code, and a subject's sums over the cells sit
-/// in `NB`-sized arrays the compiler keeps in registers, where heap
-/// accumulators cost a store-to-load round trip per cell.
+/// With the width a constant, the loops over design columns unroll and a
+/// subject's sums sit in `NB`-sized arrays held in registers, instead of heap
+/// accumulators with a store-to-load round trip per cell.
 ///
-/// The first sweep takes a subject's `exp` in a loop of its own, so the loop
-/// that accumulates has no call in it and the positive cells read the stored
-/// value back instead of taking it again. With the registers, 15.6 to 12.1 ns
-/// per cell for one step on a 20000-cell gene; the split alone is slower.
+/// The first sweep takes a subject's `exp` in its own loop, so the accumulating
+/// loop has no call in it and the positive cells read the stored value. Together
+/// with the registers: 15.6 to 12.1 ns per cell per step on a 20000-cell gene;
+/// the split alone is slower.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn newton_finish_width<const NB: usize>(
@@ -1160,12 +1120,10 @@ fn newton_finish_width<const NB: usize>(
 /// nebula's `check_conv`, applied to a finished fit.
 ///
 /// [`opt_pml`] already runs this with `variance_at_bound` false and an initial
-/// code of [`CONV_SUCCESS`]. Re-run it from the outer overdispersion loop,
-/// which is the only place that knows whether a variance component landed on
-/// its box constraint or whether an earlier optimiser already failed.
-///
-/// The singular-information test overrides everything else, including
-/// [`CONV_AT_BOUND`], which is nebula's ordering.
+/// code of [`CONV_SUCCESS`]. The outer overdispersion loop re-runs it, as only
+/// it knows whether a variance component hit its bound or an earlier optimiser
+/// failed. The singular-information test overrides everything, including
+/// [`CONV_AT_BOUND`] (nebula's ordering).
 ///
 /// ### Params
 ///
@@ -1214,11 +1172,9 @@ pub fn check_convergence(
 
 /// Every buffer the Newton loop needs, allocated once per call.
 ///
-/// `x_phi` is the only one that scales with the data: it holds the design
-/// scaled row-wise by the curvature weights, `n_cells * n_beta` doubles. The
-/// C++ materialises the same matrix, and both the cross block and the
-/// fixed-effect block are read off it, so fusing it away would change the
-/// summation order for no memory that matters at NEBULA's design widths.
+/// `x_phi` is the only buffer scaling with the data: the design scaled row-wise
+/// by the curvature weights. The C++ materialises it too; fusing it away would
+/// change the summation order.
 struct Workspace {
     /// `exp(offset + design*beta + log_w)`, one per cell.
     extb: Vec<f64>,
@@ -1366,9 +1322,8 @@ impl Workspace {
         let n_cells = data.n_cells();
         let k = data.n_subjects();
 
-        // The C++ evaluates `X*beta` into a temporary and adds the offset
-        // afterwards; keeping that order keeps the last-iteration comparison
-        // identical.
+        // As in the C++, `X*beta` goes to a temporary and the offset is added
+        // afterwards, keeping the last-iteration comparison identical.
         for r in 0..n_cells {
             let row = &data.design[r * nb..(r + 1) * nb];
             let mut acc = 0.0;
@@ -1516,9 +1471,8 @@ impl Workspace {
             }
         }
 
-        // Schur complement in the square-rooted form the C++ uses: scale the
-        // cross block by `1/sqrt(vw)` and subtract its own Gram matrix, which
-        // keeps the result symmetric by construction.
+        // Schur complement as in the C++: scale the cross block by `1/sqrt(vw)`
+        // and subtract its Gram matrix, symmetric by construction.
         for s in 0..k {
             let scale = 1.0 / self.vw[s].sqrt();
             for v in &mut self.vwb[s * nb..(s + 1) * nb] {
@@ -1667,9 +1621,8 @@ fn optimise(
                 break;
             }
 
-            // A step past the cutoff is not halved but replaced outright: at
-            // that magnitude the halvings would need forty rounds to reach a
-            // usable displacement, and the budget is ten.
+            // A step past the cutoff is replaced outright: halving would need
+            // forty rounds and the budget is ten.
             for j in 0..nb {
                 let d = work.step_beta[j];
                 if d < STEP_CUTOFF && d > -STEP_CUTOFF {
@@ -1701,10 +1654,8 @@ fn optimise(
         log_w.copy_from_slice(&work.new_log_w);
     }
 
-    // `vw` and `vb2` are the ones assembled at the previous iterate, which is
-    // what nebula reports. Recomputing them at the final point would be a
-    // different quantity, and the outer overdispersion objective is calibrated
-    // against this one.
+    // `vw` and `vb2` come from the previous iterate, as nebula reports; the
+    // outer objective is calibrated against that.
     let mut log_det = 0.0;
     for s in 0..k {
         log_det += work.vw[s].abs().ln();
@@ -1768,8 +1719,8 @@ fn evaluate_trial(work: &mut Workspace, data: &PmlData<'_>, gamma: f64, penalty:
 /// `7 m5 m3 / (48 V^4)`. Every derivative is diagonal in the subjects, so this
 /// is a scan over cells and a sum over blocks.
 ///
-/// Recomputes the curvature at the final iterate rather than reusing the one
-/// the log-determinant was taken from, which is what nebula does.
+/// Recomputes the curvature at the final iterate, not the one the
+/// log-determinant used (as nebula does).
 ///
 /// ### Params
 ///
@@ -1876,16 +1827,11 @@ fn laplace_correction(
 
 /// Solves a small symmetric system in place by pivoted `LDL'`.
 ///
-/// The Schur complement is positive definite at any sensible optimum, but the
-/// backtracking path visits points where it is not, and a plain Cholesky would
-/// simply fail there. This mirrors Eigen's `LDLT`, which is what the C++ calls:
-/// symmetric pivoting on the largest remaining diagonal, and a solve that zeroes
-/// rather than divides by a vanishing pivot. That keeps a rank-deficient design
-/// producing a finite step instead of a NaN.
-///
-/// See [`crate::glm::levenberg`] for the unpivoted Cholesky used where positive
-/// definiteness is guaranteed; the extra pivoting here is not free and is only
-/// worth it because indefinite iterates are expected.
+/// Mirrors Eigen's `LDLT` as the C++ calls it: symmetric pivoting on the largest
+/// remaining diagonal, and a solve that zeroes a vanishing pivot instead of
+/// dividing. Backtracking visits indefinite points where plain Cholesky fails,
+/// and a rank-deficient design must still give a finite step. See
+/// [`crate::glm::levenberg`] for the unpivoted Cholesky.
 ///
 /// ### Params
 ///
@@ -1957,9 +1903,8 @@ fn ldlt_solve(a: &mut [f64], b: &mut [f64], n: usize, perm: &mut [usize], tmp: &
     }
     for i in 0..n {
         let d = a[i * n + i];
-        // Eigen's own tolerance: a pivot below the smallest normal double is
-        // treated as an exact zero and the component is dropped rather than
-        // blown up.
+        // Eigen's tolerance: a pivot below the smallest normal double is an
+        // exact zero and the component is dropped.
         b[i] = if d.abs() > f64::MIN_POSITIVE {
             b[i] / d
         } else {
@@ -1980,8 +1925,7 @@ fn ldlt_solve(a: &mut [f64], b: &mut [f64], n: usize, perm: &mut [usize], tmp: &
 
 /// Determinant of a small square matrix by partial-pivot `LU`.
 ///
-/// Returned as a product rather than a sum of logs, matching the C++, so an
-/// under- or overflowing determinant behaves the same way here as there.
+/// A product, not a sum of logs, as in the C++, so under- and overflow match.
 ///
 /// ### Params
 ///
@@ -2029,10 +1973,8 @@ fn determinant(a: &mut [f64], n: usize, perm: &mut [usize]) -> f64 {
 
 /// Smallest eigenvalue of a small symmetric matrix, by cyclic Jacobi.
 ///
-/// Only used for the identifiability test, where the answer is compared against
-/// [`EIGENVALUE_CUTOFF`] and nothing finer is needed. Jacobi is chosen over a
-/// faer decomposition because the matrices are a handful of columns wide and the
-/// dispatch would cost more than the sweeps.
+/// Used only for the identifiability test against [`EIGENVALUE_CUTOFF`]. Jacobi
+/// beats a faer decomposition on matrices a few columns wide.
 ///
 /// ### Params
 ///
@@ -2099,12 +2041,9 @@ fn min_eigenvalue(matrix: &[f64], n: usize) -> f64 {
 ///////////
 
 #[cfg(test)]
-// Reference values are pasted verbatim from R's 17-digit print so they can be
-// diffed against the generating script. Truncating them to the shortest
-// round-trip would change nothing numerically and lose that.
+// Reference values are pasted verbatim from R's 17-digit print.
 #[allow(clippy::excessive_precision)]
-// The fixture builders return the five parallel arrays PmlData borrows. Naming
-// the tuple would be one alias used once.
+// Fixture builders return the five parallel arrays `PmlData` borrows.
 #[allow(clippy::type_complexity)]
 mod tests {
     use super::*;
@@ -2145,13 +2084,10 @@ mod tests {
 
     /// Relative tolerance against the R package.
     ///
-    /// Three orders tighter than the 1e-8 this port was asked for, and reached
-    /// on every fixture below, converged and stalled alike. The binding
-    /// constraint is not this arithmetic but nebula's own `eps`: it stops on an
-    /// absolute improvement in the log-likelihood, so where a Newton step is a
-    /// near-tie, a summation order that shifts the comparison by one ulp adds or
-    /// drops a whole damped step and moves the answer by 1e-7. Fixtures here are
-    /// chosen away from those ties.
+    /// Three orders tighter than 1e-8, reached on every fixture below. The
+    /// binding constraint is nebula's own absolute `eps`: at a near-tie Newton
+    /// step, a one-ulp shift in summation adds or drops a whole damped step and
+    /// moves the answer by 1e-7. Fixtures avoid such ties.
     const TOL: f64 = 1e-11;
 
     /// Fixture A: a well-behaved gene.
@@ -2315,8 +2251,8 @@ mod tests {
 
     #[test]
     fn test_opt_pml_start_near_bound_backtracks() {
-        // beta[0] = 90 sits just inside nebula's box of plus or minus 100, so
-        // the first Newton step overshoots and the per-coordinate damping runs.
+        // beta[0] = 90 is just inside nebula's +-100 box: the first Newton step
+        // overshoots and per-coordinate damping runs.
         let data = fixture_a();
         let variance = PmlVariance {
             subject: 0.25,
@@ -2348,8 +2284,8 @@ mod tests {
 
     #[test]
     fn test_opt_pml_far_outside_bounds_uses_fixed_displacement() {
-        // Both coordinates start well outside the box, so the Newton step
-        // exceeds the cutoff and the fixed-displacement branch takes over.
+        // Both coordinates start well outside the box: the Newton step exceeds
+        // the cutoff and the fixed-displacement branch runs.
         let data = fixture_a();
         let variance = PmlVariance {
             subject: 0.25,
@@ -2364,12 +2300,9 @@ mod tests {
 
     #[test]
     fn test_opt_pml_critical_point_reports_minus_ten() {
-        // Backtracking is exhausted while every gradient stays under 0.01, so
-        // nebula calls it a critical point rather than a failure. The stall here
-        // is decisive: the rejected step is orders of magnitude from improving,
-        // not a near-tie. Near-tie stalls exist and are not testable to this
-        // tolerance, because whether the backtracking runs at all is then
-        // decided by the last ulp of a log-likelihood in the thousands.
+        // Backtracking is exhausted with every gradient under 0.01: a critical
+        // point, not a failure. The stall is decisive (orders of magnitude from
+        // improving); near-tie stalls are not testable to this tolerance.
         let data = fixture_a();
         let variance = PmlVariance {
             subject: 8.0,
@@ -2412,8 +2345,7 @@ mod tests {
 
     #[test]
     fn test_opt_pml_iteration_budget_reports_minus_twenty() {
-        // A negative eps makes the stopping test unsatisfiable, so the loop runs
-        // out its budget at an otherwise converged point.
+        // A negative eps is unsatisfiable: the loop exhausts its budget.
         let data = fixture_a();
         let variance = PmlVariance {
             subject: 0.25,
@@ -2570,9 +2502,8 @@ mod tests {
 
     /// Builds the wider fixture: 64 cells, 4 subjects, 3 coefficients.
     ///
-    /// Generated by an integer recurrence rather than embedded as literals, so
-    /// the R side reproduces it exactly with the same three expressions. Every
-    /// value is dyadic, so nothing is lost on the way in.
+    /// Generated by an integer recurrence so R reproduces it with the same three
+    /// expressions. Every value is dyadic.
     ///
     /// ### Returns
     ///

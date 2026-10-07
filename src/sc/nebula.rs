@@ -1,55 +1,49 @@
 //! NEBULA's driver: one negative binomial gamma mixed model per gene.
 //!
-//! Port of `R/nebula.R` from the `nebula` package. The numerical kernels live
-//! in [`crate::sc::ptmg`] and [`crate::sc::pml`]; this module is the
-//! orchestration around them: build the offsets and the centred design, filter
-//! the genes, fan out over the survivors, and reassemble the coefficients,
-//! covariances and overdispersions on the user's own scale.
+//! Port of `R/nebula.R` from the `nebula` package. The kernels live in
+//! [`crate::sc::ptmg`] and [`crate::sc::pml`]; this module builds the offsets
+//! and centred design, filters genes, fans out over the survivors and maps
+//! coefficients, covariances and overdispersions back to the user's scale.
 //!
 //! ### The three stages of one gene
 //!
 //! 1. Bounded L-BFGS-B on the marginal likelihood
 //!    ([`ptmg_value_and_gradient`](crate::sc::ptmg::ptmg_value_and_gradient))
-//!    over `[beta, sigma, phi]`. Only the two variance components survive
-//!    this stage; nebula throws the fixed effects away and restarts them from
-//!    `log(mean count) - mean log offset`.
-//! 2. A bounded search over the two variance components alone, with the fixed
-//!    effects profiled out by [`opt_pml`] inside every evaluation. NEBULA-HL
-//!    always runs this; NEBULA-LN runs it, or a one-dimensional restriction of
-//!    it, or neither, depending on how well the large-sample approximation
-//!    behind stage one is expected to hold for the gene.
-//! 3. A final [`opt_pml`] at the chosen variances, whose observed information
+//!    over `[beta, sigma, phi]`. Only the variance components survive; the
+//!    fixed effects restart from `log(mean count) - mean log offset`.
+//! 2. A bounded search over the two variance components, with the fixed effects
+//!    profiled out by [`opt_pml`] at every evaluation. NEBULA-HL always runs it;
+//!    NEBULA-LN runs it, a one-dimensional restriction of it, or neither,
+//!    depending on how well the large-sample approximation is expected to hold.
+//! 3. A final [`opt_pml`] at the chosen variances; its observed information
 //!    inverts to the covariance of `beta`.
 //!
 //! ### Deviations from the R package
 //!
-//! nebula drives stages one and two with `nloptr`: `NLOPT_LD_LBFGS` with
-//! `ftol_abs = 1e-6`, and `NLOPT_LN_BOBYQA` with the nloptr default
-//! `xtol_rel = 1e-6`. Neither is in this crate and neither is worth adding: the
-//! stage-two objective is discontinuous at the `1e-6` level anyway, because
-//! [`opt_pml`] stops on an *absolute* improvement of `eps = 1e-6` in the
-//! penalised log-likelihood, so its Newton count flips as the variances move
-//! and the profile likelihood jumps by about that much. BOBYQA cannot resolve
-//! the minimum past that floor either, and two of its own runs from different
-//! starting points disagree by up to `1e-6` in the resulting standard errors.
+//! nebula drives stages one and two with `nloptr` (`NLOPT_LD_LBFGS` with
+//! `ftol_abs = 1e-6`, `NLOPT_LN_BOBYQA` with `xtol_rel = 1e-6`). Neither is in
+//! this crate. The stage-two objective is discontinuous at the `1e-6` level:
+//! [`opt_pml`] stops on an absolute improvement of `eps = 1e-6`, so its Newton
+//! count flips as the variances move. BOBYQA cannot resolve the minimum past
+//! that floor, and two of its own runs from different starts disagree by up to
+//! `1e-6` in the standard errors.
 //!
 //! Stage two therefore uses a bounded Nelder-Mead followed by a local quadratic
-//! least-squares polish. The polish is what buys back the accuracy: fitting a
-//! quadratic over a stencil that is wide compared with the noise averages the
-//! jitter out, where a simplex chasing individual function values does not.
-//! Measured against nebula 1.5.8 across two- and three-coefficient designs and
-//! both the LN and HL paths, the worst relative disagreement is `1.0e-6` on the
-//! coefficients, `2.1e-6` on the standard errors and `4.4e-6` on the
-//! overdispersions. That is the reproducibility floor of the reference itself
-//! rather than an error in this port: re-running nebula's own optimisers to a
-//! tolerance of `1e-14` moves its answers by as much.
+//! least-squares polish. A stencil wide compared with the noise averages the
+//! jitter out, which a simplex chasing individual values cannot. Against
+//! nebula 1.5.8 (two- and three-coefficient designs, LN and HL), the worst
+//! relative disagreement is `1.0e-6` on coefficients, `2.1e-6` on standard
+//! errors and `4.4e-6` on overdispersions. That is the reference's own
+//! reproducibility floor: re-running nebula's optimisers to a tolerance of
+//! `1e-14` moves its answers by as much.
 //!
-//! Stage one is a different problem: it has an exact gradient and no jitter, so
-//! it is one call to [`minimise`] and lands on the reference optimum.
+//! Stage one has an exact gradient and no jitter, so it is one call to
+//! [`minimise`] and lands on the reference optimum.
 //!
-//! Only `model = "NBGMM"` is implemented. `PMM` needs the Poisson-gamma
-//! kernels, which this crate does not have, and `NBLMM` needs the log-normal
-//! branch of the outer objective, which has no golden to validate against.
+//! Only `model = "NBGMM"` is implemented. `PMM` needs Poisson-gamma kernels this
+//! crate lacks; `NBLMM` needs the log-normal outer objective, which has no
+//! golden to validate against. For the Hessian and `_opt_pml_nb` differences from
+//! edgePython, see `UPSTREAM_DEVIATIONS.md` A20 and A21.
 //!
 //! ### References
 //!
@@ -76,22 +70,21 @@ use crate::sc::test::packed_len;
 
 /// Box constraint on every fixed effect in stage one, nebula's `rep(100, nb)`.
 ///
-/// The design is centred and scaled first, so a coefficient of a hundred is
-/// already far outside anything a count model can produce.
+/// The design is centred and scaled, so 100 is far outside any plausible
+/// coefficient.
 const BETA_BOUND: f64 = 100.0;
 
 /// Cells per subject below which NEBULA-LN is abandoned for NEBULA-HL.
 ///
-/// The large-sample approximation stage one relies on is an approximation in
-/// the number of cells per subject, so nebula silently overrides
-/// `method = "LN"` below thirty.
+/// The large-sample approximation needs enough cells per subject, so nebula
+/// silently overrides `method = "LN"` below thirty.
 const MIN_CELLS_PER_SUBJECT_LN: f64 = 30.0;
 
 /// Expected count per subject below which the Laplace expansion is pushed to
 /// third order.
 ///
-/// nebula's `(mct * mfs) < 3`. Below it the leading term of the expansion is
-/// visibly biased, so [`PmlParams::ord`] goes to three.
+/// nebula's `(mct * mfs) < 3`. Below it the leading term is biased, so
+/// [`PmlParams::ord`] goes to three.
 const HIGH_ORDER_COUNT_CUTOFF: f64 = 3.0;
 
 /// Laplace order used when the expected count per subject is low.
@@ -99,14 +92,10 @@ const HIGH_ORDER: u32 = 3;
 
 /// Relative slack allowed when deciding a fitted value sits on its lower bound.
 ///
-/// The optimiser does not always return the constraint exactly; it can stop a
-/// few parts in `1e6` above it, which is inside its own stopping tolerance and
-/// means the same thing. Strict equality misses those, and on the small
-/// single-cell fixture it missed two genes of 118 that R reports as pinned.
-///
-/// The margin cannot reach a real estimate: the smallest genuinely fitted
-/// subject variance seen on any fixture is four times the bound, and this
-/// admits values within one part in `1e4` of it.
+/// The optimiser can stop a few parts in `1e6` above the constraint, inside its
+/// own tolerance. Strict equality missed two of 118 genes R reports as pinned on
+/// the small fixture. The smallest genuinely fitted subject variance on any
+/// fixture is four times the bound; this admits values within one part in `1e4`.
 const BOUND_SLACK: f64 = 1.0 + 1e-4;
 
 /// Value of `kappa_obs` below which NEBULA-LN always refits the subject-level
@@ -118,32 +107,30 @@ const KAPPA_SIGMA_NUMERATOR: f64 = 8.0;
 
 /// Relative widths of the quadratic polish stencils, applied in order.
 ///
-/// The first two are wide enough to walk a poorly stopped simplex back to the
-/// basin; the last sets the accuracy. A tenth of a per cent of the incumbent is
-/// three orders above the `1e-6` jitter in the objective and still small enough
-/// that the cubic term does not bias the fitted minimum.
+/// The first two walk a poorly stopped simplex back to the basin; the last sets
+/// the accuracy. A tenth of a per cent is three orders above the `1e-6` jitter
+/// yet small enough that the cubic term does not bias the minimum.
 const POLISH_WIDTHS: [f64; 3] = [1e-2, 3e-3, 1e-3];
 
 /// Absolute floors on the polish stencil width, for `sigma` and for `phi`.
 ///
-/// A relative width collapses when a component sits on its lower bound of
-/// `1e-4`, which is exactly where the fit needs the stencil to have some reach.
+/// A relative width collapses when a component sits on its `1e-4` lower bound,
+/// where the stencil still needs some reach.
 const POLISH_FLOOR: [f64; 2] = [1e-5, 1e-4];
 
 /// Largest polish step accepted, in units of the stencil width.
 ///
-/// A quadratic model fitted over `[-1, 1]` says nothing useful two widths out,
-/// so a longer step means the model is wrong and the incumbent is kept.
+/// A quadratic fitted over `[-1, 1]` is uninformative two widths out; a longer
+/// step means the model is wrong and the incumbent is kept.
 const POLISH_MAX_STEP: f64 = 2.0;
 
 /// Relative objective tolerance for the stage-one quasi-Newton.
 ///
-/// nebula stops nlopt's L-BFGS on an *absolute* change of `eps = 1e-6` in the
-/// marginal log-likelihood, which on the few-thousand values seen here is about
-/// `1e-10` relative. This crate's [`minimise`] tests a relative change, so
-/// passing `eps` straight through would stop it four orders too early, and in
-/// NEBULA-LN the cell-level overdispersion is carried out of this stage
-/// untouched. A fixed tight value converges past nebula in every case instead.
+/// nebula stops nlopt's L-BFGS on an absolute change of `eps = 1e-6`, about
+/// `1e-10` relative on the log-likelihoods seen here. [`minimise`] tests a
+/// relative change, so passing `eps` through would stop four orders too early,
+/// and NEBULA-LN carries the cell-level overdispersion out of this stage
+/// untouched. A fixed tight value converges past nebula in every case.
 const STAGE_ONE_FTOL: f64 = 1e-13;
 
 /// Projected gradient tolerance for the stage-one quasi-Newton.
@@ -157,9 +144,8 @@ const STAGE_ONE_MAX_LINE_SEARCH: usize = 40;
 
 /// Simplex tolerances for the stage-two search.
 ///
-/// Both are absolute, and both sit below the jitter in the objective on purpose:
-/// the simplex is meant to localise the basin, and the polish is meant to find
-/// the minimum inside it.
+/// Both are absolute and sit below the objective's jitter: the simplex localises
+/// the basin, the polish finds the minimum.
 const VARIANCE_XATOL: f64 = 1e-7;
 
 /// Objective tolerance for the stage-two simplex. See [`VARIANCE_XATOL`].
@@ -170,10 +156,8 @@ const VARIANCE_MAX_ITER: usize = 500;
 
 /// Convergence code for a stage-two search that never found a finite objective.
 ///
-/// nebula reports `-50` when its outer optimiser returns a negative nlopt code.
-/// Those codes are not reproducible without nlopt, so this port raises `-50`
-/// for the one failure that is unambiguous: no evaluation of the profile
-/// likelihood succeeded.
+/// nebula reports `-50` on a negative nlopt code. Without nlopt this port raises
+/// it only when no evaluation of the profile likelihood succeeded.
 pub const CONV_OUTER_FAILED: i32 = -50;
 
 ////////////////
@@ -183,12 +167,12 @@ pub const CONV_OUTER_FAILED: i32 = -50;
 /// Which NEBULA variant to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NebulaMethod {
-    /// NEBULA-LN. Estimates the overdispersions from the marginal likelihood
-    /// and only refits them when the large-sample approximation looks unsafe.
+    /// NEBULA-LN. Estimates the overdispersions from the marginal likelihood;
+    /// refits only when the large-sample approximation looks unsafe.
     Ln,
     /// NEBULA-HL. Always refits both overdispersions against the profile
-    /// likelihood. Slower and what nebula falls back to below
-    /// [`MIN_CELLS_PER_SUBJECT_LN`] cells per subject.
+    /// likelihood. Slower; the fallback below [`MIN_CELLS_PER_SUBJECT_LN`] cells
+    /// per subject.
     Hl,
 }
 
@@ -216,18 +200,14 @@ pub struct NebulaParams {
     /// expressing it when its own mean count per cell is above `cpc`.
     ///
     /// `cpc` and `mincp` pool every cell, so one subject can carry a gene
-    /// through on its own and a subject-level coefficient then rests on a
-    /// handful of subjects. `0`, the default, switches the check off, which is
-    /// the R package's behaviour.
+    /// through. `0` (default, as in R) switches the check off.
     pub min_subjects: usize,
     /// Estimate the overdispersions by restricted maximum likelihood.
     ///
-    /// R's `nebula` package only honours this for `NBLMM`, which this port does
-    /// not implement. Here it is threaded through unconditionally and does
-    /// change the fit on NBGMM, the only model implemented: [`opt_pml`] adds a
-    /// log-determinant term to the outer overdispersion objective whenever it is
-    /// set. That behaviour has not been validated against an R reference, since
-    /// R never exercises `reml` on this model. Defaults off.
+    /// R honours this only for `NBLMM`, which is not implemented here. In this
+    /// port it changes the NBGMM fit: [`opt_pml`] adds a log-determinant term to
+    /// the outer objective. Not validated against R, which never exercises
+    /// `reml` on this model. Off by default.
     pub reml: bool,
     /// Absolute stopping tolerance handed to [`opt_pml`], nebula's `eps`.
     pub eps: f64,
@@ -289,8 +269,8 @@ impl NebulaParams {
 
 /// The fitted model for every gene that survived the expression filter.
 ///
-/// Everything is on the user's own design scale: the centring and scaling
-/// nebula applies internally is undone before these are returned.
+/// Everything is on the user's design scale; the internal centring and scaling
+/// is undone.
 #[derive(Clone, Debug)]
 pub struct NebulaFit {
     /// Fixed effects, row-major `n_genes_kept * n_coef`.
@@ -298,8 +278,8 @@ pub struct NebulaFit {
     /// Covariance of the fixed effects, packed upper triangular and row-major
     /// over genes, `n_genes_kept * packed_len(n_coef)`.
     ///
-    /// The packing is [`crate::sc::test`]'s: entry `(i, j)` with `i <= j` lives
-    /// at `j * (j + 1) / 2 + i`, so three coefficients store
+    /// Packed as in [`crate::sc::test`]: `(i, j)` with `i <= j` at
+    /// `j * (j + 1) / 2 + i`, so three coefficients store
     /// `V11, V12, V22, V13, V23, V33`.
     pub covariance: Vec<f64>,
     /// Standard errors, row-major `n_genes_kept * n_coef`.
@@ -313,27 +293,19 @@ pub struct NebulaFit {
     pub convergence: Vec<i32>,
     /// Whether [`NebulaFit::subject_overdispersion`] finished on its lower bound.
     ///
-    /// The bound is [`NebulaParams::min`]`.0`, `1e-4` by default. A gene sitting
-    /// on it has no fitted subject-level variance at all: the mixed model has
-    /// collapsed to a plain negative binomial GLM, and the reported `sigma^2` is
-    /// the constraint rather than an estimate.
+    /// The bound is [`NebulaParams::min`]`.0`, `1e-4` by default. Such a gene
+    /// has no fitted subject-level variance: the model has collapsed to a plain
+    /// negative binomial GLM and the reported `sigma^2` is the constraint.
     ///
-    /// This is not a convergence failure and [`NebulaFit::convergence`] will
-    /// usually say the gene converged, because it did. The marginal likelihood
-    /// really is still decreasing towards zero there, so the optimiser is
-    /// sitting on a legitimate Karush-Kuhn-Tucker point of the box constraint.
-    /// Lowering `min.0` simply moves the answer down with it.
+    /// This is a legitimate KKT point of the box constraint, not a convergence
+    /// failure, so [`NebulaFit::convergence`] usually reports success. Lowering
+    /// `min.0` moves the answer down with it.
     ///
-    /// The R package has no equivalent flag. Its `check_conv` tests whether
-    /// `sigma^2` hit its *upper* bound and never the lower one, so these genes
-    /// come back from `nebula()` reporting success with no indication that the
-    /// random effect was never estimated.
+    /// The R package has no such flag: its `check_conv` tests only the upper
+    /// bound, so these genes report success.
     ///
-    /// Not raised for the related case where *stage one* hits the bound but the
-    /// NEBULA-LN refit then moves `sigma^2` off it. That happens on roughly a
-    /// third of genes and the final `sigma^2` is fine; what it leaves behind is
-    /// a `phi` fitted jointly with the discarded boundary value. Flagging it
-    /// would bury the case above in noise for no action the caller could take.
+    /// Not raised when stage one hits the bound but the NEBULA-LN refit moves
+    /// `sigma^2` off it (about a third of genes; the final `sigma^2` is fine).
     pub sigma_at_bound: Vec<bool>,
     /// Zero-based indices of the input genes that survived the filter.
     pub gene_index: Vec<usize>,
@@ -347,14 +319,11 @@ pub struct NebulaFit {
 
 /// Fits NEBULA's negative binomial gamma mixed model to every gene.
 ///
-/// Densifies nothing: the counts are compressed on entry and
-/// [`nebula_sparse`] does the work. Callers that already hold a gene-major
-/// sparse matrix should go straight there.
+/// Compresses the counts on entry and calls [`nebula_sparse`]; callers holding a
+/// gene-major sparse matrix should call that directly.
 ///
-/// Cells must already be grouped by subject: `subject_id` is read as a run
-/// encoding, so a subject whose cells are split into two blocks is rejected
-/// rather than silently merged. Genes are the parallel axis, one rayon task per
-/// gene, with no shared mutable state.
+/// Cells must be grouped by subject: `subject_id` is read as a run encoding, and
+/// a subject split into two blocks is rejected, not merged.
 ///
 /// ### Params
 ///
@@ -377,9 +346,7 @@ pub struct NebulaFit {
 /// ### References
 ///
 /// He et al., Communications Biology 4, 629, 2021
-// The counts, their shape, the subject labels, the design, its width, the
-// offsets and the knobs. Bundling any of it into a struct would only move the
-// same arguments to a constructor.
+// Many arguments on purpose: a struct would only move them to a constructor.
 #[allow(clippy::too_many_arguments)]
 pub fn nebula<T: EdgeFloat>(
     counts: &[T],
@@ -411,11 +378,8 @@ pub fn nebula<T: EdgeFloat>(
 
 /// Fits NEBULA's negative binomial gamma mixed model from a sparse matrix.
 ///
-/// The entry point for a caller whose counts already live in compressed form,
-/// which for a single-cell store is all of them. A gene-major CSR is what the
-/// kernels read anyway, so nothing here copies the counts.
-///
-/// Cells must already be grouped by subject, exactly as in [`nebula`].
+/// Reads the gene-major CSR directly, copying no counts. Cells must be grouped
+/// by subject, as in [`nebula`].
 ///
 /// ### Params
 ///
@@ -465,13 +429,10 @@ pub fn nebula_sparse<T: EdgeFloat>(
     )
 }
 
-/// The shared body of every NEBULA entry point, with the per-gene fan-out left
-/// to the caller.
-///
-/// Everything that is the same whichever device fits the genes lives here: the
-/// validation, the offsets, the centred design, the expression filter and the
-/// reassembly on the user's scale. `fit` gets the kept genes and returns one
-/// outcome per kept gene, in order.
+/// Shared body of every NEBULA entry point, device-independent: validation,
+/// offsets, centred design, expression filter and reassembly on the user's
+/// scale. `fit` receives the kept genes and returns one outcome per kept gene,
+/// in order.
 ///
 /// ### Params
 ///
@@ -530,8 +491,8 @@ where
     if n_coef == 0 {
         return Err(EdgeErrors::MustBePositive("n_coef".to_string()));
     }
-    // The kernels drop everything that is not strictly positive, so a negative
-    // count would be silently ignored rather than rejected.
+    // The kernels drop non-positive values, which would silently ignore a
+    // negative count.
     if let Some(bad) = counts.data.iter().find(|v| !(v.is_finite() && **v >= 0.0)) {
         return Err(EdgeErrors::InvalidArgument(format!(
             "The counts hold {bad}, which is not a non-negative finite number."
@@ -560,9 +521,8 @@ where
         });
     }
 
-    // Offsets. nebula logs them and keeps both the arithmetic mean, which seeds
-    // the intercept, and the coefficient of variation, which the NEBULA-LN
-    // triggers key off.
+    // Offsets: the arithmetic mean seeds the intercept; the coefficient of
+    // variation drives the NEBULA-LN triggers.
     let offset_f64: Option<Vec<f64>> = match offset {
         Some(o) => Some(to_f64("offset", o)?),
         None => None,
@@ -576,8 +536,8 @@ where
     let log_mean_offset = offsets.mean_offset.ln();
     let cv2 = offsets.cv * offsets.cv;
 
-    // Design. nebula centres and scales every column, which turns the intercept
-    // into a column of ones with a standard deviation of zero.
+    // Design: every column is centred and scaled; the intercept becomes ones
+    // with a standard deviation of zero.
     let design_f64 = to_f64("design", design)?;
     let (centred, sds) = centre_design(&design_f64, n_cells, n_coef)?;
     if sds.iter().any(|s| *s < 0.0) {
@@ -596,8 +556,7 @@ where
         }
     };
 
-    // Columns that vary inside a subject. Only these can make the fitted cell
-    // means differ within a subject, which is what nebula's `get_cv` measures.
+    // Columns varying within a subject: the only ones `get_cv` measures.
     let cell_columns: Vec<usize> = cell_level_columns(&centred, n_cells, n_coef, &fid)?
         .iter()
         .enumerate()
@@ -615,9 +574,8 @@ where
         params.method
     };
 
-    // Expression filter: mean count per cell and number of expressed cells over
-    // all cells, then the number of subjects whose own mean count per cell
-    // clears `cpc`.
+    // Expression filter: mean count per cell and expressed cells over all cells,
+    // then subjects whose own mean count per cell clears `cpc`.
     let kept: Vec<usize> = (0..n_genes)
         .filter(|&g| {
             let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
@@ -688,9 +646,8 @@ pub(crate) struct Shared<'a> {
     intercept: usize,
     /// Log of the mean offset, nebula's `moffset`.
     ///
-    /// The log of the arithmetic mean, not the mean of the logs: nebula
-    /// computes `log(mexpoffset)` and leaves `cv_offset`'s own `moffset`, which
-    /// is the mean of the logs, unused.
+    /// Log of the arithmetic mean, not the mean of the logs: nebula uses
+    /// `log(mexpoffset)` and ignores `cv_offset`'s own `moffset`.
     log_mean_offset: f64,
     /// Cells per subject, nebula's `mfs`.
     cells_per_subject: f64,
@@ -813,8 +770,7 @@ pub(crate) fn plan_gene(
     let n_coef = shared.n_coef;
     let params = &shared.params;
 
-    // nebula raises the Laplace order for genes whose expected count per
-    // subject is low; the leading term alone is biased there.
+    // Low expected count per subject: raise the Laplace order.
     let ord = if counts.mean_count * shared.cells_per_subject < HIGH_ORDER_COUNT_CUTOFF {
         HIGH_ORDER
     } else {
@@ -849,16 +805,15 @@ pub(crate) fn plan_gene(
     let sigma = stage_one[n_coef];
     let gamma = stage_one[n_coef + 1];
 
-    // nebula discards the stage-one fixed effects and restarts them from the
-    // gene's mean count, keeping only the two variance components.
+    // Discard the stage-one fixed effects; restart from the gene's mean count.
     let mut beta_start = vec![0.0; n_coef];
     beta_start[shared.intercept] = log_mean_count - shared.log_mean_offset;
 
     let refit = match shared.method {
         NebulaMethod::Hl => Refit::Both,
         NebulaMethod::Ln => {
-            // nebula measures how far the fitted cell means spread within a
-            // subject; without a cell-level column that is just the offsets.
+            // Spread of fitted cell means within a subject; with no cell-level
+            // column, just the offsets.
             let cv2p = if shared.cell_columns.is_empty() {
                 shared.cv2
             } else {
@@ -1036,17 +991,14 @@ fn fit_gene(
 
 /// Minimises the marginal negative log-likelihood over `[beta, sigma, phi]`.
 ///
-/// This is nebula's stage one: one call to [`minimise`] with an exact gradient.
-/// `sigma` runs to its lower bound on most genes, which is the case that used to
-/// defeat the line search here; see the `max_feasible_step` note in
+/// nebula's stage one: one call to [`minimise`] with an exact gradient. `sigma`
+/// runs to its lower bound on most genes; see the `max_feasible_step` note in
 /// `numeric::lbfgsb`.
 ///
-/// No quadratic polish here, unlike [`refine_variance`]: the marginal likelihood
-/// is smooth, so there is no jitter to average out, and the stencil costs
-/// `3^(n_coef + 2)` evaluations, which is exponential in something the caller
-/// chooses. What is left over is well inside nebula's own stage-one tolerance,
-/// an absolute `1e-6` on the objective, which moves its `phi` by up to `4e-6`
-/// relative on the same fixture.
+/// No quadratic polish, unlike [`refine_variance`]: the objective is smooth, and
+/// the stencil costs `3^(n_coef + 2)` evaluations. The remainder is inside
+/// nebula's own stage-one tolerance (an absolute `1e-6`, moving its `phi` by up
+/// to `4e-6` relative on the same fixture).
 ///
 /// ### Params
 ///
@@ -1105,9 +1057,9 @@ fn minimise_marginal(
 
 /// What the profile likelihood needs from one penalised fit.
 ///
-/// The four scalars of [`crate::sc::pml::PmlResult`] the outer objective reads.
-/// Split out so the fit can come from somewhere other than [`opt_pml`]; the GPU
-/// path batches these across genes and hands them back one at a time.
+/// The four scalars of [`crate::sc::pml::PmlResult`] the outer objective reads,
+/// split out so the fit can come from elsewhere: the GPU path batches them
+/// across genes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InnerFit {
     /// Penalised log-likelihood at the optimum.
@@ -1123,10 +1075,9 @@ pub(crate) struct InnerFit {
 /// nebula's `pql_ll`: the marginal likelihood with the fixed effects and the
 /// random effects profiled out by a penalised fit.
 ///
-/// Every evaluation runs a full penalised fit, so this is the expensive part of
-/// a NEBULA run. Whether an evaluation was rejected is not tracked here: every
-/// rejection returns positive infinity and every infinite return is a
-/// rejection, so [`StageTwoSearch`] reads it straight off the values.
+/// Every evaluation runs a full penalised fit: the expensive part of a NEBULA
+/// run. Every rejection returns positive infinity and every infinite return is a
+/// rejection, so [`StageTwoSearch`] reads it off the values.
 pub(crate) struct VarianceObjective<'a> {
     /// The gene, in the layout [`opt_pml`] wants.
     pub(crate) data: &'a PmlData<'a>,
@@ -1180,8 +1131,7 @@ impl VarianceObjective<'_> {
 
     /// The `lgamma` tail over the positive counts, in count order.
     ///
-    /// Counts of one and two have closed forms for the gamma ratio, which is
-    /// most of a single-cell matrix; only the rest needs `lgamma`.
+    /// Counts of one and two have closed forms; only the rest need `lgamma`.
     ///
     /// ### Params
     ///
@@ -1275,9 +1225,9 @@ impl VarianceObjective<'_> {
     }
 }
 
-///////////////////////
-// Stage-two search  //
-///////////////////////
+//////////////////////
+// Stage-two search //
+//////////////////////
 
 /// Where a [`StageTwoSearch`] is waiting for values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1297,26 +1247,20 @@ enum SearchStage {
 /// nebula's stage two over the variance components, as a reverse-communication
 /// state machine.
 ///
-/// The search asks for the objective at a batch of points, the caller evaluates
-/// them however it likes, and tells the search the values. That lets many
-/// genes' searches advance in lockstep with every evaluation of a round batched
-/// onto one device launch. The CPU path drives it with an immediate evaluation,
-/// so the two paths cannot drift apart in control flow.
+/// The search asks for the objective at a batch of points and the caller
+/// supplies the values, so many genes' searches can advance in lockstep with
+/// each round batched onto one device launch. The CPU path evaluates
+/// immediately, so both paths share control flow.
 ///
-/// The sequence is: the clamped start; bounded Nelder-Mead, which evaluates
-/// every point clamped into the box so that a component can settle exactly on
-/// its bound; the clamped minimiser once more; then three quadratic polish
-/// stencils at shrinking widths. The polish is the part that matters: the
-/// objective jitters at the `1e-6` level, and a quadratic fitted over a stencil
-/// wider than the jitter averages it out where a simplex does not. If the pass
-/// at a raised Laplace order hit an evaluation the expansion could not support,
-/// the whole pass is repeated at the leading order, which is what the R
-/// package's `tryCatch` around `bobyqa` does.
+/// Sequence: the clamped start; bounded Nelder-Mead, every point clamped into
+/// the box so a component can settle on its bound; the clamped minimiser once
+/// more; then three quadratic polish stencils at shrinking widths. If a pass at
+/// a raised Laplace order hit an evaluation the expansion could not support, the
+/// whole pass is repeated at the leading order, as the R package's `tryCatch`
+/// around `bobyqa` does.
 ///
-/// A polish stencil asks for all its points in one batch, where the closure form
-/// stopped at the first infinite value. The result is the same: an infinite
-/// value discards the stencil either way, and the rejection flag is set by the
-/// first one.
+/// A polish stencil asks for all its points at once; an infinite value discards
+/// the stencil either way.
 pub(crate) struct StageTwoSearch {
     /// Lower bounds.
     lower: Vec<f64>,
@@ -1522,9 +1466,9 @@ impl StageTwoSearch {
 
     /// Builds the next polish stencil, or finishes the pass after the last.
     ///
-    /// The stencil is `3^n` points at offsets `-1, 0, 1` times the step, shifted
-    /// to `0, 1, 2` or `-2, -1, 0` in any coordinate sitting on a bound so that
-    /// the points stay distinct and inside the box.
+    /// `3^n` points at offsets `-1, 0, 1` times the step, shifted to `0, 1, 2`
+    /// or `-2, -1, 0` in any coordinate on a bound, keeping points distinct and
+    /// inside the box.
     fn begin_polish(&mut self) {
         if self.width == POLISH_WIDTHS.len() {
             let best = std::mem::take(&mut self.best);
@@ -1572,8 +1516,7 @@ impl StageTwoSearch {
 
     /// One step of Newton on a quadratic fitted to the stencil values.
     ///
-    /// The quadratic is fitted by least squares through the normal equations,
-    /// which are well conditioned at these sizes, and the step is taken only if
+    /// Least squares through the normal equations. The step is taken only if
     /// the fitted curvature is positive definite and the step stays inside the
     /// stencil.
     ///
@@ -1601,8 +1544,8 @@ impl StageTwoSearch {
             }
         }
 
-        // Normal equations. Cheaper than a QR and perfectly conditioned here:
-        // the stencil spans the quadratic space exactly.
+        // Normal equations: the stencil spans the quadratic space exactly, so
+        // they are well conditioned and cheaper than a QR.
         let mut normal = vec![0.0; n_terms * n_terms];
         let mut rhs = vec![0.0; n_terms];
         for (point, &f) in values.iter().enumerate() {
@@ -1904,8 +1847,7 @@ fn to_f64<T: EdgeFloat>(name: &str, values: &[T]) -> Result<Vec<f64>, EdgeErrors
 
 /// Builds the gene-major sparse view the kernels read counts from.
 ///
-/// Only strictly positive counts are stored, which is what nebula's C++ does
-/// with its `dgCMatrix`.
+/// Only strictly positive counts are stored, as in nebula's C++.
 ///
 /// ### Params
 ///
@@ -1952,8 +1894,8 @@ fn build_csr<T: EdgeFloat>(
 /// Undoes the centring and scaling and packs the per-gene fits.
 ///
 /// nebula scales every non-constant design column to unit population standard
-/// deviation before fitting, so the coefficients, standard errors and
-/// covariances all come back on that scale and have to be divided out again.
+/// deviation, so coefficients, standard errors and covariances are divided out
+/// again.
 ///
 /// ### Params
 ///
@@ -2025,39 +1967,37 @@ mod tests {
     use approx::assert_relative_eq;
     use std::path::PathBuf;
 
-    // Every tolerance below is set a factor of three or so above the worst case
-    // actually measured against nebula 1.5.8, quoted with it. None of them is
-    // this port's error: nebula stops BOBYQA at `xtol_rel = 1e-6` on a profile
-    // likelihood that is itself discontinuous at the `1e-6` level, and two of
-    // its own runs from different starting points disagree by as much.
+    // Each tolerance is about three times the worst case measured against
+    // nebula 1.5.8 (quoted). None is this port's error: nebula stops BOBYQA at
+    // `xtol_rel = 1e-6` on a profile likelihood discontinuous at that level,
+    // and two of its own runs from different starts disagree by as much.
 
     /// Tolerance on the coefficients. Measured worst case `1.0e-6`.
     ///
-    /// Almost all of that is the intercept, which nebula shifts by `-sigma / 2`
-    /// before the final fit, so an error in the subject-level overdispersion
-    /// lands on it halved and absolute.
+    /// Mostly the intercept, which nebula shifts by `-sigma / 2` before the final
+    /// fit, so a subject-level overdispersion error lands on it halved.
     const TOL_COEF: f64 = 5e-6;
 
     /// Tolerance on the standard errors. Measured worst case `2.1e-6`.
     const TOL_SE: f64 = 1e-5;
 
-    /// Tolerance on the covariance entries, which are standard errors squared,
-    /// so twice the relative error. Measured worst case `3.1e-6`.
+    /// Tolerance on the covariance entries (standard errors squared). Measured
+    /// worst case `3.1e-6`.
     const TOL_COV: f64 = 1e-5;
 
     /// Tolerance on the subject-level overdispersion. Measured worst case
     /// `3.6e-6`.
     ///
-    /// The profile likelihood is far flatter in this direction than in the
-    /// cell-level one, so the same jitter in the objective moves it further.
+    /// The profile likelihood is flatter here than in the cell-level direction,
+    /// so the same jitter moves it further.
     const TOL_SUBJECT: f64 = 1e-5;
 
     /// Tolerance on the cell-level overdispersion. Measured worst case `4.4e-6`,
     /// on the NEBULA-LN path.
     ///
-    /// There it is carried straight out of stage one, where nebula's own
-    /// absolute `1e-6` stopping rule leaves it uncertain at that level: running
-    /// the reference's own optimiser to `1e-14` moves it by up to `3.6e-6`.
+    /// It is carried straight out of stage one, where nebula's absolute `1e-6`
+    /// stopping rule leaves it uncertain: running the reference to `1e-14` moves
+    /// it by up to `3.6e-6`.
     const TOL_CELL: f64 = 1e-5;
 
     /// Reads a CSV from `tests/data` into a row-major matrix.
@@ -2146,10 +2086,10 @@ mod tests {
 
     /// Reorders one gene's R covariance row into this crate's packing.
     ///
-    /// R returns `lower.tri(diag = TRUE)` in column-major order, which for a
-    /// symmetric matrix reads `V11, V12, V13, V22, V23, V33`. This crate packs
-    /// the upper triangle column-major, `V11, V12, V22, V13, V23, V33`. The two
-    /// coincide for two coefficients and diverge from three.
+    /// R returns `lower.tri(diag = TRUE)` column-major:
+    /// `V11, V12, V13, V22, V23, V33`. This crate packs the upper triangle
+    /// column-major: `V11, V12, V22, V13, V23, V33`. They coincide for two
+    /// coefficients.
     ///
     /// ### Params
     ///
@@ -2164,11 +2104,10 @@ mod tests {
 
     /// Asserts a convergence code against what the R package reported.
     ///
-    /// nebula grades a fit by how many times the last Newton step had to be
-    /// halved, and at a converged point that count is settled by rounding: R
-    /// itself returns 7, 3 and 0 for three values of `phi` a part in `1e8`
-    /// apart. So a gene the R package calls converged is allowed to come back as
-    /// `CONV_CRITICAL_POINT` here, and nothing else is.
+    /// nebula grades a fit by how often the last Newton step was halved, which
+    /// rounding settles at a converged point (R returns 7, 3 and 0 for three
+    /// values of `phi` a part in `1e8` apart). A gene R calls converged may
+    /// come back as `CONV_CRITICAL_POINT` here, and nothing else.
     ///
     /// ### Params
     ///
@@ -2238,8 +2177,7 @@ mod tests {
 
     /// The fit feeds [`glm_sc_test`] and reproduces nebula's p-values.
     ///
-    /// This is the layout check that matters in practice: `glm_sc_test` reads
-    /// the packed covariance, so a p-value that lands on nebula's confirms both
+    /// `glm_sc_test` reads the packed covariance, so matching p-values confirm
     /// the packing and the standard errors end to end.
     #[test]
     fn test_wald_test_reproduces_the_r_p_values() {
@@ -2362,8 +2300,7 @@ mod tests {
             ],
         ];
 
-        // V11, V12, V22. With two coefficients R's packing and this crate's
-        // agree, so no reordering is needed.
+        // V11, V12, V22: R's packing and this crate's agree at two coefficients.
         const EXPECTED_COV: [[f64; 3]; 8] = [
             [
                 2.3363660494967357e-02,
@@ -2445,16 +2382,14 @@ mod tests {
     /// `sigma_at_bound` marks a gene whose subject-level variance was never
     /// estimated.
     ///
-    /// Three of the eight genes in this golden are pinned, and R agrees: the
-    /// `Subject` column of `tests/data/nebula_expected.csv` is exactly `1e-4`
-    /// for genes 2, 4 and 7. nebula reports all three as converged, because they
-    /// are: the marginal likelihood is still descending at the bound, so the
-    /// optimiser is sitting on a legitimate constrained optimum. What it does
-    /// not report is that the mixed model has collapsed to a plain negative
-    /// binomial GLM on those genes, which is what this flag is for.
+    /// Three of the eight genes are pinned, and R agrees: the `Subject` column
+    /// of `tests/data/nebula_expected.csv` is exactly `1e-4` for genes 2, 4 and
+    /// 7. nebula reports them as converged (a legitimate constrained optimum) but
+    /// not that the model has collapsed to a plain negative binomial GLM, which
+    /// is what this flag is for.
     ///
-    /// Verified against nebula 1.5.8 by lowering the bound and watching the
-    /// estimate follow it, which is what tells a constraint from an estimate:
+    /// Checked against nebula 1.5.8 by lowering the bound: a constraint follows
+    /// it down, an estimate does not.
     ///
     /// ```r
     /// a <- nebula(cnt, id, pred = pred, offset = sf, method = "LN")
@@ -2493,8 +2428,8 @@ mod tests {
             "genes 2, 4 and 7 of the golden are pinned, one-based"
         );
 
-        // The flag has to track the bound rather than a hardcoded constant, so
-        // raising the floor past every fitted value must flag everything.
+        // The flag tracks the bound, not a constant: a floor above every fitted
+        // value must flag everything.
         let highest = fit
             .subject_overdispersion
             .iter()
@@ -2523,11 +2458,10 @@ mod tests {
 
     /// The NEBULA-LN path, which the main golden never reaches.
     ///
-    /// Relabelling the same cells as three subjects of fifty puts the fixture
-    /// above thirty cells per subject, so `method = "LN"` survives. Eight of the
-    /// nine genes then take nebula's `LN+HL` branch, which refits only the
-    /// subject-level overdispersion against the profile likelihood, and the
-    /// ninth takes pure `LN`, keeping stage one's estimates untouched.
+    /// Three subjects of fifty cells put the fixture above thirty cells per
+    /// subject, so `method = "LN"` survives. Eight of nine genes take nebula's
+    /// `LN+HL` branch (refit of the subject-level overdispersion only); the
+    /// ninth takes pure `LN`, keeping stage one's estimates.
     ///
     /// Produced by:
     ///
@@ -2542,8 +2476,8 @@ mod tests {
         let (counts, _, design, offset) = fixture();
         let subject: Vec<usize> = (0..150).map(|i| i / 50).collect();
 
-        // The ninth gene is expressed in six cells only, which puts its expected
-        // count per subject at two and so raises the Laplace order to three.
+        // The ninth gene is expressed in six cells: expected count per subject
+        // is two, so the Laplace order rises to three.
         let mut padded = counts.clone();
         let mut sparse = vec![0.0; 150];
         for cell in [2, 5, 8, 11, 14, 17] {
@@ -2656,21 +2590,17 @@ mod tests {
             assert_relative_eq!(fit.cell_overdispersion[g], want[7], max_relative = TOL_CELL);
         }
 
-        // The ninth gene never leaves stage one, so its fit is whatever the
-        // bounded quasi-Newton returned. nebula drives that stage with nlopt's
-        // L-BFGS and this crate with the Fortran L-BFGS-B, and on a gene with
-        // six counts spread over 150 cells the two are not going to agree on a
-        // point where both overdispersions have run to their box constraints.
+        // The ninth gene never leaves stage one. nebula uses nlopt's L-BFGS and
+        // this crate L-BFGS-B, and with six counts over 150 cells the two do not
+        // agree where both overdispersions run to their box constraints.
         //
-        // The subject-level component is a hard attractor and does land exactly
-        // on its floor. The cell-level one does not: the marginal likelihood is
-        // flat in `phi` here, its gradient staying within a factor of eight of
-        // `STAGE_ONE_PGTOL` from `phi = 400` to the ceiling of 1000 for a total
-        // objective gain of 9.2e-5. One ulp in the starting intercept flips the
-        // fit between the ceiling and roughly 565, which is how the MSVC libm
-        // and glibc come out on opposite sides. Only the magnitude survives
-        // that, so only the magnitude is asserted; do not tighten this back to
-        // an exact 1e-3.
+        // The subject-level component lands exactly on its floor. The cell-level
+        // one does not: the marginal likelihood is flat in `phi`, its gradient
+        // within a factor of eight of `STAGE_ONE_PGTOL` from `phi = 400` to the
+        // ceiling of 1000 (total objective gain 9.2e-5). One ulp in the starting
+        // intercept flips the fit between the ceiling and about 565 (MSVC libm
+        // against glibc). Only the magnitude is asserted; do not tighten to an
+        // exact 1e-3.
         assert_relative_eq!(fit.subject_overdispersion[8], 1e-4, max_relative = 1e-12);
         assert!(fit.cell_overdispersion[8] < 2e-3);
         assert!(fit.coefficients[24..27].iter().all(|v| v.is_finite()));
@@ -2679,10 +2609,9 @@ mod tests {
 
     /// A gene with no counts at all in one subject.
     ///
-    /// The first subject's twenty-five cells are zeroed for gene one, which
-    /// leaves that subject's random effect identified only by the prior. Its
-    /// subject-level overdispersion jumps from 0.024 to 0.72, so this is a
-    /// genuinely different fit rather than a perturbation.
+    /// The first subject's twenty-five cells are zeroed for gene one, leaving
+    /// its random effect identified only by the prior. The subject-level
+    /// overdispersion jumps from 0.024 to 0.72.
     ///
     /// Produced by the golden call with `cnt[1, 1:25] <- 0`.
     #[test]
@@ -2734,10 +2663,9 @@ mod tests {
 
     /// The expression filter, against the genes nebula itself keeps.
     ///
-    /// Three genes are appended: one expressed in three cells, and two expressed
-    /// in six. `mincp = 5` drops the first and keeps the other two, which is
-    /// what `nebula(..., verbose = TRUE)` reports as "Remove 1 genes having low
-    /// expression" with `gene_id` 1 to 8, 10 and 11.
+    /// Three genes are appended: one expressed in three cells, two in six.
+    /// `mincp = 5` drops the first, matching `nebula(..., verbose = TRUE)`
+    /// ("Remove 1 genes having low expression", `gene_id` 1 to 8, 10 and 11).
     #[test]
     fn test_gene_filter_drops_low_count_gene() {
         let (counts, subject, design, offset) = fixture();
@@ -2794,8 +2722,7 @@ mod tests {
 
     /// The fit is unchanged by holding the inputs as `f32`.
     ///
-    /// Counts, design and offsets all convert exactly here, so the two runs
-    /// agree to the last bit rather than merely closely.
+    /// Counts, design and offsets convert exactly, so the runs agree bitwise.
     #[test]
     fn test_nebula_is_generic_over_the_float() {
         let (counts, subject, design, offset) = fixture();
@@ -2832,9 +2759,8 @@ mod tests {
 
     /// The sparse entry point is the dense one with the compression hoisted out.
     ///
-    /// Bit-for-bit, not close: [`nebula`] builds exactly this matrix and then
-    /// calls [`nebula_sparse`], so any divergence would be a bug in the split
-    /// rather than a numerical difference.
+    /// Bitwise: [`nebula`] builds this matrix and calls [`nebula_sparse`], so any
+    /// divergence is a bug in the split.
     #[test]
     fn test_nebula_sparse_matches_the_dense_entry_point() {
         let (counts, subject, design, offset) = fixture();
@@ -2850,8 +2776,8 @@ mod tests {
         )
         .expect("nebula failed");
 
-        // Built by hand rather than through `build_csr`, so the test would
-        // still catch the two paths drifting apart.
+        // Built by hand, not through `build_csr`, so drift between the paths is
+        // still caught.
         let mut data = Vec::new();
         let mut indices = Vec::new();
         let mut indptr = vec![0u32];
@@ -2942,9 +2868,8 @@ mod tests {
 
     /// NEBULA-LN below thirty cells per subject silently becomes NEBULA-HL.
     ///
-    /// The fixture has twenty-five, so asking for either variant has to give the
-    /// same answer. This is the override that makes the golden, generated with
-    /// `method = "LN"`, actually exercise the HL path.
+    /// The fixture has twenty-five, so either variant gives the same answer;
+    /// this is what makes the `method = "LN"` golden exercise the HL path.
     #[test]
     fn test_ln_falls_back_to_hl_below_thirty_cells_per_subject() {
         let (counts, subject, design, offset) = fixture();
