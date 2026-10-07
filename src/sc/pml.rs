@@ -38,6 +38,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::errors::EdgeErrors;
+use crate::sc::zeros::ZeroCells;
 
 //////////////////////
 // Tuning and codes //
@@ -477,6 +478,30 @@ pub fn opt_pml(
     variance: &PmlVariance,
     params: Option<PmlParams>,
 ) -> Result<PmlResult, EdgeErrors> {
+    opt_pml_tabled(data, None, beta_init, variance, params)
+}
+
+/// [`opt_pml`], with the zero counts summed from the run's tables.
+///
+/// ### Params
+///
+/// * `data` - One gene's design, offsets, positive counts and subject blocks
+/// * `zeros` - The tables built from this `data`'s design, offsets and
+///   subjects, or `None` to sweep every cell
+/// * `beta_init` - Starting fixed effects, length `n_beta`
+/// * `variance` - The two variance components, held fixed throughout
+/// * `params` - Tuning knobs, or `None` for nebula's defaults
+///
+/// ### Returns
+///
+/// As [`opt_pml`].
+pub(crate) fn opt_pml_tabled(
+    data: &PmlData<'_>,
+    zeros: Option<&ZeroCells>,
+    beta_init: &[f64],
+    variance: &PmlVariance,
+    params: Option<PmlParams>,
+) -> Result<PmlResult, EdgeErrors> {
     let exps = variance.subject.exp();
     if !(exps.is_finite() && exps > 1.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -490,6 +515,7 @@ pub fn opt_pml(
     };
     optimise(
         data,
+        zeros,
         beta_init,
         None,
         penalty,
@@ -533,6 +559,7 @@ pub fn opt_pml_nbm(
     };
     optimise(
         data,
+        None,
         beta_init,
         None,
         penalty,
@@ -592,7 +619,7 @@ pub fn pml_log_likelihood_gradient(
         lambda: alpha,
     };
 
-    let mut work = Workspace::new(data);
+    let mut work = Workspace::new(data, None);
     work.sweep_current(data, beta, log_w, gamma, penalty);
 
     let mut gradient = Vec::with_capacity(n_beta + k);
@@ -644,6 +671,7 @@ pub(crate) fn opt_pml_from(
     };
     optimise(
         data,
+        None,
         beta_init,
         Some(log_w_init),
         penalty,
@@ -1219,8 +1247,11 @@ impl Sweep {
 }
 
 /// Every buffer the Newton loop needs, allocated once per call.
-struct Workspace {
+struct Workspace<'z> {
+    /// The run's zero-count tables, or `None` to sweep every cell.
+    zeros: Option<&'z ZeroCells>,
     /// `exp(offset + design*beta + log_w)` per cell at the last swept point.
+    /// With tables, only the positive and the loose cells are written.
     stored: Vec<f64>,
     /// Where each subject's run of positive counts starts, length `k + 1`.
     run: Vec<usize>,
@@ -1257,17 +1288,18 @@ struct Workspace {
     new_log_w: Vec<f64>,
 }
 
-impl Workspace {
+impl<'z> Workspace<'z> {
     /// Allocates every buffer to the shape implied by `data`.
     ///
     /// ### Params
     ///
     /// * `data` - The gene whose shape sets the buffer sizes
+    /// * `zeros` - The run's zero-count tables, or `None`
     ///
     /// ### Returns
     ///
     /// A zeroed workspace with the positive-count runs located.
-    fn new(data: &PmlData<'_>) -> Self {
+    fn new(data: &PmlData<'_>, zeros: Option<&'z ZeroCells>) -> Self {
         let n_cells = data.n_cells();
         let k = data.n_subjects();
         let nb = data.n_beta();
@@ -1282,6 +1314,7 @@ impl Workspace {
         }
 
         Self {
+            zeros,
             stored: vec![0.0; n_cells],
             run,
             wide: if nb > MAX_UNROLLED_WIDTH {
@@ -1329,6 +1362,7 @@ impl Workspace {
             log_w,
             gamma,
             penalty,
+            self.zeros,
             &mut self.stored,
             &self.run,
             &mut self.wide,
@@ -1354,6 +1388,7 @@ impl Workspace {
             &self.new_log_w,
             gamma,
             penalty,
+            self.zeros,
             &mut self.stored,
             &self.run,
             &mut self.wide,
@@ -1366,10 +1401,12 @@ impl Workspace {
 /// Penalised log-likelihood, gradient and curvature at one point, in one pass
 /// per subject.
 ///
-/// Each subject is three loops: the `exp` of every cell into `stored`, a dense
-/// sweep over every cell as if its count were zero, then a sparse sweep adding
-/// what the positive counts change. Every per-cell term is linear in the count
-/// through `gstar = gamma + y`, so the split is exact. Sums associate
+/// Each subject is a dense part over every cell as if its count were zero, then
+/// a sparse sweep adding what the positive counts change. Every per-cell term is
+/// linear in the count through `gstar = gamma + y`, so the split is exact.
+/// Without tables the dense part is two loops, the `exp` of every cell into
+/// `stored` and the accumulation; with them it is one lookup per group of
+/// [`ZeroCells`] and the accumulation over the loose cells. Sums associate
 /// differently from nebula's C++, so results agree to rounding, not bitwise.
 ///
 /// ### Params
@@ -1379,6 +1416,7 @@ impl Workspace {
 /// * `log_w` - Random effects on the log scale
 /// * `gamma` - Cell-level negative binomial size
 /// * `penalty` - Prior on the random effects
+/// * `zeros` - The run's zero-count tables, or `None` to sweep every cell
 /// * `stored` - Per-cell `exp`, overwritten
 /// * `run` - Start of each subject's positive counts, from [`Workspace::new`]
 /// * `wide` - Heap sums for designs wider than [`MAX_UNROLLED_WIDTH`]
@@ -1390,6 +1428,7 @@ fn sweep(
     log_w: &[f64],
     gamma: f64,
     penalty: Penalty,
+    zeros: Option<&ZeroCells>,
     stored: &mut [f64],
     run: &[usize],
     wide: &mut [f64],
@@ -1397,7 +1436,9 @@ fn sweep(
 ) {
     macro_rules! width {
         ($nb:literal) => {
-            sweep_width::<$nb>(data, beta, log_w, gamma, penalty, stored, run, wide, out)
+            sweep_width::<$nb>(
+                data, beta, log_w, gamma, penalty, zeros, stored, run, wide, out,
+            )
         };
     }
     match data.n_beta() {
@@ -1426,6 +1467,7 @@ fn sweep_width<const NB: usize>(
     log_w: &[f64],
     gamma: f64,
     penalty: Penalty,
+    zeros: Option<&ZeroCells>,
     stored: &mut [f64],
     run: &[usize],
     wide: &mut [f64],
@@ -1442,6 +1484,7 @@ fn sweep_width<const NB: usize>(
 
     out.db.fill(0.0);
     out.vb.fill(0.0);
+    let ln_gamma = gamma.ln();
     let mut log_likelihood = 0.0;
     for s in 0..k {
         let cells = data.subject_start[s]..data.subject_start[s + 1];
@@ -1471,23 +1514,56 @@ fn sweep_width<const NB: usize>(
             }
         };
 
-        // The `exp` in its own loop keeps the accumulating loop free of calls.
-        for r in cells.clone() {
-            let row = &data.design[r * nb..(r + 1) * nb];
-            let mut eta = data.offset[r];
-            for j in 0..nb {
-                eta += row[j] * beta[j];
+        match zeros {
+            None => {
+                // The `exp` in its own loop keeps the accumulating loop free of
+                // calls.
+                for r in cells.clone() {
+                    let row = &data.design[r * nb..(r + 1) * nb];
+                    let mut eta = data.offset[r];
+                    for j in 0..nb {
+                        eta += row[j] * beta[j];
+                    }
+                    stored[r] = (eta + log_w_s).exp();
+                }
+                for r in cells {
+                    let row = &data.design[r * nb..(r + 1) * nb];
+                    let extb = stored[r];
+                    let t = extb + gamma;
+                    sum_log += t.ln();
+                    let inv = 1.0 / t;
+                    let u = extb * inv;
+                    fold(row, -gamma * u, gamma * u * inv);
+                }
             }
-            stored[r] = (eta + log_w_s).exp();
-        }
-        for r in cells {
-            let row = &data.design[r * nb..(r + 1) * nb];
-            let extb = stored[r];
-            let t = extb + gamma;
-            sum_log += t.ln();
-            let inv = 1.0 / t;
-            let u = extb * inv;
-            fold(row, -gamma * u, gamma * u * inv);
+            Some(z) => {
+                // Per group, `sum ln t = n ln gamma + L`, `sum u = A` and
+                // `sum gamma u / t = B`.
+                for g in &z.groups[z.subject_groups[s]..z.subject_groups[s + 1]] {
+                    let row = &data.design[g.row * nb..(g.row + 1) * nb];
+                    let mut log_tau = log_w_s - ln_gamma;
+                    for j in 0..nb {
+                        log_tau += row[j] * beta[j];
+                    }
+                    let [l, a, b] = g.eval::<0, 3>(log_tau);
+                    sum_log += g.n * ln_gamma + l;
+                    fold(row, -gamma * a, b);
+                }
+                for &r in &z.loose[z.subject_loose[s]..z.subject_loose[s + 1]] {
+                    let row = &data.design[r * nb..(r + 1) * nb];
+                    let mut eta = data.offset[r];
+                    for j in 0..nb {
+                        eta += row[j] * beta[j];
+                    }
+                    let extb = (eta + log_w_s).exp();
+                    stored[r] = extb;
+                    let t = extb + gamma;
+                    sum_log += t.ln();
+                    let inv = 1.0 / t;
+                    let u = extb * inv;
+                    fold(row, -gamma * u, gamma * u * inv);
+                }
+            }
         }
         for i in run[s]..run[s + 1] {
             let c = data.cell_index[i];
@@ -1497,7 +1573,13 @@ fn sweep_width<const NB: usize>(
             for j in 0..nb {
                 eta += row[j] * beta[j];
             }
-            let extb = stored[c];
+            let extb = if zeros.is_some() {
+                let e = (eta + log_w_s).exp();
+                stored[c] = e;
+                e
+            } else {
+                stored[c]
+            };
             let t = extb + gamma;
             linear += eta * y;
             weighted_log += y * t.ln();
@@ -1506,8 +1588,7 @@ fn sweep_width<const NB: usize>(
             fold(row, y * (1.0 - u), y * u * inv);
         }
 
-        log_likelihood +=
-            linear + log_w_s * data.subject_total[s] - gamma * sum_log - weighted_log;
+        log_likelihood += linear + log_w_s * data.subject_total[s] - gamma * sum_log - weighted_log;
         out.w[s] = w_s;
         out.dw[s] = resid + penalty.gradient(log_w_s, w_s);
         out.vw[s] = gamma * weight + penalty.curvature(w_s);
@@ -1539,6 +1620,7 @@ fn sweep_width<const NB: usize>(
 /// ### Params
 ///
 /// * `data` - The gene
+/// * `zeros` - The run's zero-count tables, or `None` to sweep every cell
 /// * `beta_init` - Starting fixed effects
 /// * `log_w_init` - Starting random effects, or `None` for zeros
 /// * `penalty` - Prior on the random effects
@@ -1550,6 +1632,7 @@ fn sweep_width<const NB: usize>(
 /// The fitted solution and its diagnostics.
 fn optimise(
     data: &PmlData<'_>,
+    zeros: Option<&ZeroCells>,
     beta_init: &[f64],
     log_w_init: Option<&[f64]>,
     penalty: Penalty,
@@ -1582,7 +1665,7 @@ fn optimise(
         }
         None => vec![0.0; k],
     };
-    let mut work = Workspace::new(data);
+    let mut work = Workspace::new(data, zeros);
     work.sweep_current(data, &beta, &log_w, gamma, penalty);
 
     let mut log_likelihood = work.current.log_likelihood;
@@ -1714,7 +1797,7 @@ fn optimise(
 
     let second_order = match penalty {
         Penalty::Gamma { lambda, .. } if params.ord > 1 => {
-            laplace_correction(&work, data, gamma, lambda, params.ord)
+            laplace_correction(&work, data, &beta, &log_w, gamma, lambda, params.ord)
         }
         _ => 0.0,
     };
@@ -1752,6 +1835,8 @@ fn optimise(
 ///
 /// * `work` - Workspace whose `stored` and `current.w` sit at the final iterate
 /// * `data` - The gene
+/// * `beta` - Fixed effects at the final iterate
+/// * `log_w` - Random effects at the final iterate
 /// * `gamma` - Cell-level negative binomial size
 /// * `lambda` - Rate of the gamma prior
 /// * `ord` - Expansion order, greater than one
@@ -1760,13 +1845,17 @@ fn optimise(
 ///
 /// The correction, nebula's `second`.
 fn laplace_correction(
-    work: &Workspace,
+    work: &Workspace<'_>,
     data: &PmlData<'_>,
+    beta: &[f64],
+    log_w: &[f64],
     gamma: f64,
     lambda: f64,
     ord: u32,
 ) -> f64 {
     let k = data.n_subjects();
+    let nb = data.n_beta();
+    let ln_gamma = gamma.ln();
     let high = ord > 2;
     // The curvature and the three higher derivatives, per unit of `gstar`.
     let terms = |e: f64| {
@@ -1790,10 +1879,34 @@ fn laplace_correction(
     let mut fifth_acc = 0.0;
     for s in 0..k {
         let mut sums = [0.0; 4];
-        for &e in &work.stored[data.subject_start[s]..data.subject_start[s + 1]] {
+        let mut dense = |e: f64| {
             let f = terms(e);
             for j in 0..4 {
                 sums[j] += gamma * f[j];
+            }
+        };
+        match work.zeros {
+            None => {
+                for &e in &work.stored[data.subject_start[s]..data.subject_start[s + 1]] {
+                    dense(e);
+                }
+            }
+            Some(z) => {
+                for &r in &z.loose[z.subject_loose[s]..z.subject_loose[s + 1]] {
+                    dense(work.stored[r]);
+                }
+                // `gamma` times each factor sums to the group's `B`..`E`.
+                for g in &z.groups[z.subject_groups[s]..z.subject_groups[s + 1]] {
+                    let row = &data.design[g.row * nb..(g.row + 1) * nb];
+                    let mut log_tau = log_w[s] - ln_gamma;
+                    for j in 0..nb {
+                        log_tau += row[j] * beta[j];
+                    }
+                    let f = g.eval::<2, 4>(log_tau);
+                    for j in 0..4 {
+                        sums[j] += f[j];
+                    }
+                }
             }
         }
         for i in work.run[s]..work.run[s + 1] {
@@ -2709,5 +2822,85 @@ mod tests {
             ..data
         };
         assert!(opt_pml(&short, &[0.5, -0.25], &variance, None).is_err());
+    }
+
+    /// Three subjects of 400 cells, a subject-level group and a cell-level
+    /// indicator, offsets over two orders of magnitude, about a tenth of the
+    /// cells expressed.
+    fn categorical_gene() -> (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<f64>,
+        Vec<usize>,
+    ) {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(11);
+        let starts = vec![0usize, 400, 800, 1200];
+        let mut design = Vec::new();
+        let mut offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cell_index = Vec::new();
+        let mut subject_total = vec![0.0; 3];
+        for c in 0..1200 {
+            let s = c / 400;
+            let kind = f64::from(rng.random_bool(0.4));
+            design.extend([1.0, (s % 2) as f64, kind]);
+            let o: f64 = rng.random_range(-2.3..2.3);
+            offset.push(o);
+            if rng.random_bool(0.1 + 0.05 * kind) {
+                let y = rng.random_range(1..6) as f64;
+                counts.push(y);
+                cell_index.push(c);
+                subject_total[s] += y;
+            }
+        }
+        (design, offset, counts, cell_index, subject_total, starts)
+    }
+
+    #[test]
+    fn test_opt_pml_tables_match_the_dense_sweep() {
+        let (design, offset, counts, cell_index, subject_total, starts) = categorical_gene();
+        let data = PmlData {
+            design: &design,
+            offset: &offset,
+            counts: &counts,
+            cell_index: &cell_index,
+            subject_start: &starts,
+            subject_total: &subject_total,
+        };
+        let zeros = ZeroCells::build(&design, &offset, &starts, 3).expect("categorical");
+        for (subject, cell) in [(0.3, 0.05), (0.8, 2.0), (0.05, 40.0)] {
+            let variance = PmlVariance { subject, cell };
+            let params = PmlParams {
+                reml: true,
+                ord: 3,
+                ..Default::default()
+            };
+            let start = [-1.5, 0.2, 0.1];
+            let dense = opt_pml(&data, &start, &variance, Some(params)).expect("dense");
+            let tabled = opt_pml_tabled(&data, Some(&zeros), &start, &variance, Some(params))
+                .expect("tabled");
+            assert_eq!(dense.iterations, tabled.iterations);
+            for (a, b) in dense.beta.iter().zip(&tabled.beta) {
+                assert_relative_eq!(*a, *b, max_relative = 1e-11);
+            }
+            for (a, b) in dense.information.iter().zip(&tabled.information) {
+                assert_relative_eq!(*a, *b, max_relative = 1e-11);
+            }
+            assert_relative_eq!(
+                dense.log_likelihood,
+                tabled.log_likelihood,
+                max_relative = 1e-13
+            );
+            assert_relative_eq!(dense.log_det, tabled.log_det, max_relative = 1e-12);
+            assert_relative_eq!(
+                dense.second_order,
+                tabled.second_order,
+                max_relative = 1e-10
+            );
+        }
     }
 }

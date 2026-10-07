@@ -12,10 +12,10 @@
 //!    over `[beta, sigma, phi]`. Only the variance components survive; the
 //!    fixed effects restart from `log(mean count) - mean log offset`.
 //! 2. A bounded search over the two variance components, with the fixed effects
-//!    profiled out by [`opt_pml`] at every evaluation. NEBULA-HL always runs it;
+//!    profiled out by [`opt_pml`](crate::sc::pml::opt_pml) at every evaluation. NEBULA-HL always runs it;
 //!    NEBULA-LN runs it, a one-dimensional restriction of it, or neither,
 //!    depending on how well the large-sample approximation is expected to hold.
-//! 3. A final [`opt_pml`] at the chosen variances; its observed information
+//! 3. A final [`opt_pml`](crate::sc::pml::opt_pml) at the chosen variances; its observed information
 //!    inverts to the covariance of `beta`.
 //!
 //! ### Deviations from the R package
@@ -23,7 +23,7 @@
 //! nebula drives stages one and two with `nloptr` (`NLOPT_LD_LBFGS` with
 //! `ftol_abs = 1e-6`, `NLOPT_LN_BOBYQA` with `xtol_rel = 1e-6`). Neither is in
 //! this crate. The stage-two objective is discontinuous at the `1e-6` level:
-//! [`opt_pml`] stops on an absolute improvement of `eps = 1e-6`, so its Newton
+//! [`opt_pml`](crate::sc::pml::opt_pml) stops on an absolute improvement of `eps = 1e-6`, so its Newton
 //! count flips as the variances move. BOBYQA cannot resolve the minimum past
 //! that floor, and two of its own runs from different starts disagree by up to
 //! `1e-6` in the standard errors.
@@ -56,13 +56,14 @@ use crate::numeric::lbfgsb::{LbfgsbParams, minimise};
 use crate::numeric::optimise::{NelderMeadParams, NelderMeadStepper};
 use crate::prelude::*;
 use crate::sc::pml::{
-    CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml,
+    CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml_tabled,
 };
 use crate::sc::ptmg::{
     GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
     positive_indices, ptmg_value_and_gradient_with,
 };
 use crate::sc::test::packed_len;
+use crate::sc::zeros::ZeroCells;
 
 ////////////
 // Consts //
@@ -205,11 +206,11 @@ pub struct NebulaParams {
     /// Estimate the overdispersions by restricted maximum likelihood.
     ///
     /// R honours this only for `NBLMM`, which is not implemented here. In this
-    /// port it changes the NBGMM fit: [`opt_pml`] adds a log-determinant term to
+    /// port it changes the NBGMM fit: [`opt_pml`](crate::sc::pml::opt_pml) adds a log-determinant term to
     /// the outer objective. Not validated against R, which never exercises
     /// `reml` on this model. Off by default.
     pub reml: bool,
-    /// Absolute stopping tolerance handed to [`opt_pml`], nebula's `eps`.
+    /// Absolute stopping tolerance handed to [`opt_pml`](crate::sc::pml::opt_pml), nebula's `eps`.
     pub eps: f64,
 }
 
@@ -596,6 +597,7 @@ where
         return Err(EdgeErrors::NoGenesAfterFiltering { n_genes });
     }
 
+    let zeros = ZeroCells::build(&centred, &offsets.log_offset, &fid, n_coef);
     let shared = Shared {
         design: &centred,
         log_offset: &offsets.log_offset,
@@ -610,6 +612,7 @@ where
         cell_columns: &cell_columns,
         method,
         params,
+        zeros: zeros.as_ref(),
     };
 
     let outcomes = fit(&shared, sparse, &totals, &kept)?;
@@ -660,6 +663,9 @@ pub(crate) struct Shared<'a> {
     method: NebulaMethod,
     /// The user's knobs.
     pub(crate) params: NebulaParams,
+    /// Zero-count tables for the CPU kernels, or `None` when the design has
+    /// too few cells per distinct row within a subject.
+    pub(crate) zeros: Option<&'a ZeroCells>,
 }
 
 /// One gene's fit on the centred design scale.
@@ -725,7 +731,7 @@ impl GenePlan {
     }
 }
 
-/// The per-gene view [`opt_pml`] reads.
+/// The per-gene view [`opt_pml`](crate::sc::pml::opt_pml) reads.
 ///
 /// ### Params
 ///
@@ -909,8 +915,9 @@ pub(crate) fn finish_gene(
     };
     let mut beta_start = plan.beta_start;
     beta_start[shared.intercept] -= sigma / 2.0;
-    let fit = opt_pml(
+    let fit = opt_pml_tabled(
         &pml,
+        shared.zeros,
         &beta_start,
         &PmlVariance {
             subject: sigma,
@@ -1079,7 +1086,7 @@ pub(crate) struct InnerFit {
 /// run. Every rejection returns positive infinity and every infinite return is a
 /// rejection, so [`StageTwoSearch`] reads it off the values.
 pub(crate) struct VarianceObjective<'a> {
-    /// The gene, in the layout [`opt_pml`] wants.
+    /// The gene, in the layout [`opt_pml`](crate::sc::pml::opt_pml) wants.
     pub(crate) data: &'a PmlData<'a>,
     /// Fixed effects to start the inner fit from, before the intercept shift.
     pub(crate) beta_start: &'a [f64],
@@ -1102,6 +1109,8 @@ pub(crate) struct VarianceObjective<'a> {
     /// Cell-level overdispersion held fixed, for the one-dimensional restriction
     /// NEBULA-LN uses.
     pub(crate) fixed_cell: Option<f64>,
+    /// The run's zero-count tables, or `None`.
+    pub(crate) zeros: Option<&'a ZeroCells>,
 }
 
 impl VarianceObjective<'_> {
@@ -1206,8 +1215,9 @@ impl VarianceObjective<'_> {
         let Some((subject, cell, beta)) = self.request(x) else {
             return f64::INFINITY;
         };
-        let fit = match opt_pml(
+        let fit = match opt_pml_tabled(
             self.data,
+            self.zeros,
             &beta,
             &PmlVariance { subject, cell },
             Some(self.params),
@@ -1597,7 +1607,7 @@ impl StageTwoSearch {
 /// ### Params
 ///
 /// * `shared` - The inputs common to every gene
-/// * `pml` - The gene, in the layout [`opt_pml`] wants
+/// * `pml` - The gene, in the layout [`opt_pml`](crate::sc::pml::opt_pml) wants
 /// * `beta_start` - Fixed effects to start each inner fit from
 /// * `counts` - This gene's positive counts and their summaries
 /// * `ord` - Laplace order to attempt first
@@ -1658,7 +1668,7 @@ pub(crate) fn variance_bounds(
 /// ### Params
 ///
 /// * `shared` - The inputs common to every gene
-/// * `pml` - The gene, in the layout [`opt_pml`] wants
+/// * `pml` - The gene, in the layout [`opt_pml`](crate::sc::pml::opt_pml) wants
 /// * `beta_start` - Fixed effects to start each inner fit from
 /// * `counts` - This gene's positive counts and their summaries
 /// * `order` - Laplace order
@@ -1668,7 +1678,7 @@ pub(crate) fn variance_bounds(
 ///
 /// The objective.
 pub(crate) fn variance_objective<'a>(
-    shared: &Shared<'_>,
+    shared: &Shared<'a>,
     pml: &'a PmlData<'a>,
     beta_start: &'a [f64],
     counts: &'a crate::sc::ptmg::GeneCounts,
@@ -1693,6 +1703,7 @@ pub(crate) fn variance_objective<'a>(
         n_one: counts.n_one as f64,
         n_two: counts.n_two as f64,
         fixed_cell,
+        zeros: shared.zeros,
     }
 }
 

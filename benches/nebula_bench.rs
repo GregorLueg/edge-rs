@@ -33,6 +33,9 @@
 //! `NEBULA_BENCH_COEF` change the shape. `NEBULA_BENCH_INTERCEPT_SHIFT` moves
 //! every gene's baseline on the log scale, which sets the density, and
 //! `NEBULA_BENCH_IMBALANCE` is the ratio of the largest subject to the smallest.
+//! `NEBULA_BENCH_CATEGORICAL=1` makes the cell-level covariates `0`/`1`
+//! indicators instead of uniform draws, so cells share design rows within a
+//! subject and the zero-count tables apply.
 //! `NEBULA_BENCH_ONLY=ptmg,pml` runs a comma-separated subset of the cells.
 //! `NEBULA_BENCH_SWEEP=1` adds a cell-count sweep of the two inner kernels, which
 //! is the scaling a GPU port cares about.
@@ -138,6 +141,7 @@ fn make_problem(
 ) -> Problem {
     assert!(n_coef >= 2, "the design needs an intercept and a group");
     let mut rng = SmallRng::seed_from_u64(SEED);
+    let categorical = env::var("NEBULA_BENCH_CATEGORICAL").is_ok_and(|v| v == "1");
 
     // Cells blocked by subject, sizes uneven so the ragged-block path is live.
     let mut subject_id = Vec::with_capacity(n_cells);
@@ -166,7 +170,11 @@ fn make_problem(
         design[c * n_coef] = 1.0;
         design[c * n_coef + 1] = if subject_id[c] % 2 == 0 { 0.0 } else { 1.0 };
         for j in 2..n_coef {
-            design[c * n_coef + j] = rng.random_range(-1.0..1.0);
+            design[c * n_coef + j] = if categorical {
+                f64::from(rng.random_bool(0.5))
+            } else {
+                rng.random_range(-1.0..1.0)
+            };
         }
     }
 
