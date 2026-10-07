@@ -108,7 +108,7 @@ use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
 use crate::sc::nebula::{
     GeneOutcome, GenePlan, InnerFit, NebulaFit, NebulaParams, Shared, StageTwoSearch, finish_gene,
-    gene_pml, nebula_sparse_with, plan_gene, variance_bounds, variance_objective,
+    fit_genes, gene_pml, nebula_sparse_with, plan_gene, variance_bounds, variance_objective,
 };
 use crate::sc::pml::{DeviceCurvature, PmlParams, PmlVariance, newton_finish, opt_pml_from};
 use crate::sc::ptmg::{GeneCounts, positive_indices};
@@ -278,7 +278,16 @@ pub fn nebula_sparse_gpu<T: EdgeFloat, R: Runtime>(
         n_coef,
         offset,
         params,
-        |shared, sparse, totals, kept| fit_all(shared, sparse, totals, kept, client),
+        |shared, sparse, totals, kept| {
+            // With zero-count tables the CPU path sums a gene's zero counts per
+            // group, and the device, which sweeps every cell, loses to it: 0.72
+            // against 1.58 s on 500 genes of 20000 cells at 9.5% density.
+            if shared.zeros.is_some() {
+                fit_genes(shared, sparse, totals, kept)
+            } else {
+                fit_all(shared, sparse, totals, kept, client)
+            }
+        },
     )
 }
 

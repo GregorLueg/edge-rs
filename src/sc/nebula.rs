@@ -415,23 +415,36 @@ pub fn nebula_sparse<T: EdgeFloat>(
     params: Option<NebulaParams>,
 ) -> Result<NebulaFit, EdgeErrors> {
     nebula_sparse_with(
-        counts,
-        subject_id,
-        design,
-        n_coef,
-        offset,
-        params,
-        |shared, sparse, totals, kept| {
-            let n_subjects = shared.n_subjects;
-            kept.par_iter()
-                .map(|&g| {
-                    let counts = positive_indices(sparse, g)?;
-                    let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
-                    fit_gene(shared, &counts, subject_totals)
-                })
-                .collect()
-        },
+        counts, subject_id, design, n_coef, offset, params, fit_genes,
     )
+}
+
+/// Fits every kept gene on the CPU, in parallel over genes.
+///
+/// ### Params
+///
+/// * `shared` - The inputs common to every gene
+/// * `sparse` - The counts
+/// * `totals` - Count total per subject, gene-major
+/// * `kept` - Genes that passed the expression filter
+///
+/// ### Returns
+///
+/// One outcome per kept gene, in order.
+pub(crate) fn fit_genes(
+    shared: &Shared<'_>,
+    sparse: &CompressedSparse<f64>,
+    totals: &[f64],
+    kept: &[usize],
+) -> Result<Vec<GeneOutcome>, EdgeErrors> {
+    let n_subjects = shared.n_subjects;
+    kept.par_iter()
+        .map(|&g| {
+            let counts = positive_indices(sparse, g)?;
+            let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
+            fit_gene(shared, &counts, subject_totals)
+        })
+        .collect()
 }
 
 /// Shared body of every NEBULA entry point, device-independent: validation,
