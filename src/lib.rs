@@ -6,30 +6,28 @@
 //! F-distribution fits, voom, `lmFit`, `contrasts.fit`, `eBayes`, `topTable`),
 //! and NEBULA, a negative binomial gamma mixed model for single cell.
 //!
-//! The bulk stack follows edgePython, itself a port of edgeR and limma, with
-//! the R winning wherever the two disagree. NEBULA is ported from the `nebula`
-//! package's own C++ instead.
+//! The bulk stack follows edgePython, itself a port of edgeR and limma. Where
+//! the two disagree, edgeR and limma win. NEBULA is ported from the `nebula`
+//! package's own C++.
 //!
 //! ### Numeric policy
 //!
 //! Public containers and fits are generic over [`prelude::EdgeFloat`], so
 //! single-cell counts can be held as `f32` and halve the memory. Likelihood
 //! evaluation, Cox-Reid log-determinants, the optimisers and every p-value run
-//! in `f64` regardless of `T`. A negative binomial deviance is a difference of
-//! large logs, and accumulating one in `f32` loses parity with edgeR well
-//! before it saves anything worth having.
+//! in `f64` regardless of `T`: an NB deviance is a difference of large logs and
+//! loses edgeR parity in `f32` long before it saves anything.
 //!
 //! ### Parallelism
 //!
-//! Genes are the parallel axis almost everywhere. Counts are stored gene-major,
-//! so one gene is a contiguous slice, and the fan-out is a rayon iterator over
-//! genes with a per-thread scratch buffer.
+//! Genes are the parallel axis almost everywhere. Counts are gene-major, so one
+//! gene is a contiguous slice, and the fan-out is a rayon iterator over genes
+//! with a per-thread scratch buffer.
 //!
-//! Normalisation is the exception, and deliberately so: TMM has no gene axis to
-//! fan out over, since the unit of work is one sample compared against a
-//! reference column. It parallelises over samples and transposes the counts
-//! once on entry so each sample is contiguous. Any module that departs from the
-//! gene-major rule says so in its own header.
+//! Normalisation is the exception: TMM's unit of work is one sample against a
+//! reference column, so it parallelises over samples and transposes the counts
+//! once on entry. Any module departing from the gene-major rule says so in its
+//! own header.
 
 #![warn(missing_docs)]
 

@@ -1,22 +1,17 @@
 //! Ranking and calling: edgeR's `topTags` and `decideTests`.
 //!
-//! Both take a finished test table, adjust the p-values for multiple testing and
-//! then either sort it or reduce it to a per-gene call. Neither touches counts,
-//! so there is no gene axis worth fanning out over: the cost is one sort of at
-//! most a few hundred thousand rows, at the very end of an analysis that has
-//! already spent seconds in the GLM. Everything here is sequential on purpose.
+//! Both take a finished test table, adjust the p-values and then sort it or
+//! reduce it to a per-gene call. Sequential on purpose: it is one sort of the
+//! table at the end of an analysis, with no gene axis worth fanning out over.
 //!
-//! Only Benjamini-Hochberg is offered. edgeR accepts seven adjustment methods
-//! and every published edgeR result uses the default, so this takes
-//! [`crate::numeric::stats::p_adjust_bh`] and stops there.
+//! Only Benjamini-Hochberg ([`crate::numeric::stats::p_adjust_bh`]) is offered;
+//! edgeR accepts seven methods.
 //!
 //! ### Ties
 //!
-//! R's `order` is a stable radix sort for numeric input, so a tie falls back to
-//! the original gene order. Both sorts here are stable for the same reason: a
-//! gene list is usually rendered next to its row names and an unstable tie-break
-//! would reshuffle it between runs. edgePython's `np.argsort(-alfc)` for the
-//! fold-change sort is a quicksort and does not have this property.
+//! R's `order` is a stable radix sort for numeric input, so ties keep the
+//! original gene order. Both sorts here are stable too. edgePython's
+//! `np.argsort(-alfc)` is a quicksort and is not.
 
 use crate::errors::EdgeErrors;
 use crate::numeric::stats::p_adjust_bh;
@@ -39,8 +34,8 @@ pub enum SortBy {
 
 /// A ranked, filtered slice of a test table.
 ///
-/// Every vector is the same length and is in the sorted order, so `index[k]`
-/// says which gene of the original table row `k` came from.
+/// Every vector has the same length and is in sorted order; `index[k]` is the
+/// original gene of row `k`.
 #[derive(Clone, Debug)]
 pub struct TopTags {
     /// Original gene index of each retained row, in the sorted order.
@@ -49,13 +44,13 @@ pub struct TopTags {
     pub log_fc: Vec<f64>,
     /// Average log2 counts per million.
     pub log_cpm: Vec<f64>,
-    /// Test statistic. Empty when the caller supplied none, as for the exact
-    /// test, which reports a p-value without an intermediate statistic.
+    /// Test statistic. Empty when the caller supplied none (the exact test has
+    /// none).
     pub statistic: Vec<f64>,
     /// Raw p-value.
     pub p_value: Vec<f64>,
-    /// Benjamini-Hochberg adjusted p-value. Computed over the *whole* table
-    /// before any filtering, as edgeR does, so it does not change with `n`.
+    /// Benjamini-Hochberg adjusted p-value, computed over the *whole* table
+    /// before any filtering, as in edgeR.
     pub fdr: Vec<f64>,
 }
 
@@ -94,8 +89,8 @@ fn check_length(name: &'static str, values: &[f64], n_genes: usize) -> Result<()
 ///
 /// ### Returns
 ///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`]. NaN is rejected: it would make
-/// every comparison false and silently return nothing.
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`]. NaN is rejected, since it would
+/// silently return nothing.
 fn check_cutoff(name: &str, value: f64) -> Result<(), EdgeErrors> {
     if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -111,29 +106,26 @@ fn check_cutoff(name: &str, value: f64) -> Result<(), EdgeErrors> {
 
 /// The top differentially expressed genes, edgeR's `topTags`.
 ///
-/// Adjusts, sorts, filters and truncates, in that order. The order matters: the
-/// adjustment is computed over every gene in the table, so it is unaffected by
-/// `n` and by `p_cutoff`, and the filter then compares the *adjusted* value
-/// against `p_cutoff` rather than the raw one.
+/// Adjusts, sorts, filters and truncates, in that order. The adjustment covers
+/// every gene, so `n` and `p_cutoff` do not change it, and the filter compares
+/// the *adjusted* p-value against `p_cutoff`.
 ///
 /// ### Params
 ///
 /// * `log_fc` - Log2 fold change per gene
-/// * `log_cpm` - Average log2 counts per million per gene, same length as
-///   `log_fc`
-/// * `statistic` - Test statistic per gene, or `None` for a test that has none.
-///   [`TopTags::statistic`] comes back empty in that case.
+/// * `log_cpm` - Average log2 counts per million per gene
+/// * `statistic` - Test statistic per gene, or `None` ([`TopTags::statistic`] is
+///   then empty)
 /// * `p_value` - Raw p-value per gene, same length as `log_fc`
-/// * `n` - Maximum number of rows to return, at least one. Larger than the table
-///   returns the whole table.
+/// * `n` - Maximum number of rows, at least one
 /// * `sort_by` - Which column to rank on
-/// * `p_cutoff` - Keep only genes whose adjusted p-value is at most this. A
-///   value of 1 keeps everything, as edgeR's `p.value = 1` does.
+/// * `p_cutoff` - Keep genes with adjusted p-value at most this; 1 keeps
+///   everything, as edgeR's `p.value = 1`
 ///
 /// ### Returns
 ///
-/// The retained rows in the sorted order, possibly empty if nothing passed the
-/// cutoff. Errors are [`EdgeErrors::EmptyCounts`] for an empty table,
+/// The retained rows in sorted order (possibly empty). Errors are
+/// [`EdgeErrors::EmptyCounts`] for an empty table,
 /// [`EdgeErrors::MustBePositive`] for `n = 0`,
 /// [`EdgeErrors::LengthMismatch`] if the columns disagree, and
 /// [`EdgeErrors::InvalidArgument`] for a `p_cutoff` outside `[0, 1]`.
@@ -200,25 +192,19 @@ pub fn top_tags(
 
 /// Calls each gene up, down or not significant, edgeR's `decideTests`.
 ///
-/// A gene is called when its Benjamini-Hochberg adjusted p-value is *strictly*
-/// below `p_cutoff`, which is edgeR's `p < p.value` and not `<=`. The sign then
-/// comes from the fold change, and finally any gene whose absolute fold change
-/// falls below `lfc` is reset to zero.
+/// A gene is called when its BH-adjusted p-value is *strictly* below `p_cutoff`
+/// (edgeR's `p < p.value`). The sign comes from the fold change, and any gene
+/// with absolute fold change below `lfc` is then reset to zero.
 ///
-/// The order of those last two steps is edgeR's and is worth stating: the fold
-/// change threshold is applied *after* the p-value, as a filter on an already
-/// significant call, not as part of a joint test. A gene that fails `lfc` is
-/// reported as not significant even though its p-value passed. This is not
-/// `glmTreat`, which tests against the threshold properly.
+/// As in edgeR the `lfc` threshold is a filter on an already significant call,
+/// not a joint test like `glmTreat`.
 ///
 /// ### Params
 ///
 /// * `p_value` - Raw p-value per gene
-/// * `log_fc` - Log2 fold change per gene, same length as `p_value`
-/// * `p_cutoff` - Adjusted p-value threshold, in `[0, 1]`. edgeR's default is
-///   0.05.
-/// * `lfc` - Absolute log2 fold change threshold, non-negative. Zero disables
-///   it.
+/// * `log_fc` - Log2 fold change per gene
+/// * `p_cutoff` - Adjusted p-value threshold in `[0, 1]`; edgeR's default is 0.05
+/// * `lfc` - Absolute log2 fold change threshold, non-negative; zero disables it
 ///
 /// ### Returns
 ///
@@ -262,17 +248,15 @@ pub fn decide_tests(
 
 #[cfg(test)]
 mod tests {
-    // Every reference below is pasted verbatim from R's 17-digit output. The
-    // last digit or two is past what an f64 can hold and clippy would rather
-    // they were rounded, but keeping them exactly as printed is what makes them
-    // checkable against the `Rscript` line quoted above each test.
+    // References are pasted verbatim from R's 17-digit output so they stay
+    // checkable against the `Rscript` line above each test.
     #![allow(clippy::excessive_precision)]
 
     use super::*;
     use approx::assert_relative_eq;
 
-    /// The six-gene exact test from `exact::tests`, which every fixture here is
-    /// generated from.
+    /// The six-gene exact test from `exact::tests`, the source of every fixture
+    /// here.
     /// ```r
     /// y <- matrix(c(10,12,11,40,44,38, 50,48,52,49,51,50, 2,0,5,1,3,0,
     ///               0,0,0,7,9,8, 1200,1100,1300,2400,2500,2300, 5,7,6,5,6,7),
@@ -319,7 +303,9 @@ mod tests {
         8.9951524706410912e-01,
     ];
 
-    // -- top_tags --
+    // -------- //
+    // top_tags //
+    // -------- //
 
     /// `topTags(r, n=Inf, sort.by="PValue")` gives rows 1, 4, 5, 3, 2, 6 with
     /// `cat(format(tt$table$FDR, digits=17), sep=", ")` as below.
@@ -437,8 +423,8 @@ mod tests {
         assert_eq!(got.index, vec![0, 3, 4]);
     }
 
-    /// A cutoff nothing passes gives an empty table rather than an error, which
-    /// is edgeR returning `data.frame()`.
+    /// A cutoff nothing passes gives an empty table, as edgeR returns
+    /// `data.frame()`.
     #[test]
     fn test_top_tags_can_return_nothing() {
         let got = top_tags(
@@ -482,8 +468,7 @@ mod tests {
         let got = top_tags(&fc, &fc, None, &p, usize::MAX, SortBy::PValue, 1.0).unwrap();
         assert_eq!(got.index, vec![3, 1, 0, 2]);
 
-        // Sorting on fold change alone, the two genes tied at |1.0| keep their
-        // input order.
+        // The two genes tied at |1.0| keep their input order.
         let got = top_tags(&fc, &fc, None, &p, usize::MAX, SortBy::LogFc, 1.0).unwrap();
         assert_eq!(got.index, vec![1, 0, 2, 3]);
     }
@@ -561,7 +546,9 @@ mod tests {
         ));
     }
 
-    // -- decide_tests --
+    // ------------ //
+    // decide_tests //
+    // ------------ //
 
     /// `cat(decideTests(r, p.value=0.05, lfc=0))` -> 1, 0, 0, 1, 1, 0
     #[test]
@@ -586,16 +573,15 @@ mod tests {
     }
 
     /// `cat(decideTests(r, p.value=1, lfc=0))` -> 1, -1, -1, 1, 1, -1. Everything
-    /// is called, so this is purely the sign of the fold change and it pins the
-    /// down direction.
+    /// is called, so this pins the sign of the fold change.
     #[test]
     fn test_decide_tests_calls_the_down_direction() {
         let got = decide_tests(&P_VALUE, &LOG_FC, 1.0, 0.0).unwrap();
         assert_eq!(got, vec![1, -1, -1, 1, 1, -1]);
     }
 
-    /// The comparison is strict: an adjusted p-value exactly equal to the cutoff
-    /// is not called, matching edgeR's `p < p.value`.
+    /// The comparison is strict: an adjusted p-value equal to the cutoff is not
+    /// called, as in edgeR's `p < p.value`.
     #[test]
     fn test_decide_tests_is_strict_at_the_cutoff() {
         // A single gene means BH leaves the p-value alone.
@@ -641,7 +627,7 @@ mod tests {
         ));
     }
 
-    /// An empty table is not an error here: it has nothing to call.
+    /// An empty table is not an error: nothing to call.
     #[test]
     fn test_decide_tests_on_an_empty_table() {
         assert!(decide_tests(&[], &[], 0.05, 0.0).unwrap().is_empty());

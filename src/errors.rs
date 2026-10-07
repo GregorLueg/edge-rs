@@ -1,18 +1,19 @@
 //! The crate-level error enum.
 //!
-//! One `thiserror` enum for all of `edge-rs`. Variants are grouped by subsystem
-//! with section comments; add new ones to the matching section rather than the
-//! bottom, so the file stays navigable as the port grows.
+//! One `thiserror` enum for the whole crate, grouped by subsystem. Add new
+//! variants to the matching section, not the bottom.
 //!
-//! Anything a caller could plausibly hit returns `Err` rather than panicking.
-//! Panics are reserved for broken invariants that the type system cannot state.
+//! Anything a caller could plausibly hit returns `Err`. Panics are for broken
+//! invariants only.
 
 use thiserror::Error;
 
 /// Every failure mode in the crate.
 #[derive(Debug, Error)]
 pub enum EdgeErrors {
-    // -- arguments --
+    // --------- //
+    // arguments //
+    // --------- //
     /// A parameter fell outside its documented domain.
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
@@ -32,7 +33,9 @@ pub enum EdgeErrors {
         expected: &'static str,
     },
 
-    // -- dimensions --
+    // ---------- //
+    // dimensions //
+    // ---------- //
     /// Two operands disagreed on shape.
     #[error("Expected shape {expected:?}; got {got:?}.")]
     ShapeMismatch {
@@ -54,9 +57,6 @@ pub enum EdgeErrors {
     },
 
     /// The counts matrix had no genes or no samples.
-    ///
-    /// Every downstream estimator divides by one of these, so an empty input is
-    /// an error rather than a trivially empty result.
     #[error("Counts matrix is empty: {n_genes} genes by {n_samples} samples.")]
     EmptyCounts {
         /// Number of genes (rows)
@@ -65,7 +65,9 @@ pub enum EdgeErrors {
         n_samples: usize,
     },
 
-    // -- design matrices --
+    // --------------- //
+    // design matrices //
+    // --------------- //
     /// The design matrix is rank deficient, so coefficients are not identifiable.
     #[error("Design matrix is not full rank: {n_cols} columns but rank {rank}.")]
     DesignNotFullRank {
@@ -95,7 +97,9 @@ pub enum EdgeErrors {
         n_coef: usize,
     },
 
-    // -- linear algebra --
+    // -------------- //
+    // linear algebra //
+    // -------------- //
     /// A Cholesky factorisation failed, meaning the matrix was not positive definite.
     #[error("Cholesky factorisation failed: {0}")]
     CholeskyFailed(String),
@@ -108,7 +112,9 @@ pub enum EdgeErrors {
     #[error("Eigendecomposition failed: {0}")]
     EigenFailed(String),
 
-    // -- numeric support --
+    // --------------- //
+    // numeric support //
+    // --------------- //
     /// A scalar optimiser or root finder did not converge inside its iteration budget.
     #[error(
         "{routine} failed to converge after {iterations} iterations (last change {last_delta:e})."
@@ -148,12 +154,16 @@ pub enum EdgeErrors {
         upper: f64,
     },
 
-    // -- sparse --
+    // ------ //
+    // sparse //
+    // ------ //
     /// A compressed sparse structure violated its own invariants.
     #[error("Malformed sparse matrix: {0}")]
     MalformedSparse(String),
 
-    // -- normalisation --
+    // ------------- //
+    // normalisation //
+    // ------------- //
     /// Every gene was filtered out before a normalisation factor could be computed.
     #[error("No genes survived filtering for normalisation; all {n_genes} were dropped.")]
     NoGenesAfterFiltering {
@@ -165,7 +175,9 @@ pub enum EdgeErrors {
     #[error("Invalid TMM reference column: {0}")]
     InvalidReferenceColumn(String),
 
-    // -- GLM --
+    // --- //
+    // GLM //
+    // --- //
     /// A dispersion outside `[0, inf)` was supplied to a negative binomial routine.
     #[error("Dispersion must be non-negative and finite; got {0}.")]
     InvalidDispersion(f64),
@@ -174,7 +186,9 @@ pub enum EdgeErrors {
     #[error("No gene has been loaded into the workspace; call `begin_gene` first.")]
     AplWorkspaceNotStarted,
 
-    // -- single cell / NEBULA --
+    // -------------------- //
+    // single cell / NEBULA //
+    // -------------------- //
     /// Cells were not grouped contiguously by subject, which every inner loop assumes.
     #[error(
         "Cells are not contiguous by subject: subject {subject} appears in more than one block."
@@ -185,9 +199,6 @@ pub enum EdgeErrors {
     },
 
     /// The design matrix handed to NEBULA has no intercept column.
-    ///
-    /// Centring and the starting values both key off the intercept, so its
-    /// absence is a hard error rather than something to work around.
     #[error("NEBULA requires an intercept column in the design matrix; none was found.")]
     MissingIntercept,
 
@@ -200,12 +211,13 @@ pub enum EdgeErrors {
         got: usize,
     },
 
-    // -- GPU --
+    // --- //
+    // GPU //
+    // --- //
     /// The CubeCL runtime or a device limit rejected the work.
     ///
-    /// Carries the runtime's own message. A busted device limit does not fail
-    /// loudly on wgpu, so this is raised from the validated dispatch geometry
-    /// rather than from the launch itself.
+    /// A busted device limit does not fail loudly on wgpu, so this is raised
+    /// from the validated dispatch geometry, not from the launch.
     #[cfg(feature = "gpu")]
     #[error("GPU error: {0}")]
     Gpu(String),

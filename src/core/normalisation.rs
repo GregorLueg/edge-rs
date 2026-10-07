@@ -1,33 +1,16 @@
 //! `calcNormFactors`: TMM, TMMwsp, RLE and upper-quartile scaling factors.
 //!
 //! A port of edgeR's `normLibSizes.default` and the four `.calcFactor*` helpers
-//! it dispatches to. The reference is the R source, not the intermediate Python
-//! port, wherever the two disagree; the one place they do is noted at
+//! it dispatches to. Where edgePython and edgeR disagree, edgeR wins; see
 //! [`calc_factor_tmmwsp`].
 //!
 //! ### Access pattern
 //!
-//! Counts arrive gene-major, as everywhere else in the crate, but every method
-//! here works *down a column*. TMM compares one sample against a reference
-//! sample element by element, RLE takes a per-column median of ratios, and the
-//! quantile rule reduces a column to one number. So the first thing this module
-//! does is drop the all-zero genes and transpose what survives into a
-//! column-major `f64` buffer, once, in a single pass over the row-major input.
-//!
-//! That costs one `n_kept * n_samples` allocation and buys contiguous reads for
-//! everything downstream, including the two rank sorts per sample that dominate
-//! TMM's cost. Reading the gene-major layout with a stride of `n_samples`
-//! instead would touch a fresh cache line per element and would do so twice per
-//! sample, once for the observed column and once for the reference. The
-//! geometric means RLE needs are also computed off the transposed buffer, by
-//! looping samples on the outside and genes on the inside, so both the read and
-//! the accumulator stay sequential.
-//!
-//! ### Numerics
-//!
-//! Counts carry the generic `T` and are converted to `f64` on read. Library
-//! sizes, factors and every intermediate are `f64`, per the crate numeric
-//! policy.
+//! Every method works *down a column*, unlike the rest of the crate. The module
+//! therefore drops the all-zero genes and transposes the survivors once into a
+//! column-major `f64` buffer. That costs one `n_kept * n_samples` allocation and
+//! makes the per-sample rank sorts that dominate TMM, and the RLE geometric
+//! means, read sequentially. Counts are converted from `T` to `f64` on read.
 
 use rayon::prelude::*;
 
@@ -43,37 +26,32 @@ use crate::utils::traits::EdgeFloat;
 /// Below this the observed and reference libraries are proportional.
 ///
 /// edgeR short-circuits to a factor of exactly 1 when `max(|M|)` falls under
-/// this, which keeps two identical or exactly proportional samples from picking
-/// up a factor of `1 + 1e-17` out of the weighted mean.
+/// this, so proportional samples do not pick up a factor of `1 + 1e-17`.
 const TMM_NULL_TOLERANCE: f64 = 1e-6;
 
 /// Counts at or below this count as zero for TMMwsp's singleton pairing.
 ///
-/// edgeR uses a threshold rather than `> 0` because the same routine is handed
-/// fractional counts from transcript-level quantification, where a "zero" comes
-/// back as a denormal rather than as an exact zero.
+/// edgeR uses a threshold rather than `> 0` because fractional counts from
+/// transcript-level quantification can carry a denormal "zero".
 const TMMWSP_ZERO_EPS: f64 = 1e-14;
 
 /// Ridge added to the TMMwsp asymptotic variance before inverting it.
 ///
 /// TMMwsp keeps genes that are zero in one library, whose approximate variance
-/// is unbounded. The ridge caps the weight at `(1 + eps) / eps` instead of
-/// letting a single pair dominate the mean.
+/// is unbounded. The ridge caps the weight at `(1 + eps) / eps`.
 const TMMWSP_WEIGHT_RIDGE: f64 = 1e-6;
 
 /// Median upper-quartile factor below which the reference column is picked by
 /// root-count totals instead.
 ///
-/// If more than half the samples have a zero upper quartile, `f75` carries no
-/// information and edgeR falls back to `which.max(colSums(sqrt(x)))`, the same
-/// rule TMMwsp uses unconditionally.
+/// If more than half the samples have a zero upper quartile, edgeR falls back to
+/// `which.max(colSums(sqrt(x)))`, the rule TMMwsp always uses.
 const F75_DEGENERATE: f64 = 1e-20;
 
 /// Probability of the quantile used to choose the TMM reference column.
 ///
-/// Fixed at the upper quartile regardless of [`NormParams::quantile`], which
-/// only affects the `upperquartile` method itself. edgeR hardcodes it the same
-/// way.
+/// Hardcoded as in edgeR; [`NormParams::quantile`] only affects the
+/// `upperquartile` method.
 const REF_COLUMN_QUANTILE: f64 = 0.75;
 
 /// The strings edgeR accepts, for the error message.
@@ -100,8 +78,8 @@ pub enum NormMethod {
 
 /// Parses edgeR's `method` string.
 ///
-/// Matching is case-insensitive, and `TMMwzp` is accepted as the pre-3.36 spelling
-/// of `TMMwsp`, as edgeR still does.
+/// Case-insensitive. `TMMwzp` is accepted as the old spelling of `TMMwsp`, as in
+/// edgeR.
 ///
 /// ### Params
 ///
@@ -109,8 +87,7 @@ pub enum NormMethod {
 ///
 /// ### Returns
 ///
-/// The variant, or `None` if the string matches nothing. Use
-/// `NormMethod::try_from` if you want the error rather than the `Option`.
+/// The variant, or `None`. `NormMethod::try_from` returns the error instead.
 pub fn parse_norm_method(s: &str) -> Option<NormMethod> {
     match s.to_ascii_lowercase().as_str() {
         "tmm" => Some(NormMethod::Tmm),
@@ -149,9 +126,9 @@ impl TryFrom<&str> for NormMethod {
 
 /// Tuning knobs for [`calc_norm_factors`].
 ///
-/// The names mirror edgeR's arguments: `logratio_trim` is `logratioTrim`,
-/// `sum_trim` is `sumTrim`, `do_weighting` is `doWeighting`, `a_cutoff` is
-/// `Acutoff` and `quantile` is `p`.
+/// Names mirror edgeR's: `logratio_trim` is `logratioTrim`, `sum_trim` is
+/// `sumTrim`, `do_weighting` is `doWeighting`, `a_cutoff` is `Acutoff` and
+/// `quantile` is `p`.
 #[derive(Clone, Copy, Debug)]
 pub struct NormParams {
     /// Fraction trimmed from each tail of the log-ratios. TMM and TMMwsp only.
@@ -162,8 +139,7 @@ pub struct NormParams {
     /// asymptotic variance. TMM and TMMwsp only.
     pub do_weighting: bool,
     /// Abundance floor; genes with a mean log-abundance at or below this are
-    /// dropped before trimming. TMM only, as in edgeR, where TMMwsp accepts the
-    /// argument and ignores it.
+    /// dropped before trimming. TMM only; edgeR's TMMwsp ignores it.
     pub a_cutoff: f64,
     /// Probability of the column quantile. [`NormMethod::UpperQuartile`] only.
     pub quantile: f64,
@@ -172,9 +148,7 @@ pub struct NormParams {
 impl NormParams {
     /// Builds a parameter set.
     ///
-    /// No validation happens here; [`calc_norm_factors`] checks the domains so
-    /// that a bad value surfaces as an [`EdgeErrors`] at the call that uses it
-    /// rather than at construction.
+    /// No validation here; [`calc_norm_factors`] checks the domains.
     ///
     /// ### Params
     ///
@@ -217,7 +191,7 @@ impl Default for NormParams {
     }
 }
 
-/// Rejects parameter values whose downstream behaviour is undefined.
+/// Rejects parameter values outside their domain.
 ///
 /// ### Params
 ///
@@ -257,9 +231,7 @@ fn validate_params(params: &NormParams) -> Result<(), EdgeErrors> {
 
 /// Resolves the library sizes, defaulting to the column sums.
 ///
-/// edgeR recycles a mismatched `lib.size` with a warning. This errors instead:
-/// the crate has no warning channel, and silently recycling a length-3 vector
-/// across six samples is not something a caller wants to discover downstream.
+/// edgeR recycles a mismatched `lib.size` with a warning. This errors instead.
 ///
 /// ### Params
 ///
@@ -270,8 +242,7 @@ fn validate_params(params: &NormParams) -> Result<(), EdgeErrors> {
 /// ### Returns
 ///
 /// One library size per sample, each finite and strictly positive, or an
-/// [`EdgeErrors`] if the supplied vector is the wrong length or an entry is not
-/// usable as a denominator.
+/// [`EdgeErrors`] if the length is wrong or an entry is unusable.
 fn resolve_lib_size<T: EdgeFloat>(
     counts: &[T],
     n_samples: usize,
@@ -291,8 +262,7 @@ fn resolve_lib_size<T: EdgeFloat>(
         None => column_sums(counts, n_samples),
     };
 
-    // edgeR carries a zero library size through to a NaN factor. Every method
-    // here divides by it, so refuse up front and say which sample is dead.
+    // edgeR carries a zero library size through to a NaN factor; refuse early.
     if let Some(j) = lib.iter().position(|v| !v.is_finite() || *v <= 0.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
             "library size for sample {j} must be finite and positive; got {}.",
@@ -304,11 +274,9 @@ fn resolve_lib_size<T: EdgeFloat>(
 
 /// Drops the all-zero genes and transposes the survivors to column-major `f64`.
 ///
-/// Two passes over the row-major input: one to mark which genes have a positive
-/// count anywhere, one to scatter the survivors into the transposed buffer. The
-/// scatter reads sequentially and writes with a stride of `n_kept`, which is the
-/// cheaper of the two directions because the write side is what the rest of the
-/// module then reads sequentially, repeatedly.
+/// Two passes: mark the genes with a positive count anywhere, then scatter the
+/// survivors into the transposed buffer (sequential reads, strided writes, since
+/// the rest of the module reads the buffer repeatedly).
 ///
 /// ### Params
 ///
@@ -318,9 +286,8 @@ fn resolve_lib_size<T: EdgeFloat>(
 ///
 /// ### Returns
 ///
-/// The column-major `n_kept * n_samples` buffer, sample-major, together with
-/// `n_kept`. Errors with [`EdgeErrors::InvalidArgument`] on a negative or
-/// non-finite count.
+/// The sample-major `n_kept * n_samples` buffer and `n_kept`, or
+/// [`EdgeErrors::InvalidArgument`] on a negative or non-finite count.
 fn to_column_major_nonzero<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,
@@ -358,8 +325,7 @@ fn to_column_major_nonzero<T: EdgeFloat>(
 
 /// Rescales factors to a geometric mean of one.
 ///
-/// `f / exp(mean(log(f)))`, edgeR's final line. Without it the factors are only
-/// identified up to a constant and the effective library sizes drift.
+/// `f / exp(mean(log(f)))`, edgeR's final line.
 ///
 /// ### Params
 ///
@@ -368,7 +334,7 @@ fn to_column_major_nonzero<T: EdgeFloat>(
 /// ### Returns
 ///
 /// `Ok(())`, or [`EdgeErrors::InvalidArgument`] if a factor is not finite and
-/// strictly positive, which would make the geometric mean meaningless.
+/// strictly positive.
 fn normalise_to_unit_product(f: &mut [f64]) -> Result<(), EdgeErrors> {
     if let Some(j) = f.iter().position(|v| !v.is_finite() || *v <= 0.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -391,12 +357,9 @@ fn normalise_to_unit_product(f: &mut [f64]) -> Result<(), EdgeErrors> {
 
 /// Picks the reference sample when the caller does not name one.
 ///
-/// TMM takes the sample whose upper-quartile factor sits closest to the mean of
-/// those factors, `which.min(abs(f75 - mean(f75)))`, breaking ties towards the
-/// first sample. If more than half the samples have a zero upper quartile, that
-/// statistic is uninformative and it falls back to `which.max(colSums(sqrt(x)))`.
-/// TMMwsp uses the root-count rule unconditionally, because it exists for data
-/// sparse enough that the quartile rule has already broken down.
+/// TMM takes `which.min(abs(f75 - mean(f75)))`, ties to the first sample. If
+/// more than half the samples have a zero upper quartile it falls back to
+/// `which.max(colSums(sqrt(x)))`. TMMwsp always uses the root-count rule.
 ///
 /// ### Params
 ///
@@ -408,8 +371,7 @@ fn normalise_to_unit_product(f: &mut [f64]) -> Result<(), EdgeErrors> {
 ///
 /// ### Returns
 ///
-/// The zero-based reference column, or an [`EdgeErrors`] if the quantile could
-/// not be formed.
+/// The zero-based reference column, or an [`EdgeErrors`] if the quantile fails.
 fn resolve_ref_column(
     x: &[f64],
     n_kept: usize,
@@ -452,8 +414,8 @@ fn resolve_ref_column(
 
 /// Index of the sample with the largest sum of square-rooted counts.
 ///
-/// The variance-stabilised total, which is edgeR's sparse-data proxy for "the
-/// deepest library". Ties go to the first sample, as `which.max` does.
+/// edgeR's sparse-data proxy for the deepest library. Ties go to the first
+/// sample, as `which.max` does.
 ///
 /// ### Params
 ///
@@ -486,8 +448,7 @@ fn arg_max_sqrt_colsum(x: &[f64], n_kept: usize, n_samples: usize) -> usize {
 
 /// Upper-quartile factors: a column quantile over the library size.
 ///
-/// `.calcFactorQuantile`. The quantile is R's type 7, which is also numpy's
-/// default, so [`quantile_type7`] matches both references.
+/// `.calcFactorQuantile`, with R's type 7 quantile ([`quantile_type7`]).
 ///
 /// ### Params
 ///
@@ -500,8 +461,7 @@ fn arg_max_sqrt_colsum(x: &[f64], n_kept: usize, n_samples: usize) -> usize {
 /// ### Returns
 ///
 /// One unnormalised factor per sample, or an [`EdgeErrors`] if a column
-/// quantile is zero. edgeR only warns there and returns NaN once the geometric
-/// mean is taken, which is not a useful answer to hand back.
+/// quantile is zero (edgeR warns and returns NaN).
 fn calc_factor_quantile(
     x: &[f64],
     n_kept: usize,
@@ -525,13 +485,11 @@ fn calc_factor_quantile(
 
 /// RLE factors: the median ratio to the gene-wise geometric mean.
 ///
-/// `.calcFactorRLE(x) / lib.size`. Genes whose geometric mean is zero, meaning
-/// at least one sample has no count for them, contribute nothing, which is
-/// what `[gm > 0]` does in the R.
+/// `.calcFactorRLE(x) / lib.size`. Genes with a zero geometric mean (any sample
+/// without a count) contribute nothing, as `[gm > 0]` does in the R.
 ///
-/// The geometric means are accumulated with samples on the outside and genes on
-/// the inside, so both the count read and the accumulator write run
-/// sequentially over the column-major buffer.
+/// Geometric means are accumulated samples-outside, genes-inside, so reads and
+/// accumulator writes are sequential.
 ///
 /// ### Params
 ///
@@ -543,7 +501,7 @@ fn calc_factor_quantile(
 /// ### Returns
 ///
 /// One unnormalised factor per sample, or [`EdgeErrors::NoGenesAfterFiltering`]
-/// if no gene is positive in every sample, which leaves the median undefined.
+/// if no gene is positive in every sample.
 ///
 /// ### References
 ///
@@ -593,20 +551,16 @@ fn calc_factor_rle(
 
 /// TMM factor for one sample against the reference.
 ///
-/// `.calcFactorTMM`. Genes that are zero in *either* library give a
-/// non-finite `M` or `A` and are dropped outright: TMM has nothing to say about
-/// a ratio with a zero in it. That is the whole reason TMMwsp exists.
+/// `.calcFactorTMM`. Genes zero in *either* library give a non-finite `M` or
+/// `A` and are dropped; TMMwsp exists to keep them.
 ///
-/// Trimming is by rank, on both axes at once. With `n` usable genes the kept
-/// set is the rank window `[floor(n * logratio_trim) + 1, n + 1 - that]` on the
-/// log-ratios intersected with the same window at `sum_trim` on the abundances.
-/// The `floor(...) + 1` is the part that has to be exact: computing the bound
-/// as `ceil` or dropping the `+ 1` shifts the window by one gene and moves
-/// every factor in the last few digits, sometimes further on small matrices.
+/// Trimming is by rank on both axes. With `n` usable genes the kept set is the
+/// rank window `[floor(n * logratio_trim) + 1, n + 1 - that]` on the
+/// log-ratios, intersected with the same window at `sum_trim` on the
+/// abundances. The `floor(...) + 1` must be exact: `ceil` or dropping the `+ 1`
+/// shifts the window by one gene and moves every factor.
 ///
-/// Ranks are averaged over ties, matching R's `rank()` default, so a run of
-/// equal log-ratios straddling the trim boundary is either wholly kept or
-/// wholly dropped rather than split arbitrarily.
+/// Ranks are averaged over ties, as in R's `rank()`.
 ///
 /// ### Params
 ///
@@ -686,8 +640,7 @@ fn calc_factor_tmm(
         num / kept as f64
     };
 
-    // edgeR maps a missing weighted mean to a factor of one rather than
-    // failing.
+    // edgeR maps a missing weighted mean to a factor of one.
     let f = if f.is_nan() { 0.0 } else { f };
 
     f.exp2()
@@ -695,32 +648,23 @@ fn calc_factor_tmm(
 
 /// TMMwsp factor for one sample against the reference.
 ///
-/// `.calcFactorTMMwsp`, TMM with singleton pairing. Where TMM throws away every
-/// gene that is zero in one library, TMMwsp keeps that information: it pairs
-/// the largest counts among the observed-only positives with the largest among
-/// the reference-only positives, so `k` genes seen only in the observed sample
-/// and `k` seen only in the reference offset each other instead of both
-/// vanishing. Genes zero in both are still dropped. On data where most genes
-/// are zero somewhere, that is most of the matrix.
+/// `.calcFactorTMMwsp`, TMM with singleton pairing. Instead of dropping every
+/// gene that is zero in one library, it pairs the largest counts among the
+/// observed-only positives with the largest among the reference-only positives.
+/// Genes zero in both are still dropped.
+///
+/// The trim window is `[floor(n * trim) + 1, n + 1 - that]` in 1-based
+/// positions, as in [`calc_factor_tmm`]. edgePython trims one gene too many at
+/// each end here. See `UPSTREAM_DEVIATIONS.md` A1.
 ///
 /// ### Notes
 ///
-/// **On tie-breaking:**
-///
-/// The M-values are ordered by `order(M, M.shrunk)`, R's stable sort keyed on
-/// `M` with the add-0.5 shrunk log-ratio as the tiebreak. This is not cosmetic.
-/// On sparse integer counts the same `(obs, ref)` pair recurs thousands of
-/// times, and after the singleton pairing many pairs share an `M` exactly, so
-/// the trim boundary lands in the middle of a tied run. Without a tiebreak,
-/// which members of that run get trimmed depends on the sort's internal order
-/// and the answer stops being reproducible; with it, the run is ordered by the
-/// shrunk ratio, which is monotone in the raw counts, so the pairs carrying the
-/// least evidence are trimmed first. Ties in *both* keys fall back to input
-/// order, which is why the sort must be stable and why the paired singletons
-/// are appended in edgeR's order rather than interleaved.
-///
-/// Note the trim window here is `[floor(n * trim) + 1, n + 1 - that]` in
-/// 1-based positions, the same as [`calc_factor_tmm`].
+/// **Tie-breaking:** M-values are ordered by `order(M, M.shrunk)`, a stable sort
+/// on `M` with the add-0.5 shrunk log-ratio as tiebreak. On sparse integer
+/// counts many pairs share an `M` exactly and the trim boundary lands inside a
+/// tied run, so without the tiebreak the result would depend on the sort's
+/// internal order. Ties in both keys keep input order, so the sort must be
+/// stable and the paired singletons are appended in edgeR's order.
 ///
 /// ### Params
 ///
@@ -845,11 +789,9 @@ fn calc_factor_tmmwsp(
 /// Marks the central `n + 2 - 2 * (floor(n * trim) + 1)` entries of an
 /// ordering.
 ///
-/// The window is stated in R's 1-based positions, `[lo, n + 1 - lo]` with
-/// `lo = floor(n * trim) + 1`, and translated to a half-open 0-based slice of
-/// the order vector. R would silently count *down* if `lo` exceeded the upper
-/// bound, which only happens for trims at or above 0.5 on small `n`; that keeps
-/// nothing here instead of keeping a reversed window.
+/// The window is R's 1-based `[lo, n + 1 - lo]` with `lo = floor(n * trim) + 1`,
+/// as a half-open 0-based slice. R would count *down* if `lo` exceeded the upper
+/// bound (trims at or above 0.5 on small `n`); this keeps nothing instead.
 ///
 /// ### Params
 ///
@@ -879,14 +821,11 @@ fn trim_window(order: &[usize], n: usize, trim: f64) -> Vec<bool> {
 
 /// Normalisation factors for a count matrix, as edgeR's `calcNormFactors`.
 ///
-/// Genes that are zero in every sample are dropped first, exactly as edgeR
-/// does, and the library sizes are *not* recomputed afterwards: they stay
-/// anchored to whatever was supplied or to the column sums of the unfiltered
-/// matrix. If no gene survives, or there is only one sample, the method
-/// degrades to [`NormMethod::None`] rather than failing, again matching edgeR.
+/// Genes zero in every sample are dropped first, as in edgeR; library sizes are
+/// *not* recomputed afterwards. If no gene survives, or there is one sample, the
+/// method degrades to [`NormMethod::None`], as in edgeR.
 ///
-/// The returned factors are rescaled to have a geometric mean of one, so they
-/// multiply to one across samples.
+/// The returned factors have geometric mean one.
 ///
 /// ### Params
 ///
@@ -894,20 +833,19 @@ fn trim_window(order: &[usize], n: usize, trim: f64) -> Vec<bool> {
 ///   and finite.
 /// * `n_genes` - Number of genes, that is, rows
 /// * `n_samples` - Number of samples, that is, columns
-/// * `lib_size` - Library size per sample. Defaults to the column sums. Every
-///   method divides by it, so each entry must be finite and strictly positive.
+/// * `lib_size` - Library size per sample. Defaults to the column sums. Each
+///   entry must be finite and strictly positive.
 /// * `method` - Which scaling rule to apply
 /// * `ref_column` - Zero-based reference sample for TMM and TMMwsp. `None`
-///   picks one by the rule described at [`resolve_ref_column`]. Ignored by the
-///   other methods.
+///   uses [`resolve_ref_column`]. Ignored by the other methods.
 /// * `params` - Tuning knobs, or `None` for [`NormParams::default`]
 ///
 /// ### Returns
 ///
-/// One factor per sample, with geometric mean one, or an [`EdgeErrors`] if the
-/// shape is inconsistent, a library size is not positive, the reference column
-/// is out of range, a parameter is outside its domain, or the chosen method
-/// cannot be computed on this matrix.
+/// One factor per sample, with geometric mean one, or an [`EdgeErrors`] on an
+/// inconsistent shape, a non-positive library size, an out-of-range reference
+/// column, a parameter outside its domain, or a method that cannot be computed
+/// on this matrix.
 ///
 /// ### References
 ///
@@ -1006,8 +944,7 @@ mod tests {
     /// Reads a headed, all-numeric CSV from `tests/data` into a row-major matrix.
     ///
     /// The fixtures are R `write.csv` output without row names: one quoted
-    /// header line, then one comma-separated record per row. Everything is
-    /// parsed as `f64`.
+    /// header line, then one record per row.
     ///
     /// ### Params
     ///
@@ -1078,7 +1015,9 @@ mod tests {
         }
     }
 
-    // -- method parsing and parameters --
+    // ----------------------------- //
+    // method parsing and parameters //
+    // ----------------------------- //
 
     #[test]
     fn test_parse_norm_method_accepts_every_edger_spelling() {
@@ -1114,10 +1053,12 @@ mod tests {
         assert!(!q.do_weighting);
     }
 
-    // -- R parity, tests/data/test_data_part1.csv, 22 genes by 4 samples --
+    // --------------------------------------------------------------- //
+    // R parity, tests/data/test_data_part1.csv, 22 genes by 4 samples //
+    // --------------------------------------------------------------- //
     //
-    // Row one is all zeros, so this fixture also exercises the all-zero filter.
-    // Every expected vector below is `calcNormFactors(x, ...)` from edgeR 4.8.2.
+    // Row one is all zeros (exercises the all-zero filter). Every expected
+    // vector below is `calcNormFactors(x, ...)` from edgeR 4.8.2.
 
     #[test]
     fn test_part1_tmm_matches_r() {
@@ -1374,7 +1315,9 @@ mod tests {
         );
     }
 
-    // -- R parity, tests/data/test_data_part2.csv, 1000 genes by 3 samples --
+    // ----------------------------------------------------------------- //
+    // R parity, tests/data/test_data_part2.csv, 1000 genes by 3 samples //
+    // ----------------------------------------------------------------- //
 
     #[test]
     fn test_part2_all_methods_match_r() {
@@ -1453,7 +1396,9 @@ mod tests {
         );
     }
 
-    // -- R parity, small and sparse matrices generated for this test module --
+    // ------------------------------------------------------------------ //
+    // R parity, small and sparse matrices generated for this test module //
+    // ------------------------------------------------------------------ //
 
     /// A 3 by 3 matrix with one dominant count, `matrix(1:9 with x[3,3] = 900)`.
     fn tiny() -> Vec<f64> {
@@ -1508,9 +1453,8 @@ mod tests {
 
     /// 20 genes by 3 samples of `rpois(60, 0.6)`, R `set.seed(7)`, row-major.
     ///
-    /// Two thirds of the entries are zero, so this is the fixture that actually
-    /// exercises TMMwsp's singleton pairing and the M-value tie-break: the
-    /// non-zero counts are almost all 1, so the M-values come in long tied runs.
+    /// Two thirds of the entries are zero and the rest are mostly 1, so this
+    /// exercises TMMwsp's singleton pairing and the M-value tie-break.
     fn sparse() -> Vec<f64> {
         vec![
             3.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0, 0.0, 2.0, 0.0, 0.0, 3.0, 2.0, 1.0, 0.0,
@@ -1578,7 +1522,9 @@ mod tests {
         );
     }
 
-    // -- degenerate inputs --
+    // ----------------- //
+    // degenerate inputs //
+    // ----------------- //
 
     #[test]
     fn test_single_sample_degrades_to_no_normalisation() {
@@ -1597,9 +1543,9 @@ mod tests {
             NormMethod::UpperQuartile,
         ] {
             let f = calc_norm_factors(&x, 4, 3, None, method, None, None);
-            // Every library size is zero, so this is rejected before the method
-            // ever runs. edgeR reaches the same input with lib.size supplied and
-            // returns ones, which the next assertion pins.
+            // Every library size is zero: rejected before the method runs. edgeR
+            // returns ones for the same input with lib.size supplied, which the
+            // next assertion pins.
             assert!(f.is_err());
         }
         let f = calc_norm_factors(
@@ -1659,7 +1605,9 @@ mod tests {
         }
     }
 
-    // -- reference column selection --
+    // -------------------------- //
+    // reference column selection //
+    // -------------------------- //
 
     #[test]
     fn test_reference_column_is_the_one_nearest_the_mean_f75() {
@@ -1682,7 +1630,9 @@ mod tests {
         assert_eq!(auto, pinned);
     }
 
-    // -- generic float and layout --
+    // ------------------------ //
+    // generic float and layout //
+    // ------------------------ //
 
     #[test]
     fn test_f32_counts_agree_with_f64() {
@@ -1711,7 +1661,9 @@ mod tests {
         assert_eq!(cm, vec![1.0, 3.0, 2.0, 4.0]);
     }
 
-    // -- error paths --
+    // ----------- //
+    // error paths //
+    // ----------- //
 
     #[test]
     fn test_rejects_an_out_of_range_reference_column() {
@@ -1787,9 +1739,8 @@ mod tests {
 
     #[test]
     fn test_upper_quartile_rejects_a_zero_quantile() {
-        // Eight genes, two samples. Every gene survives the all-zero filter on
-        // the strength of sample two, but sample one is zero in seven of eight,
-        // so its upper quartile is zero and the factor would come back NaN.
+        // Every gene survives the all-zero filter via sample two, but sample one
+        // is zero in seven of eight, so its upper quartile is zero (NaN in edgeR).
         let mut x = vec![0.0_f64; 16];
         for g in 0..8 {
             x[g * 2 + 1] = 1.0;
@@ -1802,8 +1753,7 @@ mod tests {
 
     #[test]
     fn test_rle_rejects_a_matrix_with_no_gene_positive_everywhere() {
-        // Every gene is zero in at least one sample, so every geometric mean is
-        // zero and the median ratio is undefined.
+        // Every geometric mean is zero, so the median ratio is undefined.
         let x = vec![1.0, 0.0, 0.0, 2.0, 3.0, 0.0, 0.0, 4.0];
         let err = calc_norm_factors(&x, 4, 2, None, NormMethod::Rle, None, None).unwrap_err();
         assert!(matches!(err, EdgeErrors::NoGenesAfterFiltering { .. }));

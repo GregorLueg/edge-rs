@@ -1,21 +1,17 @@
 //! `cpm`, `rpkm`, `tpm` and `aveLogCPM`.
 //!
-//! The per-gene expression summaries edgeR hangs off a count matrix. All four
-//! are a division by a library size, so the only interesting question is which
-//! library size: an explicit `lib_size`, the column sums of the counts, or
-//! `exp(offset)` when offsets are supplied. Offsets win outright, as in edgeR,
-//! where `lib.size` is silently discarded in their presence.
+//! Per-gene expression summaries, each a division by a library size: an
+//! explicit `lib_size`, the column sums, or `exp(offset)`. Offsets win outright
+//! and `lib_size` is then discarded, as in edgeR.
 //!
-//! Library sizes are carried as a [`Recycled`] rather than materialised. A
-//! per-sample library size stays `n_samples` values all the way into the inner
-//! loop, and only a genuinely gene-varying offset ever costs
-//! `n_genes * n_samples`.
+//! Library sizes are carried as a [`Recycled`], so only a gene-varying offset
+//! costs `n_genes * n_samples`.
 //!
-//! [`ave_log_cpm`] is the one that matters for speed: `estimateDisp` calls it on
-//! every gene of every analysis. It adds a library-size-scaled prior count and
-//! then fits an intercept-only negative binomial GLM with
-//! [`mglm_one_group`], rather than averaging log-CPMs, which is what keeps it
-//! stable for genes that are zero in most samples.
+//! [`ave_log_cpm`] is called by `estimateDisp` on every analysis. It adds a
+//! library-size-scaled prior count and fits an intercept-only NB GLM with
+//! [`mglm_one_group`] instead of averaging log-CPMs, which keeps it stable for
+//! genes that are zero in most samples. edgeR has a matrix-offset bug here that
+//! this port does not reproduce. See `UPSTREAM_DEVIATIONS.md` B1.
 
 use std::f64::consts::LN_2;
 
@@ -37,9 +33,8 @@ const BASES_PER_KB: f64 = 1000.0;
 
 /// Dispersion `aveLogCPM` assumes when the caller has not estimated one yet.
 ///
-/// edgeR's default. The abundance *ranking* is close to insensitive to it, and
-/// ranking is all `estimateDisp` uses the result for when it bins genes by
-/// abundance, so a fixed guess is good enough to start from.
+/// edgeR's default. `estimateDisp` only bins genes by abundance rank, which is
+/// close to insensitive to it.
 const DEFAULT_DISPERSION: f64 = 0.05;
 
 /////////////////
@@ -102,8 +97,7 @@ fn check_prior_count(prior_count: f64) -> Result<(), EdgeErrors> {
 
 /// Rejects library sizes that cannot be divided by.
 ///
-/// Only the stored values are examined, so a `Scalar` costs one comparison
-/// rather than `n_genes * n_samples`.
+/// Only the stored values are examined.
 ///
 /// ### Params
 ///
@@ -207,9 +201,8 @@ pub(crate) fn column_sums<T: EdgeFloat>(values: &[T], n_samples: usize) -> Vec<f
 
 /// Resolves the library sizes every summary here divides by.
 ///
-/// edgeR's precedence, from `cpm.default`: an offset replaces the library sizes
-/// outright (`lib.size <- exp(offset)`), an explicit `lib_size` comes next, and
-/// the column sums are the fallback.
+/// Precedence as in `cpm.default`: `exp(offset)`, then `lib_size`, then the
+/// column sums.
 ///
 /// ### Params
 ///
@@ -221,9 +214,8 @@ pub(crate) fn column_sums<T: EdgeFloat>(values: &[T], n_samples: usize) -> Vec<f
 ///
 /// ### Returns
 ///
-/// The library sizes on the natural scale, in the same recycled form the offset
-/// arrived in, or [`EdgeErrors`] if a length disagrees or a size is not
-/// positive.
+/// The library sizes on the natural scale, in the recycled form of the offset,
+/// or [`EdgeErrors`] if a length disagrees or a size is not positive.
 pub(crate) fn resolve_lib_sizes<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,
@@ -266,12 +258,10 @@ pub(crate) fn resolve_lib_sizes<T: EdgeFloat>(
 
 /// Adds library-size-scaled prior counts to one gene.
 ///
-/// edgeR's `addPriorCount` rule, per gene: the prior is scaled by each
-/// library's size relative to the mean *of that gene's row*, so every sample is
-/// perturbed by the same relative amount. With per-sample library sizes the row
-/// mean is the same for every gene and this collapses to the usual formula;
-/// with a gene-varying offset it does not, and edgeR really does use the row
-/// mean.
+/// edgeR's `addPriorCount` rule: the prior is scaled by each library size
+/// relative to the mean of *that gene's row*. With per-sample library sizes this
+/// is the usual formula; with a gene-varying offset it is not, and edgeR does
+/// use the row mean.
 ///
 /// ### Params
 ///
@@ -305,10 +295,8 @@ fn add_prior_count_row<T: EdgeFloat>(
 
 /// Adds prior counts to the whole matrix and reports the matching log offsets.
 ///
-/// The per-sample case is handed to [`add_prior_count`], which already
-/// implements exactly this rule; only a gene-varying library size needs the
-/// per-gene loop, and only that case pays `n_genes * n_samples` for the
-/// offsets.
+/// Per-sample library sizes go to [`add_prior_count`]; only a gene-varying
+/// library size takes the per-gene loop and pays `n_genes * n_samples` offsets.
 ///
 /// ### Params
 ///
@@ -362,9 +350,8 @@ pub(crate) fn augment_counts<T: EdgeFloat>(
 
 /// Counts per million, as edgeR's `cpm`.
 ///
-/// On the log scale a library-size-scaled prior count is added first, which is
-/// what stops a zero count reporting minus infinity and damps the variance of
-/// low-count genes.
+/// On the log scale a library-size-scaled prior count is added first, so zero
+/// counts do not give minus infinity.
 ///
 /// ### Params
 ///
@@ -374,7 +361,7 @@ pub(crate) fn augment_counts<T: EdgeFloat>(
 /// * `lib_size` - Library size per sample. `None` uses the column sums. Ignored
 ///   when `offset` is given, as in edgeR.
 /// * `offset` - Log-scale offsets. When present the library sizes are
-///   `exp(offset)`, which is the only way to get a gene-varying denominator.
+///   `exp(offset)`, the only way to get a gene-varying denominator.
 /// * `log` - Return log2-CPM rather than CPM
 /// * `prior_count` - Prior count before library-size scaling. Only used when
 ///   `log` is set; edgeR's default is 2.
@@ -496,9 +483,8 @@ pub fn rpkm<T: EdgeFloat>(
 /// Transcripts per million, as edgeR's `tpm`.
 ///
 /// CPM divided by the effective transcript length, then rescaled so the column
-/// totals are one million on average. edgeR uses the *geometric* mean of the
-/// column totals for that rescaling, not the arithmetic one, so the result is
-/// invariant to a per-sample scale factor.
+/// totals average one million. edgeR rescales by the *geometric* mean of the
+/// column totals, not the arithmetic one.
 ///
 /// ### Params
 ///
@@ -506,14 +492,13 @@ pub fn rpkm<T: EdgeFloat>(
 /// * `n_genes` - Number of genes
 /// * `n_samples` - Number of samples
 /// * `effective_length` - Effective transcript length per gene. Must be
-///   positive. Unlike [`rpkm`] this is used in bases, not kilobases: the
-///   rescaling absorbs any constant factor.
+///   positive. Used in bases, not kilobases as in [`rpkm`]; the rescaling
+///   absorbs the constant.
 ///
 /// ### Returns
 ///
 /// Row-major `n_genes * n_samples` values, or [`EdgeErrors`] if a shape
-/// disagrees or a whole sample ends up empty, which would make the geometric
-/// mean undefined.
+/// disagrees or a whole sample is empty (undefined geometric mean).
 pub fn tpm<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,
@@ -547,12 +532,9 @@ pub fn tpm<T: EdgeFloat>(
 
 /// Average log2-CPM per gene, as edgeR's `aveLogCPM`.
 ///
-/// Not a mean of [`cpm`] values. edgeR adds a library-size-scaled prior count
-/// and fits an intercept-only negative binomial GLM per gene with
-/// [`mglm_one_group`], then reports the coefficient as log2-CPM. The GLM
-/// weights samples by their information rather than equally, which is what
-/// makes the answer usable for genes that are zero in most samples, and it is
-/// the abundance covariate the whole dispersion trend is built on.
+/// Not a mean of [`cpm`] values: adds a library-size-scaled prior count, fits
+/// an intercept-only NB GLM per gene with [`mglm_one_group`] and reports the
+/// coefficient as log2-CPM.
 ///
 /// ### Params
 ///
@@ -582,9 +564,8 @@ pub fn ave_log_cpm<T: EdgeFloat>(
     check_counts(counts, n_genes, n_samples)?;
     check_prior_count(prior_count)?;
 
-    // edgeR's escape hatch for a matrix that is empty and carries no library
-    // information either: there is no abundance to estimate, so it reports the
-    // CPM of one count spread over every gene rather than log(0).
+    // edgeR's escape hatch for an all-zero matrix with no library information:
+    // the CPM of one count spread over every gene, not log(0).
     if lib_size.is_none() && offset.is_none() && counts.iter().all(|v| *v == T::zero()) {
         let abundance = -(n_genes as f64).ln();
         return Ok(vec![(abundance + PER_MILLION.ln()) / LN_2; n_genes]);
@@ -617,17 +598,14 @@ pub fn ave_log_cpm<T: EdgeFloat>(
 
 #[cfg(test)]
 mod tests {
-    // Every reference below is pasted verbatim from R's 17-digit output. The
-    // last digit or two is past what an f64 can hold and clippy would rather
-    // they were rounded, but keeping them exactly as printed is what makes them
-    // checkable against the `Rscript` line quoted above each test.
+    // References are pasted verbatim from R's 17-digit output so they stay
+    // checkable against the `Rscript` line above each test.
     #![allow(clippy::excessive_precision)]
 
     use super::*;
     use approx::assert_relative_eq;
 
-    /// 3 genes by 6 samples, the fixture every reference below was generated
-    /// from:
+    /// 3 genes by 6 samples, the fixture for every reference below:
     /// ```r
     /// y <- matrix(c(10,12,11,40,44,38, 50,48,52,49,51,50, 2,0,5,1,3,0),
     ///             nrow = 3, byrow = TRUE)
@@ -670,9 +648,8 @@ mod tests {
         Recycled::full(values, 3, 6).unwrap()
     }
 
-    /// Agreement for the closed-form summaries. These are the same arithmetic
-    /// edgeR does in a different order, so the only gap is rounding; the worst
-    /// observed here is 3e-14 relative, on the smallest log2-CPM.
+    /// Agreement for the closed-form summaries: rounding only. Worst observed
+    /// is 3e-14 relative, on the smallest log2-CPM.
     fn assert_close(got: &[f64], want: &[f64]) {
         assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(want.iter()) {
@@ -680,10 +657,9 @@ mod tests {
         }
     }
 
-    /// Agreement for [`ave_log_cpm`], which ends in a Fisher scoring iteration.
-    /// Both sides stop at the same `tol = 1e-10` on the coefficient step, so the
-    /// gap is the convergence tolerance rather than rounding: the worst observed
-    /// here is 1.4e-11 relative, and 1.3e-11 absolute on the log2 scale.
+    /// Agreement for [`ave_log_cpm`], limited by the shared `tol = 1e-10` of the
+    /// Fisher scoring step. Worst observed is 1.4e-11 relative, 1.3e-11 absolute
+    /// on the log2 scale.
     fn assert_close_fit(got: &[f64], want: &[f64]) {
         assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(want.iter()) {
@@ -691,7 +667,9 @@ mod tests {
         }
     }
 
-    // -- cpm --
+    // --- //
+    // cpm //
+    // --- //
 
     /// `cat(format(cpm(y), digits = 17), sep = ", ")`
     #[test]
@@ -979,7 +957,9 @@ mod tests {
         assert_close(&got_log, &want_log);
     }
 
-    // -- rpkm and tpm --
+    // ------------ //
+    // rpkm and tpm //
+    // ------------ //
 
     /// `glen <- c(1500, 2500, 800)`
     /// `cat(format(rpkm(y, gene.length = glen, lib.size = ls), digits = 17), sep = ", ")`
@@ -1067,7 +1047,9 @@ mod tests {
         assert_close(&got, &want);
     }
 
-    // -- aveLogCPM --
+    // --------- //
+    // aveLogCPM //
+    // --------- //
 
     /// `cat(format(aveLogCPM(y), digits = 17), sep = ", ")`
     #[test]
@@ -1117,16 +1099,12 @@ mod tests {
         assert_close_fit(&got, &want);
     }
 
-    /// A `Full` offset whose rows are all equal must give the same answer as the
-    /// per-sample form. It does here.
+    /// A `Full` offset with equal rows must match the per-sample form.
     ///
-    /// edgeR does not: `aveLogCPM(y, offset = matrix(log(ls), nrow(y), ncol(y),
-    /// byrow = TRUE), dispersion = 0.1)` returns 24.62 for the *first* gene and
-    /// the correct value for every other one, against 4.675 from the identical
-    /// `offset = log(ls)` call. The first row of a matrix offset is dropped
-    /// somewhere in edgeR 4.8.2's `.cxx_ave_log_cpm`. This crate does not
-    /// reproduce that, so the reference for this path is the vector-offset call
-    /// rather than the matrix one.
+    /// edgeR 4.8.2 does not: `aveLogCPM(y, offset = matrix(log(ls), nrow(y),
+    /// ncol(y), byrow = TRUE), dispersion = 0.1)` returns 24.62 for the first
+    /// gene against 4.675 from `offset = log(ls)`. The reference here is the
+    /// vector-offset call. See `UPSTREAM_DEVIATIONS.md` B1.
     #[test]
     fn test_ave_log_cpm_with_a_constant_full_offset_matches_the_per_sample_form() {
         let dispersion = Recycled::scalar(0.1);
@@ -1141,8 +1119,8 @@ mod tests {
         assert_close_fit(&got, &want);
     }
 
-    /// Genes 2 and 3 of `aveLogCPM(y, offset = off, dispersion = 0.1)`, the
-    /// gene-varying offset. Gene 1 is omitted for the edgeR bug documented at
+    /// Genes 2 and 3 of `aveLogCPM(y, offset = off, dispersion = 0.1)` with the
+    /// gene-varying offset. Gene 1 is omitted for the edgeR bug in
     /// [`test_ave_log_cpm_with_a_constant_full_offset_matches_the_per_sample_form`].
     #[test]
     fn test_ave_log_cpm_matches_edger_with_a_gene_varying_offset() {
@@ -1150,8 +1128,7 @@ mod tests {
         let offset = varying_offset();
         let got = ave_log_cpm(&COUNTS, 3, 6, None, Some(&offset), 2.0, Some(&dispersion)).unwrap();
         assert_close_fit(&got[1..], &[5.4609819724336592, 2.1359248464879919]);
-        // Gene 1's offset is exactly log(ls), so its answer must be the
-        // per-sample one.
+        // Gene 1's offset is exactly log(ls): must equal the per-sample answer.
         assert_relative_eq!(got[0], 4.6750928102298239, max_relative = 1e-10);
     }
 
@@ -1188,8 +1165,8 @@ mod tests {
         assert_close_fit(&got, &want);
     }
 
-    /// An entirely empty matrix with no library sizes has no abundance to
-    /// estimate, and edgeR reports `(-log(nrow) + log(1e6)) / log(2)`.
+    /// An all-zero matrix with no library sizes gives
+    /// `(-log(nrow) + log(1e6)) / log(2)`, as in edgeR.
     /// `cat(format(aveLogCPM(matrix(0, 4, 3)), digits = 17), sep = ", ")`
     #[test]
     fn test_ave_log_cpm_of_an_empty_matrix_matches_edger() {
@@ -1197,8 +1174,7 @@ mod tests {
         assert_close_fit(&got, &[17.931568569324174; 4]);
     }
 
-    /// Given library sizes, the empty-matrix short circuit does not apply and
-    /// the fit runs as usual.
+    /// Given library sizes, the all-zero short circuit does not apply.
     #[test]
     fn test_ave_log_cpm_of_an_empty_matrix_with_library_sizes_fits_normally() {
         let got = ave_log_cpm(
@@ -1217,8 +1193,7 @@ mod tests {
         }
     }
 
-    /// `f32` counts must land on the same answer to `f32` precision, since every
-    /// derived quantity is `f64` per the crate numeric policy.
+    /// `f32` counts agree to `f32` precision.
     #[test]
     fn test_cpm_is_generic_over_the_count_type() {
         let counts32: Vec<f32> = COUNTS.iter().map(|v| *v as f32).collect();
@@ -1229,7 +1204,9 @@ mod tests {
         }
     }
 
-    // -- errors --
+    // ------ //
+    // errors //
+    // ------ //
 
     #[test]
     fn test_rejects_empty_counts() {
@@ -1296,8 +1273,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::InvalidArgument(_)));
     }
 
-    /// The prior count is unused when `log` is not set, so it is not checked
-    /// there either, matching edgeR.
+    /// The prior count is not checked when `log` is unset, as in edgeR.
     #[test]
     fn test_ignores_the_prior_count_on_the_raw_scale() {
         assert!(cpm(&COUNTS, 3, 6, None, None, false, -1.0).is_ok());
@@ -1343,10 +1319,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::InvalidArgument(_)));
     }
 
-    /// A sample with no counts at all has no geometric mean to rescale by. It
-    /// trips the library size guard first, since the library sizes are derived
-    /// from the same column sums, but either way it is an error rather than a
-    /// column of NaN.
+    /// An empty sample has no geometric mean to rescale by: an error, not NaN.
     #[test]
     fn test_tpm_rejects_an_empty_sample() {
         let counts = [0.0_f64, 1.0, 0.0, 2.0];
