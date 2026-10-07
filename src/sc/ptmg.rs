@@ -3,7 +3,8 @@
 //! The subject random effect is integrated out analytically: each subject has
 //! one gamma frailty shared by its cells, and each cell has its own gamma
 //! overdispersion. The closed-form marginal likelihood in `(beta, sigma, phi)`
-//! is minimised with L-BFGS-B to give the starting values every later NEBULA
+//! is minimised, by projected Newton on dense designs and L-BFGS-B where the
+//! zero-count tables apply, to give the starting values every later NEBULA
 //! stage refines. Ports `ptmg_*_eigen` from `nebula`'s C++ plus the R-level
 //! gamma corrections. `ptmg_value_gradient_hessian` supplies the marginal
 //! Hessian edgePython lacks; see `UPSTREAM_DEVIATIONS.md` A20.
@@ -544,7 +545,7 @@ pub fn ptmg_neg_log_likelihood(data: &GeneData<'_>, params: &[f64]) -> f64 {
 ///
 /// The gradient, length `n_coef + 2`.
 pub fn ptmg_gradient(data: &GeneData<'_>, params: &[f64]) -> Vec<f64> {
-    evaluate(data, params, false, &mut PtmgScratch::new(data)).1
+    evaluate(data, params, &mut PtmgScratch::new(data)).1
 }
 
 /// Value and gradient of the marginal negative log-likelihood together.
@@ -585,8 +586,7 @@ pub(crate) fn ptmg_value_and_gradient_with(
     if let Some(zeros) = scratch.zeros {
         return evaluate_tabled(data, params, zeros, scratch);
     }
-    let (value, gradient, _) = evaluate(data, params, false, scratch);
-    (value, gradient)
+    evaluate(data, params, scratch)
 }
 
 /// Value, gradient and Hessian of the marginal negative log-likelihood.
@@ -612,7 +612,27 @@ pub fn ptmg_value_gradient_hessian(
     data: &GeneData<'_>,
     params: &[f64],
 ) -> (f64, Vec<f64>, Vec<f64>) {
-    evaluate(data, params, true, &mut PtmgScratch::new(data))
+    evaluate_hessian(data, params, &mut PtmgScratch::new(data))
+}
+
+/// [`ptmg_value_gradient_hessian`] on buffers the caller keeps across
+/// evaluations of one gene.
+///
+/// ### Params
+///
+/// * `data` - The gene, as validated by [`GeneData::new`]
+/// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
+/// * `scratch` - Built by [`PtmgScratch::new`] from this same gene
+///
+/// ### Returns
+///
+/// As [`ptmg_value_gradient_hessian`].
+pub(crate) fn ptmg_value_gradient_hessian_with(
+    data: &GeneData<'_>,
+    params: &[f64],
+    scratch: &mut PtmgScratch<'_>,
+) -> (f64, Vec<f64>, Vec<f64>) {
+    evaluate_hessian(data, params, scratch)
 }
 
 /// Fills the exponentiated linear predictor and its subject sums, and
@@ -658,30 +678,23 @@ fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch
     total
 }
 
-/// Value, gradient and optionally Hessian, in one pass over the gene.
+/// Value and gradient, in one pass over the gene.
 ///
-/// Shared body of [`ptmg_value_and_gradient`] and
-/// [`ptmg_value_gradient_hessian`]. Accumulates in log-likelihood sign and
-/// negates once at the end; the gamma corrections are then subtracted from the
-/// negated quantities, the order `R/ptmg.R` uses.
+/// Shared body of [`ptmg_value_and_gradient`] and [`ptmg_gradient`].
+/// Accumulates in log-likelihood sign and negates once at the end; the gamma
+/// corrections are then subtracted from the negated quantities, the order
+/// `R/ptmg.R` uses.
 ///
 /// ### Params
 ///
 /// * `data` - The gene, as validated by [`GeneData::new`]
 /// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
-/// * `with_hessian` - Whether to build the Hessian
 /// * `scratch` - Built by [`PtmgScratch::new`] from this same gene
 ///
 /// ### Returns
 ///
-/// The negative log-likelihood, its gradient of length `n_coef + 2`, and its
-/// row-major Hessian, which is empty when `with_hessian` is false.
-fn evaluate(
-    data: &GeneData<'_>,
-    params: &[f64],
-    with_hessian: bool,
-    scratch: &mut PtmgScratch<'_>,
-) -> (f64, Vec<f64>, Vec<f64>) {
+/// The negative log-likelihood and its gradient of length `n_coef + 2`.
+fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) -> (f64, Vec<f64>) {
     debug_assert_eq!(params.len(), data.n_params());
 
     let nb = data.n_coef;
@@ -721,25 +734,14 @@ fn evaluate(
     total += (k as f64) * terms.alpha * terms.log_lambda;
     total += (n_cells as f64) * gamma * terms.log_gamma;
 
-    // One pass per cell for value and gradient; the Hessian's per-cell buffers
-    // are kept only when wanted. Sum order matches the reference.
-    let per_cell = |len: usize| {
-        if with_hessian {
-            vec![0.0; len]
-        } else {
-            Vec::new()
-        }
-    };
-    let mut tempa = per_cell(n_cells);
-    let mut gstar = per_cell(n_cells);
-    let mut xexb = per_cell(n_cells * nb);
+    // One pass per cell. Sum order matches the reference.
     let mut xexb_f = vec![0.0; k * nb];
     let mut dbeta_41 = vec![0.0; k * nb];
     let mut d42c = vec![0.0; k];
     // One subject's cells, adding into its rows of `xexb_f` and `dbeta_41`.
     // Running sums pass by value to stay in registers; returns them with the
     // subject's `sum gstar * extb`.
-    let mut cells = |s: usize, sums: [f64; 3], xf: &mut [f64], d41: &mut [f64]| {
+    let cells = |s: usize, sums: [f64; 3], xf: &mut [f64], d41: &mut [f64]| {
         let [mut total, mut slpey, mut gstar_sum] = sums;
         let ym = ymustar[s];
         let mut acc = 0.0;
@@ -762,14 +764,6 @@ fn evaluate(
                 d41[j] += g * v;
             }
             acc += g * e;
-
-            if with_hessian {
-                tempa[i] = inv_w;
-                gstar[i] = g;
-                for j in 0..nb {
-                    xexb[i * nb + j] = row[j] * e;
-                }
-            }
         }
         ([total, slpey, gstar_sum], acc)
     };
@@ -824,24 +818,182 @@ fn evaluate(
         *g = -*g;
     }
 
-    if !with_hessian {
-        let extra = gamma_terms(data, terms.alpha, gamma, GammaOrder::Gradient);
-        let value = value - extra.subject_value - extra.cell_value;
-        gradient[nb] -= terms.alpha_pr * extra.subject_digamma;
-        gradient[nb + 1] -= extra.cell_digamma;
-        return (value, gradient, Vec::new());
+    let extra = gamma_terms(data, terms.alpha, gamma, GammaOrder::Gradient);
+    let value = value - extra.subject_value - extra.cell_value;
+    gradient[nb] -= terms.alpha_pr * extra.subject_digamma;
+    gradient[nb + 1] -= extra.cell_digamma;
+    (value, gradient)
+}
+
+/// Value, gradient and Hessian in one pass over the gene.
+///
+/// Every Hessian entry is a sum over subjects of per-subject sums over cells,
+/// so one pass per subject accumulates them all: the vectors `sum x e`,
+/// `sum g x e`, `sum x e (g/w - 1/w)` and `sum x e g e/w`, three scalars, and
+/// the three symmetric `x x' e` blocks weighted by `1`, `g` and `g e/w`. The
+/// formulas that follow are [`evaluate`]'s, applied to those sums.
+///
+/// ### Params
+///
+/// * `data` - The gene, as validated by [`GeneData::new`]
+/// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
+/// * `scratch` - Built by [`PtmgScratch::new`] from this same gene
+///
+/// ### Returns
+///
+/// The negative log-likelihood, its gradient of length `n_coef + 2`, and its
+/// row-major Hessian.
+fn evaluate_hessian(
+    data: &GeneData<'_>,
+    params: &[f64],
+    scratch: &mut PtmgScratch<'_>,
+) -> (f64, Vec<f64>, Vec<f64>) {
+    debug_assert_eq!(params.len(), data.n_params());
+
+    let nb = data.n_coef;
+    let nn = nb * nb;
+    let n_cells = data.n_cells();
+    let k = data.n_subjects();
+    let n_params = nb + 2;
+    let fid = data.fid;
+    let beta = &params[..nb];
+    let terms = Terms::new(params[nb], params[nb + 1]);
+    let gamma = terms.gamma;
+
+    let mut total = linear_predictor(data, beta, scratch);
+    let PtmgScratch {
+        y_cell,
+        extb,
+        cumsumxtb,
+        ..
+    } = &*scratch;
+
+    let mut mustar_log = vec![0.0; k];
+    let mut ymustar = vec![0.0; k];
+    let mut ymumustar = vec![0.0; k];
+    let mut imustar = vec![0.0; k];
+    for s in 0..k {
+        let ystar = data.subject_totals[s] + terms.alpha;
+        let mu = cumsumxtb[s] + terms.lambda;
+        let log_mu = mu.ln();
+        mustar_log[s] = log_mu;
+        ymustar[s] = ystar / mu;
+        ymumustar[s] = ystar / mu / mu;
+        imustar[s] = 1.0 / mu;
+        total -= ystar * log_mu;
+    }
+    total += (k as f64) * terms.alpha * terms.log_lambda;
+    total += (n_cells as f64) * gamma * terms.log_gamma;
+
+    // Per-subject sums, row-major `k * nb` vectors and `k * nb * nb` blocks
+    // (upper triangle filled).
+    let mut xexb_f = vec![0.0; k * nb];
+    let mut dbeta_41 = vec![0.0; k * nb];
+    let mut tmp1_f = vec![0.0; k * nb];
+    let mut tmp2_f = vec![0.0; k * nb];
+    let mut block_plain = vec![0.0; k * nn];
+    let mut block_g = vec![0.0; k * nn];
+    let mut block_gte = vec![0.0; k * nn];
+    let mut hb2_f = vec![0.0; k];
+    let mut b2f = vec![0.0; k];
+    let mut d42c = vec![0.0; k];
+    let mut slpey = 0.0;
+    let mut gstar_sum = 0.0;
+    let mut sum_tempa = 0.0;
+    let mut sum_gt = 0.0;
+    for s in 0..k {
+        let ym = ymustar[s];
+        let v = s * nb..(s + 1) * nb;
+        let m = s * nn..(s + 1) * nn;
+        let (xf, d41) = (&mut xexb_f[v.clone()], &mut dbeta_41[v.clone()]);
+        let (t1, t2) = (&mut tmp1_f[v.clone()], &mut tmp2_f[v]);
+        let (bp, bg, bgte) = (
+            &mut block_plain[m.clone()],
+            &mut block_g[m.clone()],
+            &mut block_gte[m],
+        );
+        let mut acc = 0.0;
+        let mut hb2 = 0.0;
+        let mut b2 = 0.0;
+        for i in fid[s]..fid[s + 1] {
+            let e = extb[i];
+            let y = y_cell[i];
+            let we = ym * e;
+            let w = we + gamma;
+            let log_w = w.ln();
+            let inv_w = 1.0 / w;
+            total += we;
+            total -= (gamma + y) * log_w;
+            slpey += log_w;
+            let g = (gamma + y) * inv_w;
+            gstar_sum += g;
+            let gt = g * inv_w;
+            let gte = gt * e;
+            sum_tempa += inv_w;
+            sum_gt += gt;
+            acc += g * e;
+            hb2 += gte - e * inv_w;
+            b2 += gte * e;
+            let f1 = gt - inv_w;
+
+            let row = &data.design[i * nb..(i + 1) * nb];
+            for a in 0..nb {
+                let xe = row[a] * e;
+                xf[a] += xe;
+                d41[a] += g * xe;
+                t1[a] += xe * f1;
+                t2[a] += xe * gte;
+                for b in a..nb {
+                    let c = xe * row[b];
+                    bp[a * nb + b] += c;
+                    bg[a * nb + b] += c * g;
+                    bgte[a * nb + b] += c * gte;
+                }
+            }
+        }
+        hb2_f[s] = hb2;
+        b2f[s] = b2;
+        d42c[s] = acc - cumsumxtb[s];
     }
 
-    // ------------------------------------- //
-    // Hessian, still in log-likelihood sign //
-    // ------------------------------------- //
+    // Gradient, as in `evaluate`.
+    let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
+    let mut gradient = vec![0.0; n_params];
+    for j in 0..nb {
+        let mut acc = 0.0;
+        for s in 0..k {
+            acc += xexb_f[s * nb + j] * ymm_d[s] - dbeta_41[s * nb + j] * ymustar[s];
+        }
+        gradient[j] = acc;
+    }
+    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
+        let row = &data.design[c * nb..(c + 1) * nb];
+        for j in 0..nb {
+            gradient[j] += row[j] * y;
+        }
+    }
+    let ldm = terms.log_lambda * (k as f64) - mustar_log.iter().sum::<f64>();
+    let adlmy = terms.exps_s * (k as f64) - ymustar.iter().sum::<f64>();
+    let hbl0: Vec<f64> = (0..k).map(|s| d42c[s] * imustar[s]).collect();
+    let dbim: f64 = hbl0.iter().sum();
+    let sum_ymm_d: f64 = ymm_d.iter().sum();
+    gradient[nb] = -terms.alpha_pr * dbim
+        + terms.lambda_pr * sum_ymm_d
+        + terms.alpha_pr * ldm
+        + terms.lambda_pr * adlmy;
+    gradient[nb + 1] = terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
+    let value = -total;
+    for g in gradient.iter_mut() {
+        *g = -*g;
+    }
+
+    // Hessian, in log-likelihood sign, as in `evaluate`.
     let mut hessian = vec![0.0; n_params * n_params];
     let lam_ratio = terms.lambda_pr / terms.lambda;
     let mut hes_sigma = (terms.alpha_dpr * terms.log_lambda + 2.0 * terms.alpha_pr * lam_ratio
         - terms.alpha * lam_ratio * lam_ratio
         + terms.alpha / terms.lambda * terms.lambda_dpr)
         * (k as f64);
-
     let sum_hbl0_imu: f64 = (0..k).map(|s| hbl0[s] * imustar[s]).sum();
     let sum_ymmd_imu: f64 = (0..k).map(|s| ymm_d[s] * imustar[s]).sum();
     hes_sigma -= dbim * terms.alpha_dpr
@@ -868,40 +1020,11 @@ fn evaluate(
         hes_sigma_beta[j] = -terms.alpha_pr * d41_imu + terms.lambda_pr * d41_ymm
             - (-terms.alpha_pr * xf_hbl_imu + 2.0 * terms.lambda_pr * xf_hbl_ymm);
     }
-
-    // `alpha_pr / mustar - lambda_pr * ymustar / mustar`, the sensitivity of
-    // the collapsed subject weight to sigma. Appears squared in the sigma
-    // block.
     let apm: Vec<f64> = (0..k)
         .map(|s| terms.alpha_pr * imustar[s] - terms.lambda_pr * ymumustar[s])
         .collect();
 
-    let mut hes_gamma = (n_cells as f64) / gamma - 2.0 * tempa.iter().sum::<f64>();
-    let mut gt = vec![0.0; n_cells];
-    let mut gte = vec![0.0; n_cells];
-    for i in 0..n_cells {
-        gt[i] = gstar[i] * tempa[i];
-        gte[i] = gt[i] * extb[i];
-    }
-    hes_gamma += gt.iter().sum::<f64>();
-
-    let mut tmp1_f = vec![0.0; k * nb];
-    let mut tmp2_f = vec![0.0; k * nb];
-    let mut hb2_f = vec![0.0; k];
-    let mut b2f = vec![0.0; k];
-    for s in 0..k {
-        for i in fid[s]..fid[s + 1] {
-            let f1 = gt[i] - tempa[i];
-            let row = &xexb[i * nb..(i + 1) * nb];
-            for j in 0..nb {
-                tmp1_f[s * nb + j] += row[j] * f1;
-                tmp2_f[s * nb + j] += row[j] * gte[i];
-            }
-            hb2_f[s] += gte[i] - extb[i] * tempa[i];
-            b2f[s] += gte[i] * extb[i];
-        }
-    }
-
+    let hes_gamma = (n_cells as f64) / gamma - 2.0 * sum_tempa + sum_gt;
     let mut hes_gamma_beta = vec![0.0; nb];
     for j in 0..nb {
         let mut a = 0.0;
@@ -913,7 +1036,6 @@ fn evaluate(
         hes_gamma_beta[j] = a - b;
     }
     let hes_sigma_gamma: f64 = (0..k).map(|s| apm[s] * hb2_f[s]).sum();
-
     for j in 0..nb {
         let mut a = 0.0;
         let mut b = 0.0;
@@ -925,30 +1047,18 @@ fn evaluate(
     }
     hes_sigma += (0..k).map(|s| b2f[s] * apm[s] * apm[s]).sum::<f64>();
 
-    // ---------- //
-    // beta block //
-    // ---------- //
     let ymu2: Vec<f64> = ymustar.iter().map(|v| v * v).collect();
     let ymuymuimu: Vec<f64> = (0..k).map(|s| ymu2[s] * imustar[s]).collect();
     let b2f_scaled: Vec<f64> = (0..k).map(|s| b2f[s] * ymuymuimu[s] * imustar[s]).collect();
     let ymmd_imu: Vec<f64> = (0..k).map(|s| ymm_d[s] * imustar[s]).collect();
-
     for p in 0..nb {
         for q in p..nb {
             let mut acc = 0.0;
             for s in 0..k {
-                let mut s_gstar = 0.0;
-                let mut s_gte = 0.0;
-                let mut s_plain = 0.0;
-                for i in fid[s]..fid[s + 1] {
-                    let cell = xexb[i * nb + p] * data.design[i * nb + q];
-                    s_gstar += cell * gstar[i];
-                    s_gte += cell * gte[i];
-                    s_plain += cell;
-                }
-                acc -= s_gstar * ymustar[s];
-                acc += s_gte * ymu2[s];
-                acc += ymm_d[s] * s_plain;
+                let at = s * nn + p * nb + q;
+                acc -= block_g[at] * ymustar[s];
+                acc += block_gte[at] * ymu2[s];
+                acc += ymm_d[s] * block_plain[at];
             }
             for s in 0..k {
                 let xf_p = xexb_f[s * nb + p];

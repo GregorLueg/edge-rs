@@ -64,7 +64,7 @@ use crate::sc::pml::{
 };
 use crate::sc::ptmg::{
     GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
-    positive_indices, ptmg_value_and_gradient_with,
+    positive_indices, ptmg_value_and_gradient_with, ptmg_value_gradient_hessian_with,
 };
 use crate::sc::test::packed_len;
 use crate::sc::zeros::ZeroCells;
@@ -140,6 +140,21 @@ const STAGE_ONE_FTOL: f64 = 1e-13;
 
 /// Projected gradient tolerance for the stage-one quasi-Newton.
 const STAGE_ONE_PGTOL: f64 = 1e-7;
+
+/// Iteration budget for the stage-one projected Newton. It converges in ten
+/// or so; one that has not by this point falls back to the quasi-Newton.
+const STAGE_ONE_NEWTON_MAX_ITER: usize = 50;
+
+/// Sufficient-decrease constant of the stage-one Newton line search.
+const STAGE_ONE_ARMIJO: f64 = 1e-4;
+
+/// Step halvings before a stage-one Newton iteration gives up.
+const STAGE_ONE_MAX_HALVINGS: usize = 40;
+
+/// First Levenberg shift, relative to the largest free diagonal, when the
+/// free block of the Hessian is not positive definite; it grows tenfold until
+/// the Cholesky factor exists.
+const STAGE_ONE_SHIFT: f64 = 1e-8;
 
 /// Iteration budget for the stage-one quasi-Newton.
 const STAGE_ONE_MAX_ITER: usize = 300;
@@ -1024,9 +1039,15 @@ fn fit_gene(
 
 /// Minimises the marginal negative log-likelihood over `[beta, sigma, phi]`.
 ///
-/// nebula's stage one: one call to [`minimise`] with an exact gradient. `sigma`
-/// runs to its lower bound on most genes; see the `max_feasible_step` note in
-/// `numeric::lbfgsb`.
+/// nebula's stage one, an L-BFGS on an exact gradient. Here a dense design
+/// takes a projected Newton step on the exact Hessian instead, which costs
+/// about one gradient evaluation and converges in ten or so where the
+/// quasi-Newton takes 35 to 120 evaluations; both land on the same optimum, to
+/// the quasi-Newton's own tolerance. A design with zero-count tables keeps the
+/// quasi-Newton: its gradient walks only the positive counts, the Hessian every
+/// cell. A Newton search that has not converged falls back to the
+/// quasi-Newton. `sigma` runs to its lower bound on most genes; see the
+/// `max_feasible_step` note in `numeric::lbfgsb`.
 ///
 /// No quadratic polish, unlike [`refine_variance`]: the objective is smooth, and
 /// the stencil costs `3^(n_coef + 2)` evaluations. The remainder is inside
@@ -1063,6 +1084,13 @@ fn minimise_marginal(
         return (best, true);
     }
 
+    if zeros.is_none()
+        && let Some((x, f)) = newton_marginal(gene, &mut scratch, &best, lower, upper)
+        && f < best_f
+    {
+        return (x, false);
+    }
+
     let params = LbfgsbParams {
         ftol: STAGE_ONE_FTOL,
         pgtol: STAGE_ONE_PGTOL,
@@ -1087,6 +1115,106 @@ fn minimise_marginal(
     }
 
     (best, false)
+}
+
+/// Projected Newton on the marginal likelihood, inside the box.
+///
+/// Coordinates on a bound with the gradient pushing outwards are held; the
+/// rest take a Newton step on their block of the exact Hessian, shifted
+/// Levenberg-style until it factors, then an Armijo backtracking along the
+/// projected path. Stops when the projected gradient is under
+/// [`STAGE_ONE_PGTOL`] or a step improves the objective by less than
+/// [`STAGE_ONE_FTOL`] relative, the quasi-Newton's own tests.
+///
+/// ### Params
+///
+/// * `gene` - The gene
+/// * `scratch` - Its dense buffers
+/// * `x0` - Starting point, inside the box
+/// * `lower` - Lower bounds
+/// * `upper` - Upper bounds
+///
+/// ### Returns
+///
+/// The minimiser and its value, or `None` if the search stalled or ran out of
+/// iterations.
+fn newton_marginal(
+    gene: &GeneData<'_>,
+    scratch: &mut PtmgScratch<'_>,
+    x0: &[f64],
+    lower: &[f64],
+    upper: &[f64],
+) -> Option<(Vec<f64>, f64)> {
+    let n = x0.len();
+    let mut x = x0.to_vec();
+    let (mut f, mut g, mut h) = ptmg_value_gradient_hessian_with(gene, &x, scratch);
+    if !f.is_finite() {
+        return None;
+    }
+    for _ in 0..STAGE_ONE_NEWTON_MAX_ITER {
+        let projected = (0..n)
+            .map(|i| ((x[i] - g[i]).clamp(lower[i], upper[i]) - x[i]).abs())
+            .fold(0.0f64, f64::max);
+        if projected < STAGE_ONE_PGTOL {
+            return Some((x, f));
+        }
+
+        let free: Vec<usize> = (0..n)
+            .filter(|&i| !((x[i] <= lower[i] && g[i] > 0.0) || (x[i] >= upper[i] && g[i] < 0.0)))
+            .collect();
+        let m = free.len();
+        let rhs: Vec<f64> = free.iter().map(|&i| -g[i]).collect();
+        let largest = free
+            .iter()
+            .fold(0.0f64, |acc, &i| acc.max(h[i * n + i].abs()));
+        let mut shift = 0.0;
+        let step_free = loop {
+            let mut block = vec![0.0; m * m];
+            for (p, &i) in free.iter().enumerate() {
+                for (q, &j) in free.iter().enumerate() {
+                    block[p * m + q] = h[i * n + j];
+                }
+                block[p * m + p] += shift;
+            }
+            if let Some(d) = cholesky_solve(&block, m, &rhs) {
+                break d;
+            }
+            shift = if shift == 0.0 {
+                STAGE_ONE_SHIFT * largest.max(1.0)
+            } else {
+                shift * 10.0
+            };
+            if !shift.is_finite() {
+                return None;
+            }
+        };
+        let mut d = vec![0.0; n];
+        for (p, &i) in free.iter().enumerate() {
+            d[i] = step_free[p];
+        }
+
+        let mut alpha = 1.0;
+        let mut accepted = None;
+        for _ in 0..STAGE_ONE_MAX_HALVINGS {
+            let xt: Vec<f64> = (0..n)
+                .map(|i| (x[i] + alpha * d[i]).clamp(lower[i], upper[i]))
+                .collect();
+            let decrease: f64 = (0..n).map(|i| g[i] * (xt[i] - x[i])).sum();
+            let (ft, gt, ht) = ptmg_value_gradient_hessian_with(gene, &xt, scratch);
+            if ft.is_finite() && ft <= f + STAGE_ONE_ARMIJO * decrease {
+                accepted = Some((xt, ft, gt, ht));
+                break;
+            }
+            alpha *= 0.5;
+        }
+        let (xt, ft, gt, ht) = accepted?;
+        let done = (f - ft) <= STAGE_ONE_FTOL * f.abs();
+        (x, f, g, h) = (xt, ft, gt, ht);
+        if done {
+            return Some((x, f));
+        }
+    }
+    None
 }
 
 ////////////////////////
