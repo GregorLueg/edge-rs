@@ -37,6 +37,11 @@
 //! reproducibility floor: re-running nebula's optimisers to a tolerance of
 //! `1e-14` moves its answers by as much.
 //!
+//! Clamping a simplex into the box can collapse it onto a bound it cannot
+//! leave, where BOBYQA would come back. A simplex that ends on a bound the start
+//! was inside is therefore restarted once from between the two, and the better
+//! minimiser kept.
+//!
 //! Stage one has an exact gradient and no jitter, so it is one call to
 //! [`minimise`] and lands on the reference optimum.
 //!
@@ -1260,6 +1265,27 @@ enum SearchStage {
     Done,
 }
 
+/// A Nelder-Mead simplex over the variance components from `x0`.
+///
+/// ### Params
+///
+/// * `x0` - Starting point, inside the box
+///
+/// ### Returns
+///
+/// The stepper, asking for `x0`.
+fn variance_simplex(x0: &[f64]) -> NelderMeadStepper {
+    NelderMeadStepper::new(
+        x0,
+        Some(NelderMeadParams {
+            xatol: VARIANCE_XATOL,
+            fatol: VARIANCE_FATOL,
+            max_iter: VARIANCE_MAX_ITER,
+        }),
+    )
+    .expect("the variance components are never empty")
+}
+
 /// nebula's stage two over the variance components, as a reverse-communication
 /// state machine.
 ///
@@ -1304,6 +1330,11 @@ pub(crate) struct StageTwoSearch {
     offsets: Vec<Vec<f64>>,
     /// The minimiser once [`SearchStage::Done`], `None` if nothing was finite.
     found: Option<Vec<f64>>,
+    /// Whether this pass's simplex has already been restarted off a bound.
+    restarted: bool,
+    /// The first simplex's clamped minimiser and its value, while the restart
+    /// runs.
+    pinned: Option<(Vec<f64>, f64)>,
 }
 
 impl StageTwoSearch {
@@ -1334,6 +1365,8 @@ impl StageTwoSearch {
             step: Vec::new(),
             offsets: Vec::new(),
             found: None,
+            restarted: false,
+            pinned: None,
         };
         search.begin_pass();
         search
@@ -1378,16 +1411,7 @@ impl StageTwoSearch {
                     return;
                 }
                 let x0 = self.clamped(&self.start);
-                let stepper = NelderMeadStepper::new(
-                    &x0,
-                    Some(NelderMeadParams {
-                        xatol: VARIANCE_XATOL,
-                        fatol: VARIANCE_FATOL,
-                        max_iter: VARIANCE_MAX_ITER,
-                    }),
-                )
-                .expect("the variance components are never empty");
-                self.simplex = Some(stepper);
+                self.simplex = Some(variance_simplex(&x0));
                 self.stage = SearchStage::NelderMead;
                 self.ask_simplex();
             }
@@ -1445,6 +1469,8 @@ impl StageTwoSearch {
     /// Starts a pass at the current order from the starting point.
     fn begin_pass(&mut self) {
         self.invalid = false;
+        self.restarted = false;
+        self.pinned = None;
         self.simplex = None;
         self.stage = SearchStage::Start;
         self.asked = vec![self.clamped(&self.start)];
@@ -1467,17 +1493,65 @@ impl StageTwoSearch {
     }
 
     /// Asks for the simplex's next point, clamped, or moves on when it is done.
+    ///
+    /// A simplex that ends on a bound the start was inside is restarted once
+    /// from [`Self::restart_point`], and the better of the two minimisers kept.
+    /// Clamping collapses a simplex whose step overshoots a bound onto that
+    /// bound, and it cannot leave again: on `sc_cat_hl` gene 3 the first run
+    /// pinned the subject variance at `1e-4` with an objective `0.071` above
+    /// nebula's interior minimum at `1.77e-2`.
     fn ask_simplex(&mut self) {
         let simplex = self.simplex.as_ref().expect("in the simplex stage");
         if let Some(x) = simplex.ask() {
             self.asked = vec![self.clamped(x)];
             return;
         }
-        let best = self.clamped(&simplex.result().x);
+        let result = simplex.result();
+        let mut best = self.clamped(&result.x);
+        if !self.restarted
+            && let Some(x0) = self.restart_point(&best)
+        {
+            self.restarted = true;
+            self.pinned = Some((best, result.f));
+            self.simplex = Some(variance_simplex(&x0));
+            self.ask_simplex();
+            return;
+        }
+        if let Some((first, f)) = self.pinned.take()
+            && f <= result.f
+        {
+            best = first;
+        }
         self.best = best.clone();
         self.simplex = None;
         self.stage = SearchStage::Check;
         self.asked = vec![best];
+    }
+
+    /// Where to restart a simplex that ended on a bound.
+    ///
+    /// ### Params
+    ///
+    /// * `best` - The first simplex's clamped minimiser
+    ///
+    /// ### Returns
+    ///
+    /// `best` with every coordinate on a bound the start was strictly inside
+    /// moved to the geometric mean of that bound and the start, or `None` when
+    /// no coordinate is on such a bound.
+    fn restart_point(&self, best: &[f64]) -> Option<Vec<f64>> {
+        let start = self.clamped(&self.start);
+        let mut x0 = best.to_vec();
+        let mut moved = false;
+        for j in 0..best.len() {
+            for bound in [self.lower[j], self.upper[j]] {
+                if best[j] == bound && start[j] != bound {
+                    x0[j] = (bound * start[j]).sqrt();
+                    moved = true;
+                }
+            }
+        }
+        moved.then_some(x0)
     }
 
     /// Builds the next polish stencil, or finishes the pass after the last.

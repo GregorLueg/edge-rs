@@ -1049,8 +1049,15 @@ if (!file.exists(file.path(DATA_DIR, "sc_small_counts.csv"))) {
 # genes. The design is written whole, intercept first, then the subject-level
 # columns (the first a 0/1 group), then the cell-level ones. `off_mu = NULL`
 # means no offset at all.
+#
+# `cat` replaces the continuous cell-level columns with a cell type: `p` its
+# level probabilities, coded as indicators of every level but the first, and
+# `confine` the subjects the last level is allowed in. Cells then share design
+# rows within a subject, which is what the CPU kernels' zero-count tables need.
+# `off_sd` spreads the offsets and `size_inv` sets the range of `1 / size`.
 make_sc_edge <- function(seed, ng, sizes, n_subj_cov, n_cell_cov, base_lo,
-                         base_hi, off_mu, plant = FALSE) {
+                         base_hi, off_mu, plant = FALSE, cat = NULL,
+                         off_sd = 0.3, size_inv = c(0.5, 3)) {
   set.seed(seed)
   nsub <- length(sizes)
   nc <- sum(sizes)
@@ -1058,19 +1065,26 @@ make_sc_edge <- function(seed, ng, sizes, n_subj_cov, n_cell_cov, base_lo,
 
   subj <- matrix(round(rnorm(nsub * n_subj_cov), 8), nsub, n_subj_cov)
   if (n_subj_cov >= 1) subj[, 1] <- rep(0:1, length.out = nsub)
-  cell <- matrix(round(rnorm(nc * n_cell_cov), 8), nc, n_cell_cov)
+  if (is.null(cat)) {
+    cell <- matrix(round(rnorm(nc * n_cell_cov), 8), nc, n_cell_cov)
+  } else {
+    lv <- length(cat$p)
+    type <- sample.int(lv, nc, replace = TRUE, prob = cat$p)
+    if (!is.null(cat$confine)) type[type == lv & !(id %in% cat$confine)] <- 1L
+    cell <- sapply(2:lv, function(l) as.numeric(type == l))
+  }
   x <- cbind(1, subj[id, , drop = FALSE], cell)
   nb <- ncol(x)
 
   beta <- cbind(log(2^runif(ng, base_lo, base_hi)),
                 matrix(rnorm(ng * (nb - 1), 0, 0.3), ng, nb - 1))
   re <- matrix(rnorm(ng * nsub, 0, 0.3), ng, nsub)
-  sf <- if (is.null(off_mu)) rep(1, nc) else round(exp(rnorm(nc, log(off_mu), 0.3)))
+  sf <- if (is.null(off_mu)) rep(1, nc) else round(exp(rnorm(nc, log(off_mu), off_sd)))
   scale <- if (is.null(off_mu)) 1 else off_mu
 
   eta <- beta %*% t(x) + re[, id]
   mu <- exp(eta) * rep(sf / scale, each = ng)
-  phi <- 1 / runif(ng, 0.5, 3)
+  phi <- 1 / runif(ng, size_inv[1], size_inv[2])
   cnt <- matrix(rnbinom(ng * nc, mu = as.vector(mu), size = rep(phi, nc)), ng, nc)
 
   # Planted: one gene silent in the third subject, two at a low enough mean to
@@ -1104,13 +1118,31 @@ SC_EDGE <- list(
   # only non-intercept columns are constant within subjects, so every design
   # wider than one carries a cell-level column.
   list(tag = "sc_high", seed = 20260927, sizes = rep(50, 10), subj = 1,
-       cell = 1, lo = 10, hi = 13, off = 5000, plant = FALSE, method = "HL")
+       cell = 1, lo = 10, hi = 13, off = 5000, plant = FALSE, method = "HL"),
+  # Categorical cell types, so the CPU kernels sum the zero counts from tables.
+  # LN over uneven subjects, offsets spread over two orders of magnitude.
+  list(tag = "sc_cat_ln", seed = 20261007,
+       sizes = c(60, 90, 150, 220, 300, 75, 110, 400), subj = 1, cell = 0,
+       lo = -4, hi = 3, off = 2000, plant = TRUE, method = "LN",
+       cat = list(p = c(0.55, 0.3, 0.15)), off_sd = 0.8),
+  # HL, one subject fifteen times the smallest, heavy overdispersion, and a
+  # rare type confined to three subjects whose groups are too small to table.
+  list(tag = "sc_cat_hl", seed = 20261008, sizes = c(35, 45, 600, 40, 250, 38),
+       subj = 1, cell = 0, lo = -5, hi = 2, off = 1000, plant = TRUE,
+       method = "HL", cat = list(p = c(0.7, 0.25, 0.05), confine = 1:3),
+       off_sd = 0.6, size_inv = c(3, 10)),
+  # HL at means low enough for the third-order Laplace correction throughout.
+  list(tag = "sc_cat_sparse", seed = 20261009, sizes = rep(150, 6), subj = 1,
+       cell = 0, lo = -7, hi = -3, off = 1000, plant = FALSE, method = "HL",
+       cat = list(p = c(0.5, 0.5)), off_sd = 0.5)
 )
 
 for (e in SC_EDGE) {
   if (!file.exists(file.path(DATA_DIR, paste0(e$tag, "_counts.csv")))) {
     s <- make_sc_edge(e$seed, 30L, e$sizes, e$subj, e$cell, e$lo, e$hi,
-                      e$off, e$plant)
+                      e$off, e$plant, e$cat,
+                      if (is.null(e$off_sd)) 0.3 else e$off_sd,
+                      if (is.null(e$size_inv)) c(0.5, 3) else e$size_inv)
     write_int(s$counts, paste0(e$tag, "_counts.csv"),
               paste0("c", seq_len(ncol(s$counts))))
     write_num(cbind(subject = s$id, offset = s$sf), paste0(e$tag, "_meta.csv"),
@@ -1177,6 +1209,8 @@ if (requireNamespace("nebula", quietly = TRUE)) {
   for (e in SC_EDGE) {
     x <- read_num(paste0(e$tag, "_design.csv"))
     colnames(x) <- NULL
+    # An all-integer design reads back as integer, which nebula's C++ rejects.
+    storage.mode(x) <- "double"
     r <- run_sc(e$tag, paste0(e$tag, "_counts.csv"), paste0(e$tag, "_meta.csv"),
                 pred = x, method = e$method, use_offset = !is.null(e$off),
                 names = seq_len(ncol(x)))

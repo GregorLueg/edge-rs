@@ -23,6 +23,17 @@
 //! * `sc_wide`: eight columns (the kernel's cap), 40 subjects of 12 cells.
 //! * `sc_high`: means of `1e3` to `1e4` on offsets around `5e3`.
 //!
+//! Three more have a categorical cell type in place of the continuous
+//! cell-level column, so the CPU kernels sum the zero counts from tables:
+//!
+//! * `sc_cat_ln`: LN over eight subjects of 60 to 400 cells, offsets over two
+//!   orders of magnitude, the planted genes.
+//! * `sc_cat_hl`: HL, one subject fifteen times the smallest, `1 / size` of 3
+//!   to 10, and a rare type in three subjects whose groups are too small to
+//!   table, so tabled and swept cells mix.
+//! * `sc_cat_sparse`: HL at means low enough for the third-order Laplace
+//!   correction.
+//!
 //! The in-crate golden is eight genes at 25 cells per subject: it reaches HL
 //! only, and LN only through a relabelling trick on the same 150 cells.
 //!
@@ -184,14 +195,14 @@ const CPU_TOLS: NebulaTols = NebulaTols {
 ///   near-Poisson. Needs `3.2e-5` on the coefficients, `1.4e-3` absolute on the
 ///   cell overdispersion, and a p-value `1.2e-2` off at `p = 6e-238`, which the
 ///   `1e-12` floor absorbs.
-/// * `sc_high`: one HL gene, `gene_id` 6, where this crate pins `sigma^2` at
-///   `1e-4` and R stops at `5.0e-3`. Worst absolute needs, CPU and GPU alike:
-///   coefficients `6.8e-3`, standard errors `7.8e-3`, `sigma^2` `4.9e-3`,
-///   covariance `2.0e-3`, p-values `5.9e-3` (0.011 against 0.017), and `1.8e-3`
-///   relative on the cell overdispersion. The other high-count genes need up to
-///   `1.7e-4` relative on the coefficients, well inside the floor.
+/// * `sc_cat_ln`: the same planted near-Poisson gene, `gene_id` 29, where R
+///   stops at `phi = 322`. Needs `5.6e-4` on the coefficients and on
+///   `sigma^2`, and `2.1e-3` absolute on the cell overdispersion.
+/// * `sc_high`: means of `1e3` to `1e4`. Needs `1.7e-4` on the coefficients,
+///   `4.4e-4` on `sigma^2` and `2.2e-3` on a covariance entry of `2.7e-7`.
 ///
-/// Neither gene is settled as a port fault or an R one.
+/// The `sc_blocks` and `sc_cat_ln` gene is not settled as a port fault or an R
+/// one.
 ///
 /// ### Params
 ///
@@ -209,13 +220,16 @@ fn tols(tag: &str, base: NebulaTols) -> NebulaTols {
             p_value: Tol::new(base.p_value.max_relative, 1e-12),
             ..base
         },
+        "sc_cat_ln" => NebulaTols {
+            coef: Tol::new(base.coef.max_relative.max(1e-3), base.coef.epsilon),
+            subject: Tol::new(base.subject.max_relative.max(1e-3), base.subject.epsilon),
+            cell: Tol::new(base.cell.max_relative, 3e-3),
+            ..base
+        },
         "sc_high" => NebulaTols {
-            coef: Tol::new(base.coef.max_relative, 1.5e-2),
-            se: Tol::new(base.se.max_relative, 1.5e-2),
-            cov: Tol::new(base.cov.max_relative, 5e-3),
-            subject: Tol::new(base.subject.max_relative, 1e-2),
-            cell: Tol::new(base.cell.max_relative.max(5e-3), base.cell.epsilon),
-            p_value: Tol::new(base.p_value.max_relative, 1.5e-2),
+            coef: Tol::new(base.coef.max_relative.max(5e-4), base.coef.epsilon),
+            subject: Tol::new(base.subject.max_relative.max(5e-4), base.subject.epsilon),
+            cov: Tol::new(base.cov.max_relative.max(3e-3), base.cov.epsilon),
             ..base
         },
         _ => base,
@@ -252,7 +266,7 @@ const NAMES_SC: &[&str] = &["int", "grp", "cov2"];
 const NAMES_EDGE: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
 
 /// Every single-cell dataset. `sc` is first; single-set tests read it by index.
-const DATASETS: [Dataset; 7] = [
+const DATASETS: [Dataset; 10] = [
     Dataset {
         tag: "sc",
         method: NebulaMethod::Ln,
@@ -303,6 +317,30 @@ const DATASETS: [Dataset; 7] = [
     },
     Dataset {
         tag: "sc_high",
+        method: NebulaMethod::Hl,
+        expect_ln: true,
+        has_offset: true,
+        names: NAMES_EDGE.split_at(3).0,
+        design_file: true,
+    },
+    Dataset {
+        tag: "sc_cat_ln",
+        method: NebulaMethod::Ln,
+        expect_ln: true,
+        has_offset: true,
+        names: NAMES_EDGE.split_at(4).0,
+        design_file: true,
+    },
+    Dataset {
+        tag: "sc_cat_hl",
+        method: NebulaMethod::Hl,
+        expect_ln: true,
+        has_offset: true,
+        names: NAMES_EDGE.split_at(4).0,
+        design_file: true,
+    },
+    Dataset {
+        tag: "sc_cat_sparse",
         method: NebulaMethod::Hl,
         expect_ln: true,
         has_offset: true,
@@ -393,7 +431,7 @@ fn load(d: &Dataset) -> Loaded {
 ///
 /// The fit.
 fn cpu_fit(i: usize) -> &'static NebulaFit {
-    static FITS: [OnceLock<NebulaFit>; DATASETS.len()] = [const { OnceLock::new() }; 7];
+    static FITS: [OnceLock<NebulaFit>; DATASETS.len()] = [const { OnceLock::new() }; DATASETS.len()];
     FITS[i].get_or_init(|| {
         let d = &DATASETS[i];
         let l = load(d);
@@ -713,8 +751,6 @@ fn s_pinned(tag: &str, s: &common::Scalars) -> usize {
     match tag {
         "sc" => 18,
         "sc_small" => 40,
-        // R's `n_pinned` is 0; this crate also pins gene 6, see `tols`.
-        "sc_high" => 1,
         _ => s.get_usize(tag, "n_pinned"),
     }
 }
