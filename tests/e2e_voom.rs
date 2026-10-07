@@ -326,7 +326,7 @@ fn test_squeeze_var_on_voom_variances_matches_limma() {
         );
 
         // Robust. The reference is limma with its uniroot converged past its own
-        // default, per UPSTREAM_DEVIATIONS.md entry 12; on this data the branch
+        // default, per UPSTREAM_DEVIATIONS.md B2; on this data the branch
         // that uses uniroot is not reached, which the generator records.
         let params = SqueezeVarParams {
             robust: true,

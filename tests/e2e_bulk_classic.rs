@@ -538,7 +538,7 @@ fn test_ave_log_cpm_matches_edger() {
         );
 
         // The offset form. Vector offsets only: a matrix offset would hit
-        // UPSTREAM_DEVIATIONS.md entry 11, where edgeR corrupts the first gene.
+        // UPSTREAM_DEVIATIONS.md B1, where edgeR corrupts the first gene.
         let offset = Recycled::by_sample(l.offset.clone());
         let got = ave_log_cpm(
             &l.kept_counts,

@@ -197,7 +197,7 @@ fn residual_deviance<T: EdgeFloat>(
 /// Note that edgePython's version takes a different branch when the offsets
 /// arrive as a matrix, which is exactly how `glmFit` passes them, and ends up
 /// with `log(lib + 2 * prior)` instead of `log(lib + 2 * prior * lib / mean)`.
-/// See `UPSTREAM_DEVIATIONS.md` entry 6. This follows edgeR.
+/// See `UPSTREAM_DEVIATIONS.md` A5. This follows edgeR.
 ///
 /// ### Params
 ///

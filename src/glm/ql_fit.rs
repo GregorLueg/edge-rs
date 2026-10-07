@@ -664,7 +664,7 @@ mod tests {
         // matrix form used for the deviances above. The two describe the same
         // model and edgeR agrees with itself on everything up to this point,
         // but its internal `aveLogCPM` corrupts the first gene when the offset
-        // arrives as a matrix (`UPSTREAM_DEVIATIONS.md` entry 11), which throws
+        // arrives as a matrix (`UPSTREAM_DEVIATIONS.md` B1), which throws
         // the trended prior for every gene. Feeding limma's own `squeezeVar`
         // the matrix-offset covariate reproduces edgeR's wrong answer exactly,
         // and the vector-offset covariate reproduces this one, which is what

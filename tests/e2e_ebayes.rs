@@ -29,7 +29,7 @@ use edge_rs::limma::voom::voom_lmfit;
 // `fitFDistUnequalDF1`, which maximises a very flat likelihood with R's
 // `optimize` at its default `tol` of 1.2e-4. That lands `df.prior` at 1.4e-8
 // relative, and everything downstream inherits it, amplified by however
-// steeply it enters. `docs/UPSTREAM_DEVIATIONS.md` entry 12 has the detail.
+// steeply it enters. `docs/UPSTREAM_DEVIATIONS.md` B2 has the detail.
 
 /// Moderated t: a coefficient over `stdev.unscaled * sqrt(s2.post)`. Two
 /// divisions on top of quantities `e2e_voom.rs` already gates, so it tracks

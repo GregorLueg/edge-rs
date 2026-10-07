@@ -36,7 +36,7 @@
 //! [`crate::limma::lowess::weighted_lowess`] so that the residual degrees of
 //! freedom can act as prior weights. Both are reproduced here exactly as
 //! dispatched upstream. edgePython uses `weightedLowess` unconditionally, which
-//! is entry 1 of the deviations listed in the [`voom`] documentation.
+//! is the first deviation listed on [`voom`] and A13 in `UPSTREAM_DEVIATIONS.md`.
 //!
 //! Genes are the parallel axis: the log-CPM transform and the weight lookup are
 //! rayon fan-outs over contiguous gene rows.
@@ -227,7 +227,7 @@ pub struct VoomResult {
 /// `UPSTREAM_DEVIATIONS.md`.
 ///
 /// * edgePython always smooths with `weightedLowess`; limma's `voom` always
-///   uses `stats::lowess`. This is the same class of mistake as entry 16 of
+///   uses `stats::lowess`. This is the same class of mistake as A11 in
 ///   `UPSTREAM_DEVIATIONS.md`, which cost 7e-4 on the quasi-likelihood prior.
 /// * edgePython uses `npts = 120` and three iterations for the unweighted
 ///   smooth, neither of which is a limma default.

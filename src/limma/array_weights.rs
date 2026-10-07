@@ -38,7 +38,7 @@
 //! reproduced here step for step, because the answer depends on where it stops.
 //!
 //! edgePython replaces all of that with a one-way ANOVA moment estimator. See
-//! the note on [`duplicate_correlation`] and `UPSTREAM_DEVIATIONS.md`.
+//! the note on [`duplicate_correlation`] and `UPSTREAM_DEVIATIONS.md` A14.
 //!
 //! ### No scalar optimiser
 //!

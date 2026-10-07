@@ -10,7 +10,7 @@
 //! `sqrt(sum(se^2 c^2))`, which silently assumes `V` is diagonal. It has no
 //! choice, because its fit discards everything but the diagonal. The error runs
 //! in either direction depending on the sign of the covariance, so it is not
-//! even conservative. See `UPSTREAM_DEVIATIONS.md` entry 2.
+//! even conservative. See `UPSTREAM_DEVIATIONS.md` A19.
 //!
 //! This crate keeps the full covariance per gene, so contrasts are correct. The
 //! R package supports the same through `covariance = TRUE`, which is what the

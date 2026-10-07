@@ -774,7 +774,7 @@ run_voom("unbal", unbal$yf$counts, unbal_des)
 # eBayes reaches squeezeVar through the non-exported .ebayes, so the converged
 # root-finder has to be injected one level deeper than for estimateDisp and
 # glmQLFit. Same reason as tightED/tightQL above, and the same deviation
-# (docs/UPSTREAM_DEVIATIONS.md, entry 12).
+# (docs/UPSTREAM_DEVIATIONS.md, B2).
 tightEB0 <- shadow(limma:::.ebayes, "squeezeVar", tightS)
 tightEB <- shadow(limma::eBayes, ".ebayes", tightEB0)
 
