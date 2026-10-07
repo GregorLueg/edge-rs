@@ -1,17 +1,15 @@
 //! Box-constrained limited-memory BFGS.
 //!
-//! NEBULA's first stage is a bounded marginal maximum likelihood fit, which
-//! edgePython hands to `scipy.optimize.minimize(method = 'L-BFGS-B', jac = True)`.
-//! That routine is Nocedal's Fortran, and binding it would put a Fortran
-//! toolchain on the Windows CI lane, so it is reimplemented here.
+//! Replaces `scipy.optimize.minimize(method = 'L-BFGS-B', jac = True)`, which
+//! edgePython uses for NEBULA's bounded marginal likelihood fit. Binding
+//! Nocedal's Fortran would need a Fortran toolchain on the Windows CI lane.
 //!
-//! This follows Byrd, Lu, Nocedal and Zhu (1995): the compact limited-memory
-//! representation `B = theta*I - W M W'`, a generalised Cauchy point to identify
-//! the active set, then subspace minimisation over the free variables. The one
-//! deliberate departure from the Fortran is the line search, which is the
-//! cubic-interpolation strong Wolfe search of Nocedal and Wright (Algorithm 3.5
-//! and 3.6) rather than More and Thuente's `dcsrch`. Both satisfy the same
-//! conditions; iterates can differ in the last digits, optima do not.
+//! Follows Byrd, Lu, Nocedal and Zhu (1995): compact representation
+//! `B = theta*I - W M W'`, generalised Cauchy point to find the active set, then
+//! subspace minimisation over the free variables. The one departure from the
+//! Fortran is the line search: cubic-interpolation strong Wolfe (Nocedal and
+//! Wright, Algorithms 3.5 and 3.6) instead of More and Thuente's `dcsrch`.
+//! Iterates can differ in the last digits, optima do not.
 //!
 //! ### References
 //!
@@ -26,28 +24,23 @@ use crate::errors::EdgeErrors;
 
 /// Armijo parameter for the sufficient decrease condition.
 ///
-/// The value both Nocedal and Wright and the Fortran use. It is deliberately
-/// tiny: sufficient decrease is meant to rule out pathological steps, not to
-/// drive the search.
+/// The value Nocedal and Wright and the Fortran use.
 const WOLFE_C1: f64 = 1e-4;
 
 /// Curvature parameter for the strong Wolfe condition.
 ///
-/// 0.9 is the standard quasi-Newton choice. Tightening it buys nothing here
-/// because the unit step is accepted on nearly every iteration.
+/// 0.9 is the standard quasi-Newton choice.
 const WOLFE_C2: f64 = 0.9;
 
 /// Minimum curvature for a memory pair to be admitted.
 ///
-/// A BFGS update needs `s'y > 0` to keep the Hessian approximation positive
-/// definite. Pairs failing this are dropped rather than damped, which is what
-/// the Fortran does.
+/// A BFGS update needs `s'y > 0` to stay positive definite. Failing pairs are
+/// dropped, not damped, as in the Fortran.
 const CURVATURE_EPS: f64 = 2.2e-16;
 
 /// Largest step the line search will consider.
 ///
-/// The subspace minimisation already truncates to the feasible box, so a unit
-/// step is the natural scale and anything far beyond it signals trouble.
+/// The subspace step is already truncated to the box, so the natural scale is 1.
 const MAX_STEP: f64 = 1e3;
 
 //////////////////
@@ -175,10 +168,8 @@ impl Memory {
 
     /// Discards every pair and returns `theta` to one.
     ///
-    /// The Fortran does this when the line search cannot make progress: a
-    /// limited-memory model built from steps taken elsewhere on the surface can
-    /// point somewhere the objective refuses to follow, and the cure is to
-    /// forget it and take a projected steepest-descent step instead.
+    /// The Fortran does this when the line search stalls: the model is stale,
+    /// so take a projected steepest-descent step instead.
     fn reset(&mut self) {
         self.s.clear();
         self.y.clear();
@@ -187,8 +178,7 @@ impl Memory {
 
     /// Admits a correction pair, evicting the oldest if full.
     ///
-    /// Pairs with insufficient curvature are rejected, which keeps the implied
-    /// Hessian positive definite.
+    /// Pairs with insufficient curvature are rejected.
     ///
     /// ### Params
     ///
@@ -262,8 +252,8 @@ impl Memory {
     /// Forms the middle matrix `M^{-1}` of the compact representation.
     ///
     /// Laid out as `[[-D, L'], [L, theta * S'S]]` with `D` the diagonal of
-    /// `s_i' y_i` and `L` strictly lower triangular with `L[i, j] = s_i' y_j`.
-    /// The routines below solve against this rather than inverting it.
+    /// `s_i' y_i` and `L` strictly lower triangular, `L[i, j] = s_i' y_j`.
+    /// Callers solve against it rather than inverting.
     ///
     /// ### Returns
     ///
@@ -332,9 +322,8 @@ impl Memory {
 
 /// Solves a small dense system by Gaussian elimination with partial pivoting.
 ///
-/// The systems here are `2k` by `2k` with `k` at most the memory size, so
-/// twenty by twenty at the default settings. A faer factorisation would be
-/// dominated by its own call overhead at that size.
+/// The systems are `2k` by `2k`, 20 by 20 at the default memory size, too small
+/// for a faer factorisation to pay off.
 ///
 /// ### Params
 ///
@@ -406,13 +395,11 @@ struct CauchyPoint {
     c: Vec<f64>,
 }
 
-/// Locates the generalised Cauchy point along the projected steepest descent
-/// path.
+/// Locates the generalised Cauchy point along the projected steepest descent path.
 ///
-/// Walks the piecewise-linear projected gradient path, tracking the first and
-/// second derivatives of the quadratic model segment by segment, and stops at
-/// the first segment whose interior minimiser falls inside it. Variables that
-/// hit a bound before then are fixed there.
+/// Walks the piecewise-linear path, tracking the model's first and second
+/// derivatives per segment, and stops at the first segment containing its
+/// minimiser. Variables that hit a bound earlier are fixed there.
 ///
 /// ### Params
 ///
@@ -546,10 +533,8 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// Minimises the quadratic model over the free variables, starting at the
 /// Cauchy point.
 ///
-/// Uses the direct primal method of the paper: form the reduced gradient at the
-/// Cauchy point, apply the inverse of the compact Hessian restricted to the
-/// free set through a Sherman-Morrison-Woodbury identity, then truncate the
-/// resulting step so the point stays inside the box.
+/// Direct primal method: reduced gradient at the Cauchy point, inverse compact
+/// Hessian on the free set via Sherman-Morrison-Woodbury, then truncate to the box.
 ///
 /// ### Params
 ///
@@ -862,8 +847,7 @@ where
     let mut evals = evals_so_far;
 
     for _ in 0..budget {
-        // Bisection is enough here: the bracket is already small and the extra
-        // robustness beats a cubic fit that can land outside the interval.
+        // Bisection: the bracket is small and a cubic fit can land outside it.
         let alpha = 0.5 * (alpha_lo + alpha_hi);
         if (alpha_hi - alpha_lo).abs() < 1e-16 {
             break;
@@ -1007,10 +991,9 @@ where
         let (x_new, f_new, grad_new, used) = match searched {
             Some(v) => v,
             None => {
-                // A line search that cannot make progress is usually the
-                // limited-memory model's fault, not the objective's. The
-                // Fortran throws the pairs away and retries from projected
-                // steepest descent, and only gives up if that fails too.
+                // A stalled line search is usually the model's fault. Like the
+                // Fortran, drop the pairs and retry from projected steepest
+                // descent; give up only if that fails too.
                 if mem.k() > 0 {
                     mem.reset();
                     continue;
@@ -1050,8 +1033,8 @@ where
 
 /// Infinity norm of the gradient projected onto the feasible box.
 ///
-/// This is the quantity scipy reports as `pgtol`: the gradient of the objective
-/// after removing the components pushing against an active bound.
+/// The quantity scipy tests against `pgtol`: the gradient with components
+/// pushing against an active bound removed.
 ///
 /// ### Params
 ///
@@ -1227,14 +1210,12 @@ mod tests {
         assert!(matches!(err, EdgeErrors::MustBePositive(_)));
     }
 
-    /// A negative binomial negative log-likelihood with a log link and a
-    /// quadratic random-effect penalty: the shape NEBULA's stage one actually
-    /// optimises, with the same box on the dispersion parameters.
+    /// NB negative log-likelihood with a log link and a quadratic random-effect
+    /// penalty: the shape of NEBULA's stage one, with the same box.
     ///
     /// Parameters are `[beta0, beta1, sigma, phi]`. At the optimum `sigma` and
-    /// `phi` are both driven onto their bounds, which is NEBULA's `-60`
-    /// convergence code, so this exercises the active set rather than a smooth
-    /// interior solve.
+    /// `phi` sit on their bounds (NEBULA's `-60` convergence code), so this
+    /// exercises the active set.
     fn nebula_shaped(p: &[f64], g: &mut [f64]) -> f64 {
         const N: usize = 60;
         let counts: Vec<f64> = (0..N)
@@ -1298,9 +1279,8 @@ mod tests {
         assert_relative_eq!(res.f, 0.516012646087, max_relative = 1e-8);
     }
 
-    /// Badly scaled and separable, with every coordinate's optimum on the upper
-    /// bound. The decay rates span three orders, so the search direction points
-    /// far outside the box on nearly every iteration.
+    /// Badly scaled and separable, every optimum on the upper bound. Decay rates
+    /// span three orders, so the direction points far outside the box.
     fn decaying(x: &[f64], g: &mut [f64]) -> f64 {
         const RATE: [f64; 4] = [1.0, 30.0, 300.0, 3000.0];
         let mut f = 0.0;
@@ -1314,11 +1294,10 @@ mod tests {
 
     /// Regression test for the line search running past the feasible step.
     ///
-    /// Without the `max_feasible_step` cap every trial point beyond the boundary
-    /// clamps to the same corner, so the objective flattens while the reported
-    /// directional derivative stays negative. The curvature condition can then
-    /// never be satisfied, the search spends its whole budget, and the driver
-    /// eventually reports a failed line search a long way from the optimum.
+    /// Without the `max_feasible_step` cap, trial points beyond the boundary
+    /// clamp to the same corner: the objective flattens while the directional
+    /// derivative stays negative, the curvature condition is never met, and the
+    /// driver reports a failed line search far from the optimum.
     #[test]
     fn test_search_stops_at_the_boundary_rather_than_past_it() {
         let lower = vec![0.0; 4];

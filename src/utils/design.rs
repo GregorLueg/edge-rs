@@ -1,13 +1,11 @@
 //! Design matrix inspection.
 //!
 //! Rank, estimability, leverage, and the factor construction that decides
-//! whether a GLM fit can take the cheap one-way path.
+//! whether a GLM fit can take the one-way path.
 //!
-//! Design matrices are `f64` throughout the crate, not generic over
-//! [`crate::prelude::EdgeFloat`]. They are `n_samples` by `n_coef`, so tens of
-//! values against count matrices of hundreds of millions, and making them
-//! generic would buy no memory while putting a rank decision at the mercy of
-//! `f32` rounding. edgeR is `f64` here and so is this.
+//! Designs are `f64`, not generic over [`crate::prelude::EdgeFloat`]: they are
+//! tiny, so `f32` would save no memory and put rank decisions at the mercy of
+//! rounding.
 //!
 //! Matrices are row-major: row `i` is `design[i * n_coef..(i + 1) * n_coef]`.
 
@@ -23,9 +21,8 @@ use crate::prelude::*;
 /// Multiplier edgeR uses to hash a design row down to one number.
 ///
 /// `designAsFactor` forms `sum_j design[i, j] * z^j` with `z = (e + pi) / 5`
-/// and treats rows sharing a value as the same group. The constant is arbitrary
-/// but must match edgeR exactly: it decides whether `glm_fit` takes the one-way
-/// path or the Levenberg path, and the two do not agree to the last digit.
+/// and groups rows sharing a value. Must match edgeR exactly: it decides
+/// between the one-way and Levenberg paths, which differ in the last digits.
 const FACTOR_HASH_BASE: f64 = (std::f64::consts::E + std::f64::consts::PI) / 5.0;
 
 /// limma's defaults for [`choose_lowess_span`]: `small_n`, `min_span`, `power`.
@@ -52,8 +49,8 @@ fn as_matrix(design: &[f64], n_rows: usize, n_cols: usize) -> Result<MatRef<'_, 
     Ok(MatRef::from_row_major_slice(design, n_rows, n_cols))
 }
 
-/// Checks that a row-major design's length matches its stated shape, and that
-/// the shape itself is non-degenerate.
+/// Checks that a row-major design's length matches its shape and both
+/// dimensions are positive.
 ///
 /// ### Params
 ///
@@ -85,8 +82,8 @@ fn validate_shape(len: usize, n_rows: usize, n_cols: usize) -> Result<(), EdgeEr
 
 /// Numerical rank of a design matrix.
 ///
-/// Counts singular values above `max(S) * max(n_rows, n_cols) * eps`, which is
-/// numpy's `matrix_rank` rule and therefore what edgePython compares against.
+/// Counts singular values above `max(S) * max(n_rows, n_cols) * eps`, numpy's
+/// `matrix_rank` rule.
 ///
 /// ### Params
 ///
@@ -128,8 +125,8 @@ pub fn is_full_rank(design: &[f64], n_rows: usize, n_cols: usize) -> Result<bool
 
 /// Coefficients that cannot be estimated from this design.
 ///
-/// Factorises the design and flags the columns whose diagonal entry of `R` is
-/// negligible. Port of limma's `nonEstimable`.
+/// Flags columns whose diagonal entry of `R` is negligible. Port of limma's
+/// `nonEstimable`.
 ///
 /// ### Params
 ///
@@ -173,10 +170,10 @@ pub fn non_estimable(
     }
 }
 
-/// Leverage of each sample, that is, the diagonal of the hat matrix.
+/// Leverage of each sample (the hat matrix diagonal).
 ///
-/// Computed as the row sums of squares of the thin `Q` factor, which avoids
-/// forming the `n_rows` by `n_rows` hat matrix.
+/// Row sums of squares of the thin `Q` factor, so the `n_rows` by `n_rows` hat
+/// matrix is never formed.
 ///
 /// ### Params
 ///
@@ -198,15 +195,12 @@ pub fn hat_diagonal(design: &[f64], n_rows: usize, n_cols: usize) -> Result<Vec<
 
 /// Groups samples by their design row.
 ///
-/// Reproduces edgeR's `designAsFactor`: hash each row to a single number with
-/// [`FACTOR_HASH_BASE`], then label the distinct values in ascending order.
-/// When the number of groups equals the number of coefficients, `glm_fit` can
-/// use the closed-form one-way fit instead of the iterative Levenberg one, so
-/// this is on the hot path for every bulk analysis.
+/// Port of edgeR's `designAsFactor`: hash each row with [`FACTOR_HASH_BASE`],
+/// then label the distinct values in ascending order. When the group count
+/// equals the coefficient count, `glm_fit` takes the closed-form one-way fit.
 ///
-/// Rows are matched on the exact `f64` hash, as in edgeR. Two rows that differ
-/// only by rounding therefore land in different groups, which is the intended
-/// conservative behaviour: the fallback path is correct, just slower.
+/// Rows match on the exact `f64` hash, as in edgeR, so rows differing by
+/// rounding land in different groups and fall back to the slower correct path.
 ///
 /// ### Params
 ///
@@ -259,8 +253,8 @@ pub fn design_as_factor(
 /// A design rewritten so that a contrast becomes a coefficient.
 #[derive(Clone, Debug)]
 pub struct ContrastDesign {
-    /// The reformed design, row-major `n_rows * n_cols`. Same shape as the
-    /// input and the same column span, just a different basis.
+    /// The reformed design, row-major `n_rows * n_cols`. Same shape and column
+    /// span as the input.
     pub design: Vec<f64>,
     /// Column indices holding the contrasts, in ascending order.
     pub coef: Vec<usize>,
@@ -268,18 +262,14 @@ pub struct ContrastDesign {
 
 /// Rewrites a design matrix so that a contrast becomes one of its coefficients.
 ///
-/// A likelihood ratio test drops the tested columns and refits, so testing an
-/// arbitrary contrast means first rotating the design until that contrast *is*
-/// a column. Port of limma's `contrastAsCoef`, which edgeR's `glmLRT` and
-/// `glmQLFTest` both go through whenever a contrast rather than a coefficient
-/// index is supplied.
+/// Port of limma's `contrastAsCoef`, used by edgeR's `glmLRT` and `glmQLFTest`
+/// when a contrast rather than a coefficient index is supplied.
 ///
-/// The rotation is `Q` from the QR factorisation of the contrast, followed by a
-/// triangular solve against `R` so the new coefficient reads as the contrast
-/// itself rather than a scaled version of it. Note that the sign of `Q` is not
-/// pinned down by the factorisation, but the contrast columns come out
-/// sign-invariant because the `R` solve carries the same sign; only the
-/// nuisance columns can flip, and their span, hence the fit, is unchanged.
+/// The rotation is `Q` from the QR of the contrast, then a triangular solve
+/// against `R` so the new coefficient is the contrast itself, not a multiple.
+/// The sign of `Q` is not pinned down, but the contrast columns are
+/// sign-invariant because the `R` solve carries the same sign. Only nuisance
+/// columns can flip, which leaves their span and the fit unchanged.
 ///
 /// ### Params
 ///
@@ -288,8 +278,8 @@ pub struct ContrastDesign {
 /// * `n_cols` - Number of coefficients
 /// * `contrast` - Column-major contrast, `n_cols * n_contrasts`
 /// * `n_contrasts` - Number of contrasts, usually one
-/// * `first` - Place the contrasts in the leading columns rather than the
-///   trailing ones. limma defaults to `true`; edgeR calls it with `false`.
+/// * `first` - Put the contrasts in the leading columns, not the trailing
+///   ones. limma defaults to `true`; edgeR calls it with `false`.
 ///
 /// ### Returns
 ///
@@ -341,7 +331,7 @@ pub fn contrast_as_coef(
     }
 
     // Solve R z = designT[..n_contrasts, ..] so the contrast rows read as the
-    // contrast rather than a multiple of it. R is upper triangular and tiny.
+    // contrast, not a multiple of it.
     for sample in 0..n_rows {
         for row in (0..n_contrasts).rev() {
             let mut acc = designt[row * n_rows + sample];
@@ -358,8 +348,7 @@ pub fn contrast_as_coef(
         }
     }
 
-    // Back to row-major, moving the contrast columns to the end unless asked
-    // for them first.
+    // Back to row-major; contrast columns go last unless `first`.
     let order: Vec<usize> = if first {
         (0..n_cols).collect()
     } else {
@@ -384,12 +373,8 @@ pub fn contrast_as_coef(
 /// Lowess span for a given number of observations.
 ///
 /// Port of limma's `chooseLowessSpan`: wider windows for small experiments,
-/// tapering towards `min_span` as the count grows.
-///
-/// limma's defaults are `small_n = 50`, `min_span = 0.3`, `power = 1/3`, and
-/// [`LIMMA_LOWESS_DEFAULTS`] carries them. edgePython passes `25` and `0.2`
-/// instead, which is a materially different span. See `UPSTREAM_DEVIATIONS.md`
-/// A8.
+/// tapering towards `min_span`. [`LIMMA_LOWESS_DEFAULTS`] carries limma's
+/// defaults; edgePython passes different ones. See `UPSTREAM_DEVIATIONS.md` A8.
 ///
 /// ### Params
 ///
@@ -490,8 +475,8 @@ mod tests {
         assert_eq!(groups, vec![0, 0, 0, 1, 1, 1]);
     }
 
-    /// A design where every row is distinct gives one group per sample, which is
-    /// what pushes `glm_fit` off the one-way path.
+    /// Every row distinct gives one group per sample, pushing `glm_fit` off the
+    /// one-way path.
     #[test]
     fn test_design_as_factor_with_a_continuous_covariate() {
         let design = vec![1.0, 0.1, 1.0, 0.2, 1.0, 0.3, 1.0, 0.4];
@@ -500,8 +485,8 @@ mod tests {
         assert_eq!(groups, vec![0, 1, 2, 3]);
     }
 
-    /// Group labels follow the ascending order of the row hash, not order of
-    /// first appearance. That is numpy's `unique` and therefore edgeR's.
+    /// Labels follow ascending row hash, not first appearance (numpy's `unique`,
+    /// hence edgeR's).
     #[test]
     fn test_design_as_factor_labels_in_ascending_hash_order() {
         let design = vec![
@@ -529,10 +514,9 @@ mod tests {
     /// contrastAsCoef(X, c(0, 1, -1), first = FALSE)
     /// ```
     ///
-    /// The contrast lands in the last column, which is where edgeR's `glmLRT`
-    /// expects it. The two nuisance columns may carry the opposite sign to
-    /// limma's, since the QR does not pin `Q` down, so the assertion is on the
-    /// contrast column exactly and on the column span for the rest.
+    /// The contrast lands in the last column, as edgeR's `glmLRT` expects. The
+    /// nuisance columns may differ in sign from limma's, so they are checked by
+    /// span only.
     #[test]
     fn test_contrast_as_coef_matches_limma() {
         let design = vec![
@@ -559,14 +543,12 @@ mod tests {
             );
         }
 
-        // The reformed design must span the same space as the original, which
-        // is what makes the refit a genuine nested model.
+        // Same span as the original, so the refit is a genuine nested model.
         assert_eq!(matrix_rank(&out.design, 6, 3).unwrap(), 3);
     }
 
     /// The contrast column must reproduce the contrast applied to the original
-    /// coefficients. That is the property the test statistic depends on, and it
-    /// holds regardless of how the QR signed itself.
+    /// coefficients, whatever sign the QR chose.
     #[test]
     fn test_contrast_column_carries_the_contrast() {
         let design = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];

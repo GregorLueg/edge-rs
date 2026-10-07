@@ -2,21 +2,16 @@
 //!
 //! Modelled on `CompressedSparseData` in `manifolds-rs` and
 //! `CompressedSparseData2` in `bixverse-rs`, with `u32` indices as in the
-//! latter: a single-cell count matrix has fewer than 4 billion entries along
-//! either axis, and halving the index width halves the bandwidth of every scan.
+//! latter, which halves the bandwidth of every scan.
 //!
-//! Two operations are worth keeping straight, because the sister crates blur
-//! them under one name:
+//! * [`CompressedSparse::transpose`] flips the format label and swaps the
+//!   shape. No data moves.
+//! * [`CompressedSparse::convert`] stores the same matrix in the other format.
+//!   It moves data.
 //!
-//! * [`CompressedSparse::transpose`] represents the transposed matrix. It flips
-//!   the format label and swaps the shape, and touches no data. Free.
-//! * [`CompressedSparse::convert`] represents the same matrix in the other
-//!   format. It actually moves data. Not free.
-//!
-//! That distinction is what makes the `bixverse-rs` boundary cheap. Its chunks
-//! arrive as CSC over `(n_cells, n_genes)`, which is bit-for-bit a CSR over
-//! `(n_genes, n_cells)`, the gene-major layout every algorithm here wants.
-//! `transpose` is the whole adapter.
+//! This keeps the `bixverse-rs` boundary cheap: its chunks arrive as CSC over
+//! `(n_cells, n_genes)`, which is bit-for-bit a CSR over `(n_genes, n_cells)`,
+//! the layout every algorithm here wants. `transpose` is the whole adapter.
 
 use crate::prelude::*;
 
@@ -56,9 +51,9 @@ impl SparseFormat {
 
 /// A sparse matrix in compressed row or column form.
 ///
-/// Fields are public so callers can hand the buffers straight to a kernel, but
-/// [`CompressedSparse::validate`] is the only thing that guarantees they are
-/// consistent. Prefer the constructors.
+/// Fields are public so buffers can go straight to a kernel, but only
+/// [`CompressedSparse::validate`] guarantees consistency. Prefer the
+/// constructors.
 #[derive(Clone, Debug)]
 pub struct CompressedSparse<T> {
     /// Non-zero values, ordered by the compressed axis then by `indices`.
@@ -107,9 +102,9 @@ impl<T: Copy> CompressedSparse<T> {
 
     /// Checks the structural invariants.
     ///
-    /// Verifies that `data` and `indices` agree in length, that `indptr` has
-    /// the right length and is non-decreasing, that it ends at the number of
-    /// non-zeros, and that every index is inside the non-compressed axis.
+    /// `data` and `indices` must match in length, `indptr` must have the right
+    /// length, be non-decreasing and end at the non-zero count, and every index
+    /// must be inside the non-compressed axis.
     ///
     /// ### Returns
     ///
@@ -227,8 +222,8 @@ impl<T: Copy> CompressedSparse<T> {
 
     /// Borrows one slice along the compressed axis.
     ///
-    /// This is the accessor the per-gene fan-out uses: for a gene-major matrix
-    /// it hands back that gene's non-zero cells and counts with no copying.
+    /// The per-gene accessor: for a gene-major matrix, that gene's non-zero
+    /// cells and counts, no copy.
     ///
     /// ### Params
     ///
@@ -246,8 +241,7 @@ impl<T: Copy> CompressedSparse<T> {
 
     /// The transposed matrix, for free.
     ///
-    /// The buffers are untouched: a CSR over `(m, n)` describes exactly the same
-    /// bytes as a CSC over `(n, m)`. Only the label and the shape change.
+    /// A CSR over `(m, n)` describes the same bytes as a CSC over `(n, m)`.
     ///
     /// ### Returns
     ///
@@ -264,9 +258,8 @@ impl<T: Copy> CompressedSparse<T> {
 
     /// The same matrix stored in the other format.
     ///
-    /// This is a real transposition of the storage and costs a pass over the
-    /// non-zeros plus a counting sort. Sequential for now; the intended call
-    /// site, ingest in `bixverse-rs`, does this once, not in a loop.
+    /// A pass over the non-zeros plus a counting sort. Sequential; meant to be
+    /// called once at ingest.
     ///
     /// ### Returns
     ///
@@ -315,7 +308,7 @@ impl<T: Copy> CompressedSparse<T> {
 
     /// Builds a compressed matrix from a dense row-major buffer.
     ///
-    /// Intended for tests and small inputs; nothing on the hot path densifies.
+    /// For tests and small inputs.
     ///
     /// ### Params
     ///
@@ -451,8 +444,8 @@ mod tests {
         assert_eq!(csc.convert().to_dense(0.0), dense);
     }
 
-    /// The free relabel: a CSR over (m, n) is a CSC over (n, m) with the same
-    /// bytes. This is the bixverse-rs boundary, so pin it explicitly.
+    /// A CSR over (m, n) is a CSC over (n, m) with the same bytes (the
+    /// bixverse-rs boundary).
     #[test]
     fn test_transpose_is_a_relabel_not_a_copy() {
         let (dense, r, c) = dense_fixture();
@@ -484,7 +477,7 @@ mod tests {
         assert_eq!(idx, &[0, 2]);
         assert_eq!(vals, &[1.0, 2.0]);
 
-        // The empty row is a valid, empty slice rather than a special case.
+        // The empty row is a valid empty slice.
         let (idx, vals) = csr.outer(1);
         assert!(idx.is_empty());
         assert!(vals.is_empty());
