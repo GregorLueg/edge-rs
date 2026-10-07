@@ -2,7 +2,7 @@
 //!
 //! Stage two, the search over the two variance components, is where NEBULA
 //! spends its time: every objective evaluation is a full penalised fit over
-//! every cell, and a gene takes about a hundred of them. This module runs that
+//! every cell, and a gene takes about forty of them. This module runs that
 //! search for every gene at once.
 //!
 //! ### Split
@@ -59,22 +59,23 @@
 //!
 //! Forced HL, 500 genes, 20 subjects, against a 10-thread CPU on an M1 Max.
 //! Seconds; "device" is the time in the device solves, staging and read-back
-//! included.
+//! included. Measured 2026-10-08, after stage two moved to BOBYQA (about forty
+//! fits per gene), stage one to Newton steps and the device sweeps to
+//! compile-time widths.
 //!
 //! | cells | coefficients | density | CPU | GPU | stage one | device | host finish |
 //! |---|---|---|---|---|---|---|---|
-//! | 20000 | 3 | 46% | 29.4 | 7.0 | 2.4 | 1.1 | 3.1 |
-//! | 20000 | 3 | 9% | 30.7 | 4.8 | 1.0 | 1.3 | 2.2 |
-//! | 20000 | 3 | 10%, subjects 100:1 | 29.7 | 5.0 | 1.1 | 1.6 | 2.2 |
-//! | 20000 | 8 | 10% | 48.4 | 14.2 | 1.5 | 9.1 | 3.1 |
-//! | 50000 | 6 | 6%, subjects 30:1 | 117.9 | 23.6 | 3.9 | 12.4 | 6.5 |
-//! | 100000 | 3 | 5% | 171.5 | 22.9 | 6.3 | 5.2 | 10.1 |
+//! | 20000 | 3 | 46% | 5.4 | 2.8 | 0.8 | 0.7 | 1.2 |
+//! | 20000 | 3 | 9% | 3.7 | 1.6 | 0.5 | 0.4 | 0.7 |
+//! | 20000 | 3 | 10%, subjects 100:1 | 3.8 | 1.6 | 0.5 | 0.3 | 0.7 |
+//! | 20000 | 8 | 10% | 8.1 | 2.9 | 1.0 | 0.7 | 0.9 |
+//! | 50000 | 6 | 6%, subjects 30:1 | 16.2 | 5.0 | 2.0 | 0.7 | 1.8 |
+//! | 100000 | 3 | 5% | 18.9 | 6.6 | 2.7 | 0.6 | 2.8 |
 //!
-//! At 4000 genes on the first shape: CPU 231 s, GPU 50.6 s, of which stage one
-//! 19.3 s and the host finish 24.6 s.
-//!
-//! At three coefficients the host is the ceiling (the `f64` finish and stage
-//! one are CPU work). At six and eight the device is.
+//! The host is the ceiling on every shape: stage one and the `f64` finish are
+//! CPU work, and the cohorts already hide the device behind the finish. A
+//! design with zero-count tables never reaches this module (see
+//! [`nebula_sparse_gpu`]).
 //!
 //! Under NEBULA-LN none of this applies unless stage one sends genes to stage
 //! two. On these shapes it sends none, or one gene in 500, and the GPU path is
@@ -85,8 +86,8 @@
 //! The search is sequential within a gene, so the round count is set by the
 //! slowest gene, about three times the median on the R fixtures. Only live
 //! searches send requests, so rounds thin out and the total device work is the
-//! total number of evaluations. A polish stencil goes out as all its points in
-//! one round.
+//! total number of evaluations. A one-component search's polish stencil goes
+//! out as all its points in one round.
 //!
 //! The rounds are not strictly lockstep. The device idles while the host
 //! finishes a round in `f64`, and the host while the device fits, so where it

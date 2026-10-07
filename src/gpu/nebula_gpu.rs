@@ -2,7 +2,7 @@
 //!
 //! The device fits a batch of *requests*: one penalised fit of one gene at one
 //! pair of variance components. A gene can carry several requests in a launch,
-//! so a stage-two polish stencil goes out as one batch.
+//! so a one-component search's polish stencil goes out as one batch.
 //!
 //! ### Layout
 //!
@@ -188,7 +188,7 @@ pub struct PendingSolve<'a> {
 /// A set of genes whose data stays on the device between launches.
 ///
 /// The counts and cell indices are the largest upload (hundreds of megabytes),
-/// and stage two fits every gene about a hundred times with only the variance
+/// and stage two fits every gene about forty times with only the variance
 /// components changed. Measured at 16384 genes and 20000 cells, a one-shot solve
 /// spent 1.5 of its 4.0 seconds on staging; later solves pay none of it.
 pub struct ResidentBatch<R: Runtime> {

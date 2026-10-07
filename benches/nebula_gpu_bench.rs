@@ -50,9 +50,8 @@ const SWEEP: [(usize, usize); 4] = [
 
 /// Solves run against one resident upload, to show what stage two would see.
 ///
-/// NEBULA's stage two calls `opt_pml` once per Nelder-Mead evaluation and once
-/// per polish stencil point, on the order of a hundred times per gene, with
-/// only the two variance components changed. Eight is enough to separate the
+/// NEBULA's stage two calls `opt_pml` once per BOBYQA evaluation, about forty
+/// times per gene, with only the two variance components changed. Eight is enough to separate the
 /// upload from the solve without making the bench tedious.
 const RESIDENT_SOLVES: usize = 8;
 
