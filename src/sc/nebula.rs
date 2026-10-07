@@ -1,10 +1,10 @@
 //! NEBULA's driver: one negative binomial gamma mixed model per gene.
 //!
-//! Port of `R/nebula.R` from the `nebula` package. The numerical kernels live in
-//! [`crate::sc::ptmg`] and [`crate::sc::pml`]; this module is the orchestration
-//! around them: build the offsets and the centred design, filter the genes, fan
-//! out over the survivors, and reassemble the coefficients, covariances and
-//! overdispersions on the user's own scale.
+//! Port of `R/nebula.R` from the `nebula` package. The numerical kernels live
+//! in [`crate::sc::ptmg`] and [`crate::sc::pml`]; this module is the
+//! orchestration around them: build the offsets and the centred design, filter
+//! the genes, fan out over the survivors, and reassemble the coefficients,
+//! covariances and overdispersions on the user's own scale.
 //!
 //! ### The three stages of one gene
 //!
@@ -28,29 +28,28 @@
 //! `xtol_rel = 1e-6`. Neither is in this crate and neither is worth adding: the
 //! stage-two objective is discontinuous at the `1e-6` level anyway, because
 //! [`opt_pml`] stops on an *absolute* improvement of `eps = 1e-6` in the
-//! penalised log-likelihood, so its Newton count flips as the variances move and
-//! the profile likelihood jumps by about that much. BOBYQA cannot resolve the
-//! minimum past that floor either, and two of its own runs from different
+//! penalised log-likelihood, so its Newton count flips as the variances move
+//! and the profile likelihood jumps by about that much. BOBYQA cannot resolve
+//! the minimum past that floor either, and two of its own runs from different
 //! starting points disagree by up to `1e-6` in the resulting standard errors.
 //!
 //! Stage two therefore uses a bounded Nelder-Mead followed by a local quadratic
-//! least-squares polish. The polish is
-//! what buys back the accuracy: fitting a quadratic over a stencil that is wide
-//! compared with the noise averages the jitter out, where a simplex chasing
-//! individual function values does not. Measured against nebula 1.5.8 across
-//! two- and three-coefficient designs and both the LN and HL paths, the worst
-//! relative disagreement is `1.0e-6` on the coefficients, `2.1e-6` on the
-//! standard errors and `4.4e-6` on the overdispersions. That is the
-//! reproducibility floor of the reference itself rather than an error in this
-//! port: re-running nebula's own optimisers to a tolerance of `1e-14` moves its
-//! answers by as much.
+//! least-squares polish. The polish is what buys back the accuracy: fitting a
+//! quadratic over a stencil that is wide compared with the noise averages the
+//! jitter out, where a simplex chasing individual function values does not.
+//! Measured against nebula 1.5.8 across two- and three-coefficient designs and
+//! both the LN and HL paths, the worst relative disagreement is `1.0e-6` on the
+//! coefficients, `2.1e-6` on the standard errors and `4.4e-6` on the
+//! overdispersions. That is the reproducibility floor of the reference itself
+//! rather than an error in this port: re-running nebula's own optimisers to a
+//! tolerance of `1e-14` moves its answers by as much.
 //!
 //! Stage one is a different problem: it has an exact gradient and no jitter, so
 //! it is one call to [`minimise`] and lands on the reference optimum.
 //!
-//! Only `model = "NBGMM"` is implemented. `PMM` needs the Poisson-gamma kernels,
-//! which this crate does not have, and `NBLMM` needs the log-normal branch of
-//! the outer objective, which has no golden to validate against.
+//! Only `model = "NBGMM"` is implemented. `PMM` needs the Poisson-gamma
+//! kernels, which this crate does not have, and `NBLMM` needs the log-normal
+//! branch of the outer objective, which has no golden to validate against.
 //!
 //! ### References
 //!
@@ -106,8 +105,8 @@ const HIGH_ORDER: u32 = 3;
 /// single-cell fixture it missed two genes of 118 that R reports as pinned.
 ///
 /// The margin cannot reach a real estimate: the smallest genuinely fitted
-/// subject variance seen on any fixture is four times the bound, and this admits
-/// values within one part in `1e4` of it.
+/// subject variance seen on any fixture is four times the bound, and this
+/// admits values within one part in `1e4` of it.
 const BOUND_SLACK: f64 = 1.0 + 1e-4;
 
 /// Value of `kappa_obs` below which NEBULA-LN always refits the subject-level
