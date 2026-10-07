@@ -27,6 +27,7 @@ use rayon::prelude::*;
 
 use crate::numeric::gamma::{digamma, ln_gamma, trigamma};
 use crate::prelude::*;
+use crate::sc::zeros::ZeroCells;
 
 ///////////////
 // Gene data //
@@ -198,17 +199,23 @@ const LOCAL_COEF: usize = 8;
 
 /// Per-gene buffers for the kernels, so repeated evaluations of one gene
 /// allocate nothing.
-pub(crate) struct PtmgScratch {
+pub(crate) struct PtmgScratch<'z> {
     /// Count per cell, zero where the gene is not expressed. Constant per gene,
     /// so filled once.
     y_cell: Vec<f64>,
-    /// `exp(eta)` per cell, overwritten by every evaluation.
+    /// `exp(eta)` per cell, overwritten by every evaluation. With tables, only
+    /// the positive and the loose cells are written.
     extb: Vec<f64>,
     /// Sum of `extb` per subject, overwritten by every evaluation.
     cumsumxtb: Vec<f64>,
+    /// The run's zero-count tables, or `None` to sweep every cell.
+    zeros: Option<&'z ZeroCells>,
+    /// Where each subject's run of positive counts starts, length
+    /// `n_subjects + 1`. Empty without tables.
+    run: Vec<usize>,
 }
 
-impl PtmgScratch {
+impl<'z> PtmgScratch<'z> {
     /// Buffers for one gene.
     ///
     /// ### Params
@@ -227,6 +234,37 @@ impl PtmgScratch {
             y_cell,
             extb: vec![0.0; data.n_cells()],
             cumsumxtb: vec![0.0; data.n_subjects()],
+            zeros: None,
+            run: Vec::new(),
+        }
+    }
+
+    /// Buffers for one gene whose value and gradient sum the zero counts from
+    /// the run's tables.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - The gene the scratch will serve, and only that gene
+    /// * `zeros` - Tables built from this gene's design, offsets and subjects
+    ///
+    /// ### Returns
+    ///
+    /// The scratch, with the positive-count runs located.
+    #[allow(clippy::needless_range_loop)]
+    pub(crate) fn tabled(data: &GeneData<'_>, zeros: &'z ZeroCells) -> Self {
+        let k = data.n_subjects();
+        let mut run = vec![0usize; k + 1];
+        let mut at = 0usize;
+        for s in 0..=k {
+            while at < data.cells.len() && data.cells[at] < data.fid[s] {
+                at += 1;
+            }
+            run[s] = at;
+        }
+        Self {
+            zeros: Some(zeros),
+            run,
+            ..Self::new(data)
         }
     }
 }
@@ -465,6 +503,7 @@ pub fn ptmg_neg_log_likelihood(data: &GeneData<'_>, params: &[f64]) -> f64 {
         y_cell,
         extb,
         cumsumxtb,
+        ..
     } = &scratch;
 
     for s in 0..n_subjects {
@@ -536,13 +575,16 @@ pub fn ptmg_value_and_gradient(data: &GeneData<'_>, params: &[f64]) -> (f64, Vec
 ///
 /// ### Returns
 ///
-/// The negative log-likelihood and its gradient, bit for bit what
-/// [`ptmg_value_and_gradient`] returns.
+/// The negative log-likelihood and its gradient: bit for bit what
+/// [`ptmg_value_and_gradient`] returns without tables, to rounding with them.
 pub(crate) fn ptmg_value_and_gradient_with(
     data: &GeneData<'_>,
     params: &[f64],
-    scratch: &mut PtmgScratch,
+    scratch: &mut PtmgScratch<'_>,
 ) -> (f64, Vec<f64>) {
+    if let Some(zeros) = scratch.zeros {
+        return evaluate_tabled(data, params, zeros, scratch);
+    }
     let (value, gradient, _) = evaluate(data, params, false, scratch);
     (value, gradient)
 }
@@ -585,7 +627,7 @@ pub fn ptmg_value_gradient_hessian(
 /// ### Returns
 ///
 /// `sum_i y_i * eta_i`, the only part of the likelihood linear in `eta`.
-fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch) -> f64 {
+fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch<'_>) -> f64 {
     let nb = data.n_coef;
     let mut total = 0.0;
 
@@ -638,7 +680,7 @@ fn evaluate(
     data: &GeneData<'_>,
     params: &[f64],
     with_hessian: bool,
-    scratch: &mut PtmgScratch,
+    scratch: &mut PtmgScratch<'_>,
 ) -> (f64, Vec<f64>, Vec<f64>) {
     debug_assert_eq!(params.len(), data.n_params());
 
@@ -656,6 +698,7 @@ fn evaluate(
         y_cell,
         extb,
         cumsumxtb,
+        ..
     } = &*scratch;
 
     let mut mustar = vec![0.0; k];
@@ -945,6 +988,190 @@ fn evaluate(
     hessian[(nb + 1) * n_params + nb + 1] -= extra.cell_trigamma;
 
     (value, gradient, hessian)
+}
+
+/// Value and gradient with the zero counts summed from the run's tables.
+///
+/// [`evaluate`] without the Hessian, split as the penalised fit splits it: the
+/// terms of every cell at a count of zero, then what the positive counts
+/// change. At a count of zero a cell's terms depend on `v = ym e / gamma`, so
+/// per group of [`ZeroCells`] they are `L` and `A` at
+/// `s = ln(ym) + x'beta - ln(gamma)`, and `sum ym e` is `ym exp(x'beta) sum O`
+/// exactly. Loose cells are summed one by one.
+///
+/// ### Params
+///
+/// * `data` - The gene, as validated by [`GeneData::new`]
+/// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
+/// * `zeros` - Tables built from this gene's design, offsets and subjects
+/// * `scratch` - Built by [`PtmgScratch::tabled`] from this same gene
+///
+/// ### Returns
+///
+/// The negative log-likelihood and its gradient, length `n_coef + 2`.
+#[allow(clippy::needless_range_loop)]
+fn evaluate_tabled(
+    data: &GeneData<'_>,
+    params: &[f64],
+    zeros: &ZeroCells,
+    scratch: &mut PtmgScratch<'_>,
+) -> (f64, Vec<f64>) {
+    let nb = data.n_coef;
+    let n_cells = data.n_cells();
+    let k = data.n_subjects();
+    let n_params = nb + 2;
+    let beta = &params[..nb];
+    let terms = Terms::new(params[nb], params[nb + 1]);
+    let gamma = terms.gamma;
+    let ln_gamma = terms.log_gamma;
+    let row_of = |r: usize| &data.design[r * nb..(r + 1) * nb];
+    let dot = |row: &[f64]| row.iter().zip(beta).fold(0.0, |acc, (&x, &b)| acc + x * b);
+
+    // Subject sums of `e` and `x e`, and the `exp` of every cell summed one by
+    // one later.
+    let mut total = 0.0;
+    let mut group_xb = vec![0.0; zeros.groups.len()];
+    let mut xexb_f = vec![0.0; k * nb];
+    for s in 0..k {
+        let xf = &mut xexb_f[s * nb..(s + 1) * nb];
+        let mut csx = 0.0;
+        for gi in zeros.subject_groups[s]..zeros.subject_groups[s + 1] {
+            let g = &zeros.groups[gi];
+            let row = row_of(g.row);
+            let xb = dot(row);
+            group_xb[gi] = xb;
+            let e = xb.exp() * g.sum_o;
+            csx += e;
+            for j in 0..nb {
+                xf[j] += row[j] * e;
+            }
+        }
+        for &r in &zeros.loose[zeros.subject_loose[s]..zeros.subject_loose[s + 1]] {
+            let row = row_of(r);
+            let e = (data.log_offset[r] + dot(row)).exp();
+            scratch.extb[r] = e;
+            csx += e;
+            for j in 0..nb {
+                xf[j] += row[j] * e;
+            }
+        }
+        for i in scratch.run[s]..scratch.run[s + 1] {
+            let c = data.cells[i];
+            let eta = data.log_offset[c] + dot(row_of(c));
+            total += eta * data.counts[i];
+            scratch.extb[c] = eta.exp();
+        }
+        scratch.cumsumxtb[s] = csx;
+    }
+
+    let mut mustar_log = vec![0.0; k];
+    let mut ymustar = vec![0.0; k];
+    let mut ymumustar = vec![0.0; k];
+    let mut imustar = vec![0.0; k];
+    for s in 0..k {
+        let ystar = data.subject_totals[s] + terms.alpha;
+        let mu = scratch.cumsumxtb[s] + terms.lambda;
+        let log_mu = mu.ln();
+        mustar_log[s] = log_mu;
+        ymustar[s] = ystar / mu;
+        ymumustar[s] = ystar / mu / mu;
+        imustar[s] = 1.0 / mu;
+        total -= ystar * log_mu;
+    }
+    total += (k as f64) * terms.alpha * terms.log_lambda;
+    total += (n_cells as f64) * gamma * terms.log_gamma;
+
+    let mut slpey = 0.0;
+    let mut gstar_sum = 0.0;
+    let mut dbeta_41 = vec![0.0; k * nb];
+    let mut d42c = vec![0.0; k];
+    for s in 0..k {
+        let ym = ymustar[s];
+        let ln_ym = ym.ln();
+        let d41 = &mut dbeta_41[s * nb..(s + 1) * nb];
+        let mut acc = 0.0;
+        // `sum ym e` over every cell of the subject.
+        total += ym * scratch.cumsumxtb[s];
+        for gi in zeros.subject_groups[s]..zeros.subject_groups[s + 1] {
+            let g = &zeros.groups[gi];
+            let row = row_of(g.row);
+            let [l, a] = g.eval::<0, 2>(ln_ym + group_xb[gi] - ln_gamma);
+            let sum_log_w = g.n * ln_gamma + l;
+            total -= gamma * sum_log_w;
+            slpey += sum_log_w;
+            gstar_sum += g.n - a;
+            // `sum gamma e / w = (gamma / ym) A`.
+            let ge = gamma / ym * a;
+            acc += ge;
+            for j in 0..nb {
+                d41[j] += row[j] * ge;
+            }
+        }
+        let mut cell = |r: usize, y: f64, dense: bool| {
+            let e = scratch.extb[r];
+            let w = ym * e + gamma;
+            let log_w = w.ln();
+            let gw = if dense { gamma / w } else { y / w };
+            if dense {
+                total -= gamma * log_w;
+                slpey += log_w;
+            } else {
+                total -= y * log_w;
+            }
+            gstar_sum += gw;
+            let ge = gw * e;
+            acc += ge;
+            let row = row_of(r);
+            for j in 0..nb {
+                d41[j] += row[j] * ge;
+            }
+        };
+        for &r in &zeros.loose[zeros.subject_loose[s]..zeros.subject_loose[s + 1]] {
+            cell(r, 0.0, true);
+        }
+        for i in scratch.run[s]..scratch.run[s + 1] {
+            cell(data.cells[i], data.counts[i], false);
+        }
+        d42c[s] = acc - scratch.cumsumxtb[s];
+    }
+
+    // From here as in `evaluate`.
+    let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
+
+    let mut gradient = vec![0.0; n_params];
+    for j in 0..nb {
+        let mut acc = 0.0;
+        for s in 0..k {
+            acc += xexb_f[s * nb + j] * ymm_d[s] - dbeta_41[s * nb + j] * ymustar[s];
+        }
+        gradient[j] = acc;
+    }
+    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
+        let row = row_of(c);
+        for j in 0..nb {
+            gradient[j] += row[j] * y;
+        }
+    }
+
+    let ldm = terms.log_lambda * (k as f64) - mustar_log.iter().sum::<f64>();
+    let adlmy = terms.exps_s * (k as f64) - ymustar.iter().sum::<f64>();
+    let dbim: f64 = (0..k).map(|s| d42c[s] * imustar[s]).sum();
+    let sum_ymm_d: f64 = ymm_d.iter().sum();
+
+    gradient[nb] = -terms.alpha_pr * dbim
+        + terms.lambda_pr * sum_ymm_d
+        + terms.alpha_pr * ldm
+        + terms.lambda_pr * adlmy;
+    gradient[nb + 1] = terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
+
+    for g in gradient.iter_mut() {
+        *g = -*g;
+    }
+    let extra = gamma_terms(data, terms.alpha, gamma, GammaOrder::Gradient);
+    let value = -total - extra.subject_value - extra.cell_value;
+    gradient[nb] -= terms.alpha_pr * extra.subject_digamma;
+    gradient[nb + 1] -= extra.cell_digamma;
+    (value, gradient)
 }
 
 /////////////
@@ -2181,5 +2408,46 @@ mod tests {
             cell_level_columns(&design, 6, 1, &[0, 2, 5]).unwrap_err(),
             EdgeErrors::InvalidArgument(_)
         ));
+    }
+
+    #[test]
+    fn test_tables_match_the_dense_value_and_gradient() {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(5);
+        let fid = vec![0usize, 300, 700, 1000];
+        let mut design = Vec::new();
+        let mut log_offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cells = Vec::new();
+        let mut totals = vec![0.0; 3];
+        for c in 0..1000 {
+            let s = fid.iter().rposition(|&f| f <= c).expect("in range");
+            let kind = f64::from(rng.random_bool(0.3));
+            design.extend([1.0, (s % 2) as f64 - 0.5, kind]);
+            log_offset.push(rng.random_range(-2.0..2.5));
+            if rng.random_bool(0.12) {
+                let y = rng.random_range(1..8) as f64;
+                counts.push(y);
+                cells.push(c);
+                totals[s] += y;
+            }
+        }
+        let gene = GeneData::new(&design, &log_offset, &counts, &cells, &totals, &fid, 3)
+            .expect("valid gene");
+        let zeros = ZeroCells::build(&design, &log_offset, &fid, 3).expect("categorical");
+        for params in [
+            [-2.0, 0.3, 0.2, 0.5, 1.0],
+            [0.5, -0.4, 1.0, 0.05, 0.02],
+            [-4.0, 0.0, -1.0, 2.0, 30.0],
+        ] {
+            let (want_value, want_grad) = ptmg_value_and_gradient(&gene, &params);
+            let mut scratch = PtmgScratch::tabled(&gene, &zeros);
+            let (value, grad) = ptmg_value_and_gradient_with(&gene, &params, &mut scratch);
+            assert_relative_eq!(value, want_value, max_relative = 1e-13);
+            for (g, w) in grad.iter().zip(&want_grad) {
+                assert_relative_eq!(*g, *w, max_relative = 1e-10, epsilon = 1e-9);
+            }
+        }
     }
 }

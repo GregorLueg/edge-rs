@@ -806,7 +806,8 @@ pub(crate) fn plan_gene(
     upper[n_coef] = params.max.0;
     upper[n_coef + 1] = params.max.1;
 
-    let (stage_one, stage_one_failed) = minimise_marginal(&gene, &start, &lower, &upper);
+    let (stage_one, stage_one_failed) =
+        minimise_marginal(&gene, shared.zeros, &start, &lower, &upper);
     let convergence = if stage_one_failed { 0 } else { CONV_SUCCESS };
     let sigma = stage_one[n_coef];
     let gamma = stage_one[n_coef + 1];
@@ -1010,6 +1011,7 @@ fn fit_gene(
 /// ### Params
 ///
 /// * `gene` - The gene, as validated by [`GeneData::new`]
+/// * `zeros` - The run's zero-count tables, or `None` to sweep every cell
 /// * `start` - Starting point, `[beta, sigma, phi]`
 /// * `lower` - Lower bounds
 /// * `upper` - Upper bounds
@@ -1020,13 +1022,17 @@ fn fit_gene(
 /// what nebula's `is_conv` records.
 fn minimise_marginal(
     gene: &GeneData<'_>,
+    zeros: Option<&ZeroCells>,
     start: &[f64],
     lower: &[f64],
     upper: &[f64],
 ) -> (Vec<f64>, bool) {
     let n = start.len();
     let mut best: Vec<f64> = (0..n).map(|j| start[j].clamp(lower[j], upper[j])).collect();
-    let mut scratch = PtmgScratch::new(gene);
+    let mut scratch = match zeros {
+        Some(z) => PtmgScratch::tabled(gene, z),
+        None => PtmgScratch::new(gene),
+    };
     let best_f = ptmg_value_and_gradient_with(gene, &best, &mut scratch).0;
     if !best_f.is_finite() {
         return (best, true);
