@@ -1,45 +1,34 @@
 //! voom: the mean-variance trend that lets counts go through a linear model.
 //!
-//! The idea is one paragraph long. Take log2-CPM, fit the linear model to it,
-//! and the residual standard deviation is a decreasing function of the count a
-//! gene was observed at. Smooth `sqrt(sigma)` against average log-count with a
-//! lowess, read that trend back at every *fitted* value rather than every
-//! observed one, and the reciprocal fourth power of what comes out is a
-//! precision weight per observation. `lmFit` with those weights then behaves as
-//! if the counts had been continuous all along.
+//! Fit the linear model to log2-CPM, smooth `sqrt(sigma)` against average
+//! log-count with a lowess, read the trend back at every *fitted* value, and
+//! take the reciprocal fourth power as a precision weight per observation.
 //!
-//! Three entry points, mirroring three upstream functions:
+//! Entry points:
 //!
 //! * [`voom`] is limma's `voom`.
 //! * [`voom_lmfit`] is edgeR's `voomLmFit` with `block = NULL` and
 //!   `sample.weights = FALSE`: the structural-zero machinery and the final
 //!   weighted refit, without the block correlation or array weight loops.
-//! * [`voom_basic`] is the thin wrapper edgePython keeps for its older API:
-//!   explicit normalisation factors and a fixed span.
+//! * [`voom_basic`] is edgePython's older wrapper: explicit normalisation
+//!   factors and a fixed span.
 //!
-//! ### Why neither `cpm` nor `ave_log_cpm` appears here
+//! ### Why neither `cpm` nor `ave_log_cpm` is used
 //!
-//! They look like they should. They do not fit. [`crate::core::expression::cpm`]
-//! scales its prior count by the library size, as edgeR's `cpm` does, whereas
-//! voom adds a flat `0.5` to every count and a flat `1` to every library size.
-//! The two agree only when all libraries are the same size.
-//! [`crate::core::expression::ave_log_cpm`] fits an intercept-only negative
-//! binomial GLM; voom's `Amean` is a plain row mean of the log2-CPM. Reusing
-//! either would be wrong rather than merely different.
+//! [`crate::core::expression::cpm`] scales its prior count by the library size,
+//! whereas voom adds a flat `0.5` to every count and a flat `1` to every
+//! library size (they agree only for equal libraries).
+//! [`crate::core::expression::ave_log_cpm`] fits an intercept-only NB GLM;
+//! voom's `Amean` is a plain row mean of the log2-CPM.
 //!
 //! ### Which lowess
 //!
-//! limma's `voom` and edgeR's `voomLmFit` both smooth with `stats::lowess`,
-//! that is [`crate::limma::lowess::lowess`], not with limma's own
-//! `weightedLowess`. The single exception is `voomLmFit` once it has found
-//! structural zeros, at which point it switches to
-//! [`crate::limma::lowess::weighted_lowess`] so that the residual degrees of
-//! freedom can act as prior weights. Both are reproduced here exactly as
-//! dispatched upstream. edgePython uses `weightedLowess` unconditionally, which
-//! is the first deviation listed on [`voom`] and A13 in `UPSTREAM_DEVIATIONS.md`.
-//!
-//! Genes are the parallel axis: the log-CPM transform and the weight lookup are
-//! rayon fan-outs over contiguous gene rows.
+//! `voom` and `voomLmFit` smooth with `stats::lowess`
+//! ([`crate::limma::lowess::lowess`]), not `weightedLowess`. The exception is
+//! `voomLmFit` once it finds structural zeros: it then uses
+//! [`crate::limma::lowess::weighted_lowess`] with the residual degrees of
+//! freedom as prior weights. edgePython uses `weightedLowess` unconditionally.
+//! See `UPSTREAM_DEVIATIONS.md` A13.
 
 use faer::MatRef;
 use rayon::prelude::*;
@@ -61,9 +50,8 @@ use crate::utils::traits::EdgeFloat;
 
 /// Reciprocal of [`PER_MILLION`], written as a literal.
 ///
-/// `1e-6` and `1.0 / 1e6` are not the same double. R's voom writes the literal,
-/// so this does too; the difference is one ulp on the fitted counts and it
-/// propagates into the fourth power of the trend.
+/// `1e-6` and `1.0 / 1e6` are different doubles. R's voom writes the literal;
+/// the one-ulp difference propagates into the fourth power of the trend.
 const INV_PER_MILLION: f64 = 1e-6;
 
 /// Robustness iterations R's `lowess` performs by default, its `iter = 3`.
@@ -71,8 +59,8 @@ const LOWESS_ITERATIONS: usize = 3;
 
 /// Tolerance edgeR's `voomLmFit` uses to call a count or a fitted value zero.
 ///
-/// Doubles as the slack on the row-count comparison, which is why the test is
-/// `> max(2, MinGroupSize) - eps` rather than `>=`.
+/// Also the slack on the row-count comparison (`> max(2, MinGroupSize) - eps`,
+/// not `>=`).
 const STRUCTURAL_ZERO_EPS: f64 = 1e-4;
 
 /// Smallest number of zeros in a row that makes it a structural-zero candidate,
@@ -94,16 +82,15 @@ const PARALLEL_WORK_THRESHOLD: usize = 32_768;
 pub struct VoomParams {
     /// Scaling rule folded into the library sizes before the log-CPM transform.
     ///
-    /// This is edgeR's `calcNormFactors`, not limma's `normalizeBetweenArrays`:
-    /// the factors multiply the library sizes rather than shifting the log
-    /// ratios. [`NormMethod::None`] leaves the library sizes alone and is what
-    /// upstream `voom(counts, design)` does.
+    /// edgeR's `calcNormFactors` (factors multiply the library sizes), not
+    /// limma's `normalizeBetweenArrays`. [`NormMethod::None`] is what upstream
+    /// `voom(counts, design)` does.
     pub normalize_method: NormMethod,
     /// Lowess span, in `(0, 1]`. Ignored when `adaptive_span` is set.
     pub span: f64,
     /// Whether to derive the span from the gene count with
     /// [`choose_lowess_span`] at limma's defaults. `true` upstream since limma
-    /// 3.56, which is why it is `true` here.
+    /// 3.56.
     pub adaptive_span: bool,
     /// Count added to every observation before the log, and half the constant
     /// added to every library size. Upstream hardcodes `0.5`.
@@ -172,38 +159,36 @@ pub struct VoomResult {
     /// Row means of [`VoomResult::e`], one per gene. limma's `Amean`.
     ///
     /// Plain means over every sample, **not** the masked means the trend uses.
-    /// `voomLmFit` keeps the two apart (`R/voomLmFit.R:193-195`): the masked
-    /// version corrects the trend abscissae for structural zeros, while
-    /// `fit$Amean`, which is what `eBayes(trend = TRUE)` reads, is the
-    /// uncorrected one at `R/voomLmFit.R:332`.
+    /// `voomLmFit` keeps them apart: the masked version
+    /// (`R/voomLmFit.R:193-195`) corrects the trend abscissae, while
+    /// `fit$Amean` (`R/voomLmFit.R:332`), which `eBayes(trend = TRUE)` reads,
+    /// is uncorrected.
     pub amean: Vec<f64>,
 }
 
-/////////////////
-// Public API  //
-/////////////////
+////////////////
+// Public API //
+////////////////
 
 /// Mean-variance trend and precision weights, as limma's `voom`.
 ///
 /// Fits the linear model to log2-CPM once, smooths `sqrt(sigma)` against
 /// average log-count with [`crate::limma::lowess::lowess`], and reads the trend
-/// back at each gene's fitted log-count. Genes that are zero in every sample are
-/// dropped from the trend, since their zero residual scale would drag the low
-/// end of it down, but they still receive weights.
+/// at each gene's fitted log-count. Genes that are zero in every sample are
+/// dropped from the trend but still receive weights.
 ///
-/// The returned weights do **not** include `weights`. limma multiplies prior
-/// weights into the fit but returns the voom weights on their own; only
+/// The returned weights do **not** include `weights` (as in limma); only
 /// [`voom_lmfit`] combines the two.
 ///
 /// ### Params
 ///
 /// * `counts` - Row-major counts, `n_genes * n_samples`. Non-negative and
 ///   finite; at least two genes.
-/// * `n_genes` - Number of genes, that is, rows
-/// * `n_samples` - Number of samples, that is, columns
+/// * `n_genes` - Number of genes (rows)
+/// * `n_samples` - Number of samples (columns)
 /// * `design` - Design matrix, row-major `n_samples * n_coef`. Must be full
 ///   rank.
-/// * `n_coef` - Number of coefficients, that is, design columns
+/// * `n_coef` - Number of coefficients (design columns)
 /// * `lib_size` - Library size per sample. `None` uses the column sums. Each
 ///   entry must be positive and finite.
 /// * `weights` - Prior observation weights handed to the linear model, or
@@ -216,41 +201,35 @@ pub struct VoomResult {
 /// if a shape disagrees, a count is negative, a library size is not positive, a
 /// parameter is outside its domain, or the design is rank deficient.
 ///
-/// When fewer than two genes have residual degrees of freedom there is nothing
-/// to fit a trend to, and every weight comes back as one, which is what limma
-/// does after warning.
+/// With fewer than two genes having residual degrees of freedom, every weight
+/// is one (limma warns and does the same).
 ///
 /// ### Where edgePython disagrees with limma
 ///
-/// All of these are reproduced as limma has them, not as edgePython has them.
-/// The numbering is local to this module and does not index
-/// `UPSTREAM_DEVIATIONS.md`.
+/// Reproduced as limma has them. The list is local, not `UPSTREAM_DEVIATIONS.md`
+/// numbering, except the first (A13).
 ///
-/// * edgePython always smooths with `weightedLowess`; limma's `voom` always
-///   uses `stats::lowess`. This is the same class of mistake as A11 in
-///   `UPSTREAM_DEVIATIONS.md`, which cost 7e-4 on the quasi-likelihood prior.
+/// * edgePython always smooths with `weightedLowess`; limma's `voom` uses
+///   `stats::lowess`. See `UPSTREAM_DEVIATIONS.md` A13.
 /// * edgePython uses `npts = 120` and three iterations for the unweighted
-///   smooth, neither of which is a limma default.
+///   smooth; neither is a limma default.
 /// * edgePython never drops the all-zero rows from the trend.
 /// * edgePython restricts the trend to genes with residual degrees of freedom;
-///   limma's `voom` does not, only `voomLmFit` does.
-/// * edgePython clamps `sigma`, the trend and the fitted counts away from zero
-///   with a `1e-8` floor; limma clamps nothing.
-/// * edgePython collapses tied trend abscissae by taking the first ordinate;
+///   only `voomLmFit` does, not `voom`.
+/// * edgePython floors `sigma`, the trend and the fitted counts at `1e-8`;
+///   limma clamps nothing.
+/// * edgePython collapses tied trend abscissae to the first ordinate;
 ///   `approxfun(ties = list("ordered", mean))` takes the mean.
-/// * edgePython multiplies prior weights into the returned weights; limma's
-///   `voom` returns the voom weights alone.
-/// * edgePython's `normalize_method` is limma's `normalizeBetweenArrays`; this
-///   port takes edgeR's `calcNormFactors` instead, because that is the type the
-///   crate carries. Neither is the other, and quantile normalisation of the
-///   log-CPM is not available here.
+/// * edgePython multiplies prior weights into the returned weights; limma
+///   returns the voom weights alone.
+/// * edgePython's `normalize_method` is `normalizeBetweenArrays`; this port
+///   takes edgeR's `calcNormFactors`. Quantile normalisation is not available.
 ///
-/// Two guards are added on top of limma, both no-ops whenever limma itself
-/// produces a usable answer. Non-finite `(sx, sy)` pairs are dropped before the
-/// smooth, and so are genes with no residual degrees of freedom. limma passes
-/// both straight to `lowess`, and a single such gene turns the entire weight
-/// matrix into `NaN`; the crate's `lm_fit` reports `sigma = 0` rather than `NA`
-/// there, which would corrupt the trend silently instead of loudly.
+/// Two guards are added on top of limma, both no-ops when limma gives a usable
+/// answer: non-finite `(sx, sy)` pairs and genes with no residual degrees of
+/// freedom are dropped before the smooth. limma passes them to `lowess`, where
+/// one such gene turns the whole weight matrix to `NaN`; the crate's `lm_fit`
+/// reports `sigma = 0` rather than `NA`, which would corrupt the trend silently.
 ///
 /// ### References
 ///
@@ -303,16 +282,15 @@ pub fn voom<T: EdgeFloat>(
 
 /// voom followed by the weighted linear model fit, as edgeR's `voomLmFit`.
 ///
-/// Two things separate this from [`voom`]. Genes with a whole group of exact
-/// zeros get those observations masked out and their residual scale and degrees
-/// of freedom recomputed on what is left, so that a group of structural zeros
-/// does not masquerade as a low-variance gene; when any such gene exists the
-/// trend switches to [`crate::limma::lowess::weighted_lowess`] with the residual
-/// degrees of freedom as prior weights. And the model is then refitted with the
-/// voom weights in place, which is the fit the caller actually wants.
+/// Differs from [`voom`] in two ways. Genes with a whole group of exact zeros
+/// have those observations masked out and their residual scale and degrees of
+/// freedom recomputed, so structural zeros do not look like low variance; if
+/// any such gene exists the trend uses [`crate::limma::lowess::weighted_lowess`]
+/// with the residual degrees of freedom as prior weights. The model is then
+/// refitted with the voom weights.
 ///
-/// The block correlation and array weight loops of `voomLmFit` are not here.
-/// This is `voomLmFit(counts, design, block = NULL, sample.weights = FALSE)`.
+/// Equivalent to `voomLmFit(counts, design, block = NULL, sample.weights =
+/// FALSE)`: no block correlation or array weight loops.
 ///
 /// ### Params
 ///
@@ -335,13 +313,12 @@ pub fn voom<T: EdgeFloat>(
 ///
 /// In addition to the list on [`voom`]:
 ///
-/// * edgePython passes `block` and `correlation` to the *first* fit; edgeR fits
-///   that one with prior weights only and introduces the correlation later.
-///   Moot here, since neither is supported.
+/// * edgePython passes `block` and `correlation` to the *first* fit; edgeR uses
+///   prior weights only there (moot here, neither is supported).
 /// * edgePython clamps the trend's prior weights to at least one; edgeR passes
-///   `df.residual` through unchanged.
-/// * edgePython runs the structural-zero detection from `voom` itself behind a
-///   flag; in edgeR it exists only in `voomLmFit`.
+///   `df.residual` unchanged.
+/// * edgePython runs structural-zero detection from `voom` behind a flag; in
+///   edgeR it exists only in `voomLmFit`.
 #[allow(clippy::too_many_arguments)]
 pub fn voom_lmfit<T: EdgeFloat>(
     counts: &[T],
@@ -454,14 +431,12 @@ pub fn voom_lmfit<T: EdgeFloat>(
 
 /// voom with explicit normalisation factors and a fixed span.
 ///
-/// edgePython's older entry point, kept because it is the shape most callers
-/// want: hand it library sizes and normalisation factors separately rather than
-/// pre-multiplying them, and get the canonical `span = 0.5` without the
-/// adaptive rule. Equivalent to
+/// edgePython's older entry point: library sizes and normalisation factors are
+/// passed separately, with `span = 0.5` and no adaptive rule. Equivalent to
 /// `voom(counts, design, lib.size = lib.size * norm.factors, span = 0.5, adaptive.span = FALSE)`.
 ///
-/// Unlike edgePython's version, `prior_count` is honoured rather than accepted
-/// and discarded. At the default `0.5` the two agree.
+/// Unlike edgePython, `prior_count` is honoured, not discarded (they agree at
+/// the default `0.5`).
 ///
 /// ### Params
 ///
@@ -555,8 +530,8 @@ struct Prepared {
 
 /// Validates the inputs and builds the log2-CPM matrix.
 ///
-/// Shared by [`voom`] and [`voom_lmfit`], which agree exactly up to and
-/// including the first `lm_fit` call.
+/// Shared by [`voom`] and [`voom_lmfit`], which agree up to and including the
+/// first `lm_fit` call.
 ///
 /// ### Params
 ///
@@ -737,8 +712,8 @@ fn check_lib_size(lib_size: &[f64], n_samples: usize) -> Result<(), EdgeErrors> 
 
 /// Arithmetic mean of a gene's row.
 ///
-/// Plain sum then divide, which is what R's `rowMeans` reduces to on a platform
-/// where `long double` is `double`.
+/// Plain sum then divide, as R's `rowMeans` does where `long double` is
+/// `double`.
 ///
 /// ### Params
 ///
@@ -775,9 +750,8 @@ fn masked_row_mean(row: &[f64], observed: &[bool]) -> f64 {
 
 /// R's corrected mean: a naive pass followed by a mean-of-residuals correction.
 ///
-/// `mean.default` on doubles does exactly this, and the shift it produces lands
-/// in every `sx` value, so the correction has to be here for the trend to agree
-/// to the last digits.
+/// `mean.default` on doubles does this; the correction shifts every `sx`, so it
+/// is needed for the trend to agree to the last digits.
 ///
 /// ### Params
 ///
@@ -889,9 +863,7 @@ fn finite_pairs(sx: &[f64], sy: &[f64]) -> (Vec<f64>, Vec<f64>) {
 
 /// Sorts a smooth by abscissa and averages the ordinates of tied abscissae.
 ///
-/// This is `approxfun(l, ties = list("ordered", mean))` applied to a lowess
-/// output. The averaging is a formality when the smoother has already given
-/// tied points the same fitted value, but the deduplication is not: the
+/// `approxfun(l, ties = list("ordered", mean))` applied to a lowess output. The
 /// interpolator needs strictly increasing knots.
 ///
 /// ### Params
@@ -934,11 +906,9 @@ fn collapse(x: &[f64], fitted: &[f64]) -> Result<Trend, EdgeErrors> {
 
 /// Reads the trend back at every fitted value and turns it into a weight.
 ///
-/// The fitted log2-CPM is converted to a fitted log2-count with the same
-/// library sizes the transform used, the trend is evaluated there with constant
-/// extension beyond the end knots (`approxfun(rule = 2)`), and the weight is the
-/// reciprocal fourth power. Genes are the parallel axis; each gene interpolates
-/// its own row.
+/// Converts fitted log2-CPM to fitted log2-count with the transform's library
+/// sizes, evaluates the trend there with constant extension beyond the end
+/// knots (`approxfun(rule = 2)`), and takes the reciprocal fourth power.
 ///
 /// ### Params
 ///
@@ -1058,13 +1028,10 @@ struct StructuralZeros {
 
 /// Finds observations that are zero because the design makes them zero.
 ///
-/// A gene with a whole group of exact zeros has a residual standard deviation
-/// that says nothing about its mean-variance behaviour, because the zeros are
-/// determined rather than sampled. edgeR's test is two-stage: shortlist rows
-/// with more zeros than the smallest group the design can resolve, then fit a
-/// Poisson GLM to those rows and keep the entries where both the count and the
-/// fitted value are zero. The smallest resolvable group is `1 / max(h)`, the
-/// reciprocal of the largest leverage.
+/// edgeR's test is two-stage: shortlist rows with more zeros than the smallest
+/// group the design can resolve (`1 / max(h)`, the reciprocal of the largest
+/// leverage), then fit a Poisson GLM to those rows and keep the entries where
+/// both the count and the fitted value are zero.
 ///
 /// ### Params
 ///
@@ -1148,10 +1115,9 @@ fn detect_structural_zeros<T: EdgeFloat>(
 
 /// Residual scale and degrees of freedom of one gene over a subset of samples.
 ///
-/// limma's `lm.series` drops the missing observations, refits on the reduced
-/// design, and reports `sqrt(RSS / df)` with `df = n_observed - rank`. This does
-/// the same, projecting onto the column space with a thin SVD so that a reduced
-/// design that has lost its rank is handled rather than silently mis-scaled.
+/// As limma's `lm.series`: drop the missing observations, refit on the reduced
+/// design, report `sqrt(RSS / df)` with `df = n_observed - rank`. A thin SVD
+/// projection handles a reduced design that has lost rank.
 ///
 /// ### Params
 ///
@@ -1237,10 +1203,9 @@ mod tests {
 
     /// Tolerance every reference comparison uses.
     ///
-    /// The worst observed disagreement with R across these fixtures is 1.1e-13
-    /// relative, on a voom weight, which is the fourth power of a trend value
-    /// and so amplifies the lowess by roughly four ulps. This leaves two orders
-    /// of magnitude of headroom over that.
+    /// Worst observed disagreement with R across these fixtures is 1.1e-13
+    /// relative, on a voom weight (the fourth power of a trend value). Two
+    /// orders of magnitude of headroom.
     const TOL: f64 = 1e-11;
 
     /// R prints a matrix column-major; the crate stores it row-major.
@@ -1312,7 +1277,11 @@ mod tests {
         ]
     }
 
-    // -- voom against limma --
+    // -------------------- //
+
+    // voom against limma //
+
+    // -------------------- //
 
     /// `Rscript -e 'suppressMessages(library(limma)); y <- matrix(c(8,16,32,64,128,256,
     /// 4,4,8,8,16,16, 64,64,64,128,128,128, 12,20,28,40,56,72), nrow=4, byrow=TRUE);
@@ -1502,8 +1471,8 @@ mod tests {
     /// `Rscript -e '...; W <- matrix(c(1,1,1,2,2,2, 1,1,1,1,1,1, 2,2,2,1,1,1, 1,2,1,2,1,2),
     /// nrow=4, byrow=TRUE); v4 <- voom(y, X, weights=W); cat(v4$weights, "\n")'`
     ///
-    /// limma feeds the prior weights to `lmFit` but returns the voom weights on
-    /// their own, so the reference is not the elementwise product.
+    /// limma returns the voom weights alone, not the product with the prior
+    /// weights.
     #[test]
     fn test_voom_with_prior_weights() {
         let w_ref = from_r(
@@ -1685,9 +1654,8 @@ mod tests {
 
     /// `Rscript -e '...; vz <- voom(yz, X); cat(vz$weights, "\n")'`
     ///
-    /// The same matrix `voom_lmfit` treats as having structural zeros. Plain
-    /// `voom` has no such machinery, so the weights differ; this pins the
-    /// difference down rather than leaving it implicit.
+    /// The same matrix `voom_lmfit` treats as having structural zeros; plain
+    /// `voom` has no such machinery, so the weights differ.
     #[test]
     fn test_voom_ignores_structural_zeros() {
         let w_ref = from_r(
@@ -1762,7 +1730,11 @@ mod tests {
         assert!(v.trend_x.is_empty());
     }
 
-    // -- voom_lmfit against edgeR --
+    // -------------------------- //
+
+    // voom_lmfit against edgeR //
+
+    // -------------------------- //
 
     /// `Rscript -e 'suppressMessages(library(edgeR)); ...; f <- voomLmFit(y, X);
     /// cat(f$coefficients, "\n"); cat(f$sigma, "\n"); cat(f$stdev.unscaled, "\n");
@@ -1850,10 +1822,9 @@ mod tests {
     /// fz <- voomLmFit(yz, X); cat(fz$sigma, "\n"); cat(fz$df.residual, "\n");
     /// cat(fz$coefficients, "\n"); cat(fz$EList$weights, "\n")'`
     ///
-    /// Gene five is zero throughout the first group, which is a structural zero
-    /// rather than a low count: its three zeros are masked out, its degrees of
-    /// freedom drop from four to two, and the trend switches to
-    /// `weightedLowess`.
+    /// Gene five is zero throughout the first group: its three zeros are
+    /// masked, its degrees of freedom drop from four to two, and the trend
+    /// switches to `weightedLowess`.
     #[test]
     fn test_voom_lmfit_handles_structural_zeros() {
         let coef_ref = from_r(
@@ -1951,9 +1922,9 @@ mod tests {
         assert_eq!(fit.df_residual, vec![4.0, 4.0, 4.0, 4.0, 2.0, 4.0]);
     }
 
-    /// The structural-zero detection is what separates `voom_lmfit` from
-    /// `voom` on this matrix; without it the weights would be the ones
-    /// [`test_voom_ignores_structural_zeros`] pins.
+    /// Structural-zero detection separates `voom_lmfit` from `voom` on this
+    /// matrix; without it the weights would be those pinned by
+    /// [`test_voom_ignores_structural_zeros`].
     #[test]
     fn test_voom_lmfit_and_voom_disagree_on_structural_zeros() {
         let v = voom(&counts6(), 6, 6, &design6(), 2, None, None, None).unwrap();
@@ -1967,7 +1938,11 @@ mod tests {
         assert_matrix(&v.e, &vl.e);
     }
 
-    // -- voom_basic --
+    // ------------ //
+
+    // voom_basic //
+
+    // ------------ //
 
     /// `Rscript -e 'suppressMessages(library(limma)); ...; nf <- c(0.8,1.25,1,1,1.25,0.8);
     /// vb <- voom(y, X, lib.size=colSums(y)*nf, span=0.5, adaptive.span=FALSE);
@@ -2053,7 +2028,11 @@ mod tests {
         assert_matrix(&a.e, &b.e);
     }
 
-    // -- options --
+    // --------- //
+
+    // options //
+
+    // --------- //
 
     /// `save_trend = false` drops the knots and nothing else.
     #[test]
@@ -2077,7 +2056,11 @@ mod tests {
         assert_matrix(&a.weights, &b.weights);
     }
 
-    // -- error branches --
+    // ---------------- //
+
+    // error branches //
+
+    // ---------------- //
 
     #[test]
     fn test_rejects_a_single_gene() {
@@ -2206,7 +2189,11 @@ mod tests {
         ));
     }
 
-    // -- internals --
+    // ----------- //
+
+    // internals //
+
+    // ----------- //
 
     #[test]
     fn test_collapse_averages_tied_abscissae() {

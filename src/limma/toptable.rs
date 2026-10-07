@@ -1,14 +1,12 @@
 //! limma's `topTable`: the moderated fit as a ranked table.
 //!
-//! Deliberately separate from [`crate::results::top_tags`], which is edgeR's.
-//! The two look alike and are not: `topTags` breaks p-value ties on descending
-//! `|logFC|` where `topTable` does not break them at all, `topTable` offers
-//! `AveExpr`, `t` and `B` as sort keys and a second `resort_by` pass, and the
-//! fold-change threshold is `>=` here, `>` in the F variant and `<` in
+//! Separate from [`crate::results::top_tags`], which is edgeR's. They differ:
+//! `topTags` breaks p-value ties on descending `|logFC|` and `topTable` does
+//! not; `topTable` offers `AveExpr`, `t` and `B` as sort keys and a `resort_by`
+//! pass; the fold-change threshold is `>=` here, `>` in the F variant and `<` in
 //! `decide_tests`. All three asymmetries are upstream's.
 //!
-//! Sequential throughout. This is one sort and one scan over the genes, with
-//! nothing to fan out over.
+//! Sequential: one sort and one scan over the genes.
 
 use crate::limma::marray::MArrayLm;
 use crate::numeric::dist::t_ppf;
@@ -47,10 +45,9 @@ pub enum TopTableSort {
 
 /// A second ordering applied to the rows that survived selection.
 ///
-/// Distinct from [`TopTableSort`] in more than timing: `LogFc` and `T` order on
-/// the **signed** value here, not the absolute one, so a resort by `LogFc`
-/// puts the most up-regulated first rather than the most changed
-/// (`R/toptable.R:280-286`).
+/// Distinct from [`TopTableSort`]: `LogFc` and `T` order on the **signed**
+/// value here, so a resort by `LogFc` puts the most up-regulated first, not the
+/// most changed (`R/toptable.R:280-286`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopTableResort {
     /// Descending signed log fold change.
@@ -70,8 +67,7 @@ pub enum TopTableResort {
 #[derive(Clone, Debug)]
 pub struct TopTableParams {
     /// Maximum rows to return. limma defaults to ten; the default here is every
-    /// row, since a caller that wants ten can say so and one that wants all of
-    /// them should not have to.
+    /// row.
     pub number: usize,
     /// Ranking column. Ignored by [`top_table_f`], which ranks on the F
     /// p-value or not at all.
@@ -103,7 +99,7 @@ impl Default for TopTableParams {
 
 /// A ranked table for one coefficient.
 ///
-/// Every vector is the same length and in the table's own order;
+/// Every vector is the same length and in the table's order;
 /// [`TopTable::index`] maps back to the original gene.
 #[derive(Clone, Debug)]
 pub struct TopTable {
@@ -218,10 +214,9 @@ fn moderated(fit: &MArrayLm) -> Result<Moderated<'_>, EdgeErrors> {
 
 /// Stable ordering of a key vector, missing values last.
 ///
-/// R's `order` is a radix sort on doubles, so ties keep their input order in
-/// both directions, and `na.last = TRUE` sends `NA` to the end regardless of
-/// the direction. Both matter: a table where half the genes tie on a p-value of
-/// one would otherwise come back in an arbitrary order.
+/// R's `order` is a stable radix sort on doubles: ties keep input order in both
+/// directions, and `na.last = TRUE` sends `NA` to the end whatever the
+/// direction.
 ///
 /// ### Params
 ///
@@ -257,13 +252,12 @@ fn order_by(keys: &[f64], ascending: bool) -> Vec<usize> {
 
 /// Ranks the genes for one coefficient.
 ///
-/// Port of limma's `topTable` on a single coefficient, which upstream reaches
-/// through `.topTableT` (`R/toptable.R:152-290`). The fit must have been
-/// through [`crate::limma::ebayes::ebayes`].
+/// Port of limma's `topTable` on a single coefficient (`.topTableT`,
+/// `R/toptable.R:152-290`). The fit must have been through
+/// [`crate::limma::ebayes::ebayes`].
 ///
-/// Order of operations, which differs from `top_tags`: adjust over every gene,
-/// thin on the adjusted p-value and the fold change, sort, truncate, then
-/// optionally resort.
+/// Order of operations, unlike `top_tags`: adjust over every gene, thin on the
+/// adjusted p-value and fold change, sort, truncate, then optionally resort.
 ///
 /// ### Params
 ///
@@ -322,7 +316,9 @@ pub fn top_table(
         }
     };
 
-    // -- thin --
+    // ---- //
+    // thin //
+    // ---- //
     let mut kept: Vec<usize> = (0..n_genes).collect();
     if params.p_value < 1.0 || params.lfc > 0.0 {
         kept.retain(|&g| {
@@ -333,7 +329,9 @@ pub fn top_table(
         });
     }
 
-    // -- sort, then truncate --
+    // ------------------- //
+    // sort, then truncate //
+    // ------------------- //
     let keys: Vec<f64> = match params.sort_by {
         TopTableSort::B => kept.iter().map(|&g| b[g]).collect(),
         TopTableSort::LogFc => kept.iter().map(|&g| log_fc[g].abs()).collect(),
@@ -352,7 +350,9 @@ pub fn top_table(
     }
     kept.truncate(params.number);
 
-    // -- resort --
+    // ------ //
+    // resort //
+    // ------ //
     if let Some(by) = params.resort_by {
         let keys: Vec<f64> = match by {
             TopTableResort::LogFc => kept.iter().map(|&g| log_fc[g]).collect(),
@@ -393,16 +393,15 @@ pub fn top_table(
 
 /// Ranks the genes across several coefficients on the moderated F.
 ///
-/// Port of limma's `topTable` with more than one coefficient, which upstream
-/// reaches through `.topTableF` (`R/toptable.R:68-150`).
+/// Port of limma's `topTable` with more than one coefficient (`.topTableF`,
+/// `R/toptable.R:68-150`).
 ///
 /// The F statistic is the one already on the fit, over **every** coefficient,
-/// even when `coefs` names a subset. That is upstream's behaviour and it is
-/// easy to misread: `topTable` subsets the fit at `R/toptable.R:45`, but `F`
-/// belongs to the per-gene group in `[.MArrayLM` (`R/subsetting.R:117-118`), so
-/// subsetting columns leaves it untouched. `coefs` selects which coefficients
-/// are tabulated, not which hypothesis is tested. To test a subset, rotate onto
-/// it with `contrasts_fit` and moderate again.
+/// even when `coefs` names a subset. `topTable` subsets the fit at
+/// `R/toptable.R:45`, but `F` belongs to the per-gene group in `[.MArrayLM`
+/// (`R/subsetting.R:117-118`) and is left untouched. So `coefs` selects which
+/// coefficients are tabulated, not which hypothesis is tested. To test a
+/// subset, rotate onto it with `contrasts_fit` and moderate again.
 ///
 /// ### Params
 ///
@@ -446,7 +445,9 @@ pub fn top_table_f(
     let n_coef = fit.n_coef;
     let adj = p_adjust_bh(p_value);
 
-    // -- thin: any coefficient over the threshold, and significant --
+    // --------------------------------------------------------- //
+    // thin: any coefficient over the threshold, and significant //
+    // --------------------------------------------------------- //
     let mut kept: Vec<usize> = (0..n_genes).collect();
     if params.p_value < 1.0 || params.lfc > 0.0 {
         kept.retain(|&g| {
@@ -605,8 +606,8 @@ mod tests {
 
     #[test]
     fn test_top_table_adjusted_p_is_computed_before_thinning() {
-        // The adjustment runs over every gene, so truncating must not change
-        // the adjusted value a surviving gene carries.
+        // The adjustment runs over every gene, so truncating must not change a
+        // surviving gene's adjusted value.
         let fit = moderated_fit();
         let all = top_table(&fit, 1, None).unwrap();
         let params = TopTableParams {
@@ -639,8 +640,8 @@ mod tests {
 
     #[test]
     fn test_top_table_confidence_interval_survives_thinning() {
-        // This is the 3.66.0 bug: the interval must belong to the gene it is
-        // printed next to, whether or not a threshold removed anything.
+        // The 3.66.0 bug: the interval must belong to the gene it is printed
+        // next to, whether or not a threshold removed anything.
         let fit = moderated_fit();
         let base = TopTableParams {
             confint: Some(DEFAULT_CONF_LEVEL),

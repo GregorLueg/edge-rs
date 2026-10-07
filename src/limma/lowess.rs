@@ -1,11 +1,10 @@
 //! limma's `weightedLowess`.
 //!
 //! Locally weighted linear regression with prior weights, ported from limma's
-//! `src/weighted_lowess.c` and its R wrapper. This is the trend smoother behind
-//! the quasi-likelihood prior and voom's mean-variance curve, so every QL
-//! analysis runs through it.
+//! `src/weighted_lowess.c` and its R wrapper. It is the trend smoother behind
+//! the quasi-likelihood prior and voom's mean-variance curve.
 //!
-//! The shape of the algorithm, and the reason it is cheap:
+//! Algorithm:
 //!
 //! 1. sort by `x`
 //! 2. pick roughly `npts` seed points, spaced at least `delta` apart
@@ -14,19 +13,16 @@
 //! 5. linearly interpolate the non-seed points between consecutive seeds
 //! 6. reweight by the bisquare of the scaled absolute residual and repeat
 //!
-//! Step 2 is the whole trick: a full local fit at every point is `O(n^2)`, while
-//! fitting at ~200 seeds and interpolating is `O(npts * span * n)`. limma
-//! defaults to that, and so does this, which means the fit is an approximation
-//! to the exact loess by construction. Pass `delta = Some(0.0)` for the exact
-//! version.
+//! Step 2 is the speed-up: a fit at every point is `O(n^2)`, fitting at ~200
+//! seeds and interpolating is `O(npts * span * n)`. limma and this port default
+//! to the latter, so the fit approximates exact loess. Pass `delta = Some(0.0)`
+//! for the exact version.
 //!
 //! ### Parallelism
 //!
-//! Seeds are the parallel axis: both the window search and the local fits fan
-//! out over rayon once the work crosses `PARALLEL_WORK_THRESHOLD`, since each
-//! seed is independent of the rest. The interpolation and the robustness pass
-//! stay sequential; both are single passes over `n` with loop-carried state and
-//! neither is where the time goes.
+//! Seeds are the parallel axis: window search and local fits fan out over rayon
+//! above `PARALLEL_WORK_THRESHOLD`. Interpolation and the robustness pass stay
+//! sequential (loop-carried state).
 //!
 //! ### References
 //!
@@ -42,20 +38,17 @@ use crate::errors::EdgeErrors;
 
 /// Work below which the fan-out over seed points stays sequential.
 ///
-/// One iteration costs roughly `n_seeds * span * n` weighted sums, and
-/// `n_seeds * n` is the part of that a caller can vary. With the default
-/// `npts = 200` on a few hundred points the whole pass is a few thousand flops
-/// and rayon's fork costs more than it saves; a 200-seed fit over 20 000 genes,
-/// which is the voom case, is worth splitting.
+/// One iteration costs roughly `n_seeds * span * n` weighted sums. On a few
+/// hundred points rayon's fork costs more than it saves; a 200-seed fit over
+/// 20 000 genes (the voom case) is worth splitting.
 pub(crate) const PARALLEL_WORK_THRESHOLD: usize = 1 << 16;
 
 /// Degeneracy threshold lifted verbatim from limma's `weighted_lowess.c`.
 ///
-/// Guards three separate comparisons: a window whose points are effectively
-/// coincident (fall back to a weighted mean), a local regression with no spread
-/// in `x` (fall back to the weighted mean of `y`), and the residual scale below
-/// which the robustness loop stops early. limma uses `1e-7` for all three, and
-/// the fits only agree to the last digit if this matches.
+/// Guards three comparisons: a window of coincident points (weighted mean), a
+/// local regression with no spread in `x` (weighted mean of `y`), and the
+/// residual scale below which the robustness loop stops early. limma uses `1e-7`
+/// for all three; the fits only agree to the last digit if this matches.
 const THRESHOLD: f64 = 1e-7;
 
 /// Fraction of the covariate range used as the lowess interpolation cell width,
@@ -75,7 +68,7 @@ pub struct LowessParams {
     /// Must lie in `(0, 1]`.
     pub span: f64,
     /// Total number of fitting passes. One means no robustness iteration; the
-    /// robustness weights are still computed and returned.
+    /// robustness weights are still returned.
     pub iterations: usize,
     /// Approximate number of seed points to fit at. Only consulted when
     /// `delta` is `None`.
@@ -97,8 +90,7 @@ impl LowessParams {
     ///
     /// ### Returns
     ///
-    /// The parameter set. Nothing is validated here; [`weighted_lowess`]
-    /// checks the values against the data it is given.
+    /// The parameter set. Validation happens in [`weighted_lowess`].
     pub fn new(span: f64, iterations: usize, npts: usize, delta: Option<f64>) -> Self {
         Self {
             span,
@@ -146,9 +138,9 @@ struct Window {
     start: usize,
     /// Last index inside the window, inclusive.
     end: usize,
-    /// Largest distance from the seed to a point admitted while the window was
-    /// growing. This is the tricube bandwidth, and it deliberately excludes the
-    /// points added afterwards by the tie extension, exactly as limma does.
+    /// Largest distance from the seed to a point admitted while growing the
+    /// window. This is the tricube bandwidth; the tie extension does not update
+    /// it, as in limma.
     max_dist: f64,
 }
 
@@ -158,8 +150,7 @@ struct Window {
 
 /// Fills `out` by evaluating `f` at every index, optionally over rayon.
 ///
-/// The two seed loops differ only in what they compute, so the dispatch on
-/// [`PARALLEL_WORK_THRESHOLD`] lives here rather than being written out twice.
+/// Shared dispatch on [`PARALLEL_WORK_THRESHOLD`] for the two seed loops.
 ///
 /// ### Params
 ///
@@ -180,12 +171,9 @@ where
 
 /// Derives the seed spacing `delta` from a target number of seed points.
 ///
-/// limma's R wrapper asks: if the points were to be grouped into `npts - k`
-/// clusters, and the `k` widest gaps were the ones separating them, how wide
-/// would the average remaining gap be? The answer for cluster count `k` is
-/// `cumsum(sort(diff(x)))[n - 1 - k] / (npts - k)`, and `delta` is the smallest
-/// such width over `k = 0..npts`. Taking the minimum is what keeps the seeds
-/// from collapsing onto a dense patch of `x`.
+/// Mirrors limma's R wrapper: for cluster count `k`, the width is
+/// `cumsum(sort(diff(x)))[n - 1 - k] / (npts - k)`, and `delta` is the minimum
+/// over `k = 0..npts`.
 ///
 /// ### Params
 ///
@@ -194,9 +182,8 @@ where
 ///
 /// ### Returns
 ///
-/// The spacing, or zero when `npts` already covers every point so that no
-/// binning is needed. Errors with [`EdgeErrors::MustBePositive`] if `npts` is
-/// zero, matching the R wrapper's own check.
+/// The spacing, or zero when `npts` covers every point. Errors with
+/// [`EdgeErrors::MustBePositive`] if `npts` is zero, as the R wrapper does.
 pub(crate) fn resolve_delta(xs: &[f64], npts: usize) -> Result<f64, EdgeErrors> {
     if npts == 0 {
         return Err(EdgeErrors::MustBePositive("npts".to_string()));
@@ -256,12 +243,10 @@ pub(crate) fn find_seeds(xs: &[f64], delta: f64) -> Vec<usize> {
 
 /// Grows the local window around one seed point.
 ///
-/// Extends one index at a time, always towards whichever neighbour is closer in
-/// `x`, until the prior weight enclosed reaches `span_weight` or both ends of
-/// the data are hit. The window is then widened over any run of tied `x` at
-/// either edge, so that tied points are never split across the boundary. The
-/// tie extension deliberately does not update the bandwidth, which is limma's
-/// behaviour.
+/// Extends towards the closer neighbour in `x` until the enclosed prior weight
+/// reaches `span_weight` or both ends are hit, then widens over runs of tied
+/// `x` at either edge so ties are never split. The tie extension does not
+/// update the bandwidth, as in limma.
 ///
 /// ### Params
 ///
@@ -327,12 +312,10 @@ fn seed_window(xs: &[f64], ws: &[f64], curpt: usize, span_weight: f64) -> Window
 
 /// Evaluates the tricube-weighted local line at one seed.
 ///
-/// Two degenerate paths, both limma's: a bandwidth below [`THRESHOLD`] means
-/// the window has collapsed onto one `x` value and the answer is the weighted
-/// mean of `y`; a window whose weighted variance in `x` is below [`THRESHOLD`]
-/// cannot support a slope, so the intercept alone is returned. A window with no
-/// weight at all returns zero rather than a NaN, which is how limma keeps a
-/// fully downweighted neighbourhood from poisoning the interpolation.
+/// Degenerate paths, as in limma: a bandwidth below [`THRESHOLD`] gives the
+/// weighted mean of `y`; a weighted variance in `x` below [`THRESHOLD`] gives
+/// the intercept alone. A window with no weight returns zero, not NaN, so a
+/// fully downweighted neighbourhood cannot poison the interpolation.
 ///
 /// ### Params
 ///
@@ -397,16 +380,14 @@ fn lowess_fit(xs: &[f64], ys: &[f64], ws: &[f64], rw: &[f64], curpt: usize, wind
 
 /// Runs the fit-interpolate-reweight loop over sorted data.
 ///
-/// Each pass fits every seed against the current robustness weights, fills the
-/// gaps between consecutive seeds by linear interpolation, then rescales the
-/// absolute residuals by six times their weighted median and squares the
-/// bisquare of that. The loop exits early once that scale collapses relative to
-/// the mean absolute residual, which is what makes an exact fit return weights
-/// of one rather than zero.
+/// Each pass fits the seeds with the current robustness weights, interpolates
+/// between them, then rescales the absolute residuals by six times their
+/// weighted median and squares the bisquare of that. The loop exits early once
+/// that scale collapses relative to the mean absolute residual, so an exact fit
+/// returns weights of one.
 ///
-/// Note that the robustness weights are recomputed after the final fit, so they
-/// describe the returned fit rather than the one before it. limma does the
-/// same, which is why `iterations = 1` still returns non-trivial weights.
+/// Weights are recomputed after the final fit, as in limma, so they describe
+/// the returned fit and `iterations = 1` still returns non-trivial weights.
 ///
 /// ### Params
 ///
@@ -517,16 +498,11 @@ fn lowess_iterations(
 
 /// Locally weighted regression of `y` on `x` with prior weights.
 ///
-/// Port of limma's `weightedLowess`. Inputs need not be sorted: the data is
-/// sorted by `x` internally and the results are mapped back, so `fitted[i]` and
-/// `robust_weights[i]` correspond to `x[i]` and `y[i]` **in the caller's
-/// original order**. Ties in `x` keep their input order and are never split
-/// across a window boundary.
+/// Port of limma's `weightedLowess`. Inputs need not be sorted; outputs follow
+/// the caller's order. Ties in `x` are never split across a window boundary.
 ///
-/// The fit is an approximation by default. Local regressions are performed only
-/// at seed points spaced `delta` apart and the rest is linear interpolation;
-/// see the module documentation. Set `params.delta = Some(0.0)` to fit at every
-/// point instead.
+/// Fits only at seeds spaced `delta` apart and interpolates the rest (see the
+/// module header). Set `params.delta = Some(0.0)` to fit every point.
 ///
 /// ### Params
 ///
@@ -539,9 +515,9 @@ fn lowess_iterations(
 /// ### Returns
 ///
 /// The fitted values and bisquare robustness weights, or [`EdgeErrors`] if the
-/// lengths disagree, fewer than two points were supplied, `span` falls outside
+/// lengths disagree, fewer than two points were supplied, `span` is outside
 /// `(0, 1]`, `iterations` is zero, a prior weight is negative, or `npts` is zero
-/// while `delta` is left to be derived.
+/// while `delta` is derived.
 ///
 /// ### References
 ///
@@ -654,12 +630,10 @@ pub fn weighted_lowess(
 
 /// Cleveland's lowess on data already sorted by `x`.
 ///
-/// A local linear fit is computed at a subset of the points, spaced at least
-/// `delta` apart, and the rest are linearly interpolated between them; the whole
-/// thing repeats `n_steps` times with bisquare weights on the residuals. The
-/// `delta` skipping is what keeps the cost near linear, and reproducing it
-/// exactly is necessary because the interpolated points are genuinely different
-/// from what a fit at every point would give.
+/// Fits locally at points at least `delta` apart and interpolates the rest,
+/// repeating `n_steps` times with bisquare residual weights. The `delta`
+/// skipping must be reproduced exactly: interpolated points differ from a fit
+/// at every point.
 ///
 /// ### Params
 ///
@@ -776,9 +750,9 @@ fn clowess(x: &[f64], y: &[f64], f: f64, n_steps: usize, delta: f64) -> Vec<f64>
 
 /// One tricube-weighted local linear fit, the `lowest` of Cleveland's code.
 ///
-/// The window runs from `nleft` and is extended past `nright` to pick up ties in
-/// `x`. When the window has no spread the fit falls back to a weighted mean,
-/// which is what the `sqrt(c) > 0.001 * range` guard is for.
+/// The window runs from `nleft` and extends past `nright` over ties in `x`.
+/// With no spread in the window the fit falls back to a weighted mean (the
+/// `sqrt(c) > 0.001 * range` guard).
 ///
 /// ### Params
 ///
@@ -866,18 +840,11 @@ fn lowest(
 
 /// Fitted values of R's `stats::lowess`, in the caller's original order.
 ///
-/// Distinct from [`weighted_lowess`] in this same module, which is limma's own
-/// `weightedLowess`. Both are needed: limma's `loessFit` returns early to this
-/// one whenever it has no prior weights, and edgeR's `compute_ave_qd` uses this
-/// one too. Reaching for the wrong one costs up to 7e-4 on the quasi-likelihood
-/// prior.
-///
-/// limma's `fitFDistRobustly` smooths the log variances with
-/// `loessFit(z, covariate, span = 0.4)`, and `loessFit` with no prior weights is
-/// a straight call to `stats::lowess`. That is Cleveland's original lowess, not
-/// limma's own `weightedLowess` in [`crate::limma::lowess`]: the two differ in
-/// how the local window is chosen and in the robustness weighting, so the trend
-/// only matches limma's if this one is used.
+/// Not [`weighted_lowess`]: limma's `loessFit` calls `stats::lowess` when there
+/// are no prior weights (as in `fitFDistRobustly`, `loessFit(z, covariate, span
+/// = 0.4)`), and edgeR's `compute_ave_qd` uses it too. The two differ in window
+/// choice and robustness weighting; using the wrong one costs up to 7e-4 on the
+/// quasi-likelihood prior.
 ///
 /// ### Params
 ///
@@ -926,15 +893,12 @@ mod tests {
 
     /// Relative tolerance against limma, applied with no absolute floor.
     ///
-    /// The worst disagreement actually observed across every case below is
-    /// 1.5e-15, a couple of ulps, which is what one expects when the same
-    /// arithmetic is performed in a marginally different order. The tolerance
-    /// is loosened to 1e-13 only so a different optimiser or libm cannot make
-    /// the suite flaky.
+    /// Worst observed disagreement across the cases below is 1.5e-15. Set to
+    /// 1e-13 so a different optimiser or libm cannot make the suite flaky.
     const TOL: f64 = 1e-13;
 
     /// The shared 50-point fixture, built from exactly representable arithmetic
-    /// so that R and Rust construct bit-identical inputs.
+    /// so R and Rust get bit-identical inputs.
     ///
     /// R: `i <- 1:50; x <- i/64; noise <- ((i*i*37) %% 101)/500 - 0.1;`
     /// `y <- 3*x - 2*x*x + noise`
@@ -1179,9 +1143,8 @@ mod tests {
         assert_close(&fit.fitted, &LIMMA_SPAN05_FITTED);
     }
 
-    /// With `npts = 10` the derived delta is 0.0765625, so only a handful of
-    /// seeds are fitted and everything else is interpolated. This is the test
-    /// that exercises the binning shortcut against limma rather than around it.
+    /// With `npts = 10` the derived delta is 0.0765625, so few seeds are fitted
+    /// and the rest interpolated: exercises the binning shortcut against limma.
     #[test]
     fn test_matches_limma_with_delta_binning() {
         let (x, y) = fixture();
@@ -1387,8 +1350,8 @@ mod tests {
         assert!(weighted_lowess(&x, &y, None, Some(params)).is_ok());
     }
 
-    /// `delta = Some(0.0)` fits every point, which is what the default does here
-    /// anyway since `npts = 200` exceeds the fifty points on offer.
+    /// `delta = Some(0.0)` fits every point, as the default does here since
+    /// `npts = 200` exceeds the 50 points.
     #[test]
     fn test_explicit_zero_delta_matches_the_default() {
         let (x, y) = fixture();
@@ -1397,8 +1360,7 @@ mod tests {
         assert_close(&fit.fitted, &LIMMA_SPAN03_FITTED);
     }
 
-    /// The rayon fan-out must be bit-for-bit the sequential answer: each seed
-    /// fit is independent, so splitting them changes no summation order.
+    /// The rayon fan-out must be bit-for-bit the sequential answer.
     #[test]
     fn test_parallel_path_agrees_with_sequential() {
         let n = 400usize;

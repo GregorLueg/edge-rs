@@ -1,18 +1,15 @@
 //! limma's `eBayes`: moderated t, moderated F and the B-statistic.
 //!
-//! Almost all of the work is [`crate::limma::squeeze_var::squeeze_var`], which
-//! fits the scaled F prior to the genewise variances. What is left is arithmetic
-//! on top of it, and two things that are not:
+//! Most of the work is [`crate::limma::squeeze_var::squeeze_var`]. On top of it:
 //!
 //! * the B-statistic needs a prior variance for the *coefficients*, estimated by
 //!   `tmixture` from the order statistics of the largest moderated t values;
 //! * the moderated F rotates the t statistics into a basis where the
-//!   coefficients are uncorrelated, which is an eigendecomposition of the
-//!   coefficient correlation matrix.
+//!   coefficients are uncorrelated, via an eigendecomposition of the coefficient
+//!   correlation matrix.
 //!
-//! Everything genewise is elementwise, so it is a rayon fan-out over genes.
-//! `tmixture` is not: it ranks all genes against each other and so runs
-//! sequentially.
+//! Genewise steps run over genes with rayon. `tmixture` ranks all genes against
+//! each other and runs sequentially.
 //!
 //! ### References
 //!
@@ -36,10 +33,9 @@ use crate::utils::linalg::{cov2cor, self_adjoint_eigen_desc};
 /// Prior degrees of freedom above which the posterior variance is treated as
 /// the prior exactly.
 ///
-/// limma's `Infdf <- df.prior > 10^6` (`R/ebayes.R:78`). Past it the
-/// log-ratio kernel of the B-statistic is replaced by its limit, which is what
-/// keeps a `df.prior` of infinity from producing a `NaN` rather than the
-/// perfectly well-defined answer it has.
+/// limma's `Infdf <- df.prior > 10^6` (`R/ebayes.R:78`). Past it the B-statistic
+/// kernel switches to its limit, so an infinite `df.prior` gives a number
+/// rather than `NaN`.
 const INFINITE_DF_PRIOR: f64 = 1e6;
 
 /// Relative size below which an eigenvalue of the correlation matrix counts as
@@ -47,8 +43,7 @@ const INFINITE_DF_PRIOR: f64 = 1e6;
 ///
 /// `sum(E$values / E$values[1] > 1e-8)` in `classifyTestsF`
 /// (`R/decidetests.R:213`). It sets the numerator degrees of freedom of the
-/// moderated F, so it has to match upstream exactly rather than merely be
-/// reasonable.
+/// moderated F, so it must match upstream exactly.
 const EIGEN_RANK_TOL: f64 = 1e-8;
 
 //////////////////
@@ -57,9 +52,8 @@ const EIGEN_RANK_TOL: f64 = 1e-8;
 
 /// What the prior variance is allowed to depend on.
 ///
-/// limma's `trend` argument is overloaded: `FALSE` for no covariate, `TRUE` for
-/// the average log-expression, or a numeric vector to supply one directly
-/// (`R/ebayes.R:43-54`).
+/// limma's `trend` argument: `FALSE` for no covariate, `TRUE` for the average
+/// log-expression, or a numeric vector (`R/ebayes.R:43-54`).
 #[derive(Clone, Debug, Default)]
 pub enum EBayesTrend {
     /// One prior for every gene. limma's `trend = FALSE`.
@@ -116,8 +110,7 @@ impl Default for EBayesParams {
 /// Reads a vector that is either length one or one value per gene.
 ///
 /// `squeezeVar` returns a scalar prior for an untrended, non-robust fit and a
-/// per-gene one otherwise, and limma relies on R's recycling to paper over the
-/// difference.
+/// per-gene one otherwise; limma relies on R's recycling.
 ///
 /// ### Params
 ///
@@ -136,9 +129,8 @@ fn recycled(v: &[f64], i: usize) -> f64 {
 ///
 /// `lods = log(p / (1 - p)) - log(r) / 2 + kernel` with
 /// `r = (u^2 + v0) / u^2` the variance inflation a differentially expressed
-/// gene would show. The kernel has two forms: the log-ratio one, and its limit
-/// as the prior degrees of freedom go to infinity (`R/ebayes.R:78-88`). limma
-/// switches per gene, not globally.
+/// gene would show. The kernel has a log-ratio form and an infinite-`df_prior`
+/// limit (`R/ebayes.R:78-88`); limma switches per gene, not globally.
 ///
 /// ### Params
 ///
@@ -188,8 +180,8 @@ fn log_odds(
 
 /// Prior coefficient variance for every coefficient.
 ///
-/// A column loop over [`tmixture_vector`]. Kept sequential: each column already
-/// sorts every gene, and there are only ever a handful of columns.
+/// A sequential column loop over [`tmixture_vector`]: each column already sorts
+/// every gene and there are few columns.
 ///
 /// ### Params
 ///
@@ -227,17 +219,15 @@ fn tmixture_matrix(
 
 /// Scale factor of a two-component mixture of t distributions.
 ///
-/// The model is that a proportion `p` of genes have a t statistic distributed
-/// as `sqrt(1 + v0 / v1) t(df)` and the rest as `t(df)`, with `v1` the squared
+/// A proportion `p` of genes have a t statistic distributed as
+/// `sqrt(1 + v0 / v1) t(df)` and the rest as `t(df)`, with `v1` the squared
 /// unscaled standard deviation. This estimates `v0` by comparing the largest
-/// observed statistics against the order statistics the null would produce, and
-/// averaging the per-gene solutions.
+/// observed statistics against the null's order statistics and averaging the
+/// per-gene solutions.
 ///
 /// Genes with unequal degrees of freedom are first converted to the largest
-/// `df` present, by matching tail probabilities. That conversion runs in logs,
-/// because the statistics it applies to are by construction the most extreme in
-/// the experiment and their tail probabilities routinely underflow
-/// (`R/ebayes.R:137-138`).
+/// `df` present by matching tail probabilities. This runs in logs, since these
+/// extreme statistics routinely underflow (`R/ebayes.R:137-138`).
 ///
 /// ### Params
 ///
@@ -258,8 +248,8 @@ fn tmixture_vector(
     proportion: f64,
     limits: (f64, f64),
 ) -> Result<f64, EdgeErrors> {
-    // Missing statistics drop out first, and the gene count that drives
-    // everything below is the count of what survives (`R/ebayes.R:116-124`).
+    // Missing statistics drop out first; the gene count below is what survives
+    // (`R/ebayes.R:116-124`).
     let mut abs_t = Vec::with_capacity(tstat.len());
     let mut v1 = Vec::with_capacity(tstat.len());
     let mut dfs = Vec::with_capacity(tstat.len());
@@ -276,8 +266,7 @@ fn tmixture_vector(
     if ntarget < 1 {
         return Ok(f64::NAN);
     }
-    // Keeps `ptarget` below one when the target count rounded up past the
-    // proportion it came from.
+    // Keeps `ptarget` below one when the target count rounded up.
     let p = (ntarget as f64 / n_genes as f64).max(proportion);
 
     let max_df = dfs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
@@ -311,10 +300,9 @@ fn tmixture_vector(
 /// Moderated F across the coefficients.
 ///
 /// limma's `classifyTestsF(fstat.only = TRUE)` (`R/decidetests.R:172-223`).
-/// The t statistics for one gene are correlated with each other through the
-/// design; rotating by `Q = V diag(1 / sqrt(lambda)) / sqrt(r)` decorrelates
-/// and rescales them, so their sum of squares is an F on `r` numerator degrees
-/// of freedom.
+/// Rotating a gene's correlated t statistics by
+/// `Q = V diag(1 / sqrt(lambda)) / sqrt(r)` decorrelates and rescales them, so
+/// their sum of squares is an F on `r` numerator degrees of freedom.
 ///
 /// ### Params
 ///
@@ -337,8 +325,8 @@ fn moderated_f(
         return Ok((t.iter().map(|v| v * v).collect(), 1.0));
     }
 
-    // An all-zero contrast leaves a zero variance, which `cov2cor` would divide
-    // by. limma nudges it to one first (`R/decidetests.R:181-189`).
+    // An all-zero contrast leaves a zero variance that `cov2cor` would divide
+    // by; limma nudges it to one (`R/decidetests.R:181-189`).
     let mut cov = cov_coefficients.to_vec();
     let smallest = (0..n_coef).fold(f64::INFINITY, |a, i| a.min(cov[i * n_coef + i]));
     if smallest == 0.0 {
@@ -389,14 +377,12 @@ fn moderated_f(
 /// Empirical Bayes moderation of a linear model fit.
 ///
 /// Port of limma's `eBayes`. Shrinks each gene's residual variance towards a
-/// fitted prior, divides the coefficients by the moderated standard errors to
-/// get a t statistic with more degrees of freedom than the gene itself has, and
-/// adds the log-odds of differential expression. When the design is full rank
-/// it also computes the moderated F across coefficients.
+/// fitted prior, forms moderated t statistics and log-odds, and, when the design
+/// is full rank, the moderated F.
 ///
-/// The fit must have been through [`crate::limma::lm_fit::lm_fit`], and through
-/// [`crate::limma::contrasts::contrasts_fit`] first if the hypotheses of
-/// interest are contrasts rather than bare coefficients.
+/// The fit must come from [`crate::limma::lm_fit::lm_fit`], and through
+/// [`crate::limma::contrasts::contrasts_fit`] first if the hypotheses are
+/// contrasts.
 ///
 /// ### Params
 ///
@@ -416,7 +402,9 @@ fn moderated_f(
 /// Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004
 pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayLm, EdgeErrors> {
     let params = params.unwrap_or_default();
-    // -- checks --
+    // ------ //
+    // checks //
+    // ------ //
     if !(params.proportion > 0.0 && params.proportion < 1.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
             "proportion must lie strictly inside (0, 1); got {}",
@@ -437,7 +425,9 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
     let n_genes = fit.n_genes;
     let n_coef = fit.n_coef;
 
-    // -- the covariate the prior is trended against --
+    // ------------------------------------------ //
+    // the covariate the prior is trended against //
+    // ------------------------------------------ //
     let covariate: Option<Vec<f64>> = match &params.trend {
         EBayesTrend::None => None,
         EBayesTrend::Amean => Some(fit.amean.clone().ok_or_else(|| {
@@ -459,7 +449,9 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
         }
     };
 
-    // -- the variance prior --
+    // ------------------ //
+    // the variance prior //
+    // ------------------ //
     let var: Vec<f64> = fit.sigma.iter().map(|s| s * s).collect();
     let squeezed = squeeze_var(
         &var,
@@ -476,11 +468,12 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
     let s2_prior = squeezed.var_prior;
     let df_prior = squeezed.df_prior;
 
-    // -- moderated t, and the degrees of freedom it is read against --
+    // ---------------------------------------------------------- //
+    // moderated t, and the degrees of freedom it is read against //
+    // ---------------------------------------------------------- //
     //
-    // The pooled cap matters on small designs: without it a gene can be handed
-    // more degrees of freedom than the whole experiment has, see
-    // `R/ebayes.R:62-64`.
+    // The pooled cap matters on small designs: without it a gene can get more
+    // degrees of freedom than the whole experiment (`R/ebayes.R:62-64`).
     let df_pooled: f64 = fit.df_residual.iter().filter(|v| v.is_finite()).sum();
     let df_total: Vec<f64> = (0..n_genes)
         .map(|g| (fit.df_residual[g] + recycled(&df_prior, g)).min(df_pooled))
@@ -507,7 +500,9 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
             Ok(())
         })?;
 
-    // -- prior coefficient variance for the B-statistic --
+    // ---------------------------------------------- //
+    // prior coefficient variance for the B-statistic //
+    // ---------------------------------------------- //
     let median_prior = median(&s2_prior);
     let limits = (
         params.stdev_coef_lim.0.powi(2) / median_prior,
@@ -542,7 +537,9 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
         params.proportion,
     );
 
-    // -- moderated F, when every coefficient is estimable --
+    // ------------------------------------------------ //
+    // moderated F, when every coefficient is estimable //
+    // ------------------------------------------------ //
     let (f_stat, f_p_value) = if is_full_rank(&fit.design, fit.n_samples, fit.pivot.len())? {
         let df2: Vec<f64> = (0..n_genes)
             .map(|g| fit.df_residual[g] + recycled(&df_prior, g))
@@ -671,8 +668,8 @@ mod tests {
 
     #[test]
     fn test_moderated_f_on_uncorrelated_coefficients_is_the_mean_square() {
-        // An identity correlation matrix gives Q = I / sqrt(2), so the
-        // statistic is the mean of the squared t values.
+        // An identity correlation gives Q = I / sqrt(2): the statistic is the
+        // mean of the squared t values.
         let t = vec![2.0, 4.0];
         let (f, df1) = moderated_f(&t, &[1.0, 0.0, 0.0, 1.0], 1, 2).unwrap();
         assert_eq!(df1, 2.0);
@@ -690,10 +687,9 @@ mod tests {
     #[test]
     fn test_infinite_prior_takes_the_limiting_kernel() {
         // The log-ratio kernel tends to the limiting one as the degrees of
-        // freedom grow, so both branches must give nearly the same log-odds on
-        // a large `df_total`. They agree to about 1e-5 and no better, because
-        // the log-ratio form is evaluating `ln(1 + tiny)` by then. That
-        // degradation is why limma splits the branch at all.
+        // freedom grow, so both give nearly the same log-odds on a large
+        // `df_total`. They agree to about 1e-5 only, as the log-ratio form
+        // evaluates `ln(1 + tiny)` by then; that is why limma splits the branch.
         let t = vec![3.0];
         let u = vec![0.5];
         let dft = vec![1e12];
@@ -706,15 +702,15 @@ mod tests {
     #[test]
     fn test_tmixture_returns_nan_when_no_gene_is_targeted() {
         // `ceiling` of any positive number is at least one, so the target count
-        // only reaches zero once every statistic has been dropped as missing.
+        // is zero only once every statistic has been dropped as missing.
         let out = tmixture_vector(&[f64::NAN], &[1.0], &[3.0], 0.01, (0.0, 1e6)).unwrap();
         assert!(out.is_nan());
     }
 
     #[test]
     fn test_tmixture_skips_missing_statistics() {
-        // The gene count driving the order statistics is the count of what
-        // survived, not the input length.
+        // The gene count driving the order statistics is what survived, not
+        // the input length.
         let t: Vec<f64> = (0..50)
             .map(|i| {
                 if i % 5 == 0 {
