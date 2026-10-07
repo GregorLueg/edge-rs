@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.2.0
+
+### Breaking changes
+
+* `NebulaParams` gains a public `min_subjects` field. Code building the struct
+  with an exhaustive literal no longer compiles; `..NebulaParams::default()`
+  keeps working.
+
+### Features
+
+* NEBULA can drop genes that too few subjects express. `min_subjects` counts
+  the subjects whose own mean count per cell clears `cpc` and drops the gene
+  below the threshold. `cpc` and `mincp` pool every cell, so a single subject
+  could carry a gene through and leave a subject-level coefficient resting on a
+  handful of subjects. Applies to `nebula`, `nebula_sparse` and
+  `nebula_sparse_gpu`. Defaults to `0`, off, which matches the R package.
+
 ## v0.1.2
 
 ### Features
