@@ -1,7 +1,7 @@
 //! libscran's `WeightedLowess`.
 //!
 //! The smoother behind scrapper's `fitVarianceTrend`. It shares seed selection
-//! with limma's `weightedLowess` ([`resolve_delta`], [`find_seeds`] come from
+//! with limma's `weightedLowess` (`resolve_delta`, `find_seeds` come from
 //! [`super::lowess`]) but differs enough in the fit to be a sibling function
 //! rather than a flag on [`super::lowess::weighted_lowess`]:
 //!

@@ -215,7 +215,7 @@ pub fn ln_gamma(x: f64) -> f64 {
 
 /// Digamma function, the logarithmic derivative of the gamma function.
 ///
-/// Recurrence up to [`RECURRENCE_THRESHOLD`], then `ln(z)` minus the asymptotic
+/// Recurrence up to `RECURRENCE_THRESHOLD`, then `ln(z)` minus the asymptotic
 /// expansion of `ln(z) - psi(z)`, shared with [`logmdigamma`].
 ///
 /// ### Params
@@ -263,7 +263,7 @@ pub fn trigamma(x: f64) -> f64 {
 ///
 /// ### Params
 ///
-/// * `n` - Order of differentiation. Orders above [`POLYGAMMA_MAX_ORDER`] give
+/// * `n` - Order of differentiation. Orders above `POLYGAMMA_MAX_ORDER` give
 ///   `NaN`; edgeR never asks past two.
 /// * `x` - Argument, must be strictly positive.
 ///

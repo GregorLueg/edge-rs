@@ -90,7 +90,7 @@ pub struct AdjustedDeviance {
     /// because each sample contributes its own `kappa`.
     pub df: Vec<f64>,
     /// Quasi-likelihood dispersion, `deviance / df`. Zero where `df` has
-    /// collapsed below [`THRESHOLD_ZERO`].
+    /// collapsed below `THRESHOLD_ZERO`.
     pub s2: Vec<f64>,
 }
 
@@ -105,7 +105,7 @@ pub struct AdjustedDeviance {
 ///
 /// with `(alpha, kappa)` from [`compute_weight`], `d` the unit deviance and `h`
 /// the leverage under working weights `mu / (1 + mu phi w / prior)`.
-/// Observations with complementary leverage below [`THRESHOLD_ZERO`] drop out
+/// Observations with complementary leverage below `THRESHOLD_ZERO` drop out
 /// of both sums.
 ///
 /// ### Params

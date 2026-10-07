@@ -18,7 +18,7 @@
 //!
 //! The coefficient tables are copied verbatim from `ql_weights.c` by way of
 //! edgePython. Panel boundaries and the affine maps onto `[-1, 1]` live in
-//! [`Panel`] tables next to the coefficients they index.
+//! `Panel` tables next to the coefficients they index.
 //!
 //! ### Deviations from edgePython
 //!
@@ -443,7 +443,7 @@ fn pois_kappa_tail(mu: f64) -> f64 {
 
 /// Reciprocal scale of the Poisson unit deviance.
 ///
-/// Piecewise Chebyshev below [`POIS_ASYMPTOTIC_MU`], asymptotic expansion
+/// Piecewise Chebyshev below `POIS_ASYMPTOTIC_MU`, asymptotic expansion
 /// above. The first panel divides out the `log(mu)` singularity at `mu -> 0`.
 ///
 /// ### Params
@@ -453,7 +453,7 @@ fn pois_kappa_tail(mu: f64) -> f64 {
 /// ### Returns
 ///
 /// `2 E[d] / Var[d]` for `d` the Poisson unit deviance at `mu`, or zero when
-/// `mu` is below [`MIN_MU`].
+/// `mu` is below `MIN_MU`.
 pub fn pois_alpha(mu: f64) -> f64 {
     if mu < MIN_MU {
         return 0.0;
@@ -481,7 +481,7 @@ pub fn pois_alpha(mu: f64) -> f64 {
 /// ### Returns
 ///
 /// `2 E[d]^2 / Var[d]` for `d` the Poisson unit deviance at `mu`, or zero when
-/// `mu` is below [`MIN_MU`].
+/// `mu` is below `MIN_MU`.
 pub fn pois_kappa(mu: f64) -> f64 {
     if mu < MIN_MU {
         return 0.0;
@@ -766,8 +766,8 @@ fn nb_moments_large_phi(mu: f64, phi: f64) -> (f64, f64) {
 
 /// Reciprocal scale of the negative binomial unit deviance.
 ///
-/// Dispatches on `phi`: case 1 fits below [`PHI_CASE1_MAX`] (including zero),
-/// case 2 below [`PHI_CASE2_MAX`], direct summation above.
+/// Dispatches on `phi`: case 1 fits below `PHI_CASE1_MAX` (including zero),
+/// case 2 below `PHI_CASE2_MAX`, direct summation above.
 ///
 /// ### Params
 ///
@@ -777,7 +777,7 @@ fn nb_moments_large_phi(mu: f64, phi: f64) -> (f64, f64) {
 /// ### Returns
 ///
 /// `2 E[d] / Var[d]` for `d` the unit deviance at `(mu, phi)`, or zero when
-/// `mu` is below [`MIN_MU`].
+/// `mu` is below `MIN_MU`.
 pub fn nb_alpha(mu: f64, phi: f64) -> f64 {
     compute_weight(mu, phi, 1.0).0
 }
@@ -785,7 +785,7 @@ pub fn nb_alpha(mu: f64, phi: f64) -> f64 {
 /// Degrees of freedom of the negative binomial unit deviance.
 ///
 /// Dispatches on `phi` as [`nb_alpha`] does. For both moments above
-/// [`PHI_CASE2_MAX`] use [`compute_weight`], which sums the mass function once.
+/// `PHI_CASE2_MAX` use [`compute_weight`], which sums the mass function once.
 ///
 /// ### Params
 ///
@@ -795,7 +795,7 @@ pub fn nb_alpha(mu: f64, phi: f64) -> f64 {
 /// ### Returns
 ///
 /// `2 E[d]^2 / Var[d]` for `d` the unit deviance at `(mu, phi)`, or zero when
-/// `mu` is below [`MIN_MU`].
+/// `mu` is below `MIN_MU`.
 pub fn nb_kappa(mu: f64, phi: f64) -> f64 {
     compute_weight(mu, phi, 1.0).1
 }
@@ -813,7 +813,7 @@ pub fn nb_kappa(mu: f64, phi: f64) -> f64 {
 /// ### Returns
 ///
 /// `(alpha, kappa)`: the reciprocal scale for the adjusted deviance and the
-/// degrees of freedom it carries. Both are zero for a mean below [`MIN_MU`].
+/// degrees of freedom it carries. Both are zero for a mean below `MIN_MU`.
 pub fn compute_weight(u: f64, phi: f64, prior: f64) -> (f64, f64) {
     let mu = u / prior;
     if phi < PHI_CASE1_MAX {

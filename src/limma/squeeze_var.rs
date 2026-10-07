@@ -204,7 +204,7 @@ pub struct SqueezeVarParams {
     /// variances, each in `[0, 0.5)`. Only used when `robust` is set.
     pub winsor_tail_p: (f64, f64),
     /// Span of the lowess trend against the covariate. `None` picks each fit's
-    /// own default: [`ROBUST_LOWESS_SPAN`] on the legacy robust path,
+    /// own default: `ROBUST_LOWESS_SPAN` on the legacy robust path,
     /// `chooseLowessSpan(n, small.n = 500)` on the unequal-`df1` path.
     ///
     /// Setting it forces `legacy` off, as in limma, whose `squeezeVar` never
@@ -412,7 +412,7 @@ pub fn squeeze_var(
 ///
 /// Genes with a non-finite or negligible `df1`, or a non-finite or negative
 /// variance, are dropped. Exact zeros among the survivors are lifted to
-/// [`ZERO_VAR_OFFSET`] times the median.
+/// `ZERO_VAR_OFFSET` times the median.
 ///
 /// ### Params
 ///
@@ -478,7 +478,7 @@ pub fn fit_f_dist(x: &[f64], df1: &[f64]) -> Result<(f64, f64), EdgeErrors> {
 /// The spline is built over the surviving genes, as in limma, so surviving genes
 /// match to rounding. limma evaluates it at dropped genes with `predict.ns`;
 /// [`natural_spline_basis`] does not expose its knots, so the trend is read off
-/// the fitted values with [`extend_trend`]. Dropped genes carry an interpolation
+/// the fitted values with `extend_trend`. Dropped genes carry an interpolation
 /// error of order the local covariate spacing squared (about `1e-3` on forty
 /// genes). Only affects fits where some `df1` is zero or some variance is not
 /// finite. See `UPSTREAM_DEVIATIONS.md` A6 and A10.
@@ -649,9 +649,9 @@ pub struct UnequalDf1Fit {
 /// `1 / trigamma(df_g / 2)`.
 ///
 /// Genes are down-weighted, not dropped. A `NaN` variance or a `df1` below
-/// [`UNEQUAL_DF1_TOL`] gets zero prior weight and a placeholder `df1` of one, so
+/// `UNEQUAL_DF1_TOL` gets zero prior weight and a placeholder `df1` of one, so
 /// it still comes back with a trend value. Variances are floored at
-/// [`UNEQUAL_ZERO_VAR_OFFSET`] times the median informative variance.
+/// `UNEQUAL_ZERO_VAR_OFFSET` times the median informative variance.
 ///
 /// With `robust` set the fit runs twice: the second pass uses the
 /// Benjamini-Hochberg adjusted two-sided F p-values as prior weights, holding

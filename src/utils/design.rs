@@ -195,7 +195,7 @@ pub fn hat_diagonal(design: &[f64], n_rows: usize, n_cols: usize) -> Result<Vec<
 
 /// Groups samples by their design row.
 ///
-/// Port of edgeR's `designAsFactor`: hash each row with [`FACTOR_HASH_BASE`],
+/// Port of edgeR's `designAsFactor`: hash each row with `FACTOR_HASH_BASE`,
 /// then label the distinct values in ascending order. When the group count
 /// equals the coefficient count, `glm_fit` takes the closed-form one-way fit.
 ///

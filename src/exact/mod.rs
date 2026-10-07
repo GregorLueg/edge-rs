@@ -492,7 +492,7 @@ fn q2q_one(x: f64, input_mean: f64, output_mean: f64, dispersion: f64) -> Result
 ///
 /// * The normal half is the linear map `output_mean + sd_out (x - input_mean) /
 ///   sd_in`, which `qnorm(pnorm(...))` reduces to. Agrees to the last bit or two.
-/// * The upper gamma tail uses [`ln_reg_gamma_upper`] and its inverse, not
+/// * The upper gamma tail uses `ln_reg_gamma_upper` and its inverse, not
 ///   `gamma_cdf` and `gamma_ppf`.
 ///
 /// ### Params

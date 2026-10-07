@@ -541,7 +541,7 @@ pub(crate) fn fit_one_gene(
 
 /// Fits genewise negative binomial GLMs with Levenberg damping.
 ///
-/// Damping starts at [`INITIAL_DAMPING`], divides by ten on an accepted step and
+/// Damping starts at `INITIAL_DAMPING`, divides by ten on an accepted step and
 /// multiplies by ten on a rejected one, as in edgeR. A step is accepted when it
 /// does not increase the deviance, so the iteration is monotone and needs no
 /// line search.

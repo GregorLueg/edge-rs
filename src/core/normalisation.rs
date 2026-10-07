@@ -2,7 +2,7 @@
 //!
 //! A port of edgeR's `normLibSizes.default` and the four `.calcFactor*` helpers
 //! it dispatches to. Where edgePython and edgeR disagree, edgeR wins; see
-//! [`calc_factor_tmmwsp`].
+//! `calc_factor_tmmwsp`.
 //!
 //! ### Access pattern
 //!
@@ -837,7 +837,7 @@ fn trim_window(order: &[usize], n: usize, trim: f64) -> Vec<bool> {
 ///   entry must be finite and strictly positive.
 /// * `method` - Which scaling rule to apply
 /// * `ref_column` - Zero-based reference sample for TMM and TMMwsp. `None`
-///   uses [`resolve_ref_column`]. Ignored by the other methods.
+///   uses `resolve_ref_column`. Ignored by the other methods.
 /// * `params` - Tuning knobs, or `None` for [`NormParams::default`]
 ///
 /// ### Returns

@@ -546,7 +546,7 @@ pub fn tpm<T: EdgeFloat>(
 /// * `prior_count` - Prior count before library-size scaling; edgeR's default
 ///   is 2
 /// * `dispersion` - Dispersion, recycled over genes and samples. `None` uses
-///   [`DEFAULT_DISPERSION`].
+///   `DEFAULT_DISPERSION`.
 ///
 /// ### Returns
 ///

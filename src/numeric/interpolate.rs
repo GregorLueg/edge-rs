@@ -493,7 +493,7 @@ fn refine_on_segment(
 /// ### Params
 ///
 /// * `x` - Covariate values, need not be sorted
-/// * `df` - Requested number of basis columns, at least [`MIN_BASIS_DF`]
+/// * `df` - Requested number of basis columns, at least `MIN_BASIS_DF`
 ///
 /// ### Returns
 ///

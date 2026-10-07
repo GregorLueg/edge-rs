@@ -1092,7 +1092,7 @@ pub fn gamma_cdf(x: f64, shape: f64, scale: f64) -> Result<f64, EdgeErrors> {
 /// `x` with `P(X <= x) = p`. `p = 0` gives 0.0 and `p = 1` gives `+inf`.
 /// [`EdgeErrors::InvalidArgument`] for `p` outside `[0, 1]` or a non-positive
 /// `shape` or `scale`, and [`EdgeErrors::NoConvergence`] if the bracket has not
-/// closed within [`GAMMA_PPF_MAX_ITER`].
+/// closed within `GAMMA_PPF_MAX_ITER`.
 pub fn gamma_ppf(p: f64, shape: f64, scale: f64) -> Result<f64, EdgeErrors> {
     check_probability("p", p)?;
     check_positive("shape", shape)?;

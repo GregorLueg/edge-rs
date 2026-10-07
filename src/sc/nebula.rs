@@ -171,7 +171,7 @@ pub enum NebulaMethod {
     /// refits only when the large-sample approximation looks unsafe.
     Ln,
     /// NEBULA-HL. Always refits both overdispersions against the profile
-    /// likelihood. Slower; the fallback below [`MIN_CELLS_PER_SUBJECT_LN`] cells
+    /// likelihood. Slower; the fallback below `MIN_CELLS_PER_SUBJECT_LN` cells
     /// per subject.
     Hl,
 }
@@ -184,7 +184,7 @@ pub struct NebulaParams {
     /// Upper bounds on `(sigma, phi)`, nebula's `max`.
     pub max: (f64, f64),
     /// Which variant to run. Overridden to [`NebulaMethod::Hl`] below
-    /// [`MIN_CELLS_PER_SUBJECT_LN`] cells per subject, as in the R package.
+    /// `MIN_CELLS_PER_SUBJECT_LN` cells per subject, as in the R package.
     pub method: NebulaMethod,
     /// Refit both overdispersions when the product of the cells per subject and
     /// the estimated `phi` falls below this.
