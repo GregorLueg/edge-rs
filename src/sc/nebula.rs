@@ -213,6 +213,14 @@ pub struct NebulaParams {
     pub cpc: f64,
     /// Drop a gene expressed in fewer than this many cells.
     pub mincp: usize,
+    /// Drop a gene that fewer than this many subjects express, a subject
+    /// expressing it when its own mean count per cell is above `cpc`.
+    ///
+    /// `cpc` and `mincp` pool every cell, so one subject can carry a gene
+    /// through on its own and a subject-level coefficient then rests on a
+    /// handful of subjects. `0`, the default, switches the check off, which is
+    /// the R package's behaviour.
+    pub min_subjects: usize,
     /// Estimate the overdispersions by restricted maximum likelihood.
     ///
     /// R's `nebula` package only honours this for `NBLMM`, which this port does
@@ -237,6 +245,7 @@ impl Default for NebulaParams {
             kappa: 800.0,
             cpc: 0.005,
             mincp: 5,
+            min_subjects: 0,
             reml: false,
             eps: 1e-6,
         }
@@ -607,12 +616,23 @@ where
         params.method
     };
 
-    // Expression filter: mean count per cell, and number of expressed cells.
+    // Expression filter: mean count per cell and number of expressed cells over
+    // all cells, then the number of subjects whose own mean count per cell
+    // clears `cpc`.
     let kept: Vec<usize> = (0..n_genes)
         .filter(|&g| {
-            let total: f64 = totals[g * n_subjects..(g + 1) * n_subjects].iter().sum();
+            let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
+            let total: f64 = subject_totals.iter().sum();
             let (indices, _) = sparse.outer(g);
-            total / (n_cells as f64) > params.cpc && indices.len() >= params.mincp
+            let pooled = total / (n_cells as f64) > params.cpc && indices.len() >= params.mincp;
+            pooled
+                && (params.min_subjects == 0
+                    || subject_totals
+                        .iter()
+                        .zip(fid.windows(2))
+                        .filter(|(t, w)| **t / (w[1] - w[0]) as f64 > params.cpc)
+                        .count()
+                        >= params.min_subjects)
         })
         .collect();
     if kept.is_empty() {
@@ -669,9 +689,9 @@ pub(crate) struct Shared<'a> {
     intercept: usize,
     /// Log of the mean offset, nebula's `moffset`.
     ///
-    /// The log of the arithmetic mean, not the mean of the logs: nebula computes
-    /// `log(mexpoffset)` and leaves `cv_offset`'s own `moffset`, which is the
-    /// mean of the logs, unused.
+    /// The log of the arithmetic mean, not the mean of the logs: nebula
+    /// computes `log(mexpoffset)` and leaves `cv_offset`'s own `moffset`, which
+    /// is the mean of the logs, unused.
     log_mean_offset: f64,
     /// Cells per subject, nebula's `mfs`.
     cells_per_subject: f64,
