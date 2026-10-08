@@ -6,9 +6,9 @@
 //! * **Common**: maximise the likelihood summed over genes.
 //! * **Trended**: smooth the per-gene curves against abundance, then maximise
 //!   each smoothed curve.
-//! * **Tagwise**: add `prior_n` times the smoothed curve to each gene's own curve
-//!   before maximising (weighted likelihood empirical Bayes). A large `prior_n`
-//!   pulls a gene onto the trend.
+//! * **Tagwise**: add `prior_n` times the smoothed curve to each gene's own
+//!   curve before maximising (weighted likelihood empirical Bayes). A large
+//!   `prior_n` pulls a gene onto the trend.
 //!
 //! The grid is uniform in `log2(dispersion / 0.1)` and the maximisation runs in
 //! that coordinate, so 21 points cover four orders of magnitude.
@@ -34,7 +34,8 @@ use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, matrix_ran
 
 /// Reference dispersion the grid is centred on.
 ///
-/// The grid runs over `0.1 * 2^t`, so `t = 0` is a dispersion of 0.1. edgeR's choice.
+/// The grid runs over `0.1 * 2^t`, so `t = 0` is a dispersion of 0.1. edgeR's
+/// choice.
 const GRID_CENTRE: f64 = 0.1;
 
 /// Prior sample size above which shrinkage is total.
@@ -114,7 +115,8 @@ pub struct WlebParams {
 }
 
 impl Default for WlebParams {
-    /// edgeR's defaults: a prior sample size of 5, a locfit trend, everything on.
+    /// edgeR's defaults: a prior sample size of 5, a locfit trend, everything
+    /// on.
     fn default() -> Self {
         Self {
             prior_n: vec![5.0],
@@ -280,8 +282,8 @@ fn smooth_surface(
 /// * `n_genes` - Number of genes
 /// * `covariate` - Abundance per gene, required for any trend method but
 ///   [`TrendMethod::None`]
-/// * `m0` - Precomputed smoothed surface. Skips the smoothing, so `estimate_disp`
-///   does not smooth twice.
+/// * `m0` - Precomputed smoothed surface. Skips the smoothing, so
+///   `estimate_disp` does not smooth twice.
 /// * `params` - What to compute and how, or [`WlebParams::default`]
 ///
 /// ### Returns

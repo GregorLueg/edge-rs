@@ -54,7 +54,8 @@ pub struct ShrinkResult {
     /// `1 / dispersion` as fitted, before shrinkage. Infinite where the
     /// dispersion is zero.
     pub phi_raw: Vec<f64>,
-    /// Posterior `phi`. Genes excluded from the prior fit carry the median prior.
+    /// Posterior `phi`. Genes excluded from the prior fit carry the median
+    /// prior.
     pub phi_post: Vec<f64>,
     /// Prior `phi` each gene was shrunk towards; constant unless trended.
     pub phi_prior: Vec<f64>,

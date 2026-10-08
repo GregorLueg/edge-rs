@@ -206,9 +206,10 @@ pub const MAX_BETA_CAP: usize = 8;
 /// * `nb` - Design width
 /// * `max_iter` - Newton budget
 /// * `max_backtrack` - Backtracking budget within one step
-/// * `final_assembly` - Non-zero to assemble once more at the returned point, so
-///   the reported information and log-determinant belong to it. Zero skips that
-///   sweep over the cells and leaves both at the last Newton step's values
+/// * `final_assembly` - Non-zero to assemble once more at the returned point,
+///   so the reported information and log-determinant belong to it. Zero skips
+///   that sweep over the cells and leaves both at the last Newton step's
+///   values
 /// * `nb_cap` - The design width at compile time, which every loop over
 ///   columns in the sweeps unrolls to
 ///

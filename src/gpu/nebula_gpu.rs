@@ -102,13 +102,14 @@ pub struct PmlReply {
     ///
     /// At the returned point when [`GpuSolveParams::information`] is set.
     /// Without it this, [`Self::subject_curvature`] and [`Self::cross_block`]
-    /// are the last Newton step's, one converged step behind the returned point.
+    /// are the last Newton step's, one converged step behind the returned
+    /// point.
     pub information: Vec<f64>,
     /// Curvature of each random effect, nebula's `vw`, length `k`; empty unless
     /// read back in full.
     pub subject_curvature: Vec<f64>,
-    /// Cross block of the information, nebula's `vwb`, row-major `k * nb`; empty
-    /// unless read back in full.
+    /// Cross block of the information, nebula's `vwb`, row-major `k * nb`;
+    /// empty unless read back in full.
     pub cross_block: Vec<f64>,
 }
 
@@ -189,8 +190,7 @@ pub struct PendingSolve<'a> {
 ///
 /// The counts and cell indices are the largest upload (hundreds of megabytes),
 /// and stage two fits every gene about forty times with only the variance
-/// components changed. Measured at 16384 genes and 20000 cells, a one-shot solve
-/// spent 1.5 of its 4.0 seconds on staging; later solves pay none of it.
+/// components changed.
 pub struct ResidentBatch<R: Runtime> {
     /// Shared design, row-major `n_cells * nb`.
     design: GpuTensor<R, f32>,

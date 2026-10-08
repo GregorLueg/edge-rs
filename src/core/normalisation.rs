@@ -8,8 +8,8 @@
 //!
 //! Every method works *down a column*, unlike the rest of the crate. The module
 //! therefore drops the all-zero genes and transposes the survivors once into a
-//! column-major `f64` buffer. That costs one `n_kept * n_samples` allocation and
-//! makes the per-sample rank sorts that dominate TMM, and the RLE geometric
+//! column-major `f64` buffer. That costs one `n_kept * n_samples` allocation
+//! and makes the per-sample rank sorts that dominate TMM, and the RLE geometric
 //! means, read sequentially. Counts are converted from `T` to `f64` on read.
 
 use rayon::prelude::*;

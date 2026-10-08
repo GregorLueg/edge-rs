@@ -7,7 +7,8 @@
 //! ### Two pipelines
 //!
 //! The **legacy** path (edgeR before 4.0) divides the residual deviance by the
-//! residual degrees of freedom after dropping structural zeros, and shrinks that.
+//! residual degrees of freedom after dropping structural zeros, and shrinks
+//! that.
 //!
 //! The **current** path, the default as in edgeR, adjusts both numerator and
 //! denominator: each observation contributes a fraction of a degree of freedom

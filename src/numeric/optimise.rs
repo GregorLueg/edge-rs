@@ -9,7 +9,8 @@
 //!   and power trend fitters
 //!
 //! [`brent_fmin`] is R's `Brent_fmin` (not a `scipy.optimize` port), used by
-//! `disp_cox_reid` and limma's `squeezeVar`, where stopping at R's point matters.
+//! `disp_cox_reid` and limma's `squeezeVar`, where stopping at R's point
+//! matters.
 //!
 //! [`nelder_mead`] reproduces scipy's initial simplex exactly: the trend fits
 //! minimise a nearly flat objective and are sensitive to it.

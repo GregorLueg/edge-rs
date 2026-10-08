@@ -581,7 +581,8 @@ fn interpolate_row(
 /// * `y` - Row-major matrix of responses, `n_rows * n_cols`
 /// * `n_rows` - Number of rows, the points of each smooth
 /// * `n_cols` - Number of columns, each smoothed independently
-/// * `x` - Covariate, one value per row, in any order, or `None` for `1..=n_rows`
+/// * `x` - Covariate, one value per row, in any order, or `None` for
+///   `1..=n_rows`
 /// * `weights` - Prior weights, one per row, or `None` for all ones. Must be
 ///   non-negative.
 /// * `span` - Proportion of the rows behind each local bandwidth, in `(0, 1]`
@@ -799,7 +800,8 @@ fn loess_row(
 /// * `y` - Row-major matrix of responses, `n_rows * n_cols`
 /// * `n_rows` - Number of rows, the points of each smooth
 /// * `n_cols` - Number of columns, each smoothed independently
-/// * `x` - Covariate, one value per row, in any order, or `None` for `1..=n_rows`
+/// * `x` - Covariate, one value per row, in any order, or `None` for
+///   `1..=n_rows`
 /// * `span` - Proportion of the rows inside each window, in `(0, 1]`
 ///
 /// ### Returns

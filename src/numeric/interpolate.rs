@@ -191,8 +191,9 @@ pub fn fmm_spline(x: &[f64], y: &[f64]) -> Result<FmmSpline, EdgeErrors> {
 impl FmmSpline {
     /// Evaluates the spline at one abscissa.
     ///
-    /// Outside the knot range the nearest end segment's cubic is extended, as in
-    /// R's `spline_eval`. It diverges quickly, so far-out values are meaningless.
+    /// Outside the knot range the nearest end segment's cubic is extended, as
+    /// in R's `spline_eval`. It diverges quickly, so far-out values are
+    /// meaningless.
     ///
     /// ### Params
     ///
@@ -482,10 +483,11 @@ fn refine_on_segment(
 /// d_j(x) - d_{K-1}(x),   d_j(x) = ((x - k_j)_+^3 - (x - k_K)_+^3) / (k_K - k_j)
 /// ```
 ///
-/// Boundary knots sit at the range of `x`, the `df - 2` internal knots at equally
-/// spaced quantiles, as in R's `ns(x, df = df, intercept = TRUE)`. The span
-/// matches R's but the columns do not (B-spline there, truncated power here):
-/// fitted values agree, coefficients do not. See `UPSTREAM_DEVIATIONS.md` A6.
+/// Boundary knots sit at the range of `x`, the `df - 2` internal knots at
+/// equally spaced quantiles, as in R's `ns(x, df = df, intercept = TRUE)`. The
+/// span matches R's but the columns do not (B-spline there, truncated power
+/// here): fitted values agree, coefficients do not. See
+/// `UPSTREAM_DEVIATIONS.md` A6.
 ///
 /// If every `x` is identical the basis degenerates to `[1, x]` and the returned
 /// column count is 2, not `df`.
@@ -590,7 +592,8 @@ fn truncated_cube(x: f64, knot: f64) -> f64 {
 ///
 /// ### Returns
 ///
-/// `(max(x - knot, 0)^3 - tail) / (xi_last - knot)`, or zero on a degenerate knot.
+/// `(max(x - knot, 0)^3 - tail) / (xi_last - knot)`, or zero on a degenerate
+/// knot.
 #[inline]
 fn truncated_power_term(x: f64, knot: f64, xi_last: f64, tail: f64) -> f64 {
     let span = xi_last - knot;

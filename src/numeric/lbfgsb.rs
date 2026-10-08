@@ -5,10 +5,10 @@
 //! Nocedal's Fortran would need a Fortran toolchain on the Windows CI lane.
 //!
 //! Follows Byrd, Lu, Nocedal and Zhu (1995): compact representation
-//! `B = theta*I - W M W'`, generalised Cauchy point to find the active set, then
-//! subspace minimisation over the free variables. The one departure from the
-//! Fortran is the line search: cubic-interpolation strong Wolfe (Nocedal and
-//! Wright, Algorithms 3.5 and 3.6) instead of More and Thuente's `dcsrch`.
+//! `B = theta*I - W M W'`, generalised Cauchy point to find the active set,
+//! then subspace minimisation over the free variables. The one departure from
+//! the Fortran is the line search: cubic-interpolation strong Wolfe (Nocedal
+//! and Wright, Algorithms 3.5 and 3.6) instead of More and Thuente's `dcsrch`.
 //! Iterates can differ in the last digits, optima do not.
 //!
 //! ### References
@@ -534,7 +534,8 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// Cauchy point.
 ///
 /// Direct primal method: reduced gradient at the Cauchy point, inverse compact
-/// Hessian on the free set via Sherman-Morrison-Woodbury, then truncate to the box.
+/// Hessian on the free set via Sherman-Morrison-Woodbury, then truncate to the
+/// box.
 ///
 /// ### Params
 ///

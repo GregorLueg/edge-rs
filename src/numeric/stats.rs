@@ -17,9 +17,9 @@ use crate::prelude::*;
 
 /// Benjamini-Hochberg adjusted p-values, exactly as R's `p.adjust`.
 ///
-/// Sorts descending, forms `n / i * p` (`i` the descending rank), takes a running
-/// minimum, clamps at 1 and scatters back to the input order. The running
-/// minimum also makes tied p-values come out equal.
+/// Sorts descending, forms `n / i * p` (`i` the descending rank), takes a
+/// running minimum, clamps at 1 and scatters back to the input order. The
+/// running minimum also makes tied p-values come out equal.
 ///
 /// Sequential: one sort, run once at the end of an analysis.
 ///
@@ -258,8 +258,9 @@ pub fn trimmed_mean(x: &[f64], trim: f64) -> Result<f64, EdgeErrors> {
 ///
 /// ### Returns
 ///
-/// The smoothed matrix, row-major with `n_cols` columns. Errors are [`EdgeErrors::MustBePositive`] for a zero
-/// `width`, [`EdgeErrors::EmptyCounts`] for a zero dimension, and
+/// The smoothed matrix, row-major with `n_cols` columns. Errors are
+/// [`EdgeErrors::MustBePositive`] for a zero `width`,
+/// [`EdgeErrors::EmptyCounts`] for a zero dimension, and
 /// [`EdgeErrors::LengthMismatch`] when `x` disagrees with `n_rows * n_cols`.
 pub fn moving_average_by_col(
     x: &[f64],

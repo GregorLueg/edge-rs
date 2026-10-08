@@ -3,8 +3,8 @@
 //! Separate from [`crate::results::top_tags`], which is edgeR's. They differ:
 //! `topTags` breaks p-value ties on descending `|logFC|` and `topTable` does
 //! not; `topTable` offers `AveExpr`, `t` and `B` as sort keys and a `resort_by`
-//! pass; the fold-change threshold is `>=` here, `>` in the F variant and `<` in
-//! `decide_tests`. All three asymmetries are upstream's.
+//! pass; the fold-change threshold is `>=` here, `>` in the F variant and `<`
+//! in `decide_tests`. All three asymmetries are upstream's.
 //!
 //! Sequential: one sort and one scan over the genes.
 

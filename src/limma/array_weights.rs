@@ -25,10 +25,10 @@
 //! A per-gene two-component mixed model through `statmod::mixedModel2Fit`, then
 //! a trimmed mean of the Fisher z-transformed correlations. The per-gene fit
 //! projects out the fixed effects, takes an SVD of the projected block design,
-//! and fits a gamma GLM of the squared rotated residuals on the squared singular
-//! values. The Levenberg damping of that GLM is reproduced step for step, since
-//! the answer depends on where it stops. edgePython uses a one-way ANOVA moment
-//! estimator instead. See `UPSTREAM_DEVIATIONS.md` A14.
+//! and fits a gamma GLM of the squared rotated residuals on the squared
+//! singular values. The Levenberg damping of that GLM is reproduced step for
+//! step, since the answer depends on where it stops. edgePython uses a one-way
+//! ANOVA moment estimator instead. See `UPSTREAM_DEVIATIONS.md` A14.
 //!
 //! ### Implementation notes
 //!

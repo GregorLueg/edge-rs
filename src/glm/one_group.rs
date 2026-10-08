@@ -59,8 +59,8 @@ impl Default for OneGroupParams {
 /// * `offset` - Log-scale offsets, recycled over genes and samples
 /// * `weights` - Optional observation weights
 /// * `coef_start` - Optional starting coefficient per gene. A non-finite entry
-///   asks for that gene to be initialised from the data, matching edgeR's use of
-///   `NA` as a per-gene opt-out.
+///   asks for that gene to be initialised from the data, matching edgeR's use
+///   of `NA` as a per-gene opt-out.
 /// * `params` - Tuning knobs, or [`OneGroupParams::default`]
 ///
 /// ### Returns

@@ -8,15 +8,16 @@
 //! limma splits `lmFit` across `lm.series` and `gls.series`, each with a fast
 //! all-observed branch and a slow per-gene branch. They are one computation.
 //! With working covariance `V = D^-1/2 R D^-1/2` (`D` the weights, `R` the
-//! compound-symmetry correlation from `block`), whitening by the Cholesky factor
-//! of `V` turns every case into ordinary least squares. Plain weights are
-//! `R = I`, where whitening is a row scaling by `sqrt(w)`.
+//! compound-symmetry correlation from `block`), whitening by the Cholesky
+//! factor of `V` turns every case into ordinary least squares. Plain weights
+//! are `R = I`, where whitening is a row scaling by `sqrt(w)`.
 //!
 //! The factor is computed once, not per gene: `V` factors as `L = D^-1/2 L_R`
 //! (scaling a lower triangular matrix by a positive diagonal keeps it lower
 //! triangular, and Cholesky factors are unique), so `L_R` depends only on
-//! `block` and the correlation. Genes that keep all their observations reuse it;
-//! only genes with dropped observations refactorise, on their own submatrix.
+//! `block` and the correlation. Genes that keep all their observations reuse
+//! it; only genes with dropped observations refactorise, on their own
+//! submatrix.
 //!
 //! ### Missing observations
 //!
@@ -26,8 +27,8 @@
 //! ### Rank deficiency
 //!
 //! The per-gene solve is a Householder QR that accepts design columns left to
-//! right and rejects any whose residual norm has collapsed (LINPACK `dqrdc2`, as
-//! in R's `lm.fit`). Rejected columns report `NaN` for their coefficient and
+//! right and rejects any whose residual norm has collapsed (LINPACK `dqrdc2`,
+//! as in R's `lm.fit`). Rejected columns report `NaN` for their coefficient and
 //! unscaled standard deviation, as R reports `NA`.
 //! ### References
 //!
@@ -70,15 +71,15 @@ pub struct LmFitResult {
     pub coefficients: Vec<f64>,
     /// Unscaled standard deviations, row-major `n_genes * n_coef`.
     ///
-    /// The square root of the diagonal of `(X' V^-1 X)^-1`. The residual scale is
-    /// kept in [`LmFitResult::sigma`] so `eBayes` can moderate it.
+    /// The square root of the diagonal of `(X' V^-1 X)^-1`. The residual scale
+    /// is kept in [`LmFitResult::sigma`] so `eBayes` can moderate it.
     pub stdev_unscaled: Vec<f64>,
     /// Residual standard deviation per gene.
     ///
     /// `sqrt(rss / df_residual)` with `rss` the whitened residual sum of
-    /// squares. Zero where `df_residual` is zero, where limma reports `NA`; this
-    /// is the one deliberate departure here, harmless because `squeezeVar` drops
-    /// zero-df genes.
+    /// squares. Zero where `df_residual` is zero, where limma reports `NA`;
+    /// this is the one deliberate departure here, harmless because `squeezeVar`
+    /// drops zero-df genes.
     pub sigma: Vec<f64>,
     /// Residual degrees of freedom per gene.
     ///
@@ -105,7 +106,8 @@ pub struct LmFitResult {
     /// Rank of the design, shared by every fully observed gene.
     ///
     /// A gene that lost observations can have a lower rank of its own; that
-    /// shows as extra `NaN` coefficients and a smaller [`LmFitResult::df_residual`].
+    /// shows as extra `NaN` coefficients and a smaller
+    /// [`LmFitResult::df_residual`].
     pub rank: usize,
 }
 
@@ -242,8 +244,9 @@ impl Scratch {
 /// * `m` - Number of observations in play
 /// * `stride` - Column stride of `a` and `hh`
 /// * `n_coef` - Number of design columns
-/// * `pivot` - Whether to apply the rank test. A design full rank on all samples
-///   stays full rank after whitening, so a fully observed gene can skip it.
+/// * `pivot` - Whether to apply the rank test. A design full rank on all
+///   samples stays full rank after whitening, so a fully observed gene can skip
+///   it.
 ///
 /// ### Returns
 ///

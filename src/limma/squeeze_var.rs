@@ -5,8 +5,8 @@
 //! the quasi-likelihood dispersions.
 //!
 //! The model is `s2_g ~ s0^2 * F(df_g, df0)`. The moment fits estimate `s0^2`
-//! and `df0` by matching moments of `z = log(s2)`, since `log` of a scaled F has
-//! finite moments for any `df0`:
+//! and `df0` by matching moments of `z = log(s2)`, since `log` of a scaled F
+//! has finite moments for any `df0`:
 //!
 //! ```text
 //! E[z_g] = log(s0^2) - [log(df0/2) - psi(df0/2)] + [log(df_g/2) - psi(df_g/2)]
@@ -28,10 +28,10 @@
 //! default picks `FALSE` when residual degrees of freedom differ between genes.
 //! Both branches are here, with the same dispatch.
 //!
-//! [`fit_f_dist_unequal_df1`] is a different estimator, not a moment variant: it
-//! maximises the marginal likelihood over `df0` with the scale profiled out, so
-//! each gene may carry its own `df_g`. Most real data takes this branch, since
-//! `glmQLFit` gives unequal residual degrees of freedom once a gene has
+//! [`fit_f_dist_unequal_df1`] is a different estimator, not a moment variant:
+//! it maximises the marginal likelihood over `df0` with the scale profiled out,
+//! so each gene may carry its own `df_g`. Most real data takes this branch,
+//! since `glmQLFit` gives unequal residual degrees of freedom once a gene has
 //! structural zeros.
 //!
 //! ### References
@@ -122,8 +122,8 @@ const ROOT_RTOL: f64 = 8.0 * f64::EPSILON;
 /// Iteration budget for the `df2` root search.
 const ROOT_MAX_ITER: usize = 200;
 
-/// Relative tolerance on the QR diagonal used to rank the spline basis, matching
-/// the default `tol` of R's `lm.fit`.
+/// Relative tolerance on the QR diagonal used to rank the spline basis,
+/// matching the default `tol` of R's `lm.fit`.
 const RANK_TOL: f64 = 1e-7;
 
 /// Gene count above which the per-gene tail probabilities run over rayon.
@@ -154,7 +154,8 @@ const UNEQUAL_ZERO_VAR_OFFSET: f64 = 1e-12;
 /// The span is 1 below 500 genes and tapers towards `min.span` above.
 const UNEQUAL_LOWESS_SMALL_N: usize = 500;
 
-/// Lower clamp on the lowess prior weights, `min.weight` in the `loessFit` call.
+/// Lower clamp on the lowess prior weights, `min.weight` in the `loessFit`
+/// call.
 const LOESS_MIN_WEIGHT: f64 = 1e-8;
 
 /// Upper clamp on the lowess prior weights, `max.weight` in the same call.
@@ -255,8 +256,10 @@ pub struct SqueezeVarResult {
 /// `df` is the same, non-legacy otherwise, and a supplied `span` forces
 /// non-legacy. Within the legacy family:
 ///
-/// * no covariate, `robust` clear - [`fit_f_dist`], a single prior for all genes
-/// * covariate, `robust` clear - [`fit_f_dist_trend`], a spline in the covariate
+/// * no covariate, `robust` clear - [`fit_f_dist`], a single prior for all
+///   genes
+/// * covariate, `robust` clear - [`fit_f_dist_trend`], a spline in the
+///   covariate
 /// * `robust` set - [`fit_f_dist_robustly`], with or without the covariate
 ///
 /// The non-legacy family is [`fit_f_dist_unequal_df1`].
@@ -468,20 +471,20 @@ pub fn fit_f_dist(x: &[f64], df1: &[f64]) -> Result<(f64, f64), EdgeErrors> {
 /// Port of limma's `fitFDist` with a covariate. As [`fit_f_dist`], but the mean
 /// of `e` is a natural cubic spline in the covariate, so the prior variance
 /// varies by gene while the prior degrees of freedom stay shared. The spline
-/// gets 2, 3 or 4 basis columns by surviving gene count, capped at the number of
-/// distinct covariate values; below two it falls back to [`fit_f_dist`].
+/// gets 2, 3 or 4 basis columns by surviving gene count, capped at the number
+/// of distinct covariate values; below two it falls back to [`fit_f_dist`].
 ///
 /// Infinite covariates are pushed one unit past the finite range, as in limma.
 ///
 /// ### Deviation from limma
 ///
-/// The spline is built over the surviving genes, as in limma, so surviving genes
-/// match to rounding. limma evaluates it at dropped genes with `predict.ns`;
-/// [`natural_spline_basis`] does not expose its knots, so the trend is read off
-/// the fitted values with `extend_trend`. Dropped genes carry an interpolation
-/// error of order the local covariate spacing squared (about `1e-3` on forty
-/// genes). Only affects fits where some `df1` is zero or some variance is not
-/// finite. See `UPSTREAM_DEVIATIONS.md` A6 and A10.
+/// The spline is built over the surviving genes, as in limma, so surviving
+/// genes match to rounding. limma evaluates it at dropped genes with
+/// `predict.ns`; [`natural_spline_basis`] does not expose its knots, so the
+/// trend is read off the fitted values with `extend_trend`. Dropped genes carry
+/// an interpolation error of order the local covariate spacing squared
+/// (about `1e-3` on forty genes). Only affects fits where some `df1` is zero or
+/// some variance is not finite. See `UPSTREAM_DEVIATIONS.md` A6 and A10.
 ///
 /// ### Params
 ///
@@ -602,8 +605,8 @@ pub fn fit_f_dist_trend(
 /// The prior scale (length one untrended, per gene trended) and the per-gene
 /// prior degrees of freedom. Errors as [`fit_f_dist`], plus
 /// [`EdgeErrors::InvalidArgument`] for fewer than two genes, a non-finite
-/// covariate, a Winsorising proportion outside `[0, 0.5)`, or more than half the
-/// variances non-positive.
+/// covariate, a Winsorising proportion outside `[0, 0.5)`, or more than half
+/// the variances non-positive.
 ///
 /// ### References
 ///
@@ -661,10 +664,10 @@ pub struct UnequalDf1Fit {
 ///
 /// ### Precision limit
 ///
-/// limma uses `pf(..., log.p = TRUE)`. [`crate::numeric::dist`] has no log-scale
-/// F tail, so this takes `f_sf(..).ln()`. They agree to rounding until the tail
-/// underflows below `1e-308`, far past any real variance ratio; beyond that
-/// `df2_outlier` here is wrong and limma's is right.
+/// limma uses `pf(..., log.p = TRUE)`. [`crate::numeric::dist`] has no
+/// log-scale F tail, so this takes `f_sf(..).ln()`. They agree to rounding
+/// until the tail underflows below `1e-308`, far past any real variance ratio;
+/// beyond that `df2_outlier` here is wrong and limma's is right.
 ///
 /// ### Params
 ///
@@ -1165,11 +1168,11 @@ fn robust_infinite_df2(
 
 /// Turns the shared `df2` into a per-gene one by discounting outliers.
 ///
-/// `ProbNotOutlier` is the ratio of a gene's tail probability to the uniform one
-/// its rank implies, capped at one. Each gene's prior is the mixture of `df2`
-/// and `df2_outlier` weighted by it. `df2_outlier` is the degrees of freedom at
-/// which the most extreme gene would sit at the median, found by one rescaling
-/// step.
+/// `ProbNotOutlier` is the ratio of a gene's tail probability to the uniform
+/// one its rank implies, capped at one. Each gene's prior is the mixture of
+/// `df2` and `df2_outlier` weighted by it. `df2_outlier` is the degrees of
+/// freedom at which the most extreme gene would sit at the median, found by one
+/// rescaling step.
 ///
 /// The final `cummax` in tail-probability order, after flattening the leading
 /// run to its running mean, is limma's. It keeps the prior monotone in the
@@ -1223,9 +1226,9 @@ fn shrink_df2(
 
 /// Rescales the variances of genes with fewer degrees of freedom than the rest.
 ///
-/// The Winsorised moments assume one `df1`. As in limma, each low-`df1` variance
-/// is mapped through its own F distribution and back through the one at the
-/// largest `df1`, matching on the smaller tail to avoid cancelled
+/// The Winsorised moments assume one `df1`. As in limma, each low-`df1`
+/// variance is mapped through its own F distribution and back through the one
+/// at the largest `df1`, matching on the smaller tail to avoid cancelled
 /// probabilities.
 ///
 /// ### Params
@@ -1275,8 +1278,8 @@ fn unify_df1(x: &mut [f64], df1: &[f64], scale: &[f64], df2: f64) -> Result<f64,
 
 /// The body of `fitFDistUnequalDF1`, recursing once for the robust pass.
 ///
-/// Split from [`fit_f_dist_unequal_df1`] so the recursion skips revalidation and
-/// `df1` arrives already recycled to full length.
+/// Split from [`fit_f_dist_unequal_df1`] so the recursion skips revalidation
+/// and `df1` arrives already recycled to full length.
 ///
 /// ### Params
 ///

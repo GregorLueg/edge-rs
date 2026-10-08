@@ -1,12 +1,13 @@
 //! limma's `eBayes`: moderated t, moderated F and the B-statistic.
 //!
-//! Most of the work is [`crate::limma::squeeze_var::squeeze_var`]. On top of it:
+//! Most of the work is [`crate::limma::squeeze_var::squeeze_var`]. On top of
+//! it:
 //!
-//! * the B-statistic needs a prior variance for the *coefficients*, estimated by
-//!   `tmixture` from the order statistics of the largest moderated t values;
+//! * the B-statistic needs a prior variance for the *coefficients*, estimated
+//!   by `tmixture` from the order statistics of the largest moderated t values;
 //! * the moderated F rotates the t statistics into a basis where the
-//!   coefficients are uncorrelated, via an eigendecomposition of the coefficient
-//!   correlation matrix.
+//!   coefficients are uncorrelated, via an eigendecomposition of the
+//!   coefficient correlation matrix.
 //!
 //! Genewise steps run over genes with rayon. `tmixture` ranks all genes against
 //! each other and runs sequentially.

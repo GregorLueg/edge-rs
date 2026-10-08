@@ -3,9 +3,9 @@
 //! Given fixed variance components, profiles out the fixed and subject random
 //! effects jointly. The parameters are `(beta, log_w)`: `n_beta` fixed effects
 //! and one random effect per subject. The `(n_beta + k)` Hessian is never
-//! formed. The random-effect block is diagonal (independent subjects, contiguous
-//! cells), so a Schur complement reduces each Newton step to an `n_beta` system
-//! plus `k` divisions.
+//! formed. The random-effect block is diagonal (independent subjects,
+//! contiguous cells), so a Schur complement reduces each Newton step to an
+//! `n_beta` system plus `k` divisions.
 //!
 //! * [`opt_pml`]: gamma prior on `w` (NBGMM). The penalty is
 //!   `alpha log w - lambda w` with `alpha`, `lambda` derived from `sigma[0]`;
@@ -28,8 +28,8 @@
 //! ### Deviations from edgePython
 //!
 //! Ported from `nebula`'s `src/optimization.cpp`, not edgePython's
-//! `_opt_pml_nb`, which adds a ridge, a `vw` floor, a linear-predictor clamp and
-//! drops REML. See `UPSTREAM_DEVIATIONS.md` A21.
+//! `_opt_pml_nb`, which adds a ridge, a `vw` floor, a linear-predictor clamp
+//! and drops REML. See `UPSTREAM_DEVIATIONS.md` A21.
 //!
 //! ### References
 //!

@@ -6,8 +6,8 @@
 //!   off a chi-squared.
 //! * [`glm_ql_ftest`] (`glmQLFTest`) divides that difference by a squeezed
 //!   quasi-likelihood dispersion and reads an F.
-//! * [`glm_treat`] (`glmTreat`) shifts the offsets by a fold-change threshold and
-//!   tests against an interval null.
+//! * [`glm_treat`] (`glmTreat`) shifts the offsets by a fold-change threshold
+//!   and tests against an interval null.
 //!
 //! The quasi-likelihood quantities arrive in a [`QlSummary`]; the squeezing
 //! belongs to `glmQLFit`. The data behind the fit travels in one
@@ -240,7 +240,8 @@ fn project(
 /// * `n_coef_null` - Columns the null keeps
 /// * `dispersion` - Dispersion to fit at
 /// * `offset` - Offsets to fit at
-/// * `start` - Warm start, row-major `n_genes * n_coef_null`, if one is available
+/// * `start` - Warm start, row-major `n_genes * n_coef_null`, if one is
+///   available
 ///
 /// ### Returns
 ///
@@ -303,7 +304,8 @@ fn fit_null<T: EdgeFloat>(
 /// One bound of the threshold test.
 ///
 /// Fits the full and null models at offsets shifted by `sign * adjustment` and
-/// returns the root of the deviance difference, the z-score for the shifted null.
+/// returns the root of the deviance difference, the z-score for the shifted
+/// null.
 ///
 /// ### Params
 ///
@@ -425,9 +427,9 @@ fn norm_pdf(x: f64) -> f64 {
 ///
 /// Ports limma's `zscoreT` (exact setting): the upper t tail is evaluated
 /// directly and inverted through the normal quantile, never as `1 - cdf`. limma
-/// works in logs; here the tail probability is floored and the answer clamped to
-/// [`MAX_TREAT_ZSCORE`], where the normal tail is already 1e-316 and the treat
-/// integral would otherwise divide by an infinity.
+/// works in logs; here the tail probability is floored and the answer clamped
+/// to [`MAX_TREAT_ZSCORE`], where the normal tail is already 1e-316 and the
+/// treat integral would otherwise divide by an infinity.
 ///
 /// ### Params
 ///
@@ -445,11 +447,12 @@ fn zscore_t(x: f64, df: f64) -> Result<f64, EdgeErrors> {
     Ok(if x < 0.0 { -z } else { z })
 }
 
-/// Genes whose quasi-likelihood variance has dropped below the Poisson variance.
+/// Genes whose quasi-likelihood variance has dropped below the Poisson
+/// variance.
 ///
 /// Ports edgeR's `check_poisson_bound`: a gene is flagged once one library has
-/// `s2_post * (1 + dispersion * mu) < 1`. The dispersion is the one stored on the
-/// fit, undivided by `average_ql_dispersion`, as in edgeR.
+/// `s2_post * (1 + dispersion * mu) < 1`. The dispersion is the one stored on
+/// the fit, undivided by `average_ql_dispersion`, as in edgeR.
 ///
 /// ### Params
 ///
@@ -1005,9 +1008,9 @@ pub fn glm_lrt<T: EdgeFloat>(
 /// Ports edgeR's `glmQLFTest`. Runs [`glm_lrt`], then divides the deviance
 /// difference by the tested degrees of freedom and the posterior
 /// quasi-likelihood dispersion to get an F on `df_test` and
-/// `df_prior + df_residual` degrees of freedom. The denominator is capped at the
-/// total residual degrees of freedom, so a large `df_prior` cannot claim more
-/// information than the data hold.
+/// `df_prior + df_residual` degrees of freedom. The denominator is capped at
+/// the total residual degrees of freedom, so a large `df_prior` cannot claim
+/// more information than the data hold.
 ///
 /// The Poisson bound refits at zero dispersion and raises the p-value of any
 /// gene whose `s2_post * (1 + dispersion * mu)` has fallen below the Poisson

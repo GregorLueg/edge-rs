@@ -12,11 +12,12 @@
 //!    over `[beta, sigma, phi]`. Only the variance components survive; the
 //!    fixed effects restart from `log(mean count) - mean log offset`.
 //! 2. A bounded search over the two variance components, with the fixed effects
-//!    profiled out by [`opt_pml`](crate::sc::pml::opt_pml) at every evaluation. NEBULA-HL always runs it;
-//!    NEBULA-LN runs it, a one-dimensional restriction of it, or neither,
-//!    depending on how well the large-sample approximation is expected to hold.
-//! 3. A final [`opt_pml`](crate::sc::pml::opt_pml) at the chosen variances; its observed information
-//!    inverts to the covariance of `beta`.
+//!    profiled out by [`opt_pml`](crate::sc::pml::opt_pml) at every evaluation.
+//!    NEBULA-HL always runs it; NEBULA-LN runs it, a one-dimensional
+//!    restriction of it, or neither, depending on how well the large-sample
+//!    approximation is expected to hold.
+//! 3. A final [`opt_pml`](crate::sc::pml::opt_pml) at the chosen variances; its
+//!    observed information inverts to the covariance of `beta`.
 //!
 //! ### Deviations from the R package
 //!
@@ -52,8 +53,8 @@
 //!
 //! Only `model = "NBGMM"` is implemented. `PMM` needs Poisson-gamma kernels this
 //! crate lacks; `NBLMM` needs the log-normal outer objective, which has no
-//! golden to validate against. For the Hessian and `_opt_pml_nb` differences from
-//! edgePython, see `UPSTREAM_DEVIATIONS.md` A20 and A21.
+//! golden to validate against. For the Hessian and `_opt_pml_nb` differences
+//! from edgePython, see `UPSTREAM_DEVIATIONS.md` A20 and A21.
 //!
 //! ### References
 //!

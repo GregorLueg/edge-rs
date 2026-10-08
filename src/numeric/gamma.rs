@@ -93,7 +93,8 @@ fn is_outside_domain(x: f64) -> bool {
     x.is_nan() || x <= 0.0
 }
 
-/// Walks `x` up in unit steps to `target`, accumulating the recurrence correction.
+/// Walks `x` up in unit steps to `target`, accumulating the recurrence
+/// correction.
 ///
 /// The sum of `(x + j)^-power` is accumulated from the largest `j` downwards so
 /// the small terms are not rounded away against the first.
