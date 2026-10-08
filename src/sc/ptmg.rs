@@ -928,7 +928,9 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
     }
     let [total, slpey, gstar_sum] = sums;
 
-    let parts = gradient_parts(data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum);
+    let parts = gradient_parts(
+        data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum,
+    );
     finish_gradient(data, &terms, total, parts.gradient)
 }
 
@@ -1057,7 +1059,9 @@ fn evaluate_hessian(
         hbl0,
         dbim,
         sum_ymm_d,
-    } = gradient_parts(data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum);
+    } = gradient_parts(
+        data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum,
+    );
     let value = -total;
     for g in gradient.iter_mut() {
         *g = -*g;
@@ -1477,7 +1481,9 @@ fn evaluate_tabled(
         d42c[s] = acc - scratch.cumsumxtb[s];
     }
 
-    let parts = gradient_parts(data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum);
+    let parts = gradient_parts(
+        data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum,
+    );
     finish_gradient(data, &terms, total, parts.gradient)
 }
 

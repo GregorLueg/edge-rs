@@ -575,4 +575,43 @@ mod tests {
         let covered: f64 = zeros.groups.iter().map(|g| g.n).sum();
         assert_eq!(covered as usize + zeros.loose.len(), n);
     }
+
+    #[test]
+    fn test_group_is_continuous_across_the_table_ends() {
+        let log_o = offsets(300, 11);
+        let group = build_group(0, &log_o);
+        let distinct: Vec<(f64, f64)> = log_o.iter().map(|&l| (l, 1.0)).collect();
+        for edge in [group.s_lo, group.s_hi] {
+            for s in [edge - 1e-9, edge, edge + 1e-9] {
+                let want = direct_sums(&distinct, s);
+                let got = group.eval::<0, 6>(s);
+                for f in 0..N_SUMS {
+                    let scale = if f < 3 { want[f].abs() } else { want[2] };
+                    assert!(
+                        (got[f] - want[f]).abs() <= 1e-12 * scale,
+                        "sum {f} at s = {s}: {} against {}",
+                        got[f],
+                        want[f]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_group_handles_infinite_and_nan_arguments() {
+        let group = build_group(0, &offsets(100, 13));
+        // Every `v` is zero, so every sum is.
+        assert!(
+            group
+                .eval::<0, 6>(f64::NEG_INFINITY)
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+        // Every `v` is infinite: `L` diverges and `A` counts the cells.
+        let high = group.eval::<0, 3>(f64::INFINITY);
+        assert_eq!(high[0], f64::INFINITY);
+        assert_eq!(high[1], group.n);
+        assert!(group.eval::<0, 6>(f64::NAN).iter().all(|v| v.is_nan()));
+    }
 }

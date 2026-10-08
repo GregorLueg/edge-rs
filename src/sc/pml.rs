@@ -1196,7 +1196,10 @@ pub fn check_convergence(
 ///
 /// For each boundary, the first positive count at or past it, length `k + 1`.
 pub(crate) fn positive_runs(cells: &[usize], starts: &[usize]) -> Vec<usize> {
-    starts.iter().map(|&b| cells.partition_point(|&c| c < b)).collect()
+    starts
+        .iter()
+        .map(|&b| cells.partition_point(|&c| c < b))
+        .collect()
 }
 
 /// Widest design whose per-subject sums sit in fixed-size arrays, so the loops

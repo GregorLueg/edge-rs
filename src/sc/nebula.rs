@@ -1157,9 +1157,8 @@ fn newton_marginal(
     let n = x0.len();
     let mut x = x0.to_vec();
     let (mut f, mut g, mut h) = ptmg_value_gradient_hessian_with(gene, &x, scratch);
-    let finite = |v: f64, g: &[f64], h: &[f64]| {
-        v.is_finite() && g.iter().chain(h).all(|x| x.is_finite())
-    };
+    let finite =
+        |v: f64, g: &[f64], h: &[f64]| v.is_finite() && g.iter().chain(h).all(|x| x.is_finite());
     if !finite(f, &g, &h) {
         return None;
     }
@@ -3492,5 +3491,201 @@ mod tests {
             err,
             EdgeErrors::NoGenesAfterFiltering { n_genes: 8 }
         ));
+    }
+
+    /// Drives a stage-two search with an objective that also sees the order.
+    fn run_search(
+        start: &[f64],
+        ord: u32,
+        mut f: impl FnMut(&[f64], u32, usize) -> f64,
+    ) -> (Option<(Vec<f64>, bool)>, u32) {
+        let lower = vec![1e-4; start.len()];
+        let upper = if start.len() == 2 {
+            vec![10.0, 1000.0]
+        } else {
+            vec![10.0]
+        };
+        let mut search = StageTwoSearch::new(start, &lower, &upper, ord);
+        let mut calls = 0;
+        while let Some(points) = search.ask() {
+            let order = search.order();
+            let values: Vec<f64> = points
+                .iter()
+                .map(|x| {
+                    calls += 1;
+                    f(x, order, calls)
+                })
+                .collect();
+            search.tell(&values);
+        }
+        let order = search.order();
+        (search.result(), order)
+    }
+
+    #[test]
+    fn test_stage_two_finds_an_interior_minimum() {
+        let (found, order) = run_search(&[0.5, 2.0], 1, |x, _, _| {
+            (x[0] - 0.3).powi(2) + 0.01 * (x[1] - 4.0).powi(2)
+        });
+        let (x, failed) = found.expect("a minimiser");
+        assert!(!failed);
+        assert_eq!(order, 1);
+        assert_relative_eq!(x[0], 0.3, max_relative = 1e-4);
+        assert_relative_eq!(x[1], 4.0, max_relative = 1e-4);
+    }
+
+    #[test]
+    fn test_stage_two_retries_at_order_one_after_a_rejected_fit() {
+        // Rejected from the fifth fit on at the raised order, as nebula's
+        // `second < -1` error; the order-one pass is clean.
+        let (found, order) = run_search(&[0.5, 2.0], 3, |x, order, calls| {
+            if order > 1 && calls >= 5 {
+                f64::INFINITY
+            } else {
+                (x[0] - 0.3).powi(2) + 0.01 * (x[1] - 4.0).powi(2)
+            }
+        });
+        assert_eq!(order, 1);
+        let (x, failed) = found.expect("the order-one pass finds it");
+        assert!(!failed);
+        assert_relative_eq!(x[0], 0.3, max_relative = 1e-4);
+    }
+
+    #[test]
+    fn test_stage_two_abandons_a_non_finite_order_one_pass() {
+        let (found, _) = run_search(&[0.5, 2.0], 1, |x, _, calls| {
+            if calls == 7 {
+                f64::NAN
+            } else {
+                (x[0] - 0.3).powi(2) + 0.01 * (x[1] - 4.0).powi(2)
+            }
+        });
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_stage_two_reports_a_roundoff_limited_search_as_failed() {
+        // The box and start of the `bobyqa_roundoff` trace, which nloptr ends
+        // at -4: nebula keeps the point but records `-50`.
+        let mut search = StageTwoSearch::new(&[0.0, 0.0], &[-2.0, -2.0], &[2.0, 2.0], 1);
+        while let Some(points) = search.ask() {
+            let values: Vec<f64> = points.iter().map(|x| (x[0] + x[1] - 1.0).powi(2)).collect();
+            search.tell(&values);
+        }
+        let (x, failed) = search.result().expect("the point is kept");
+        assert!(failed);
+        assert_relative_eq!(x[0] + x[1], 1.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_one_component_search_keeps_a_genuine_bound_after_the_restart() {
+        // Increasing in sigma: the minimiser is the lower bound, before and
+        // after the restart from between the bound and the start.
+        let (found, _) = run_search(&[0.5], 1, |x, _, _| x[0]);
+        let (x, failed) = found.expect("a minimiser");
+        assert!(!failed);
+        assert_eq!(x[0], 1e-4);
+    }
+
+    #[test]
+    fn test_restart_point_is_the_geometric_mean_of_bound_and_start() {
+        let search = StageTwoSearch::new(&[0.25], &[1e-4], &[10.0], 1);
+        let x0 = search.restart_point(&[1e-4]).expect("on its bound");
+        assert_relative_eq!(x0[0], (1e-4f64 * 0.25).sqrt(), max_relative = 1e-15);
+        assert!(search.restart_point(&[0.1]).is_none());
+    }
+
+    /// Design, log offsets, counts, cells, subject totals and boundaries.
+    type NewtonGene = (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<f64>,
+        Vec<usize>,
+    );
+
+    /// A small dense gene: 6 subjects of 80 cells, `[1, group, U(-1, 1)]`.
+    fn newton_gene() -> NewtonGene {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(17);
+        let fid: Vec<usize> = (0..=6).map(|s| s * 80).collect();
+        let mut design = Vec::new();
+        let mut log_offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cells = Vec::new();
+        let mut totals = vec![0.0; 6];
+        for c in 0..480 {
+            let s = c / 80;
+            design.extend([1.0, (s % 2) as f64 - 0.5, rng.random_range(-1.0..1.0)]);
+            log_offset.push(rng.random_range(-0.5..0.5));
+            if rng.random_bool(0.35) {
+                let y = rng.random_range(1..6) as f64;
+                counts.push(y);
+                cells.push(c);
+                totals[s] += y;
+            }
+        }
+        (design, log_offset, counts, cells, totals, fid)
+    }
+
+    #[test]
+    fn test_stage_one_newton_lands_on_the_quasi_newton_optimum() {
+        let (design, log_offset, counts, cells, totals, fid) = newton_gene();
+        let gene = GeneData::new(&design, &log_offset, &counts, &cells, &totals, &fid, 3)
+            .expect("valid gene");
+        let start = [0.0, 0.0, 0.0, 1.0, 1.0];
+        let lower = [-BETA_BOUND, -BETA_BOUND, -BETA_BOUND, 1e-4, 1e-4];
+        let upper = [BETA_BOUND, BETA_BOUND, BETA_BOUND, 10.0, 1000.0];
+        let mut scratch = PtmgScratch::new(&gene);
+        let (x, f) =
+            newton_marginal(&gene, &mut scratch, &start, &lower, &upper).expect("Newton converges");
+        let lbfgs = minimise(
+            |x, g| {
+                let (value, gradient) = ptmg_value_and_gradient_with(&gene, x, &mut scratch);
+                g.copy_from_slice(&gradient);
+                value
+            },
+            &start,
+            &lower,
+            &upper,
+            Some(LbfgsbParams {
+                ftol: STAGE_ONE_FTOL,
+                pgtol: STAGE_ONE_PGTOL,
+                max_iter: STAGE_ONE_MAX_ITER,
+                max_line_search: STAGE_ONE_MAX_LINE_SEARCH,
+                ..LbfgsbParams::default()
+            }),
+        )
+        .expect("quasi-Newton runs");
+        assert!(f <= lbfgs.f + 1e-9 * lbfgs.f.abs());
+        for (a, b) in x.iter().zip(&lbfgs.x) {
+            assert_relative_eq!(*a, *b, max_relative = 1e-4, epsilon = 1e-6);
+        }
+
+        // From its own optimum it gains no more than its stopping tolerance.
+        let (x2, f2) =
+            newton_marginal(&gene, &mut scratch, &x, &lower, &upper).expect("already converged");
+        assert!(f2 <= f && f - f2 <= STAGE_ONE_FTOL * f.abs());
+        for (a, b) in x2.iter().zip(&x) {
+            assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_stage_one_newton_holds_a_pinned_coordinate() {
+        // Started on the lower bound of `sigma` with an upper bound pressing
+        // it there, every step keeps it on the bound.
+        let (design, log_offset, counts, cells, totals, fid) = newton_gene();
+        let gene = GeneData::new(&design, &log_offset, &counts, &cells, &totals, &fid, 3)
+            .expect("valid gene");
+        let start = [0.0, 0.0, 0.0, 1e-4, 1.0];
+        let lower = [-BETA_BOUND, -BETA_BOUND, -BETA_BOUND, 1e-4, 1e-4];
+        let upper = [BETA_BOUND, BETA_BOUND, BETA_BOUND, 2e-4, 1000.0];
+        let mut scratch = PtmgScratch::new(&gene);
+        if let Some((x, _)) = newton_marginal(&gene, &mut scratch, &start, &lower, &upper) {
+            assert!(x[3] >= 1e-4 && x[3] <= 2e-4);
+        }
     }
 }

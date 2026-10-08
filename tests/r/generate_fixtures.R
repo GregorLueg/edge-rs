@@ -1273,7 +1273,21 @@ if (requireNamespace("nloptr", quietly = TRUE)) {
          x0 = c(1, 1), lo = c(0, 0), hi = c(2, 2)),
     list(tag = "chain3",
          f = function(x) (x[1] - 1)^2 + 100 * (x[2] - x[1]^2)^2 + (x[3] - x[2])^2 + 0.5 * x[3]^4,
-         x0 = c(0.5, 2, -1), lo = c(-3, -3, -3), hi = c(3, 3, 3))
+         x0 = c(0.5, 2, -1), lo = c(-3, -3, -3), hi = c(3, 3, 3)),
+    # A quadratic under a fast ripple degrades the interpolation set until
+    # BOBYQA calls `rescue`: once here, twice in the next. Every constant is
+    # exactly representable, so R's decimal parser cannot shift an input.
+    list(tag = "rescue",
+         f = function(x) (x[1] - 0.25)^2 + 2 * (x[2] + 0.125)^2 + 0.5 * x[1] * x[2] +
+           sin(10000 * x[1] + 30000 * x[2]),
+         x0 = c(1.75, -1.75), lo = c(-2, -2), hi = c(2, 2)),
+    list(tag = "rescue_twice",
+         f = function(x) (x[1] - 0.25)^2 + 2 * (x[2] + 0.125)^2 + 0.5 * x[1] * x[2] +
+           0.25 * sin(50000 * x[1] + 70000 * x[2]),
+         x0 = c(1.75, -1.75), lo = c(-2, -2), hi = c(2, 2)),
+    # A valley with no unique minimiser; BOBYQA ends ROUNDOFF_LIMITED (-4).
+    list(tag = "roundoff", f = function(x) (x[1] + x[2] - 1)^2,
+         x0 = c(0, 0), lo = c(-2, -2), hi = c(2, 2))
   )
   for (cs in bobyqa_cases) {
     trace <- list()
@@ -1282,11 +1296,12 @@ if (requireNamespace("nloptr", quietly = TRUE)) {
       trace[[length(trace) + 1]] <<- c(x, v)
       v
     }
-    invisible(nloptr::bobyqa(cs$x0, fn, lower = cs$lo, upper = cs$hi))
+    res <- nloptr::bobyqa(cs$x0, fn, lower = cs$lo, upper = cs$hi)
     m <- do.call(rbind, trace)[-(1:2), , drop = FALSE]
     write.table(format(m, digits = 17), file.path(DATA_DIR, paste0("bobyqa_", cs$tag, ".csv")),
                 sep = ",", row.names = FALSE, col.names = FALSE, quote = FALSE)
-    cat(sprintf("bobyqa_%s: %d evaluations\n", cs$tag, nrow(m)))
+    put(paste0("bobyqa_", cs$tag), "status", res$convergence)
+    cat(sprintf("bobyqa_%s: %d evaluations, status %d\n", cs$tag, nrow(m), res$convergence))
   }
 } else {
   cat("nloptr not installed, skipping BOBYQA traces\n")

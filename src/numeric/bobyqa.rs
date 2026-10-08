@@ -2856,6 +2856,8 @@ mod tests {
         lo: &'static [f64],
         /// Upper bounds.
         hi: &'static [f64],
+        /// nloptr's exit status.
+        status: BobyqaStatus,
     }
 
     fn rosen(x: &[f64]) -> f64 {
@@ -2864,6 +2866,24 @@ mod tests {
 
     fn corner(x: &[f64]) -> f64 {
         (x[0] - 3.0).powi(2) + 10.0 * (x[1] + 1.0).powi(2) + x[0] * x[1]
+    }
+
+    fn ripple(x: &[f64]) -> f64 {
+        (x[0] - 0.25).powi(2)
+            + 2.0 * (x[1] + 0.125).powi(2)
+            + 0.5 * x[0] * x[1]
+            + (10000.0 * x[0] + 30000.0 * x[1]).sin()
+    }
+
+    fn ripple_fast(x: &[f64]) -> f64 {
+        (x[0] - 0.25).powi(2)
+            + 2.0 * (x[1] + 0.125).powi(2)
+            + 0.5 * x[0] * x[1]
+            + 0.25 * (50000.0 * x[0] + 70000.0 * x[1]).sin()
+    }
+
+    fn valley(x: &[f64]) -> f64 {
+        (x[0] + x[1] - 1.0).powi(2)
     }
 
     fn chain3(x: &[f64]) -> f64 {
@@ -2875,13 +2895,14 @@ mod tests {
             + 0.5 * x[2].powf(4.0)
     }
 
-    const CASES: [Case; 4] = [
+    const CASES: [Case; 7] = [
         Case {
             tag: "rosen",
             f: rosen,
             x0: &[-1.2, 1.0],
             lo: &[-2.0, -1.0],
             hi: &[2.0, 3.0],
+            status: BobyqaStatus::XtolReached,
         },
         Case {
             tag: "rosen_edge",
@@ -2889,6 +2910,7 @@ mod tests {
             x0: &[0.4001, 0.2],
             lo: &[0.4, 0.2],
             hi: &[2.0, 2.0],
+            status: BobyqaStatus::XtolReached,
         },
         Case {
             tag: "corner",
@@ -2896,6 +2918,7 @@ mod tests {
             x0: &[1.0, 1.0],
             lo: &[0.0, 0.0],
             hi: &[2.0, 2.0],
+            status: BobyqaStatus::XtolReached,
         },
         Case {
             tag: "chain3",
@@ -2903,6 +2926,32 @@ mod tests {
             x0: &[0.5, 2.0, -1.0],
             lo: &[-3.0, -3.0, -3.0],
             hi: &[3.0, 3.0, 3.0],
+            status: BobyqaStatus::XtolReached,
+        },
+        // `rescue` once, then twice: the ripple degrades the interpolation set.
+        Case {
+            tag: "rescue",
+            f: ripple,
+            x0: &[1.75, -1.75],
+            lo: &[-2.0, -2.0],
+            hi: &[2.0, 2.0],
+            status: BobyqaStatus::XtolReached,
+        },
+        Case {
+            tag: "rescue_twice",
+            f: ripple_fast,
+            x0: &[1.75, -1.75],
+            lo: &[-2.0, -2.0],
+            hi: &[2.0, 2.0],
+            status: BobyqaStatus::XtolReached,
+        },
+        Case {
+            tag: "roundoff",
+            f: valley,
+            x0: &[0.0, 0.0],
+            lo: &[-2.0, -2.0],
+            hi: &[2.0, 2.0],
+            status: BobyqaStatus::RoundoffLimited,
         },
     ];
 
@@ -2950,7 +2999,7 @@ mod tests {
                 assert_eq!(g, w, "{}: evaluation {i}", case.tag);
             }
             assert_eq!(res.evaluations, want.len());
-            assert_eq!(res.status, BobyqaStatus::XtolReached);
+            assert_eq!(res.status, case.status, "{}: status", case.tag);
         }
     }
 

@@ -143,3 +143,10 @@ sc_cat_sparse,n_pinned,17
 sc_shrink,uniroot_calls,1
 sc_shrink,df_residual,988
 sc_shrink,n_usable,294
+bobyqa_rosen,status,4
+bobyqa_rosen_edge,status,4
+bobyqa_corner,status,4
+bobyqa_chain3,status,4
+bobyqa_rescue,status,4
+bobyqa_rescue_twice,status,4
+bobyqa_roundoff,status,-4
