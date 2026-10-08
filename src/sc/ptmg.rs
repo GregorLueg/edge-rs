@@ -28,6 +28,7 @@ use rayon::prelude::*;
 
 use crate::numeric::gamma::{digamma, ln_gamma, trigamma};
 use crate::prelude::*;
+use crate::sc::pml::positive_runs;
 use crate::sc::zeros::ZeroCells;
 
 ///////////////
@@ -251,20 +252,10 @@ impl<'z> PtmgScratch<'z> {
     /// ### Returns
     ///
     /// The scratch, with the positive-count runs located.
-    #[allow(clippy::needless_range_loop)]
     pub(crate) fn tabled(data: &GeneData<'_>, zeros: &'z ZeroCells) -> Self {
-        let k = data.n_subjects();
-        let mut run = vec![0usize; k + 1];
-        let mut at = 0usize;
-        for s in 0..=k {
-            while at < data.cells.len() && data.cells[at] < data.fid[s] {
-                at += 1;
-            }
-            run[s] = at;
-        }
         Self {
             zeros: Some(zeros),
-            run,
+            run: positive_runs(data.cells, data.fid),
             ..Self::new(data)
         }
     }
@@ -678,6 +669,178 @@ fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch
     total
 }
 
+/// Subject-level quantities every kernel derives from the subject sums of
+/// `exp(eta)`.
+struct Subjects {
+    /// `ln(mustar)`, `mustar = cumsumxtb + lambda`.
+    mustar_log: Vec<f64>,
+    /// `ystar / mustar`, `ystar = cumsumy + alpha`.
+    ymustar: Vec<f64>,
+    /// `ystar / mustar^2`.
+    ymumustar: Vec<f64>,
+    /// `1 / mustar`.
+    imustar: Vec<f64>,
+}
+
+impl Subjects {
+    /// Derives the subject scalars and folds their terms into the likelihood:
+    /// `-ystar ln(mustar)` per subject, then `k alpha ln(lambda)` and
+    /// `n gamma ln(gamma)`.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - The gene
+    /// * `terms` - The reparametrised variance components
+    /// * `cumsumxtb` - Sum of `exp(eta)` per subject
+    /// * `total` - The log-likelihood so far, updated
+    ///
+    /// ### Returns
+    ///
+    /// The scalars.
+    #[allow(clippy::needless_range_loop)]
+    fn new(data: &GeneData<'_>, terms: &Terms, cumsumxtb: &[f64], total: &mut f64) -> Self {
+        let k = data.n_subjects();
+        let mut out = Self {
+            mustar_log: vec![0.0; k],
+            ymustar: vec![0.0; k],
+            ymumustar: vec![0.0; k],
+            imustar: vec![0.0; k],
+        };
+        for s in 0..k {
+            let ystar = data.subject_totals[s] + terms.alpha;
+            let mu = cumsumxtb[s] + terms.lambda;
+            let log_mu = mu.ln();
+            out.mustar_log[s] = log_mu;
+            out.ymustar[s] = ystar / mu;
+            out.ymumustar[s] = ystar / mu / mu;
+            out.imustar[s] = 1.0 / mu;
+            *total -= ystar * log_mu;
+        }
+        *total += (k as f64) * terms.alpha * terms.log_lambda;
+        *total += (data.n_cells() as f64) * terms.gamma * terms.log_gamma;
+        out
+    }
+}
+
+/// The gradient in log-likelihood sign, and the intermediates the Hessian
+/// reuses.
+struct GradientParts {
+    /// Gradient of the log-likelihood, length `n_coef + 2`, before the gamma
+    /// corrections.
+    gradient: Vec<f64>,
+    /// `ymumustar * d42c` per subject.
+    ymm_d: Vec<f64>,
+    /// `d42c / mustar` per subject.
+    hbl0: Vec<f64>,
+    /// `sum hbl0`.
+    dbim: f64,
+    /// `sum ymm_d`.
+    sum_ymm_d: f64,
+}
+
+/// The gradient from the per-subject sums, as `ptmg_der_eigen` assembles it.
+///
+/// ### Params
+///
+/// * `data` - The gene
+/// * `terms` - The reparametrised variance components
+/// * `subjects` - The subject scalars
+/// * `xexb_f` - `sum x e` per subject, row-major `k * n_coef`
+/// * `dbeta_41` - `sum g x e` per subject, row-major `k * n_coef`
+/// * `d42c` - `sum g e - sum e` per subject
+/// * `slpey` - `sum log w` over every cell
+/// * `gstar_sum` - `sum g` over every cell
+///
+/// ### Returns
+///
+/// The gradient and its intermediates.
+#[allow(clippy::too_many_arguments)]
+fn gradient_parts(
+    data: &GeneData<'_>,
+    terms: &Terms,
+    subjects: &Subjects,
+    xexb_f: &[f64],
+    dbeta_41: &[f64],
+    d42c: &[f64],
+    slpey: f64,
+    gstar_sum: f64,
+) -> GradientParts {
+    let nb = data.n_coef;
+    let k = data.n_subjects();
+    let n_cells = data.n_cells() as f64;
+    let Subjects {
+        mustar_log,
+        ymustar,
+        ymumustar,
+        imustar,
+    } = subjects;
+
+    let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
+    let mut gradient = vec![0.0; nb + 2];
+    for j in 0..nb {
+        let mut acc = 0.0;
+        for s in 0..k {
+            acc += xexb_f[s * nb + j] * ymm_d[s] - dbeta_41[s * nb + j] * ymustar[s];
+        }
+        gradient[j] = acc;
+    }
+    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
+        let row = &data.design[c * nb..(c + 1) * nb];
+        for j in 0..nb {
+            gradient[j] += row[j] * y;
+        }
+    }
+
+    let ldm = terms.log_lambda * (k as f64) - mustar_log.iter().sum::<f64>();
+    let adlmy = terms.exps_s * (k as f64) - ymustar.iter().sum::<f64>();
+    let hbl0: Vec<f64> = (0..k).map(|s| d42c[s] * imustar[s]).collect();
+    let dbim: f64 = hbl0.iter().sum();
+    let sum_ymm_d: f64 = ymm_d.iter().sum();
+    gradient[nb] = -terms.alpha_pr * dbim
+        + terms.lambda_pr * sum_ymm_d
+        + terms.alpha_pr * ldm
+        + terms.lambda_pr * adlmy;
+    gradient[nb + 1] = terms.log_gamma * n_cells + n_cells - slpey - gstar_sum;
+
+    GradientParts {
+        gradient,
+        ymm_d,
+        hbl0,
+        dbim,
+        sum_ymm_d,
+    }
+}
+
+/// Negates the log-likelihood and its gradient and subtracts the gamma terms
+/// `R/ptmg.R` adds.
+///
+/// ### Params
+///
+/// * `data` - The gene
+/// * `terms` - The reparametrised variance components
+/// * `total` - The log-likelihood
+/// * `gradient` - Its gradient, from [`gradient_parts`]
+///
+/// ### Returns
+///
+/// The negative log-likelihood and its gradient.
+fn finish_gradient(
+    data: &GeneData<'_>,
+    terms: &Terms,
+    total: f64,
+    mut gradient: Vec<f64>,
+) -> (f64, Vec<f64>) {
+    let nb = data.n_coef;
+    for g in gradient.iter_mut() {
+        *g = -*g;
+    }
+    let extra = gamma_terms(data, terms.alpha, terms.gamma, GammaOrder::Gradient);
+    let value = -total - extra.subject_value - extra.cell_value;
+    gradient[nb] -= terms.alpha_pr * extra.subject_digamma;
+    gradient[nb + 1] -= extra.cell_digamma;
+    (value, gradient)
+}
+
 /// Value and gradient, in one pass over the gene.
 ///
 /// Shared body of [`ptmg_value_and_gradient`] and [`ptmg_gradient`].
@@ -698,9 +861,7 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
     debug_assert_eq!(params.len(), data.n_params());
 
     let nb = data.n_coef;
-    let n_cells = data.n_cells();
     let k = data.n_subjects();
-    let n_params = nb + 2;
     let fid = data.fid;
     let beta = &params[..nb];
     let terms = Terms::new(params[nb], params[nb + 1]);
@@ -714,25 +875,8 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
         ..
     } = &*scratch;
 
-    let mut mustar = vec![0.0; k];
-    let mut mustar_log = vec![0.0; k];
-    let mut ymustar = vec![0.0; k];
-    let mut ymumustar = vec![0.0; k];
-    let mut imustar = vec![0.0; k];
-    for s in 0..k {
-        let csx = cumsumxtb[s];
-        let ystar = data.subject_totals[s] + terms.alpha;
-        let mu = csx + terms.lambda;
-        let log_mu = mu.ln();
-        mustar[s] = mu;
-        mustar_log[s] = log_mu;
-        ymustar[s] = ystar / mu;
-        ymumustar[s] = ystar / mu / mu;
-        imustar[s] = 1.0 / mu;
-        total -= ystar * log_mu;
-    }
-    total += (k as f64) * terms.alpha * terms.log_lambda;
-    total += (n_cells as f64) * gamma * terms.log_gamma;
+    let subjects = Subjects::new(data, &terms, cumsumxtb, &mut total);
+    let ymustar = &subjects.ymustar;
 
     // One pass per cell. Sum order matches the reference.
     let mut xexb_f = vec![0.0; k * nb];
@@ -784,45 +928,8 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
     }
     let [total, slpey, gstar_sum] = sums;
 
-    let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
-
-    let mut gradient = vec![0.0; n_params];
-    for j in 0..nb {
-        let mut acc = 0.0;
-        for s in 0..k {
-            acc += xexb_f[s * nb + j] * ymm_d[s] - dbeta_41[s * nb + j] * ymustar[s];
-        }
-        gradient[j] = acc;
-    }
-    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
-        let row = &data.design[c * nb..(c + 1) * nb];
-        for j in 0..nb {
-            gradient[j] += row[j] * y;
-        }
-    }
-
-    let ldm = terms.log_lambda * (k as f64) - mustar_log.iter().sum::<f64>();
-    let adlmy = terms.exps_s * (k as f64) - ymustar.iter().sum::<f64>();
-    let hbl0: Vec<f64> = (0..k).map(|s| d42c[s] * imustar[s]).collect();
-    let dbim: f64 = hbl0.iter().sum();
-    let sum_ymm_d: f64 = ymm_d.iter().sum();
-
-    gradient[nb] = -terms.alpha_pr * dbim
-        + terms.lambda_pr * sum_ymm_d
-        + terms.alpha_pr * ldm
-        + terms.lambda_pr * adlmy;
-    gradient[nb + 1] = terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
-
-    let value = -total;
-    for g in gradient.iter_mut() {
-        *g = -*g;
-    }
-
-    let extra = gamma_terms(data, terms.alpha, gamma, GammaOrder::Gradient);
-    let value = value - extra.subject_value - extra.cell_value;
-    gradient[nb] -= terms.alpha_pr * extra.subject_digamma;
-    gradient[nb + 1] -= extra.cell_digamma;
-    (value, gradient)
+    let parts = gradient_parts(data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum);
+    finish_gradient(data, &terms, total, parts.gradient)
 }
 
 /// Value, gradient and Hessian in one pass over the gene.
@@ -868,22 +975,13 @@ fn evaluate_hessian(
         ..
     } = &*scratch;
 
-    let mut mustar_log = vec![0.0; k];
-    let mut ymustar = vec![0.0; k];
-    let mut ymumustar = vec![0.0; k];
-    let mut imustar = vec![0.0; k];
-    for s in 0..k {
-        let ystar = data.subject_totals[s] + terms.alpha;
-        let mu = cumsumxtb[s] + terms.lambda;
-        let log_mu = mu.ln();
-        mustar_log[s] = log_mu;
-        ymustar[s] = ystar / mu;
-        ymumustar[s] = ystar / mu / mu;
-        imustar[s] = 1.0 / mu;
-        total -= ystar * log_mu;
-    }
-    total += (k as f64) * terms.alpha * terms.log_lambda;
-    total += (n_cells as f64) * gamma * terms.log_gamma;
+    let subjects = Subjects::new(data, &terms, cumsumxtb, &mut total);
+    let Subjects {
+        mustar_log,
+        ymustar,
+        ymumustar,
+        imustar,
+    } = &subjects;
 
     // Per-subject sums, row-major `k * nb` vectors and `k * nb * nb` blocks
     // (upper triangle filled).
@@ -953,32 +1051,13 @@ fn evaluate_hessian(
         sum_gt,
     } = scalars;
 
-    // Gradient, as in `evaluate`.
-    let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
-    let mut gradient = vec![0.0; n_params];
-    for j in 0..nb {
-        let mut acc = 0.0;
-        for s in 0..k {
-            acc += xexb_f[s * nb + j] * ymm_d[s] - dbeta_41[s * nb + j] * ymustar[s];
-        }
-        gradient[j] = acc;
-    }
-    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
-        let row = &data.design[c * nb..(c + 1) * nb];
-        for j in 0..nb {
-            gradient[j] += row[j] * y;
-        }
-    }
-    let ldm = terms.log_lambda * (k as f64) - mustar_log.iter().sum::<f64>();
-    let adlmy = terms.exps_s * (k as f64) - ymustar.iter().sum::<f64>();
-    let hbl0: Vec<f64> = (0..k).map(|s| d42c[s] * imustar[s]).collect();
-    let dbim: f64 = hbl0.iter().sum();
-    let sum_ymm_d: f64 = ymm_d.iter().sum();
-    gradient[nb] = -terms.alpha_pr * dbim
-        + terms.lambda_pr * sum_ymm_d
-        + terms.alpha_pr * ldm
-        + terms.lambda_pr * adlmy;
-    gradient[nb + 1] = terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
+    let GradientParts {
+        mut gradient,
+        ymm_d,
+        hbl0,
+        dbim,
+        sum_ymm_d,
+    } = gradient_parts(data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum);
     let value = -total;
     for g in gradient.iter_mut() {
         *g = -*g;
@@ -1296,9 +1375,7 @@ fn evaluate_tabled(
     scratch: &mut PtmgScratch<'_>,
 ) -> (f64, Vec<f64>) {
     let nb = data.n_coef;
-    let n_cells = data.n_cells();
     let k = data.n_subjects();
-    let n_params = nb + 2;
     let beta = &params[..nb];
     let terms = Terms::new(params[nb], params[nb + 1]);
     let gamma = terms.gamma;
@@ -1343,22 +1420,8 @@ fn evaluate_tabled(
         scratch.cumsumxtb[s] = csx;
     }
 
-    let mut mustar_log = vec![0.0; k];
-    let mut ymustar = vec![0.0; k];
-    let mut ymumustar = vec![0.0; k];
-    let mut imustar = vec![0.0; k];
-    for s in 0..k {
-        let ystar = data.subject_totals[s] + terms.alpha;
-        let mu = scratch.cumsumxtb[s] + terms.lambda;
-        let log_mu = mu.ln();
-        mustar_log[s] = log_mu;
-        ymustar[s] = ystar / mu;
-        ymumustar[s] = ystar / mu / mu;
-        imustar[s] = 1.0 / mu;
-        total -= ystar * log_mu;
-    }
-    total += (k as f64) * terms.alpha * terms.log_lambda;
-    total += (n_cells as f64) * gamma * terms.log_gamma;
+    let subjects = Subjects::new(data, &terms, &scratch.cumsumxtb, &mut total);
+    let ymustar = &subjects.ymustar;
 
     let mut slpey = 0.0;
     let mut gstar_sum = 0.0;
@@ -1414,43 +1477,8 @@ fn evaluate_tabled(
         d42c[s] = acc - scratch.cumsumxtb[s];
     }
 
-    // From here as in `evaluate`.
-    let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
-
-    let mut gradient = vec![0.0; n_params];
-    for j in 0..nb {
-        let mut acc = 0.0;
-        for s in 0..k {
-            acc += xexb_f[s * nb + j] * ymm_d[s] - dbeta_41[s * nb + j] * ymustar[s];
-        }
-        gradient[j] = acc;
-    }
-    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
-        let row = row_of(c);
-        for j in 0..nb {
-            gradient[j] += row[j] * y;
-        }
-    }
-
-    let ldm = terms.log_lambda * (k as f64) - mustar_log.iter().sum::<f64>();
-    let adlmy = terms.exps_s * (k as f64) - ymustar.iter().sum::<f64>();
-    let dbim: f64 = (0..k).map(|s| d42c[s] * imustar[s]).sum();
-    let sum_ymm_d: f64 = ymm_d.iter().sum();
-
-    gradient[nb] = -terms.alpha_pr * dbim
-        + terms.lambda_pr * sum_ymm_d
-        + terms.alpha_pr * ldm
-        + terms.lambda_pr * adlmy;
-    gradient[nb + 1] = terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
-
-    for g in gradient.iter_mut() {
-        *g = -*g;
-    }
-    let extra = gamma_terms(data, terms.alpha, gamma, GammaOrder::Gradient);
-    let value = -total - extra.subject_value - extra.cell_value;
-    gradient[nb] -= terms.alpha_pr * extra.subject_digamma;
-    gradient[nb + 1] -= extra.cell_digamma;
-    (value, gradient)
+    let parts = gradient_parts(data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum);
+    finish_gradient(data, &terms, total, parts.gradient)
 }
 
 /////////////

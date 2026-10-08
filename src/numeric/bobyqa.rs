@@ -860,14 +860,12 @@ impl BobyqaStepper {
     fn l60(&mut self) -> Label {
         let n = self.n;
         let npt = self.npt;
-        let np = n + 1;
         {
             let (gnew, rest) = self.w[1..].split_at_mut(n);
             let (xbdi, rest) = rest.split_at_mut(n);
             let (s, rest) = rest.split_at_mut(n);
             let (hs, rest) = rest.split_at_mut(n);
             let hred = &mut rest[..n];
-            debug_assert_eq!(np, n + 1);
             trsbox(
                 n,
                 npt,

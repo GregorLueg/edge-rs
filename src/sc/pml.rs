@@ -374,9 +374,6 @@ enum Penalty {
 impl Penalty {
     /// Adds the prior's contribution to the log-likelihood.
     ///
-    /// The summation order is the C++'s per variant; reassociating can flip the
-    /// last iteration (see the module header).
-    ///
     /// ### Params
     ///
     /// * `log_likelihood` - Data contribution accumulated so far
@@ -925,15 +922,7 @@ fn newton_finish_width<const NB: usize>(
     let alpha = 1.0 / (exps - 1.0);
     let lambda = 1.0 / (exps.sqrt() * (exps - 1.0));
 
-    // Where each subject's run of positive counts starts.
-    let mut run = vec![0usize; k + 1];
-    let mut at = 0usize;
-    for s in 0..=k {
-        while at < data.cell_index.len() && data.cell_index[at] < data.subject_start[s] {
-            at += 1;
-        }
-        run[s] = at;
-    }
+    let run = positive_runs(data.cell_index, data.subject_start);
 
     let mut beta = beta.to_vec();
     let mut log_w = log_w.to_vec();
@@ -1196,6 +1185,20 @@ pub fn check_convergence(
 // Workspace //
 ///////////////
 
+/// Where each subject's run of positive counts starts.
+///
+/// ### Params
+///
+/// * `cells` - Cell index of each positive count, increasing
+/// * `starts` - Subject boundaries, length `k + 1`
+///
+/// ### Returns
+///
+/// For each boundary, the first positive count at or past it, length `k + 1`.
+pub(crate) fn positive_runs(cells: &[usize], starts: &[usize]) -> Vec<usize> {
+    starts.iter().map(|&b| cells.partition_point(|&c| c < b)).collect()
+}
+
 /// Widest design whose per-subject sums sit in fixed-size arrays, so the loops
 /// over design columns unroll and the sums stay in registers. Wider designs run
 /// the same sweep with the width read at run time and the sums on the heap.
@@ -1303,15 +1306,7 @@ impl<'z> Workspace<'z> {
         let n_cells = data.n_cells();
         let k = data.n_subjects();
         let nb = data.n_beta();
-
-        let mut run = vec![0usize; k + 1];
-        let mut at = 0usize;
-        for s in 0..=k {
-            while at < data.cell_index.len() && data.cell_index[at] < data.subject_start[s] {
-                at += 1;
-            }
-            run[s] = at;
-        }
+        let run = positive_runs(data.cell_index, data.subject_start);
 
         Self {
             zeros,

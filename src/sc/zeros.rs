@@ -37,7 +37,7 @@ use rayon::prelude::*;
 ////////////
 
 /// Number of tabulated sums: `L`, `A`, `B`, `C`, `D`, `E`.
-pub(crate) const N_SUMS: usize = 6;
+const N_SUMS: usize = 6;
 
 /// Chebyshev degree of each panel.
 const DEGREE: usize = 16;
@@ -74,7 +74,7 @@ const ASYMPTOTE_DEPTH: f64 = 40.0;
 
 /// Smallest group worth a table. Below it a lookup costs more than the sweep
 /// over the group's cells.
-pub(crate) const MIN_GROUP_CELLS: usize = 32;
+const MIN_GROUP_CELLS: usize = 32;
 
 /// Share of the cells that must sit in tabled groups for the tables to be built
 /// at all.
