@@ -37,6 +37,7 @@
   now takes R's optimiser path, and the `1e-6` jitter of the profile likelihood
   sends nearby runs to slightly different points. The R fixtures gate every
   change; three new categorical fixtures cover the zero-count tables.
+* Repo clean-up: reduction in documentation and unnecessary details.
 
 ## v0.2.0
 
