@@ -1234,9 +1234,12 @@ where
     let count = checked_cube_count("opt_pml_gpu", gx, gy, 1, &limits)
         .map_err(|e| EdgeErrors::Gpu(e.to_string()))?;
 
+    // Every sweep strides `spread` and `vb2` by the comptime width and the
+    // design and outputs by the runtime one, so the two must agree.
     macro_rules! dispatch {
         ($cap:expr) => {
             unsafe {
+                debug_assert_eq!(nb, $cap as usize);
                 opt_pml_gpu::launch_unchecked::<F, R>(
                     client,
                     count,

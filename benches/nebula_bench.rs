@@ -12,12 +12,13 @@
 //!
 //! The measured cells are:
 //!
-//! * `ptmg` - one [`ptmg_value_and_gradient`] call on one gene. The stage-one
-//!   inner kernel where the zero-count tables apply; L-BFGS-B calls it tens of
-//!   times per gene. Dense designs take Newton steps on the Hessian instead.
-//! * `pml` - one [`opt_pml`] call on one gene. The stage-two and stage-three
-//!   inner kernel; stage two calls it once per BOBYQA evaluation, about forty
-//!   times per gene.
+//! * `ptmg` - one [`ptmg_value_and_gradient`] call on one gene, the dense
+//!   public entry point. Stage one calls it, or its tabled counterpart, tens of
+//!   times per gene under L-BFGS-B; dense designs take Newton steps instead.
+//! * `pml` - one [`opt_pml`] call on one gene, dense. The stage-two and
+//!   stage-three inner kernel; stage two calls it once per BOBYQA evaluation,
+//!   about forty times per gene. Only `ln` and `hl` reach the zero-count
+//!   tables.
 //! * `ln` - `nebula_sparse` end to end on NEBULA's own defaults.
 //! * `hl` - the same, forced onto NEBULA-HL, so every gene pays the full
 //!   stage-two search. This is the upper bound and the shape a GPU would target.

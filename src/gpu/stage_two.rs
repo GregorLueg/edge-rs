@@ -238,6 +238,11 @@ impl Timing {
 /// so the variance components, and with them the coefficients and standard
 /// errors, land within a measured tolerance. See `tests/e2e_nebula_gpu.rs`.
 ///
+/// A design whose zero counts the CPU tabulates (cells sharing design rows
+/// within subjects, `crate::sc::zeros`) runs the CPU path instead, which
+/// is faster there: its results are the CPU's bit for bit, and it accepts
+/// designs wider than the device's eight columns.
+///
 /// ### Params
 ///
 /// * `counts` - Raw counts, CSR over `(n_genes, n_cells)`

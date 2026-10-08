@@ -32,6 +32,13 @@
 //! different side of a jitter. They then stop within BOBYQA's own resolution
 //! of each other.
 //!
+//! A non-finite objective ends the BOBYQA pass. nebula stops there only on its
+//! `second < -1` error (raised at a higher Laplace order, which this port
+//! retries at order one, as nebula does) and otherwise hands the value to
+//! NLopt, whose quadratic model it then poisons. At order one the only source
+//! is a non-finite penalised likelihood, so this port reports the gene as
+//! failed instead of continuing on a broken model.
+//!
 //! The one-component restriction NEBULA-LN refits (nebula's `nlminb`) runs a
 //! bounded Nelder-Mead followed by a local quadratic least-squares polish. A
 //! stencil wide compared with the noise averages the jitter out, which a
@@ -174,10 +181,12 @@ const VARIANCE_FATOL: f64 = 1e-7;
 /// Simplex iteration budget for the stage-two search.
 const VARIANCE_MAX_ITER: usize = 500;
 
-/// Convergence code for a stage-two search that never found a finite objective.
+/// Convergence code for a failed stage-two search, nebula's `-50`.
 ///
-/// nebula reports `-50` on a negative nlopt code. Without nlopt this port raises
-/// it only when no evaluation of the profile likelihood succeeded.
+/// nebula reports it on a negative nlopt code. Here: BOBYQA ending
+/// `RoundoffLimited` (its point is kept, as nebula keeps it), a box BOBYQA
+/// refuses, or a search abandoned on a non-finite objective at order one; the
+/// last two keep stage one's variance components.
 pub const CONV_OUTER_FAILED: i32 = -50;
 
 ////////////////
@@ -1148,7 +1157,10 @@ fn newton_marginal(
     let n = x0.len();
     let mut x = x0.to_vec();
     let (mut f, mut g, mut h) = ptmg_value_gradient_hessian_with(gene, &x, scratch);
-    if !f.is_finite() {
+    let finite = |v: f64, g: &[f64], h: &[f64]| {
+        v.is_finite() && g.iter().chain(h).all(|x| x.is_finite())
+    };
+    if !finite(f, &g, &h) {
         return None;
     }
     for _ in 0..STAGE_ONE_NEWTON_MAX_ITER {
@@ -1201,7 +1213,7 @@ fn newton_marginal(
                 .collect();
             let decrease: f64 = (0..n).map(|i| g[i] * (xt[i] - x[i])).sum();
             let (ft, gt, ht) = ptmg_value_gradient_hessian_with(gene, &xt, scratch);
-            if ft.is_finite() && ft <= f + STAGE_ONE_ARMIJO * decrease {
+            if finite(ft, &gt, &ht) && ft <= f + STAGE_ONE_ARMIJO * decrease {
                 accepted = Some((xt, ft, gt, ht));
                 break;
             }
