@@ -774,7 +774,7 @@ run_voom("unbal", unbal$yf$counts, unbal_des)
 # eBayes reaches squeezeVar through the non-exported .ebayes, so the converged
 # root-finder has to be injected one level deeper than for estimateDisp and
 # glmQLFit. Same reason as tightED/tightQL above, and the same deviation
-# (docs/UPSTREAM_DEVIATIONS.md, entry 12).
+# (docs/UPSTREAM_DEVIATIONS.md, B2).
 tightEB0 <- shadow(limma:::.ebayes, "squeezeVar", tightS)
 tightEB <- shadow(limma::eBayes, ".ebayes", tightEB0)
 
@@ -1049,8 +1049,15 @@ if (!file.exists(file.path(DATA_DIR, "sc_small_counts.csv"))) {
 # genes. The design is written whole, intercept first, then the subject-level
 # columns (the first a 0/1 group), then the cell-level ones. `off_mu = NULL`
 # means no offset at all.
+#
+# `cat` replaces the continuous cell-level columns with a cell type: `p` its
+# level probabilities, coded as indicators of every level but the first, and
+# `confine` the subjects the last level is allowed in. Cells then share design
+# rows within a subject, which is what the CPU kernels' zero-count tables need.
+# `off_sd` spreads the offsets and `size_inv` sets the range of `1 / size`.
 make_sc_edge <- function(seed, ng, sizes, n_subj_cov, n_cell_cov, base_lo,
-                         base_hi, off_mu, plant = FALSE) {
+                         base_hi, off_mu, plant = FALSE, cat = NULL,
+                         off_sd = 0.3, size_inv = c(0.5, 3)) {
   set.seed(seed)
   nsub <- length(sizes)
   nc <- sum(sizes)
@@ -1058,19 +1065,26 @@ make_sc_edge <- function(seed, ng, sizes, n_subj_cov, n_cell_cov, base_lo,
 
   subj <- matrix(round(rnorm(nsub * n_subj_cov), 8), nsub, n_subj_cov)
   if (n_subj_cov >= 1) subj[, 1] <- rep(0:1, length.out = nsub)
-  cell <- matrix(round(rnorm(nc * n_cell_cov), 8), nc, n_cell_cov)
+  if (is.null(cat)) {
+    cell <- matrix(round(rnorm(nc * n_cell_cov), 8), nc, n_cell_cov)
+  } else {
+    lv <- length(cat$p)
+    type <- sample.int(lv, nc, replace = TRUE, prob = cat$p)
+    if (!is.null(cat$confine)) type[type == lv & !(id %in% cat$confine)] <- 1L
+    cell <- sapply(2:lv, function(l) as.numeric(type == l))
+  }
   x <- cbind(1, subj[id, , drop = FALSE], cell)
   nb <- ncol(x)
 
   beta <- cbind(log(2^runif(ng, base_lo, base_hi)),
                 matrix(rnorm(ng * (nb - 1), 0, 0.3), ng, nb - 1))
   re <- matrix(rnorm(ng * nsub, 0, 0.3), ng, nsub)
-  sf <- if (is.null(off_mu)) rep(1, nc) else round(exp(rnorm(nc, log(off_mu), 0.3)))
+  sf <- if (is.null(off_mu)) rep(1, nc) else round(exp(rnorm(nc, log(off_mu), off_sd)))
   scale <- if (is.null(off_mu)) 1 else off_mu
 
   eta <- beta %*% t(x) + re[, id]
   mu <- exp(eta) * rep(sf / scale, each = ng)
-  phi <- 1 / runif(ng, 0.5, 3)
+  phi <- 1 / runif(ng, size_inv[1], size_inv[2])
   cnt <- matrix(rnbinom(ng * nc, mu = as.vector(mu), size = rep(phi, nc)), ng, nc)
 
   # Planted: one gene silent in the third subject, two at a low enough mean to
@@ -1104,13 +1118,31 @@ SC_EDGE <- list(
   # only non-intercept columns are constant within subjects, so every design
   # wider than one carries a cell-level column.
   list(tag = "sc_high", seed = 20260927, sizes = rep(50, 10), subj = 1,
-       cell = 1, lo = 10, hi = 13, off = 5000, plant = FALSE, method = "HL")
+       cell = 1, lo = 10, hi = 13, off = 5000, plant = FALSE, method = "HL"),
+  # Categorical cell types, so the CPU kernels sum the zero counts from tables.
+  # LN over uneven subjects, offsets spread over two orders of magnitude.
+  list(tag = "sc_cat_ln", seed = 20261007,
+       sizes = c(60, 90, 150, 220, 300, 75, 110, 400), subj = 1, cell = 0,
+       lo = -4, hi = 3, off = 2000, plant = TRUE, method = "LN",
+       cat = list(p = c(0.55, 0.3, 0.15)), off_sd = 0.8),
+  # HL, one subject fifteen times the smallest, heavy overdispersion, and a
+  # rare type confined to three subjects whose groups are too small to table.
+  list(tag = "sc_cat_hl", seed = 20261008, sizes = c(35, 45, 600, 40, 250, 38),
+       subj = 1, cell = 0, lo = -5, hi = 2, off = 1000, plant = TRUE,
+       method = "HL", cat = list(p = c(0.7, 0.25, 0.05), confine = 1:3),
+       off_sd = 0.6, size_inv = c(3, 10)),
+  # HL at means low enough for the third-order Laplace correction throughout.
+  list(tag = "sc_cat_sparse", seed = 20261009, sizes = rep(150, 6), subj = 1,
+       cell = 0, lo = -7, hi = -3, off = 1000, plant = FALSE, method = "HL",
+       cat = list(p = c(0.5, 0.5)), off_sd = 0.5)
 )
 
 for (e in SC_EDGE) {
   if (!file.exists(file.path(DATA_DIR, paste0(e$tag, "_counts.csv")))) {
     s <- make_sc_edge(e$seed, 30L, e$sizes, e$subj, e$cell, e$lo, e$hi,
-                      e$off, e$plant)
+                      e$off, e$plant, e$cat,
+                      if (is.null(e$off_sd)) 0.3 else e$off_sd,
+                      if (is.null(e$size_inv)) c(0.5, 3) else e$size_inv)
     write_int(s$counts, paste0(e$tag, "_counts.csv"),
               paste0("c", seq_len(ncol(s$counts))))
     write_num(cbind(subject = s$id, offset = s$sf), paste0(e$tag, "_meta.csv"),
@@ -1177,6 +1209,8 @@ if (requireNamespace("nebula", quietly = TRUE)) {
   for (e in SC_EDGE) {
     x <- read_num(paste0(e$tag, "_design.csv"))
     colnames(x) <- NULL
+    # An all-integer design reads back as integer, which nebula's C++ rejects.
+    storage.mode(x) <- "double"
     r <- run_sc(e$tag, paste0(e$tag, "_counts.csv"), paste0(e$tag, "_meta.csv"),
                 pred = x, method = e$method, use_offset = !is.null(e$off),
                 names = seq_len(ncol(x)))
@@ -1218,6 +1252,60 @@ if (requireNamespace("nebula", quietly = TRUE)) {
   cat(sprintf("sc_shrink: %d usable, df %d, uniroot calls recorded\n", sum(ok), df_res))
 } else {
   cat("nebula not installed, skipping single-cell fixtures\n")
+}
+
+############
+# BOBYQA #
+############
+
+# nebula's stage two runs `nloptr::bobyqa`, NLopt 2.7.1 inside nloptr 2.2.1.
+# Every point the optimiser evaluates is recorded on four bounded problems, so
+# src/numeric/bobyqa.rs can be held to the same sequence. nloptr evaluates the
+# start twice itself before NLopt runs; those two rows are dropped. The
+# objectives use only correctly rounded operations (`^2` is `x * x` in R,
+# `floor`, `abs`): a libm `sin` or `pow` rounds differently on another
+# platform, and BOBYQA turns one ulp into a different path.
+if (requireNamespace("nloptr", quietly = TRUE)) {
+  bobyqa_cases <- list(
+    list(tag = "rosen", f = function(x) 100 * (x[2] - x[1]^2)^2 + (1 - x[1])^2,
+         x0 = c(-1.2, 1), lo = c(-2, -1), hi = c(2, 3)),
+    list(tag = "rosen_edge", f = function(x) 100 * (x[2] - x[1]^2)^2 + (1 - x[1])^2,
+         x0 = c(0.4001, 0.2), lo = c(0.4, 0.2), hi = c(2, 2)),
+    list(tag = "corner", f = function(x) (x[1] - 3)^2 + 10 * (x[2] + 1)^2 + x[1] * x[2],
+         x0 = c(1, 1), lo = c(0, 0), hi = c(2, 2)),
+    list(tag = "chain3",
+         f = function(x) (x[1] - 1)^2 + 100 * (x[2] - x[1]^2)^2 + (x[3] - x[2])^2 + 0.5 * (x[3]^2)^2,
+         x0 = c(0.5, 2, -1), lo = c(-3, -3, -3), hi = c(3, 3, 3)),
+    # A quadratic under a fast squared triangle wave degrades the interpolation
+    # set until BOBYQA calls `rescue`. Every constant is exactly representable,
+    # so R's decimal parser cannot shift an input.
+    list(tag = "rescue",
+         f = function(x) {
+           u <- 10000 * x[1] + 30000 * x[2]
+           t <- abs(u - 2 * floor((u + 1) / 2))
+           (x[1] - 0.25)^2 + 2 * (x[2] + 0.125)^2 + 0.5 * x[1] * x[2] + 0.5 * (t * t)
+         },
+         x0 = c(-1, 0.25), lo = c(-2, -2), hi = c(2, 2)),
+    # A valley with no unique minimiser; BOBYQA ends ROUNDOFF_LIMITED (-4).
+    list(tag = "roundoff", f = function(x) (x[1] + x[2] - 1)^2,
+         x0 = c(0, 0), lo = c(-2, -2), hi = c(2, 2))
+  )
+  for (cs in bobyqa_cases) {
+    trace <- list()
+    fn <- function(x) {
+      v <- cs$f(x)
+      trace[[length(trace) + 1]] <<- c(x, v)
+      v
+    }
+    res <- nloptr::bobyqa(cs$x0, fn, lower = cs$lo, upper = cs$hi)
+    m <- do.call(rbind, trace)[-(1:2), , drop = FALSE]
+    write.table(format(m, digits = 17), file.path(DATA_DIR, paste0("bobyqa_", cs$tag, ".csv")),
+                sep = ",", row.names = FALSE, col.names = FALSE, quote = FALSE)
+    put(paste0("bobyqa_", cs$tag), "status", res$convergence)
+    cat(sprintf("bobyqa_%s: %d evaluations, status %d\n", cs$tag, nrow(m), res$convergence))
+  }
+} else {
+  cat("nloptr not installed, skipping BOBYQA traces\n")
 }
 
 flush_scalars()

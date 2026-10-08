@@ -1,13 +1,9 @@
 //! Single-group negative binomial fits.
 //!
 //! edgeR's `mglmOneGroup`: one coefficient per gene, fitted by Fisher scoring.
-//! With a single group the score and information both collapse to sums over
-//! samples, so there is no linear system to solve and each Newton step is a
-//! division.
-//!
-//! This is not just a special case kept for tidiness. `aveLogCPM` calls it for
-//! every gene on every analysis, and `mglmOneWay` calls it once per group, so it
-//! sits underneath both `estimateDisp` and the fast path of `glmFit`.
+//! Score and information collapse to sums over samples, so each Newton step is
+//! a division. `aveLogCPM` calls this for every gene and `mglmOneWay` once per
+//! group, so it sits under both `estimateDisp` and the fast path of `glmFit`.
 
 use rayon::prelude::*;
 
@@ -33,9 +29,8 @@ pub struct OneGroupParams {
     pub max_iter: usize,
     /// Convergence tolerance on the coefficient step.
     ///
-    /// A gene stops when the step is smaller than `tol * (|coef| + 0.1)`. Much
-    /// tighter than the Levenberg fit's, because a single Newton step here costs
-    /// two passes over the samples rather than a factorisation.
+    /// A gene stops when the step is smaller than `tol * (|coef| + 0.1)`.
+    /// Tighter than the Levenberg fit's, as a step here is cheap.
     pub tol: f64,
 }
 
@@ -64,8 +59,8 @@ impl Default for OneGroupParams {
 /// * `offset` - Log-scale offsets, recycled over genes and samples
 /// * `weights` - Optional observation weights
 /// * `coef_start` - Optional starting coefficient per gene. A non-finite entry
-///   asks for that gene to be initialised from the data, matching edgeR's use of
-///   `NA` as a per-gene opt-out.
+///   asks for that gene to be initialised from the data, matching edgeR's use
+///   of `NA` as a per-gene opt-out.
 /// * `params` - Tuning knobs, or [`OneGroupParams::default`]
 ///
 /// ### Returns
@@ -112,7 +107,6 @@ pub fn mglm_one_group<T: EdgeFloat>(
     }
 
     let mut coefficients = vec![0.0; n_genes];
-    // Built once and shared, rather than per gene.
     let all_samples: Vec<usize> = (0..n_samples).collect();
 
     coefficients
@@ -246,8 +240,7 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// With zero dispersion and no offset the fit is the Poisson maximum
-    /// likelihood estimate, which is the log of the sample mean.
+    /// Zero dispersion, no offset: the Poisson MLE, the log sample mean.
     #[test]
     fn test_poisson_fit_is_the_log_sample_mean() {
         let counts = vec![10.0, 12.0, 14.0, 5.0, 5.0, 5.0];
@@ -266,8 +259,7 @@ mod tests {
         assert_relative_eq!(coef[1], 5.0_f64.ln(), max_relative = 1e-10);
     }
 
-    /// The dispersion cancels out of the score when every sample shares an
-    /// offset, so the estimate is the log sample mean whatever the dispersion.
+    /// With a shared offset the dispersion cancels out of the score.
     #[test]
     fn test_dispersion_does_not_move_a_balanced_fit() {
         let counts = vec![10.0, 12.0, 14.0];
@@ -389,8 +381,7 @@ mod tests {
         assert!(coef[0] <= EMPTY_GENE_COEF);
     }
 
-    /// A non-finite starting value asks for that gene to be initialised from the
-    /// data, which is how edgeR uses `NA` per gene.
+    /// A non-finite start initialises that gene from the data (edgeR's per-gene `NA`).
     #[test]
     fn test_non_finite_start_falls_back_to_the_data() {
         let counts = vec![10.0, 12.0, 14.0, 5.0, 5.0, 5.0];

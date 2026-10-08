@@ -1,23 +1,21 @@
 //! GPU NEBULA against the `f64` CPU path.
 //!
-//! The reference here is `edge-rs`'s own `opt_pml`, not the R package: the CPU
-//! path is already gated against nebula 1.5.8 in `tests/e2e_nebula.rs`, so
-//! anything this suite catches is the `f32` device arithmetic and nothing else.
+//! The reference is `edge-rs`'s own `opt_pml`, not the R package: the CPU path
+//! is gated against nebula 1.5.8 in `tests/e2e_nebula.rs`, so anything caught
+//! here is the `f32` device arithmetic.
 //!
-//! The tolerances are deliberately far looser than the `1e-6` the CPU path
-//! holds, and they are measured rather than guessed. wgpu exposes no `f64`, so
-//! the device evaluates one `exp` and one `ln` per cell at about `1e-7`
-//! relative each, which compensated summation cannot undo. See the module doc
-//! of `edge_rs::gpu::pml_kernel`.
+//! Tolerances are far looser than the `1e-6` of the CPU path, and measured. wgpu
+//! exposes no `f64`, so the device evaluates one `exp` and one `ln` per cell at
+//! about `1e-7` relative each, which compensated summation cannot undo (see
+//! `edge_rs::gpu::pml_kernel`).
 //!
-//! Past the sweep, a handful of tiny shapes check what neither the sweep nor
-//! the R fixtures in `tests/e2e_nebula.rs` can: the error paths, run-to-run
-//! determinism of the stage-two cohorts, odd request counts, and a launch wide
-//! enough to need the second grid dimension.
+//! After the sweep, tiny shapes cover what the sweep and the R fixtures cannot:
+//! error paths, run-to-run determinism of the stage-two cohorts, odd request
+//! counts, and a launch needing the second grid dimension.
 //!
-//! The resolution floor is swept rather than asserted at one value. A gate that
-//! does not move across the sweep is insensitive rather than permissive, and
-//! the sweep is also how the shipped default was chosen.
+//! The resolution floor is swept, not asserted at one value: a gate that does
+//! not move across the sweep is insensitive, not permissive. The sweep also
+//! chose the shipped default.
 //!
 //! Run with:
 //! ```text
@@ -57,22 +55,20 @@ const LL_TOL: f64 = 1e-4;
 
 /// Worst relative disagreement allowed on `beta` after a single Newton step.
 ///
-/// Looser than [`BETA_TOL`] because one step from a cold start lands far from
-/// the optimum, where the iterate is still large and its components are not yet
-/// separated; at convergence the two paths agree an order of magnitude better.
+/// Looser than [`BETA_TOL`]: one step from a cold start lands far from the
+/// optimum. At convergence the two paths agree an order of magnitude better.
 const ONE_STEP_BETA_TOL: f64 = 5e-2;
 
-/// Resolution floors the suite sweeps, to show the gate can move.
+/// Resolution floors swept.
 const NOISE_SWEEP: [f64; 4] = [0.0, 1e-7, 1e-6, 1e-5];
 
-/// Absolute stopping tolerances the suite sweeps. Zero means iterate until a
-/// step stops improving the objective at all.
+/// Absolute stopping tolerances swept. Zero iterates until a step stops
+/// improving the objective.
 const EPS_SWEEP: [f64; 3] = [1e-6, 1e-9, 0.0];
 
 /// Coefficients smaller than this in absolute value are compared absolutely.
 ///
-/// A relative comparison against a coefficient that is legitimately near zero
-/// measures nothing but the rounding of the smaller operand.
+/// A relative comparison near zero only measures rounding.
 const NEAR_ZERO: f64 = 1e-3;
 
 ///////////////
@@ -81,9 +77,9 @@ const NEAR_ZERO: f64 = 1e-3;
 
 /// Problem shape: genes, cells, subjects, design columns.
 ///
-/// `EDGE_RS_GPU_CELLS` overrides the cell count. The cancellation in the Schur
-/// complement and in the gradient scales with the per-subject count totals, so
-/// sweeping the cell count is how that is told apart from ordinary rounding.
+/// `EDGE_RS_GPU_CELLS` overrides the cell count. Cancellation in the Schur
+/// complement and gradient scales with the per-subject count totals, so sweeping
+/// the cell count separates it from ordinary rounding.
 fn shape() -> (usize, usize, usize, usize) {
     let cells = std::env::var("EDGE_RS_GPU_CELLS")
         .ok()
@@ -103,8 +99,8 @@ const TRUE_PHI_INV: f64 = 0.5;
 
 /// Requests per launch past which the grid needs its second dimension.
 ///
-/// A dispatch dimension holds at most 65535 workgroups and a workgroup carries
-/// two requests, so anything above `2 * 65535` spills into `y`.
+/// A dispatch dimension holds at most 65535 workgroups of two requests each, so
+/// anything above `2 * 65535` spills into `y`.
 const ONE_DIM_REQUESTS: usize = 2 * 65_535;
 
 /// One generated batch, in the layout both paths read.
@@ -137,9 +133,8 @@ fn make_batch() -> Batch {
 
 /// Draws a batch from the gamma-gamma-Poisson model NEBULA fits.
 ///
-/// Cells are laid out subject by subject, with uneven block sizes so the ragged
-/// subject path is exercised. Column one is a subject-level group, the rest
-/// vary by cell.
+/// Cells are laid out subject by subject with uneven block sizes (ragged subject
+/// path). Column one is a subject-level group, the rest vary by cell.
 ///
 /// ### Params
 ///
@@ -256,7 +251,7 @@ fn rel(got: f64, want: f64) -> f64 {
 // Tests //
 ///////////
 
-/// Fits every gene on the CPU, which is the reference for this suite.
+/// Fits every gene on the CPU (the reference).
 ///
 /// ### Params
 ///
@@ -373,9 +368,9 @@ fn compare(
 
 /// Dumps the worst genes at one resolution floor, split by what is wrong.
 ///
-/// A relative error on a coefficient that is statistically zero says nothing,
-/// so the absolute difference and the error restricted to coefficients of
-/// substance are printed alongside it.
+/// Also prints the absolute difference and the relative error restricted to
+/// coefficients of substance, since a relative error on a coefficient near zero
+/// says nothing.
 ///
 /// ### Params
 ///
@@ -461,16 +456,14 @@ fn diagnose(
 
 /// One Newton step on both paths, from the same starting point.
 ///
-/// Isolates the step assembly from the search: after exactly one step the
-/// gradient, the curvature, the Schur complement and the `LDL'` solve have all
-/// run once at `(beta_init, 0)`, so the step itself must agree closely.
+/// Isolates the step assembly from the search: after one step the gradient,
+/// curvature, Schur complement and `LDL'` solve have each run once at
+/// `(beta_init, 0)`, so the step must agree closely.
 ///
-/// The observed information is deliberately not compared here. The two paths
-/// assemble it at different points by design — nebula and the CPU port report
-/// the penultimate iterate's, the kernel the final one's — and at a budget of a
-/// single Newton step those two points are as far apart as they ever get.
-/// `gpu_opt_pml_matches_cpu` is where the information is checked, at
-/// convergence, which is the only place the comparison means anything.
+/// The observed information is not compared. By design nebula and the CPU port
+/// report the penultimate iterate's, the kernel the final one's, and after one
+/// step those points are furthest apart. `gpu_opt_pml_matches_cpu` checks it at
+/// convergence.
 #[test]
 fn gpu_first_newton_step_matches_cpu() {
     let batch = make_batch();
@@ -607,9 +600,9 @@ info {worst_info:.3e} (needs {INFO_TOL:.0e}), loglik {worst_ll:.3e} (needs {LL_T
 
 /// The inner fit across the range of subject-level variance stage two visits.
 ///
-/// Stage two's search runs `sigma^2` down to its lower bound of `1e-4`, where
-/// the gamma prior's `alpha` and `lambda` both grow like `1 / sigma^2`. The fit
-/// has to hold there too, not only at the variance the counts were drawn with.
+/// Stage two's search runs `sigma^2` down to its lower bound of `1e-4`, where the
+/// gamma prior's `alpha` and `lambda` both grow like `1 / sigma^2`. The fit must
+/// hold there, not only at the variance the counts were drawn with.
 #[test]
 fn gpu_opt_pml_holds_across_the_variance_range() {
     let batch = make_batch();
@@ -697,9 +690,9 @@ fn gpu_opt_pml_holds_across_the_variance_range() {
     }
 }
 
-//////////////////
-// Tiny shapes  //
-//////////////////
+/////////////////
+// Tiny shapes //
+/////////////////
 
 /// A fixture from `tests/data/e2e`, as [`nebula_sparse_gpu`] takes it.
 struct Fixture {
@@ -770,8 +763,8 @@ fn fixture(tag: &str, design_file: bool) -> Fixture {
 
 /// Keeps only the genes with at least `min_cells` positive counts.
 ///
-/// A gene with no counts at all has its intercept running to minus infinity,
-/// which neither path is meant to fit and NEBULA's own filter never passes.
+/// A gene with no counts has its intercept running to minus infinity, which
+/// neither path fits and NEBULA's own filter rejects.
 ///
 /// ### Params
 ///
@@ -818,8 +811,7 @@ fn assert_same_bits(a: &NebulaFit, b: &NebulaFit) {
     assert_eq!(a.convergence, b.convergence, "convergence");
 }
 
-/// Asserts one GPU run of `batch` against its CPU reference at the default
-/// resolution floor.
+/// Asserts one GPU run of `batch` against the CPU at the default resolution floor.
 ///
 /// ### Params
 ///
@@ -854,11 +846,11 @@ fn assert_batch_matches_cpu(
     assert!(ll < LL_TOL, "{label}: log-likelihood disagrees by {ll:.3e}");
 }
 
-/// The two things the device fit cannot do come back as errors, not as
-/// answers: `reml`, and a design wider than [`MAX_BETA_CAP`](edge_rs::gpu::pml_kernel::MAX_BETA_CAP).
+/// `reml`, and a design wider than
+/// [`MAX_BETA_CAP`](edge_rs::gpu::pml_kernel::MAX_BETA_CAP), must return errors.
 ///
-/// HL, so every gene reaches stage two and the width check actually runs; under
-/// LN a gene that needs no refit never touches the device.
+/// HL, so every gene reaches stage two and the width check runs; under LN a gene
+/// needing no refit never touches the device.
 #[test]
 fn gpu_rejects_what_it_cannot_fit() {
     let f = fixture("sc_k2", true);
@@ -913,10 +905,10 @@ fn gpu_rejects_what_it_cannot_fit() {
 /// Two runs of the same input give the same bits.
 ///
 /// Whether stage two splits its searches into two cohorts is decided by timing
-/// the first rounds, so it can differ between runs. The cohorts are meant to
-/// change only when a search is told its values, never what, and `sc_small`
-/// runs 118 HL searches, above the count at which the cohorts merge. A machine
-/// that never splits only shows plain run-to-run determinism.
+/// the first rounds, so it can differ between runs. The cohorts must change only
+/// when a search is told its values, never what; `sc_small` runs 118 HL searches,
+/// above the count at which the cohorts merge. A machine that never splits only
+/// shows plain determinism.
 #[test]
 fn gpu_nebula_is_deterministic() {
     let f = fixture("sc_small", false);
@@ -938,8 +930,8 @@ fn gpu_nebula_is_deterministic() {
 
 /// A launch wide enough to need the grid's second dimension.
 ///
-/// A request the grid does not cover fails silently: its output is whatever
-/// the buffer held. Tiny genes keep the launch cheap; the ones past
+/// A request the grid does not cover fails silently (its output is whatever the
+/// buffer held). Tiny genes keep the launch cheap; those past
 /// [`ONE_DIM_REQUESTS`] are the point.
 #[test]
 fn gpu_grid_past_one_dimension() {

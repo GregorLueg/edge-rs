@@ -1,29 +1,19 @@
 //! Fixture loading and comparison for the end-to-end parity tests.
 //!
 //! Every fixture under `tests/data/e2e` is written by
-//! `tests/r/generate_fixtures.R`
-//! against edgeR `4.8.2`, limma `3.66` and nebula `1.5.8`. CI never runs the R;
-//! the files are committed and read from here.
+//! `tests/r/generate_fixtures.R` against edgeR `4.8.2`, limma `3.66` and nebula
+//! `1.5.8`. CI never runs the R; the files are committed.
 //!
-//! That is what the in-crate tests do, and at thirty genes it is the right
-//! answer. Over a thousand it reports the first failing gene and nothing else,
-//! which is the wrong end of the problem: what you want to know is the worst
-//! disagreement, where it landed and how many genes are involved.
-//! [`assert_close`] scans the whole vector and says all three, and takes care to
-//! point at the worst *failing* gene rather than the worst gene, which are often
-//! different once a tolerance has an absolute leg.
-//!
-//! The same scan doubles as the calibration tool. With `EDGE_RS_TOL_REPORT` set
-//! it prints the worst observed error for every labelled quantity even when the
-//! test passes:
+//! [`assert_close`] scans the whole vector and reports the worst *failing* pair
+//! and the failure count, not just the first miss. With `EDGE_RS_TOL_REPORT` set
+//! it also prints the worst observed error per labelled quantity, even on a pass:
 //!
 //! ```text
 //! EDGE_RS_TOL_REPORT=1 cargo test --release --test 'e2e_*' -- --nocapture
 //! ```
 //!
-//! Tolerances are set from that table rather than guessed, and each one carries
-//! its measured worst case in the doc comment on the constant, following what
-//! `src/sc/nebula.rs` already does.
+//! Tolerances are read off that table, and each constant records its measured
+//! worst case in its doc comment (pattern: `src/sc/nebula.rs`).
 
 #![allow(dead_code)]
 
@@ -36,10 +26,9 @@ use std::path::PathBuf;
 
 /// A comparison tolerance, split the way `approx` splits it.
 ///
-/// A pair passes when it is within `epsilon` absolutely or within
-/// `max_relative` relatively. The absolute leg matters for quantities that
-/// legitimately reach zero, such as a log fold change on a gene with no signal,
-/// where a relative test is meaningless.
+/// A pair passes when it is within `epsilon` absolutely or `max_relative`
+/// relatively. The absolute leg covers quantities that legitimately reach zero,
+/// such as a log fold change on a gene with no signal.
 #[derive(Clone, Copy, Debug)]
 pub struct Tol {
     /// Largest acceptable relative difference.
@@ -49,7 +38,7 @@ pub struct Tol {
 }
 
 impl Tol {
-    /// A pure relative tolerance, with no absolute escape hatch.
+    /// A pure relative tolerance.
     ///
     /// ### Params
     ///
@@ -126,9 +115,6 @@ fn relative_difference(got: f64, want: f64) -> f64 {
 ///////////
 
 /// One candidate for the worst disagreement in a comparison.
-///
-/// [`assert_close`] tracks two of these: the worst pair overall, for the
-/// calibration report, and the worst pair that actually failed, for the panic.
 #[derive(Clone, Copy, Debug)]
 struct Worst {
     /// Index of the pair.
@@ -145,19 +131,13 @@ struct Worst {
 
 /// Compares two vectors elementwise and panics naming the worst failure.
 ///
-/// Two running maxima are kept, and they are not the same entry. The panic
-/// message names the worst *failing* pair, because the largest relative
-/// difference in the vector is frequently one the absolute leg of the tolerance
-/// let through, and pointing at it sends the reader to a value that is fine. The
-/// calibration report names the worst pair overall, since that is the number a
-/// tolerance has to clear.
+/// The panic names the worst *failing* pair, which differs from the worst pair
+/// overall whenever the absolute leg of the tolerance lets the largest relative
+/// difference through. The calibration report (`EDGE_RS_TOL_REPORT`) prints the
+/// worst error whether or not the comparison passes.
 ///
-/// `NaN` against `NaN` passes, since R writes `NA` where the crate carries
-/// `NaN` for a non-estimable coefficient. `NaN` against a finite value fails.
-///
-/// When `EDGE_RS_TOL_REPORT` is set the worst observed error is printed whether
-/// or not the comparison passes, which is how the tolerance constants in these
-/// tests were calibrated.
+/// `NaN` against `NaN` passes (R writes `NA` for a non-estimable coefficient);
+/// `NaN` against a finite value fails.
 ///
 /// ### Params
 ///
@@ -277,8 +257,8 @@ pub fn assert_close_scalar(got: f64, want: f64, tol: Tol, label: &str) {
 
 /// Asserts two integer-valued vectors are equal, reporting how many differ.
 ///
-/// Used for the filter masks and the gene index vectors, where a tolerance
-/// would be meaningless: a disagreement is a different gene set, not a drift.
+/// For filter masks and gene index vectors, where a disagreement is a different
+/// gene set, not drift.
 ///
 /// ### Params
 ///
@@ -368,8 +348,8 @@ impl Table {
 
     /// Borrows one column and rounds it to `usize`.
     ///
-    /// The fixtures carry integer quantities as doubles because everything else
-    /// in the file is a double. Values must be non-negative whole numbers.
+    /// Fixtures store integers as doubles. Values must be non-negative whole
+    /// numbers.
     ///
     /// ### Params
     ///
@@ -407,8 +387,8 @@ impl Table {
 
     /// Flattens the whole table row-major.
     ///
-    /// This is the layout the crate uses for a gene-by-sample matrix, so a
-    /// fixture written one gene per row comes back ready to compare.
+    /// Matches the crate's gene-by-sample layout for a fixture written one gene
+    /// per row.
     ///
     /// ### Returns
     ///
@@ -462,9 +442,7 @@ fn fixture_path(name: &str) -> PathBuf {
 
 /// Parses one field, mapping R's spellings of the non-finite values.
 ///
-/// R writes `NaN`, `Inf` and `-Inf`, all of which Rust accepts. The generator
-/// rewrites `NA` to `NaN` on the way out, but the mapping is kept here too so a
-/// hand-edited fixture cannot fail obscurely.
+/// Maps `NA` to `NaN` as well, so a hand-edited fixture cannot fail obscurely.
 ///
 /// ### Params
 ///

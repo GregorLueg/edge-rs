@@ -1,11 +1,9 @@
 //! Cox-Reid adjusted profile likelihood.
 //!
-//! The dispersion cannot be estimated from the profile likelihood directly:
-//! profiling out the coefficients biases it downwards, badly so when the design
-//! has many columns relative to the samples. Cox and Reid's adjustment corrects
-//! for that by subtracting half the log determinant of the observed
-//! information, `-0.5 log|X'WX|`, which is what makes edgeR's dispersion
-//! estimates usable on small experiments.
+//! Profiling out the coefficients biases the dispersion downwards, badly when
+//! the design has many columns relative to the samples. Cox and Reid's
+//! adjustment subtracts half the log determinant of the observed information,
+//! `-0.5 log|X'WX|`.
 //!
 //! ### References
 //!
@@ -33,10 +31,9 @@ const ETA_CLAMP: f64 = 500.0;
 
 /// Floor applied to the information matrix pivots before taking logarithms.
 ///
-/// edgePython's `eps`. A design that is singular for a particular gene, which
-/// happens when a group has no counts at all, would otherwise contribute an
-/// infinite adjustment and take the whole grid with it. Clamping matches
-/// edgeR's LDL path, which floors the same quantity.
+/// edgePython's `eps`. A gene whose design is singular (a group with no counts)
+/// would otherwise give an infinite adjustment. Matches edgeR's LDL path, which
+/// floors the same quantity.
 const PIVOT_FLOOR: f64 = 1e-10;
 
 /////////////////
@@ -51,8 +48,8 @@ struct GeneScratch {
     mu: Vec<f64>,
     /// Information matrix, row-major.
     information: Vec<f64>,
-    /// Coefficients, reused as a warm start across dispersions and reset by
-    /// [`AplWorkspace::begin_gene`] at the start of each gene.
+    /// Coefficients, a warm start across dispersions, reset by
+    /// [`AplWorkspace::begin_gene`] for each gene.
     beta: Vec<f64>,
     /// Scratch for the general Levenberg path.
     levenberg: Scratch,
@@ -86,10 +83,9 @@ impl GeneScratch {
 
 /// Cox-Reid adjustment `-0.5 log|X'WX|` from the assembled information matrix.
 ///
-/// Factorises in place by Cholesky, which exists because `X'WX` is positive
-/// semi-definite by construction, and reads the determinant off the diagonal.
-/// A pivot that is not positive means the design is singular for this gene, and
-/// the remaining pivots are floored rather than the whole gene discarded.
+/// Factorises in place by Cholesky (`X'WX` is positive semi-definite) and reads
+/// the determinant off the diagonal. A non-positive pivot means the design is
+/// singular for this gene; pivots are floored rather than the gene discarded.
 ///
 /// ### Params
 ///
@@ -109,8 +105,7 @@ fn cox_reid_adjustment(xtwx: &mut [f64], n_coef: usize) -> f64 {
                 sum -= xtwx[i * n_coef + k] * xtwx[j * n_coef + k];
             }
             if i == j {
-                // The Cholesky pivot squared is the LDL pivot, which is the
-                // quantity edgeR floors.
+                // The Cholesky pivot squared is the LDL pivot edgeR floors.
                 let pivot = if sum > PIVOT_FLOOR { sum } else { PIVOT_FLOOR };
                 log_det += pivot.ln();
                 xtwx[i * n_coef + i] = pivot.sqrt();
@@ -170,8 +165,7 @@ fn log_likelihood(
 
 /// Assembles `X'WX` for one gene from its fitted means.
 ///
-/// The working weight is `w mu / (1 + phi mu)` for a negative binomial and
-/// `w mu` in the Poisson limit, which is the same expression with `phi = 0`.
+/// The working weight is `w mu / (1 + phi mu)`; `phi = 0` gives the Poisson `w mu`.
 ///
 /// ### Params
 ///
@@ -250,10 +244,9 @@ fn fit_one_way_gene(
 
 /// Fits one gene on the general path and writes its fitted means.
 ///
-/// `scratch.beta` is read as the starting point and overwritten with the answer,
-/// which is what lets consecutive grid points warm-start each other. The caller
-/// owns that buffer's initial state and must reset it when it moves to a new
-/// gene; see [`apl_grid`].
+/// `scratch.beta` is the starting point and is overwritten with the answer, so
+/// consecutive grid points warm-start each other. The caller must reset it for
+/// each new gene; see [`apl_grid`].
 ///
 /// ### Params
 ///
@@ -275,11 +268,7 @@ fn fit_general_gene(
 ) {
     scratch.levenberg.y.copy_from_slice(&scratch.y);
 
-    // Start from the previous grid point's answer. Neighbouring dispersions give
-    // very similar coefficients, so this saves most of the iterations after the
-    // first grid point.
-    //
-    // The budget is `glmFit`'s rather than `mglmLevenberg`'s, because that is the
+    // Starts from the previous grid point's answer. The budget is `glmFit`'s, the
     // route `adjustedProfileLik` takes to the fitter.
     let params = LevenbergParams {
         max_iter: GLM_FIT_MAX_ITER,
@@ -306,21 +295,14 @@ fn fit_general_gene(
 /// Reusable state for evaluating the adjusted profile likelihood of one gene at
 /// many dispersions.
 ///
-/// [`apl_grid`] refits the coefficients at every grid point and carries the
-/// previous point's answer into the next, which is what keeps a 20-point sweep
-/// far cheaper than 20 independent fits. A caller driving its own search over
-/// the dispersion, an optimiser rather than a grid, cannot use that through
-/// [`apl_at`]: each call allocates its own buffers, re-derives the design's
-/// factor structure and cold-starts the coefficients again.
+/// [`apl_grid`] warm-starts each grid point from the previous one. A caller
+/// running its own search over the dispersion cannot get that through
+/// [`apl_at`], which allocates, re-derives the factor structure and cold-starts
+/// on every call.
 ///
-/// This type exposes the same machinery point by point. Build it once per
-/// design, call [`AplWorkspace::begin_gene`] when the gene changes, then
-/// [`AplWorkspace::eval`] for every dispersion the search asks about. Each
-/// evaluation starts from the last one's coefficients, so the saving grows with
-/// the number of points the search visits.
-///
-/// The buffers are sized at construction and never reallocated, so one
-/// workspace per worker thread is the intended pattern.
+/// Build once per design, call [`AplWorkspace::begin_gene`] when the gene
+/// changes, then [`AplWorkspace::eval`] per dispersion. Buffers are never
+/// reallocated: use one workspace per worker thread.
 pub struct AplWorkspace<'a> {
     /// Row-major design, `n_samples * n_coef`.
     design: &'a [f64],
@@ -345,8 +327,7 @@ pub struct AplWorkspace<'a> {
 impl<'a> AplWorkspace<'a> {
     /// Allocates a workspace for one design.
     ///
-    /// The design's factor structure is derived once here rather than per
-    /// evaluation, which is the other half of what [`apl_at`] repeats.
+    /// The design's factor structure is derived once here.
     ///
     /// ### Params
     ///
@@ -393,9 +374,7 @@ impl<'a> AplWorkspace<'a> {
 
     /// Builds a workspace from a design whose factor structure is already known.
     ///
-    /// [`apl_grid`] derives that structure once for the whole matrix and then
-    /// hands each worker its own workspace, so re-deriving it per worker would
-    /// be pure repetition.
+    /// [`apl_grid`] derives the structure once and hands each worker a workspace.
     ///
     /// ### Params
     ///
@@ -431,12 +410,10 @@ impl<'a> AplWorkspace<'a> {
 
     /// Loads a gene and cold-starts its coefficients.
     ///
-    /// The coefficients are deliberately carried from one [`AplWorkspace::eval`]
-    /// to the next, so a new gene has to clear them: neighbouring dispersions
-    /// are close together, neighbouring genes need not be, and over a wide
-    /// abundance range the previous gene's answer is far enough out that the fit
-    /// lands on the wrong optimum. This matches `estimateDisp`, which clears its
-    /// warm start once per gene.
+    /// Coefficients carry over between [`AplWorkspace::eval`] calls, so a new gene
+    /// must clear them: the previous gene's answer can be far enough out to land
+    /// on the wrong optimum. Matches `estimateDisp`, which clears its warm start
+    /// per gene.
     ///
     /// ### Params
     ///
@@ -575,16 +552,12 @@ impl<'a> AplWorkspace<'a> {
 
 /// Adjusted profile likelihood across a grid of dispersions.
 ///
-/// For each gene the coefficients are refitted at every grid point, since the
-/// profile likelihood is defined at the maximum over coefficients for that
-/// dispersion. The result feeds
-/// [`crate::numeric::interpolate::maximize_interpolant`], which finds the
-/// maximising dispersion by fitting a spline through the grid.
+/// Coefficients are refitted at every grid point. The result feeds
+/// [`crate::numeric::interpolate::maximize_interpolant`], which splines through
+/// the grid.
 ///
-/// Genes are the parallel axis, with one scratch buffer per worker. Each gene is
-/// cold-started, so a gene's row depends only on that gene: the answer does not
-/// move with the batch it was submitted in, nor with how rayon happened to split
-/// the work.
+/// Each gene is cold-started, so a gene's row does not depend on the batch or on
+/// how rayon splits the work.
 ///
 /// ### Params
 ///
@@ -647,8 +620,7 @@ pub fn apl_grid<T: EdgeFloat>(
     let n_grid = grid.len();
     let (labels, n_groups) = design_as_factor(design, n_samples, n_coef)?;
 
-    // Sample indices per group, used only on the one-way path. Derived once and
-    // handed to every worker, since it depends on the design alone.
+    // Sample indices per group, one-way path only.
     let mut members: Vec<Vec<usize>> = vec![Vec::new(); n_groups];
     for (sample, &label) in labels.iter().enumerate() {
         members[label].push(sample);
@@ -668,8 +640,7 @@ pub fn apl_grid<T: EdgeFloat>(
         },
         |workspace, (gene, row)| {
             let start = gene * n_samples;
-            // Every argument was validated above, so the only failure this could
-            // report is one the caller has already been protected from.
+            // Shapes and grid were validated above.
             workspace
                 .begin_gene(
                     &counts[start..start + n_samples],
@@ -690,9 +661,8 @@ pub fn apl_grid<T: EdgeFloat>(
 
 /// Adjusted profile likelihood at one shared dispersion.
 ///
-/// The common-dispersion estimators maximise the summed adjusted profile
-/// likelihood over a single scalar, so this is the shape they need. A per-gene
-/// dispersion instead belongs in [`apl_grid`], which is built for it.
+/// The shape the common-dispersion estimators need. Per-gene dispersions belong
+/// in [`apl_grid`].
 ///
 /// ### Params
 ///
@@ -784,8 +754,8 @@ mod tests {
         }
     }
 
-    /// The grid form must agree with evaluating each dispersion on its own,
-    /// which pins the warm-start reuse across grid points.
+    /// The grid must agree with evaluating each dispersion on its own, which
+    /// pins the warm-start reuse.
     #[test]
     fn test_grid_agrees_with_pointwise_evaluation() {
         let (counts, design, offset) = fixture();
@@ -804,8 +774,7 @@ mod tests {
         }
     }
 
-    /// The whole grid against edgeR, not just one point: the maximising grid
-    /// index per gene must match.
+    /// The maximising grid index per gene must match edgeR.
     ///
     /// ```r
     /// grid <- 1e-4 * 2^(0:24)
@@ -813,10 +782,9 @@ mod tests {
     /// apply(apl, 1, which.max) - 1   # 6, 6, 14
     /// ```
     ///
-    /// Genes 0 and 1 are both underdispersed relative to Poisson and tie low.
-    /// Gene 2 has counts of 2, 0, 5 against 1, 3, 0, whose scatter exceeds its
-    /// mean, and peaks eight grid points higher. A wrong Cox-Reid adjustment
-    /// moves these, since it is the only term that depends on the design.
+    /// Genes 0 and 1 are underdispersed relative to Poisson and tie low. Gene 2
+    /// (counts 2, 0, 5 against 1, 3, 0) peaks eight grid points higher. A wrong
+    /// Cox-Reid adjustment moves these.
     #[test]
     fn test_grid_maximisers_match_edger() {
         let (counts, design, offset) = fixture();
@@ -836,23 +804,18 @@ mod tests {
         assert_eq!([argmax(0), argmax(1), argmax(2)], [6, 6, 14]);
     }
 
-    /// A continuous covariate forces the general fitting path. It must agree
-    /// with the one-way path where both are valid, so compare a one-way design
-    /// expressed two ways.
+    /// Two codings of the same one-way design must agree.
     #[test]
     fn test_general_path_agrees_with_the_one_way_path() {
         let (counts, _, offset) = fixture();
-        // Group indicator, which is one-way.
         let indicator = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
-        // The same model with a redundant continuous column that ties every
-        // sample to its own group, forcing the Levenberg path.
         let one_way = apl_grid(&counts, 3, 6, &indicator, 2, &[0.1], &offset, None).unwrap();
 
         // Treatment coding of the same model: still one-way, different rotation.
         let treatment = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
         let rotated = apl_grid(&counts, 3, 6, &treatment, 2, &[0.1], &offset, None).unwrap();
 
-        // The adjusted profile likelihood is invariant to reparametrisation.
+        // Invariant to reparametrisation.
         for (a, b) in one_way.iter().zip(rotated.iter()) {
             assert_relative_eq!(a, b, max_relative = 1e-9);
         }
@@ -895,8 +858,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::LengthMismatch { .. }));
     }
 
-    /// The workspace must walk a grid to the same values `apl_grid` reports,
-    /// since it is the same warm start driven by hand.
+    /// The workspace must walk a grid to the values `apl_grid` reports.
     #[test]
     fn test_workspace_reproduces_the_grid() {
         let (counts, design, offset) = fixture();
@@ -920,8 +882,7 @@ mod tests {
         }
     }
 
-    /// The one-way path has no coefficients to carry, so the workspace has to
-    /// agree there too.
+    /// The one-way path has no coefficients to carry; the workspace must agree there too.
     #[test]
     fn test_workspace_reproduces_the_grid_on_the_one_way_path() {
         let (counts, design, offset) = fixture();
@@ -950,7 +911,7 @@ mod tests {
     }
 
     /// Sums one gene's adjusted profile likelihood across a grid, driving the
-    /// workspace the way an optimiser would.
+    /// workspace as an optimiser would.
     fn walk<'a>(
         workspace: &mut AplWorkspace<'a>,
         counts: &'a [f64],
@@ -973,7 +934,7 @@ mod tests {
     #[test]
     fn test_workspace_cold_starts_each_gene() {
         let (counts, _, offset) = fixture();
-        // A continuous column forces the general path, where the warm start lives.
+        // A continuous column forces the general path, which has the warm start.
         let continuous: Vec<f64> = (0..6).flat_map(|s| [1.0, (s as f64) * 0.37]).collect();
         let grid = [0.02, 0.15];
 

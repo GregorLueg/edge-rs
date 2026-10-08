@@ -1,34 +1,30 @@
 //! Chebyshev approximations to the moments of the negative binomial unit
 //! deviance, and the unit deviance itself.
 //!
-//! A port of edgeR's `ql_weights.c` and the deviance kernel of
-//! `compute_nbdev.c`. Under the fitted model the unit deviance of one
-//! observation behaves like a scaled chi-square, and the quasi-likelihood
-//! machinery needs its first two moments. Matching moments gives
+//! Port of edgeR's `ql_weights.c` and the deviance kernel of `compute_nbdev.c`.
+//! The unit deviance of one observation behaves like a scaled chi-square, and
+//! the quasi-likelihood machinery needs its first two moments. Matching
+//! moments gives
 //!
 //! ```text
 //! alpha = 2 * E[d] / Var[d]        kappa = 2 * E[d]^2 / Var[d]
 //! ```
 //!
-//! so `alpha` is the reciprocal scale that maps the deviance onto a chi-square
-//! and `kappa` is that chi-square's degrees of freedom. Neither has a closed
-//! form, so edgeR ships piecewise Chebyshev fits: in `mu` alone for the Poisson
-//! limit, and in `(mu, phi)` jointly for the negative binomial. Only above
-//! `phi = 4.001` does the C fall back on summing the probability mass function
-//! directly, which is cheap there because the distribution has collapsed onto a
-//! handful of small counts.
+//! so `alpha` is the reciprocal scale onto a chi-square and `kappa` its
+//! degrees of freedom. Neither has a closed form, so edgeR ships piecewise
+//! Chebyshev fits: in `mu` alone for the Poisson limit, in `(mu, phi)` jointly
+//! for the negative binomial. Only above `phi = 4.001` does the C sum the
+//! probability mass function directly.
 //!
 //! The coefficient tables are copied verbatim from `ql_weights.c` by way of
-//! edgePython. Panel boundaries and the affine maps that take each panel onto
-//! `[-1, 1]` live in [`Panel`] tables next to the coefficients they index, so
-//! the fit and its domain cannot drift apart.
+//! edgePython. Panel boundaries and the affine maps onto `[-1, 1]` live in
+//! `Panel` tables next to the coefficients they index.
 //!
 //! ### Deviations from edgePython
 //!
-//! [`unit_nb_deviance`] follows edgeR's C, not edgePython. The small-`phi`
-//! series in the C writes `2/3*resid` with integer operands, so that term is
-//! identically zero; edgePython "corrected" it to `2.0/3.0*resid` and drifts
-//! from edgeR by up to 7e-4 relative on large counts. See the tests.
+//! [`unit_nb_deviance`] follows edgeR's C: the small-`phi` series has
+//! `2/3*resid` with integer operands, which is identically zero. edgePython
+//! "corrects" it to `2.0/3.0*resid`. See `UPSTREAM_DEVIATIONS.md` A4.
 //!
 //! ### References
 //!
@@ -42,9 +38,8 @@ use crate::numeric::gamma::ln_gamma;
 
 /// Below this mean every weight is reported as an exact zero.
 ///
-/// edgeR's `low_value`. The fits are all multiplied by `log(mu)`-shaped
-/// factors that lose meaning once `mu` underflows the fitted range, and a gene
-/// with a mean this small contributes nothing to the quasi-likelihood anyway.
+/// edgeR's `low_value`. The fits lose meaning once `mu` underflows their range,
+/// and such a gene contributes nothing to the quasi-likelihood.
 const MIN_MU: f64 = 1e-32;
 
 /// Upper bound of the case 1 negative binomial fits.
@@ -61,8 +56,8 @@ const PHI_CASE1_HALF: f64 = 0.368;
 
 /// Half-width of the case 2 `phi` domain, which maps `[0, 4]` onto `[-1, 1]`.
 ///
-/// The fitted range stops at 4.001 rather than 4, so the largest `phi` reaching
-/// case 2 maps to a hair over 1. Chebyshev polynomials are well behaved there.
+/// The fitted range stops at 4.001, so the largest `phi` reaching case 2 maps
+/// marginally past 1.
 const PHI_CASE2_HALF: f64 = 2.0;
 
 /// Mean above which the Poisson fits give way to their asymptotic expansions.
@@ -71,7 +66,7 @@ const POIS_ASYMPTOTIC_MU: f64 = 20.0;
 /// Mean below which the Poisson fits carry an explicit `log(mu)` factor.
 ///
 /// Both moments vanish as `mu -> 0` like `mu * log(mu)^2`, which no polynomial
-/// in `mu` can follow, so the first panel fits the smooth remainder instead.
+/// can follow, so the first panel fits the smooth remainder.
 const POIS_LOG_MU: f64 = 0.02;
 
 /// Coefficients per panel in the one-dimensional Poisson fits.
@@ -102,14 +97,14 @@ const NB2_MID_MU: f64 = 50.0;
 
 /// Mean above which case 2 collapses to a `phi`-only fit.
 ///
-/// Both moments have flattened out in `mu` by here, so the `mu -> inf` edge of
-/// the separable fit is used unchanged.
+/// Both moments are flat in `mu` here, so the `mu -> inf` edge of the separable
+/// fit is used unchanged.
 const NB2_LARGE_MU: f64 = 5000.0;
 
 /// Breakpoints in `mu` for the case 2 reciprocal-`mu` panels.
 ///
-/// The separable fit above [`NB2_MID_MU`] is a polynomial in `1/mu`, not in
-/// `mu`, so these panels carry their own maps rather than a [`Panel`] table.
+/// The separable fit above [`NB2_MID_MU`] is polynomial in `1/mu`, so these
+/// panels carry their own maps rather than a [`Panel`] table.
 const NB2_MID_KNOTS: [f64; 2] = [100.0, 1000.0];
 
 /// Side length of a case 2 two-dimensional panel, which holds `10 * 10` terms.
@@ -120,8 +115,7 @@ const NB2_MID_LEN: usize = 10;
 
 /// Edge series in the case 2 separable table: three panels sharing four edges.
 ///
-/// The last of the four is the `mu -> inf` edge, which is also the whole answer
-/// above [`NB2_LARGE_MU`].
+/// The last is the `mu -> inf` edge, the whole answer above [`NB2_LARGE_MU`].
 const NB2_MID_EDGES: usize = 4;
 
 /// Terms kept in the direct probability mass function sum beyond `mu^2 * phi`.
@@ -129,8 +123,7 @@ const NB_SUM_SLACK: f64 = 10.0;
 
 /// Hard cap on terms in the direct probability mass function sum.
 ///
-/// Above `phi = 4.001` the negative binomial has almost all of its mass on the
-/// first few counts, so fifty terms is a generous tail.
+/// Above `phi = 4.001` almost all mass sits on the first few counts.
 const NB_SUM_MAX: usize = 50;
 
 /// Blocks of the case 1 large-`mu` fit for alpha.
@@ -199,8 +192,7 @@ const NB1_MID_PANELS: [Panel; 4] = [
 /// Panels of the case 2 joint fit for alpha, valid up to [`NB2_MID_MU`].
 ///
 /// The first panel maps `[0, 0.02]` rather than `[0, 0.01]` onto `[-1, 1]`, so
-/// only the left half of its Chebyshev domain is ever used. That is how the C
-/// writes it.
+/// only the left half of its domain is used. This mirrors the C.
 #[rustfmt::skip]
 const NB2_ALPHA_PANELS: [Panel; 6] = [
     Panel { upper: 0.01, centre2: 0.02, width2: 0.02, offset: 0 },
@@ -228,10 +220,8 @@ const NB2_KAPPA_PANELS: [Panel; 6] = [
 
 /// One panel of a piecewise Chebyshev fit in `mu`.
 ///
-/// The fit is stitched from panels, each holding its own block of coefficients
-/// and its own affine map onto `[-1, 1]`. Storing twice the centre and twice
-/// the half-width lets the map be written `(2 * mu - centre2) / width2`, which
-/// is the form the C source uses for most panels.
+/// Each panel has its own coefficient block and affine map onto `[-1, 1]`,
+/// written `(2 * mu - centre2) / width2` as in the C source.
 #[derive(Clone, Copy, Debug)]
 struct Panel {
     /// Exclusive upper bound in `mu`; the last panel of a table uses infinity
@@ -265,8 +255,8 @@ fn locate(panels: &[Panel], mu: f64) -> (f64, usize) {
 
 /// Picks a coefficient offset from a table of `mu` breakpoints.
 ///
-/// Used by the large-`mu` case 1 fits, which vary the block of `phi`
-/// coefficients with `mu` but apply no map in `mu` at all.
+/// For the large-`mu` case 1 fits, which switch the `phi` coefficient block on
+/// `mu` but apply no map in `mu`.
 ///
 /// ### Params
 ///
@@ -289,9 +279,8 @@ fn locate_block(blocks: &[(f64, usize)], mu: f64) -> usize {
 /// Evaluates the three series a separable panel is built from.
 ///
 /// A separable table holds one `phi` series per panel edge, then one `mu`
-/// series per panel. Consecutive panels share an edge, so panel `p` reads its
-/// lower edge at `offset` and its upper edge at `offset + len`. The `mu` series
-/// that blends the two sits `edges * len` further along.
+/// series per panel. Panel `p` reads its lower edge at `offset`, its upper edge
+/// at `offset + len`, and its blend series `edges * len` further along.
 ///
 /// ### Params
 ///
@@ -306,7 +295,7 @@ fn locate_block(blocks: &[(f64, usize)], mu: f64) -> usize {
 /// ### Returns
 ///
 /// `(lower edge, upper edge, blend)`. Case 1 and case 2 blend in opposite
-/// directions, so the combination is left to the caller.
+/// directions, so the caller combines them.
 #[inline]
 fn edge_series(
     table: &[f64],
@@ -330,9 +319,8 @@ fn edge_series(
 
 /// Evaluates a Chebyshev series of the first kind at `x`.
 ///
-/// The basis is generated by the three-term recurrence and accumulated in
-/// ascending order, matching the reference term for term. Nothing is
-/// allocated: the recurrence carries two values through the loop.
+/// Three-term recurrence, accumulated in ascending order to match the
+/// reference term for term. No allocation.
 ///
 /// ### Params
 ///
@@ -365,9 +353,8 @@ pub fn cheb_eval(coefficients: &[f64], x: f64) -> f64 {
 
 /// Evaluates a tensor product Chebyshev series at `(x, y)`.
 ///
-/// Coefficients are laid out `y`-major: term `(i, j)` multiplying
-/// `T_j(x) * T_i(y)` sits at `i * nx + j`. Both recurrences are run inline, the
-/// `x` one restarted for each `y` term, so no basis is materialised.
+/// Coefficients are `y`-major: term `(i, j)` multiplying `T_j(x) * T_i(y)` sits
+/// at `i * nx + j`. Both recurrences run inline, so no basis is materialised.
 ///
 /// ### Params
 ///
@@ -456,9 +443,8 @@ fn pois_kappa_tail(mu: f64) -> f64 {
 
 /// Reciprocal scale of the Poisson unit deviance.
 ///
-/// Piecewise Chebyshev below [`POIS_ASYMPTOTIC_MU`] and an asymptotic
-/// expansion above it. The first panel divides out the `log(mu)` singularity
-/// that the deviance carries as `mu -> 0`.
+/// Piecewise Chebyshev below `POIS_ASYMPTOTIC_MU`, asymptotic expansion
+/// above. The first panel divides out the `log(mu)` singularity at `mu -> 0`.
 ///
 /// ### Params
 ///
@@ -467,7 +453,7 @@ fn pois_kappa_tail(mu: f64) -> f64 {
 /// ### Returns
 ///
 /// `2 E[d] / Var[d]` for `d` the Poisson unit deviance at `mu`, or zero when
-/// `mu` is below [`MIN_MU`].
+/// `mu` is below `MIN_MU`.
 pub fn pois_alpha(mu: f64) -> f64 {
     if mu < MIN_MU {
         return 0.0;
@@ -495,7 +481,7 @@ pub fn pois_alpha(mu: f64) -> f64 {
 /// ### Returns
 ///
 /// `2 E[d]^2 / Var[d]` for `d` the Poisson unit deviance at `mu`, or zero when
-/// `mu` is below [`MIN_MU`].
+/// `mu` is below `MIN_MU`.
 pub fn pois_kappa(mu: f64) -> f64 {
     if mu < MIN_MU {
         return 0.0;
@@ -520,12 +506,10 @@ pub fn pois_kappa(mu: f64) -> f64 {
 
 /// Reciprocal scale of the negative binomial unit deviance, case 1.
 ///
-/// Three regimes in `mu`. Below [`NB1_MID_MU`] a joint `7 x 7` fit in
-/// `(mu, phi)` multiplies the Poisson answer. Between there and
-/// [`NB1_LARGE_MU`] the fit is separable: two `phi` series give the value at
-/// the panel edges and an `x` series interpolates between them. Above
-/// [`NB1_LARGE_MU`] the `mu` dependence has collapsed onto the Poisson
-/// asymptote and only a `phi` correction remains.
+/// Three regimes in `mu`. Below [`NB1_MID_MU`], a joint `7 x 7` fit in
+/// `(mu, phi)` multiplies the Poisson answer. Up to [`NB1_LARGE_MU`], a
+/// separable fit: two `phi` series give the panel edges and an `x` series
+/// interpolates. Above, only a `phi` correction to the Poisson asymptote.
 ///
 /// ### Params
 ///
@@ -566,8 +550,8 @@ fn nb_alpha_case1(mu: f64, phi: f64) -> f64 {
 
 /// Degrees of freedom of the negative binomial unit deviance, case 1.
 ///
-/// Same three regimes as [`nb_alpha_case1`], with its own panel breakpoints
-/// and one extra large-`mu` block.
+/// Same regimes as [`nb_alpha_case1`], with its own breakpoints and one extra
+/// large-`mu` block.
 ///
 /// ### Params
 ///
@@ -612,10 +596,9 @@ fn nb_kappa_case1(mu: f64, phi: f64) -> f64 {
 
 /// Reciprocal scale of the negative binomial unit deviance, case 2.
 ///
-/// Below [`NB2_MID_MU`] a joint `10 x 10` fit in `(mu, phi)`, with the same
-/// `log(mu)` factor the Poisson fit uses on its first panel. Up to
-/// [`NB2_LARGE_MU`] a separable fit in `1/mu` and `phi`. Above that the
-/// `mu -> inf` edge alone.
+/// Below [`NB2_MID_MU`], a joint `10 x 10` fit in `(mu, phi)` with the Poisson
+/// first-panel `log(mu)` factor. Up to [`NB2_LARGE_MU`], a separable fit in
+/// `1/mu` and `phi`. Above, the `mu -> inf` edge alone.
 ///
 /// ### Params
 ///
@@ -727,10 +710,8 @@ fn locate_reciprocal(mu: f64) -> (f64, usize) {
 
 /// Both deviance moments by direct summation over the probability mass function.
 ///
-/// Once `phi` clears [`PHI_CASE2_MAX`] the negative binomial is concentrated on
-/// small counts, so the moments can be summed outright. The term count grows
-/// with `mu^2 phi` and is capped at [`NB_SUM_MAX`], which covers the mass to
-/// well past any precision the fits offer elsewhere.
+/// Above [`PHI_CASE2_MAX`] the distribution sits on small counts. The term
+/// count grows with `mu^2 phi`, capped at [`NB_SUM_MAX`].
 ///
 /// ### Params
 ///
@@ -752,8 +733,8 @@ fn nb_moments_large_phi(mu: f64, phi: f64) -> (f64, f64) {
     let log_1mp = (1.0 - p).ln();
     let ln_gamma_size = ln_gamma(size);
 
-    // Both moments are needed before the variance can be accumulated, so the
-    // terms are held rather than folded. The cap keeps them on the stack.
+    // The mean must be known before the variance can be accumulated, so terms
+    // are held; the cap keeps them on the stack.
     let mut mass = [0.0_f64; NB_SUM_MAX];
     let mut deviance = [0.0_f64; NB_SUM_MAX];
     for i in 0..n {
@@ -785,9 +766,8 @@ fn nb_moments_large_phi(mu: f64, phi: f64) -> (f64, f64) {
 
 /// Reciprocal scale of the negative binomial unit deviance.
 ///
-/// Dispatches on `phi`: the exact Poisson limit at zero, the case 1 fits below
-/// [`PHI_CASE1_MAX`], the case 2 fits below [`PHI_CASE2_MAX`], and direct
-/// summation above that.
+/// Dispatches on `phi`: case 1 fits below `PHI_CASE1_MAX` (including zero),
+/// case 2 below `PHI_CASE2_MAX`, direct summation above.
 ///
 /// ### Params
 ///
@@ -797,16 +777,15 @@ fn nb_moments_large_phi(mu: f64, phi: f64) -> (f64, f64) {
 /// ### Returns
 ///
 /// `2 E[d] / Var[d]` for `d` the unit deviance at `(mu, phi)`, or zero when
-/// `mu` is below [`MIN_MU`].
+/// `mu` is below `MIN_MU`.
 pub fn nb_alpha(mu: f64, phi: f64) -> f64 {
     compute_weight(mu, phi, 1.0).0
 }
 
 /// Degrees of freedom of the negative binomial unit deviance.
 ///
-/// Dispatches on `phi` exactly as [`nb_alpha`] does. Callers wanting both
-/// moments above [`PHI_CASE2_MAX`] should use [`compute_weight`], which sums
-/// the probability mass function once instead of twice.
+/// Dispatches on `phi` as [`nb_alpha`] does. For both moments above
+/// `PHI_CASE2_MAX` use [`compute_weight`], which sums the mass function once.
 ///
 /// ### Params
 ///
@@ -816,15 +795,14 @@ pub fn nb_alpha(mu: f64, phi: f64) -> f64 {
 /// ### Returns
 ///
 /// `2 E[d]^2 / Var[d]` for `d` the unit deviance at `(mu, phi)`, or zero when
-/// `mu` is below [`MIN_MU`].
+/// `mu` is below `MIN_MU`.
 pub fn nb_kappa(mu: f64, phi: f64) -> f64 {
     compute_weight(mu, phi, 1.0).1
 }
 
 /// Both quasi-likelihood weights for one observation.
 ///
-/// The prior divides the fitted value before the weights are taken, which is
-/// how edgeR folds the prior count out of the mean it fitted with it.
+/// The prior divides the fitted value before the weights are taken, as in edgeR.
 ///
 /// ### Params
 ///
@@ -835,7 +813,7 @@ pub fn nb_kappa(mu: f64, phi: f64) -> f64 {
 /// ### Returns
 ///
 /// `(alpha, kappa)`: the reciprocal scale for the adjusted deviance and the
-/// degrees of freedom it carries. Both are zero for a mean below [`MIN_MU`].
+/// degrees of freedom it carries. Both are zero for a mean below `MIN_MU`.
 pub fn compute_weight(u: f64, phi: f64, prior: f64) -> (f64, f64) {
     let mu = u / prior;
     if phi < PHI_CASE1_MAX {
@@ -851,11 +829,8 @@ pub fn compute_weight(u: f64, phi: f64, prior: f64) -> (f64, f64) {
 // Unit deviance //
 ///////////////////
 
-/// The unit deviance, re-exported from its canonical home.
-///
-/// The quasi-likelihood weights and the GLM fitter must agree on this to the
-/// last bit, so there is exactly one implementation and it lives in
-/// [`crate::glm::deviance`].
+/// The unit deviance, re-exported from [`crate::glm::deviance`] so the weights
+/// and the GLM fitter share one implementation.
 pub use crate::glm::deviance::unit_nb_deviance;
 
 ////////////////////////
@@ -3112,7 +3087,6 @@ const NB_K_2_2: [f64; 70] = [
 
 #[cfg(test)]
 mod tests {
-    // The deviance regime boundaries live with the deviance itself.
     use super::*;
     use crate::glm::deviance::{
         GAMMA_REGIME as DEVIANCE_GAMMA_MU_PHI, POISSON_REGIME as DEVIANCE_POISSON_PHI,
@@ -3121,10 +3095,9 @@ mod tests {
 
     /// edgePython `pois_alpha` and `pois_kappa` as `(mu, alpha, kappa)`.
     ///
-    /// Produced by `uv run --with numpy --with numba --with scipy --with pandas
+    /// From `uv run --with numpy --with numba --with scipy --with pandas
     /// --with statsmodels python -c "from edgepython.ql_weights import
-    /// pois_alpha, pois_kappa; ..."` over a grid straddling every panel
-    /// boundary of both fits.
+    /// pois_alpha, pois_kappa; ..."` over a grid straddling every panel boundary.
     const POIS_REF: [(f64, f64, f64); 28] = [
         (1e-33, 0.0, 0.0),
         (1e-06, 0.08411973860813003, 2.3243108858558407e-06),
@@ -3605,15 +3578,15 @@ mod tests {
         (1e6, 1.001e6, 1e-5, 90.99933383298236),
     ];
 
-    /// Closed form of the negative binomial unit deviance, with no attempt at
-    /// numerical care. The authority away from the branch crossovers.
+    /// Closed-form unit deviance with no numerical care. The authority away from
+    /// the branch crossovers.
     fn exact_deviance(y: f64, mu: f64, phi: f64) -> f64 {
         let inv_phi = 1.0 / phi;
         let first = if y == 0.0 { 0.0 } else { y * (y / mu).ln() };
         2.0 * (first - (y + inv_phi) * ((y + inv_phi) / (mu + inv_phi)).ln())
     }
 
-    /// Worst relative error over a table, treating an expected zero as absolute.
+    /// Worst relative error over a table; an expected zero is compared absolutely.
     fn worst_relative(errors: &[(f64, f64)]) -> f64 {
         errors.iter().fold(0.0_f64, |worst, (got, expected)| {
             let e = if *expected == 0.0 {
@@ -3625,7 +3598,9 @@ mod tests {
         })
     }
 
-    // -- Chebyshev evaluation --
+    // -------------------- //
+    // Chebyshev evaluation //
+    // -------------------- //
 
     #[test]
     fn test_cheb_eval_reproduces_the_basis() {
@@ -3691,7 +3666,9 @@ mod tests {
         );
     }
 
-    // -- coefficient table integrity --
+    // --------------------------- //
+    // coefficient table integrity //
+    // --------------------------- //
 
     #[test]
     fn test_coefficient_tables_have_the_expected_shapes() {
@@ -3711,8 +3688,8 @@ mod tests {
 
     #[test]
     fn test_leading_coefficients_match_the_c_source() {
-        // Spot check of the first entry of every table against ql_weights.c,
-        // which is what a mistranscribed sign or exponent would show up in.
+        // First entry of every table against ql_weights.c, which catches a
+        // mistranscribed sign or exponent.
         assert_eq!(POIS_ALPHA_COEF[0], 0.992269079723461);
         assert_eq!(POIS_KAPPA_COEF[0], 1.98775180998087);
         assert_eq!(NB_A_1_1[0], 1.04049914108557);
@@ -3727,7 +3704,9 @@ mod tests {
         assert_eq!(NB_K_2_2[0], 1.47107357007529);
     }
 
-    // -- Poisson --
+    // ------- //
+    // Poisson //
+    // ------- //
 
     /// edgePython: `pois_alpha(mu), pois_kappa(mu)` for each `mu` in the table.
     #[test]
@@ -3760,10 +3739,9 @@ mod tests {
 
     #[test]
     fn test_poisson_panels_join_up() {
-        // Panels are fitted independently, so the joins are only as continuous
-        // as the fits are accurate. The bound is the worst jump edgePython
-        // itself shows, 1.0e-3 for alpha at mu = 0.02; a misplaced boundary or
-        // a coefficient block read at the wrong offset moves it by order one.
+        // Panels are fitted independently. The bound is the worst jump in
+        // edgePython, 1.0e-3 for alpha at mu = 0.02; a misplaced boundary or
+        // wrong offset moves it by order one.
         for knot in [0.02, 0.4249, 0.4966, 1.5, 3.544, 4.2714, 20.0] {
             let below = knot * (1.0 - 1e-9);
             assert_relative_eq!(pois_alpha(below), pois_alpha(knot), max_relative = 2e-3);
@@ -3771,7 +3749,9 @@ mod tests {
         }
     }
 
-    // -- negative binomial, case 1 --
+    // ------------------------- //
+    // negative binomial, case 1 //
+    // ------------------------- //
 
     /// edgePython: `anbinomdevc_1(mu, phi), knbinomdevc_1(mu, phi)`.
     #[test]
@@ -3782,9 +3762,8 @@ mod tests {
             errors.push((nb_kappa(mu, phi), kappa));
         }
         let worst = worst_relative(&errors);
-        // Bit exact against edgePython over the whole grid at the time of
-        // writing; the bound leaves room for a differing `log` on another
-        // platform.
+        // Bit exact against edgePython; the bound leaves room for a differing
+        // `log` on other platforms.
         assert!(worst < 1e-14, "worst relative error {worst:e}");
     }
 
@@ -3811,7 +3790,9 @@ mod tests {
         }
     }
 
-    // -- negative binomial, case 2 --
+    // ------------------------- //
+    // negative binomial, case 2 //
+    // ------------------------- //
 
     /// edgePython: `anbinomdevc_2(mu, phi), knbinomdevc_2(mu, phi)`.
     #[test]
@@ -3828,10 +3809,9 @@ mod tests {
 
     #[test]
     fn test_case2_panels_join_up() {
-        // The case 2 fits are visibly rougher than case 1: edgePython jumps by
-        // 4.8e-2 for alpha at mu = 0.01, where the log factor is switched off,
-        // and by 2.5e-2 at the mu = 3.88 knot with phi at the top of the range.
-        // The bound is that behaviour, not this port's.
+        // Case 2 is rougher than case 1: edgePython jumps by 4.8e-2 for alpha at
+        // mu = 0.01 (log factor off) and 2.5e-2 at the mu = 3.88 knot with phi at
+        // the top of the range. The bound is that behaviour.
         for knot in [
             0.01, 0.43, 0.5, 3.62, 3.88, 10.0, 30.0, 50.0, 100.0, 1000.0, 5000.0,
         ] {
@@ -3851,7 +3831,9 @@ mod tests {
         }
     }
 
-    // -- dispatch --
+    // -------- //
+    // dispatch //
+    // -------- //
 
     /// edgePython: the same `phi` dispatch chain, evaluated at three means.
     #[test]
@@ -3895,13 +3877,9 @@ mod tests {
     /// `phi = 0` must take the case 1 fit, not the Poisson one.
     ///
     /// edgeR's `compute_weight` has no Poisson branch: `phi = 0` falls into
-    /// `anbinomdevc_1`, which carries [`pois_alpha`] as an internal factor.
-    /// An earlier version of this module short circuited to [`pois_alpha`]
-    /// directly, which cost 1.8e-4 relative on the adjusted deviance at
-    /// `dispersion = 0` measured against `glmQLFit(dispersion = 0)`.
-    ///
-    /// The two are close but not equal, so asserting equality with the Poisson
-    /// fit is what pinned the bug in place. Assert the dispatch instead.
+    /// `anbinomdevc_1`, which carries [`pois_alpha`] as a factor. Short
+    /// circuiting to Poisson costs 1.8e-4 relative on the adjusted deviance
+    /// against `glmQLFit(dispersion = 0)`.
     #[test]
     fn test_zero_dispersion_takes_the_case_one_fit() {
         for mu in [0.005, 0.1, 1.0, 7.0, 15.0, 30.0, 100.0, 500.0] {
@@ -3912,8 +3890,7 @@ mod tests {
             assert_relative_eq!(nb_alpha(mu, 0.0), nb_alpha(mu, 1e-12), max_relative = 1e-9);
             assert_relative_eq!(nb_kappa(mu, 0.0), nb_kappa(mu, 1e-12), max_relative = 1e-9);
 
-            // Close to the Poisson fit, since that is a factor of it, but the
-            // two are not the same number.
+            // Close to the Poisson fit (a factor of it), but not equal.
             assert_relative_eq!(nb_alpha(mu, 0.0), pois_alpha(mu), max_relative = 2e-3);
         }
     }
@@ -3928,8 +3905,7 @@ mod tests {
 
     #[test]
     fn test_large_phi_moments_are_a_sane_chi_square() {
-        // alpha is a reciprocal scale and kappa a degrees of freedom, so both
-        // are positive and kappa = alpha * E[d] must hold by construction.
+        // Both are positive and kappa = alpha * E[d] by construction.
         for phi in [4.001, 10.0, 100.0] {
             for mu in [0.1, 2.0, 50.0] {
                 let (alpha, kappa) = compute_weight(mu, phi, 1.0);
@@ -3939,7 +3915,9 @@ mod tests {
         }
     }
 
-    // -- unit deviance --
+    // ------------- //
+    // unit deviance //
+    // ------------- //
 
     /// edgeR 4.8.2 via `nbinomUnitDeviance`.
     #[test]
@@ -3950,15 +3928,14 @@ mod tests {
             .collect();
         let worst = worst_relative(&errors);
         // Worst observed 8.6e-11, on `y = 1e6, mu = 1e6 + 1, phi = 1e-6`, where
-        // the series differences two quantities of order 1e6 to produce one of
-        // order 1e-6. Every other case in the table agrees to 5e-13 or better.
+        // the series differences two quantities of order 1e6 to give one of
+        // order 1e-6. Every other case agrees to 5e-13 or better.
         assert!(worst < 1e-9, "worst relative error {worst:e}");
     }
 
     #[test]
     fn test_unit_deviance_matches_the_closed_form() {
-        // Away from both crossovers the exact expression is well conditioned,
-        // so it is the authority rather than a reference dump.
+        // Away from both crossovers the closed form is well conditioned.
         for (y, mu, phi) in [
             (0.0, 5.0, 0.1),
             (1.0, 5.0, 0.1),
@@ -4005,11 +3982,10 @@ mod tests {
 
     #[test]
     fn test_unit_deviance_crosses_the_poisson_branch_smoothly() {
-        // phi = 1e-4 switches from the series to the exact form. The series is
-        // truncated after the cubic term, so the step across the boundary is
-        // the first term it drops: order phi^2 (y - mu)^3, which is 9e-7
-        // relative here. Both sides still agree with the closed form, which is
-        // well conditioned at this dispersion.
+        // phi = 1e-4 switches from the series to the exact form. The series
+        // stops after the cubic term, so the step is the first dropped term,
+        // order phi^2 (y - mu)^3 (9e-7 relative here). Both sides agree with the
+        // closed form.
         let (y, mu) = (30.0, 25.0);
         let below = unit_nb_deviance(y, mu, DEVIANCE_POISSON_PHI * (1.0 - 1e-12));
         let above = unit_nb_deviance(y, mu, DEVIANCE_POISSON_PHI);
@@ -4029,8 +4005,8 @@ mod tests {
     #[test]
     fn test_unit_deviance_crosses_the_gamma_branch_smoothly() {
         // mu * phi = 1e6 switches to the gamma limit. The exact form has lost
-        // most of its digits by there, so the two branches are compared to each
-        // other and the gamma side is checked against its own limit.
+        // most digits by there, so the branches are compared to each other and
+        // the gamma side to its own limit.
         let phi = 1.0;
         let mu = DEVIANCE_GAMMA_MU_PHI;
         for ratio in [0.5, 0.9, 1.1, 2.0] {
@@ -4049,11 +4025,9 @@ mod tests {
 
     #[test]
     fn test_unit_deviance_series_beats_the_exact_form_near_the_poisson_limit() {
-        // This is the point of the small phi branch. At phi = 1e-12 the exact
-        // form forms `y + 1/phi` and a log of two numbers that agree to twelve
-        // digits, so it loses about twelve of them; the series never forms
-        // either. The phi -> 0 limit is the Poisson deviance, which is well
-        // conditioned and therefore the authority.
+        // At phi = 1e-12 the exact form takes a log of two numbers agreeing to
+        // twelve digits and loses about twelve; the series never forms either.
+        // The phi -> 0 limit is the Poisson deviance, the authority here.
         let (y, mu, phi) = (12.0, 10.0, 1e-12);
         let series = unit_nb_deviance(y, mu, phi);
         let exact = exact_deviance(y, mu, phi);

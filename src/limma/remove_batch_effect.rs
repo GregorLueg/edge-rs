@@ -1,13 +1,11 @@
 //! limma's `removeBatchEffect`: regress batch out of a log-expression matrix.
 //!
-//! Batch factors get sum-to-zero contrasts, so the corrected values stay
-//! centred on the grand mean rather than on the first batch. The batch columns
-//! are fitted jointly with the design of interest through [`lm_fit`], and only
-//! the batch part of the fit is subtracted: the design protects the biology
-//! from being absorbed into the batch coefficients.
+//! Batch factors get sum-to-zero contrasts, so corrected values stay centred on
+//! the grand mean. The batch columns are fitted jointly with the design of
+//! interest through [`lm_fit`] and only the batch part is subtracted, so the
+//! design protects the biology.
 //!
-//! Meant for plotting and unsupervised work. For testing, put batch into the
-//! design instead, as limma's own documentation says.
+//! For plotting and unsupervised work. For testing, put batch into the design.
 //!
 //! ### References
 //!
@@ -25,8 +23,8 @@ use crate::prelude::*;
 /// Sum-to-zero encoding of one batch factor, R's `contr.sum` on
 /// `factor(labels)`.
 ///
-/// Levels are the distinct labels in ascending order, which is how R orders the
-/// levels of a numeric vector. The last level carries `-1` in every column.
+/// Levels are the distinct labels in ascending order, as R orders a numeric
+/// vector's levels. The last level carries `-1` in every column.
 ///
 /// ### Params
 ///
@@ -111,15 +109,12 @@ fn check_len(name: &'static str, len: usize, n_samples: usize) -> Result<(), Edg
 
 /// Removes batch effects and covariates from a log-expression matrix.
 ///
-/// Port of limma's `removeBatchEffect` without `group`. Builds
-/// `X_batch = cbind(contr.sum(batch), contr.sum(batch2), covariates)`, fits
-/// `cbind(design, X_batch)` per gene with [`lm_fit`] and returns
-/// `x - beta_batch %*% t(X_batch)`. Coefficients the fit cannot estimate count
-/// as zero, as in limma. Covariates are column-centred first, also as in limma,
-/// so the correction leaves the grand mean alone.
-///
-/// With no batch, no second batch and no covariates the input comes back
-/// unchanged, again as in limma.
+/// Port of limma's `removeBatchEffect` without `group`. Fits
+/// `cbind(design, X_batch)` per gene with [`lm_fit`], where
+/// `X_batch = cbind(contr.sum(batch), contr.sum(batch2), covariates)`, and
+/// returns `x - beta_batch %*% t(X_batch)`. As in limma, covariates are
+/// column-centred first, aliased coefficients count as zero, and with no
+/// batch, second batch or covariates the input comes back unchanged.
 ///
 /// ### Params
 ///
@@ -232,12 +227,12 @@ mod tests {
     const N_GENES: usize = 8;
     const N_SAMPLES: usize = 6;
 
-    /// Absolute tolerance. Every reference is a small dyadic combination, so
-    /// anything past round-off is a real difference.
+    /// Absolute tolerance. References are small dyadic combinations, so anything
+    /// past round-off is a real difference.
     const TOL: f64 = 1e-13;
 
     /// `y[i] = ((i * 7) mod 23) / 64`, row-major 8 by 6. Dyadic, so R and Rust
-    /// see bit-identical inputs.
+    /// see identical inputs.
     fn fixture_y() -> Vec<f64> {
         (0..N_GENES * N_SAMPLES)
             .map(|i| ((i * 7) % 23) as f64 / 64.0)

@@ -1,11 +1,10 @@
 //! End-to-end parity for `contrasts.fit` and `eBayes`.
 //!
-//! The chain is `voomLmFit -> [contrasts.fit] -> eBayes`, gated against limma
-//! 3.66.0 through the fixtures under `tests/data/e2e`. The voom half is already
-//! covered by `e2e_voom.rs`; what is new here is the moderated t, the moderated
-//! F, the B-statistic and the contrast rotation.
+//! Chain: `voomLmFit -> [contrasts.fit] -> eBayes`, against limma 3.66.0. The voom
+//! half is gated in `e2e_voom.rs`; this file covers the moderated t and F, the
+//! B-statistic, the contrast rotation and `topTable`.
 //!
-//! Tolerances are measured, not guessed:
+//! Tolerances come from
 //! `EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_ebayes -- --nocapture`.
 
 mod common;
@@ -20,63 +19,56 @@ use edge_rs::limma::voom::voom_lmfit;
 // Tolerances //
 ////////////////
 
-// Every figure below is the worst observed over both datasets and all four
-// eBayes variants, read off the NEEDS column of
-// `EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_ebayes -- --nocapture`.
+// Figures are the worst observed over both datasets and all four eBayes
+// variants (NEEDS column).
 //
-// The `unbal` numbers are consistently a decade or two worse than `fac`, and it
-// is the same cause throughout: its prior degrees of freedom come out of
-// `fitFDistUnequalDF1`, which maximises a very flat likelihood with R's
-// `optimize` at its default `tol` of 1.2e-4. That lands `df.prior` at 1.4e-8
-// relative, and everything downstream inherits it, amplified by however
-// steeply it enters. `docs/UPSTREAM_DEVIATIONS.md` entry 12 has the detail.
+// `unbal` is a decade or two worse than `fac` throughout: its prior df comes out
+// of `fitFDistUnequalDF1`, which maximises a flat likelihood with R's `optimize`
+// at its default `tol` of 1.2e-4. That puts `df.prior` at 1.4e-8 relative, and
+// everything downstream inherits it, amplified by how steeply it enters.
 
-/// Moderated t: a coefficient over `stdev.unscaled * sqrt(s2.post)`. Two
-/// divisions on top of quantities `e2e_voom.rs` already gates, so it tracks
+/// Moderated t: a coefficient over `stdev.unscaled * sqrt(s2.post)`. Tracks
 /// `s2_post` at half the exponent. Needs `2.8e-9`.
 const TOL_T: Tol = Tol::rel(1e-8);
 
-/// Moderated t and moderated F p-values. The t tail is steep in `|t|`, so a
-/// relative wobble in the statistic comes out multiplied by roughly `t^2` in
-/// the tail: the worst case sits at the most significant gene in the table,
-/// where `t` is around 40. Needs `9.6e-7`. The absolute floor only exists to
-/// admit the p-values that have underflowed to zero on both sides.
+/// Moderated t and moderated F p-values. A relative wobble in the statistic is
+/// multiplied by roughly `t^2` in the tail; the worst case is the most
+/// significant gene, with `t` around 40. Needs `9.6e-7`. The absolute floor
+/// admits p-values that underflowed to zero on both sides.
 const TOL_P: Tol = Tol::new(3e-6, 1e-300);
 
-/// Squeezed posterior variance, the quantity `e2e_voom.rs` gates through
-/// `squeezeVar` directly. Needs `5.6e-9`.
+/// Squeezed posterior variance (gated through `squeezeVar` in `e2e_voom.rs`).
+/// Needs `5.6e-9`.
 const TOL_S2: Tol = Tol::rel(2e-8);
 
-/// Prior and total degrees of freedom. This is the `optimize` tolerance itself,
-/// unamplified, and the number every other tolerance here is derived from.
-/// Needs `1.4e-8`.
+/// Prior and total degrees of freedom: the `optimize` tolerance itself,
+/// unamplified, and the source of every other tolerance here. Needs `1.4e-8`.
 const TOL_DF: Tol = Tol::rel(5e-8);
 
-/// The B-statistic, the loosest thing in the suite. Its kernel carries a factor
-/// of `(1 + df_total) / 2`, so the prior's `1.4e-8` arrives multiplied by about
-/// eighteen on `unbal`, and the robust variant adds its own shrunken per-gene
-/// prior on top. Needs `1.7e-6`. The absolute floor covers the log-odds
-/// crossing zero; against a range of roughly -6 to +114 it gives nothing away.
+/// The B-statistic, the loosest quantity. Its kernel carries a factor of
+/// `(1 + df_total) / 2`, so the prior's `1.4e-8` is multiplied by about eighteen
+/// on `unbal`, and the robust variant adds a per-gene prior on top. Needs
+/// `1.7e-6`. The absolute floor covers the log-odds crossing zero (range about
+/// -6 to +114).
 const TOL_LODS: Tol = Tol::new(5e-6, 2e-6);
 
 /// Moderated F: a sum of squared rotated t values, so twice the t error before
-/// the eigendecomposition contributes anything of its own. Needs `4.8e-9`.
+/// the eigendecomposition adds anything. Needs `4.8e-9`.
 const TOL_F: Tol = Tol::rel(2e-8);
 
-/// Contrast coefficients, their unscaled standard errors and the rotated
-/// covariance. Pure linear algebra over quantities `e2e_voom.rs` already gates,
-/// with no prior anywhere in it, which is why this is four decades tighter than
-/// everything else here. Needs `1.4e-11`, and `7.5e-15` absolute.
+/// Contrast coefficients, unscaled standard errors and the rotated covariance.
+/// Pure linear algebra with no prior, hence four decades tighter than the rest.
+/// Needs `1.4e-11`, and `7.5e-15` absolute.
 const TOL_CONTRAST: Tol = Tol::new(1e-10, 1e-13);
 
-/// The prior coefficient variance `tmixture` estimates. Averaged over the top
-/// one per cent of genes by `|t|`, so it would move sharply if a gene crossed
-/// the `ntarget` boundary; none does on these fixtures. Needs `8.1e-10`.
+/// The prior coefficient variance `tmixture` estimates, averaged over the top one
+/// per cent of genes by `|t|`. It would move sharply if a gene crossed the
+/// `ntarget` boundary; none does here. Needs `8.1e-10`.
 const TOL_VAR_PRIOR: Tol = Tol::rel(3e-9);
 
-///////////////
-// Datasets  //
-///////////////
+//////////////
+// Datasets //
+//////////////
 
 /// A dataset with an eBayes fixture.
 struct Dataset {
@@ -88,9 +80,7 @@ struct Dataset {
     n_contrasts: usize,
 }
 
-/// The same two datasets the voom suite runs on. The near-Poisson set has no
-/// mean-variance trend worth fitting, so it has no voom fixture and therefore
-/// no eBayes fixture either.
+/// The two voom datasets. The near-Poisson set has no voom or eBayes fixture.
 const DATASETS: [Dataset; 2] = [
     Dataset {
         tag: "fac",
@@ -138,8 +128,8 @@ fn load(d: &Dataset) -> Loaded {
     let counts = counts_t.row_major_counts();
     let (design, _, n_coef) = common::matrix(&format!("{}_design.csv", d.tag));
     assert_eq!(n_coef, d.n_coef, "{}: unexpected design width", d.tag);
-    // The R generator writes the transpose, so reading the rows row-major
-    // already gives the column-major layout `contrasts_fit` wants.
+    // The generator writes the transpose, so row-major reads give the
+    // column-major layout `contrasts_fit` wants.
     let (contrasts, n_rows, n_cols) = common::matrix(&format!("{}_contrasts.csv", d.tag));
     assert_eq!(
         n_rows, d.n_contrasts,
@@ -185,8 +175,7 @@ fn fit(l: &Loaded) -> MArrayLm {
 
 /// Unflattens a per-coefficient block of a fixture into row-major order.
 ///
-/// The R side writes `t1..tP` as separate columns; the crate holds them
-/// row-major.
+/// R writes `t1..tP` as separate columns; the crate holds them row-major.
 ///
 /// ### Params
 ///
@@ -253,9 +242,9 @@ fn assert_ebayes(out: &MArrayLm, want: &common::Table, label: &str) {
     );
 }
 
-///////////////
-// eBayes    //
-///////////////
+////////////
+// eBayes //
+////////////
 
 #[test]
 fn test_ebayes_matches_limma() {
@@ -346,8 +335,8 @@ fn test_robust_ebayes_matches_limma() {
         let want = common::table(&format!("{}_ebayes_robust.csv", d.tag));
         assert_ebayes(&out, &want, &format!("{}/robust", d.tag));
 
-        // The robust fit only produces a per-gene prior when it finds an
-        // outlier, so the length itself is part of the parity.
+        // The robust fit yields a per-gene prior only when it finds an outlier,
+        // so the length is part of the parity.
         assert_eq!(
             out.df_prior.as_ref().unwrap().len(),
             common::scalars().get_usize(&format!("{}_ebayes", d.tag), "robust_n_df_prior"),
@@ -357,9 +346,9 @@ fn test_robust_ebayes_matches_limma() {
     }
 }
 
-////////////////////
-// contrasts.fit  //
-////////////////////
+///////////////////
+// contrasts.fit //
+///////////////////
 
 #[test]
 fn test_contrasts_fit_matches_limma() {
@@ -439,9 +428,9 @@ fn test_ebayes_on_contrasts_matches_limma() {
     }
 }
 
-/////////////////////
-// make_contrasts  //
-/////////////////////
+////////////////////
+// make_contrasts //
+////////////////////
 
 #[test]
 fn test_make_contrasts_rebuilds_the_fixture_matrices() {
@@ -467,19 +456,15 @@ fn test_make_contrasts_rebuilds_the_fixture_matrices() {
 // topTable //
 //////////////
 
-/// Tolerance for the table's own columns, which are the eBayes ones reordered.
-/// Selection and ordering are exact, so only the values carry error and each
-/// takes the tolerance of the quantity it came from.
+/// Tolerance for the table's own columns (the eBayes ones, reordered). Selection
+/// and ordering are exact, so only the values carry error.
 const TOL_TABLE: Tol = Tol::new(5e-6, 2e-6);
 
-/// Confidence interval bounds. The margin of error inherits `s2_post` and
-/// `df_total`, but the bound itself is `logFC -/+ margin`, and a gene whose
-/// fold change is close to its own margin lands near zero with most of its
-/// digits cancelled. That is where the worst relative error sits: `3.2e-7`, on
-/// a bound of 4.6e-3 against a fold change of order one. Absolutely it is never
-/// worse than `8.6e-9`, which is the honest measure of the quantity, so the
-/// epsilon carries the real bound and the relative merely admits the
-/// cancellation.
+/// Confidence interval bounds: `logFC -/+ margin`, with the margin inheriting
+/// `s2_post` and `df_total`. A fold change close to its margin cancels most
+/// digits; the worst relative error is `3.2e-7`, on a bound of 4.6e-3 against a
+/// fold change of order one. Absolutely it is never worse than `8.6e-9`, so the
+/// epsilon carries the real bound.
 const TOL_CI: Tol = Tol::new(1e-6, 5e-8);
 
 /// Runs the standard pipeline and returns the moderated fit.
@@ -505,7 +490,7 @@ fn moderated(d: &Dataset) -> (Loaded, MArrayLm) {
 /// * `want` - Loaded fixture
 /// * `label` - Prefix for the tolerance report
 fn assert_table(tt: &edge_rs::limma::toptable::TopTable, want: &common::Table, label: &str) {
-    // The R side writes one-based gene indices as its row names.
+    // R writes one-based gene indices as row names.
     let want_index: Vec<usize> = want
         .column("index")
         .iter()
@@ -629,10 +614,9 @@ fn test_top_table_confidence_intervals_match_limma() {
 fn test_top_table_confidence_intervals_survive_filtering() {
     use edge_rs::limma::toptable::{TopTableParams, top_table};
 
-    // The interval has to stay attached to its own gene once a threshold has
-    // removed rows. limma got this wrong until mid-2025, forming the margin of
-    // error after thinning while indexing the unthinned vectors; the fix is in
-    // 3.66.0, so the fixture comes straight from `topTable`.
+    // The interval must stay attached to its gene once a threshold removes rows.
+    // limma had a misindexing bug here until mid-2025; fixed in 3.66.0, so the
+    // fixture comes straight from `topTable`.
     for d in &DATASETS {
         let (_, fit) = moderated(d);
         let params = TopTableParams {
@@ -713,36 +697,29 @@ fn test_top_table_f_matches_limma() {
     }
 }
 
-//////////////////
-// limma-trend  //
-//////////////////
+/////////////////
+// limma-trend //
+/////////////////
 
 // The other bulk route: log-CPM straight into `lm_fit`, with the mean-variance
-// relationship absorbed by a trended prior rather than by voom's observation
-// weights. limma recommends it over voom when the library sizes are not too
-// variable, and it is cheaper: no trend fit, no per-observation weights, one
-// least squares pass instead of two.
+// relationship absorbed by a trended prior instead of voom weights.
 //
-// `robust = TRUE` is the part worth gating hard. It is what makes the trended
-// prior tolerant of outlier genes, and combined with `trend` it reaches
-// `fitFDistUnequalDF1`'s robust branch, which nothing else in the suite does.
+// `robust = TRUE` with `trend` reaches `fitFDistUnequalDF1`'s robust branch,
+// which nothing else in the suite does.
 
 /// Residual standard deviations from the unweighted fit on log-CPM. Needs
 /// `1.5e-14`.
 ///
-/// The whole limma-trend path runs tighter than voom by two to four decades:
-/// its worst moderated t is `1.4e-10` against voom's `2.8e-9`, and most
-/// quantities land at `1e-13` or better. There is no `fitFDistUnequalDF1` in
-/// the way. The residual degrees of freedom are constant here, so `squeezeVar`
-/// takes the legacy branch and its moment matching, rather than the profile
-/// likelihood `optimize` only resolves to its default `tol`. The shared
-/// tolerances above are inherited unchanged and are loose for this path.
+/// The limma-trend path runs two to four decades tighter than voom: worst
+/// moderated t is `1.4e-10` against voom's `2.8e-9`, and most quantities land at
+/// `1e-13` or better. Residual df are constant, so `squeezeVar` takes the legacy
+/// moment-matching branch, not the `optimize` profile likelihood. The shared
+/// tolerances above are inherited and loose for this path.
 const TOL_TREND_SIGMA: Tol = Tol::rel(5e-14);
 
 /// Builds the effective library sizes, `lib.size * norm.factors`.
 ///
-/// Both are already in the `<tag>_kept_samples.csv` fixture, so this does not
-/// re-run TMM.
+/// Read from `<tag>_kept_samples.csv`; TMM is not re-run.
 ///
 /// ### Params
 ///
@@ -787,8 +764,7 @@ fn limma_trend(d: &Dataset, robust: bool) -> (Loaded, MArrayLm) {
     )
     .expect("cpm failed");
 
-    // limma takes `Amean` from `getEAWP`, which is the row means of the
-    // expression matrix. Nothing computes it for us outside voom.
+    // limma takes `Amean` from `getEAWP`: the row means of the expression matrix.
     let amean: Vec<f64> = y
         .chunks_exact(l.n_samples)
         .map(|r| r.iter().sum::<f64>() / l.n_samples as f64)
@@ -855,8 +831,7 @@ fn test_limma_trend_matches_limma() {
 
         let scenario = format!("{}_limma_trend", d.tag);
         let scalars = common::scalars();
-        // A trended prior varies by gene; its degrees of freedom do not, until
-        // the robust fit makes them.
+        // A trended prior varies by gene; its df do not, until the robust fit.
         assert_eq!(
             fit.df_prior.as_ref().unwrap().len(),
             scalars.get_usize(&scenario, "n_df_prior"),
@@ -887,7 +862,7 @@ fn test_robust_limma_trend_matches_limma() {
         let want = common::table(&format!("{}_limma_trend_ebayes_robust.csv", d.tag));
         assert_ebayes(&fit, &want, &format!("{}/limma_trend_robust", d.tag));
 
-        // Winsorising turns the prior degrees of freedom into a per-gene vector.
+        // Winsorising makes the prior df a per-gene vector.
         assert_eq!(
             fit.df_prior.as_ref().unwrap().len(),
             common::scalars().get_usize(&format!("{}_limma_trend", d.tag), "robust_n_df_prior"),

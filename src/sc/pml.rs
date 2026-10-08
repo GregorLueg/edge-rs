@@ -1,47 +1,35 @@
 //! NEBULA's penalised maximum likelihood inner solver.
 //!
-//! Given fixed variance components, this profiles out the subject random
-//! effects and the fixed effects jointly. The parameter vector is
-//! `(beta, log_w)` with `beta` the `n_beta` fixed effects and `log_w` one
-//! random effect per subject, so the Hessian is `(n_beta + k)` square. It is
-//! never formed: the random-effect block is diagonal, because subjects are
-//! independent and the cells of one subject are contiguous, so a Schur
-//! complement reduces every Newton step to an `n_beta` system plus `k`
-//! divisions.
+//! Given fixed variance components, profiles out the fixed and subject random
+//! effects jointly. The parameters are `(beta, log_w)`: `n_beta` fixed effects
+//! and one random effect per subject. The `(n_beta + k)` Hessian is never
+//! formed. The random-effect block is diagonal (independent subjects,
+//! contiguous cells), so a Schur complement reduces each Newton step to an
+//! `n_beta` system plus `k` divisions.
 //!
-//! Two random-effect distributions share the loop:
-//!
-//! * [`opt_pml`] puts a gamma prior on `w`, which is NEBULA's NBGMM. The
-//!   penalty is `alpha log w - lambda w` with `alpha` and `lambda` derived from
-//!   `sigma[0]`, and the Laplace approximation to the marginal likelihood can
-//!   be pushed past its leading term via `ord`.
-//! * [`opt_pml_nbm`] puts a normal prior on `log w`, which is NEBULA's NBLMM.
-//!   The penalty is `-log_w'log_w / (2 alpha) - (k/2) log alpha`, and no
-//!   higher-order correction is defined.
+//! * [`opt_pml`]: gamma prior on `w` (NBGMM). The penalty is
+//!   `alpha log w - lambda w` with `alpha`, `lambda` derived from `sigma[0]`;
+//!   `ord` extends the Laplace approximation past its leading term.
+//! * [`opt_pml_nbm`]: normal prior on `log w` (NBLMM). The penalty is
+//!   `-log_w'log_w / (2 alpha) - (k/2) log alpha`; no higher-order correction.
 //!
 //! ### Layout
 //!
-//! Row-major throughout, `f64` throughout. The design is `n_cells * n_beta`,
-//! counts are stored as the positive entries only with their cell indices
-//! alongside, and subjects are half-open `[start, end)` blocks of cells.
+//! The design is row-major `n_cells * n_beta`. Counts are the positive entries
+//! with their cell indices, and subjects are half-open `[start, end)` blocks.
 //!
 //! ### Parallelism
 //!
-//! Sequential, deliberately. The parallel axis for NEBULA is genes, and one
-//! call here is one gene; fanning out inside would oversubscribe against that.
-//! The second reason is reproducibility: the outer loop stops on an absolute
-//! improvement in the log-likelihood, so a rayon reduction that reassociates
-//! the sums can flip the last iteration on or off and move `beta` by far more
-//! than the reassociation itself.
+//! Sequential by design: one call is one gene, and the caller parallelises over
+//! genes. The outer loop also stops on an absolute improvement in the
+//! log-likelihood, so a reassociating reduction can flip the last iteration and
+//! move `beta` by more than the reassociation itself.
 //!
 //! ### Deviations from edgePython
 //!
-//! This is a port of `nebula`'s own `src/optimization.cpp`, not of
-//! edgePython's `_opt_pml_nb`. edgePython clamps the linear predictor at 500,
-//! floors `vw` at `1e-15`, adds `1e-8` to any diagonal of the information
-//! matrix below `1e-10`, and drops the REML term from the log-determinant.
-//! None of those appear in the C++, and each moves the returned information
-//! matrix, which is exactly the standard error. They are not reproduced here.
+//! Ported from `nebula`'s `src/optimization.cpp`, not edgePython's
+//! `_opt_pml_nb`, which adds a ridge, a `vw` floor, a linear-predictor clamp
+//! and drops REML. See `UPSTREAM_DEVIATIONS.md` A21.
 //!
 //! ### References
 //!
@@ -50,15 +38,15 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::errors::EdgeErrors;
+use crate::sc::zeros::ZeroCells;
 
-////////////////////////
-// Tuning and codes   //
-////////////////////////
+//////////////////////
+// Tuning and codes //
+//////////////////////
 
 /// Newton iteration budget, matching nebula's hard-coded `maxstep`.
 ///
-/// nebula flags a fit that reaches this as `-20`, so the number is part of the
-/// contract rather than a free tuning knob.
+/// nebula flags a fit that reaches this as `-20`, so the value is fixed.
 const DEFAULT_MAX_ITER: usize = 50;
 
 /// Backtracking budget inside one Newton step, nebula's `maxstd`.
@@ -79,10 +67,8 @@ const GRADIENT_TOLERANCE: f64 = 0.01;
 /// Magnitude past which a Newton component is treated as unbounded rather than
 /// damped.
 ///
-/// A step of `exp(40)` on the log scale is not a step, it is an overflow, so
-/// nebula replaces it with a fixed displacement instead of halving it forty
-/// times. The same constant seeds that displacement, which is then halved once
-/// per backtrack.
+/// nebula replaces such a step with a fixed displacement, seeded by the same
+/// constant and halved once per backtrack, instead of halving it forty times.
 const STEP_CUTOFF: f64 = 40.0;
 
 /// Smallest eigenvalue of the information matrix nebula will invert.
@@ -93,9 +79,8 @@ const EIGENVALUE_CUTOFF: f64 = 1e-8;
 
 /// Jacobi sweep budget for the smallest-eigenvalue check.
 ///
-/// Cyclic Jacobi converges cubically once the off-diagonal is small; on the
-/// handful-of-columns matrices seen here it is done in three or four sweeps and
-/// thirty is pure slack.
+/// Cyclic Jacobi needs three or four sweeps on these small matrices; thirty is
+/// slack.
 const JACOBI_SWEEPS: usize = 30;
 
 /// Converged, by a sufficiently small improvement in the objective.
@@ -249,9 +234,8 @@ impl PmlData<'_> {
 
 /// The two variance components, held on nebula's own scale.
 ///
-/// The meaning of `subject` differs between the two solvers, which is nebula's
-/// convention, not a slip: the C++ reads the same `sigma[0]` slot differently
-/// in `opt_pml` and `opt_pml_nbm`.
+/// `subject` means different things in the two solvers: the C++ reads the same
+/// `sigma[0]` slot differently in `opt_pml` and `opt_pml_nbm`.
 #[derive(Clone, Copy, Debug)]
 pub struct PmlVariance {
     /// nebula's `sigma[0]`.
@@ -276,20 +260,17 @@ pub struct PmlVariance {
 pub struct PmlParams {
     /// Add `log|det(information)|` to the log-determinant.
     ///
-    /// nebula's `reml`, which switches the outer overdispersion estimate from
-    /// maximum likelihood to restricted maximum likelihood. Off by default,
-    /// matching `nebula(..., reml = 0)`.
+    /// nebula's `reml`: restricted instead of plain maximum likelihood for the
+    /// outer overdispersion estimate. Off by default, as `nebula(..., reml = 0)`.
     pub reml: bool,
     /// Stop once a Newton step improves the penalised log-likelihood by less
-    /// than this. Absolute, not relative, exactly as nebula.
+    /// than this (absolute, as in nebula).
     pub eps: f64,
     /// Order of the Laplace expansion of the marginal likelihood.
     ///
-    /// `1` uses the leading term only and leaves
-    /// [`PmlResult::second_order`] at zero. `2` adds the third-derivative term,
-    /// `3` the fourth-derivative terms. nebula raises this to `3` for genes
-    /// whose expected count per subject is below three, where the leading term
-    /// alone is biased. Ignored by [`opt_pml_nbm`].
+    /// `1`: leading term only ([`PmlResult::second_order`] stays zero). `2` adds
+    /// the third-derivative term, `3` the fourth. nebula uses `3` for genes with
+    /// an expected count per subject below three. Ignored by [`opt_pml_nbm`].
     pub ord: u32,
     /// Newton iteration budget.
     pub max_iter: usize,
@@ -324,8 +305,8 @@ pub struct PmlResult {
     /// Observed information for the fixed effects, row-major `nb * nb`.
     ///
     /// nebula's `var`: the Schur complement of the joint observed information
-    /// after the random-effect block has been eliminated. Its inverse is the
-    /// covariance matrix of `beta`.
+    /// after eliminating the random-effect block. Its inverse is the covariance
+    /// of `beta`.
     pub information: Vec<f64>,
     /// Value of the penalised log-likelihood at the optimum.
     pub log_likelihood: f64,
@@ -336,8 +317,7 @@ pub struct PmlResult {
     /// Log-determinant of the observed information.
     ///
     /// `sum log|vw|` over subjects, plus `log|det(information)|` when
-    /// [`PmlParams::reml`] is set. The outer overdispersion objective subtracts
-    /// half of this.
+    /// [`PmlParams::reml`] is set. The outer objective subtracts half of it.
     pub log_det: f64,
     /// Higher-order Laplace correction, nebula's `second`.
     ///
@@ -352,16 +332,15 @@ pub struct PmlResult {
     pub convergence: i32,
     /// Newton steps taken.
     pub iterations: usize,
-    /// Backtracking halvings used inside the final Newton step, nebula's
-    /// `damp`. Eleven means the step stalled at a critical point, twelve means
-    /// it stalled with a live gradient.
+    /// Backtracking halvings in the final Newton step, nebula's `damp`. Eleven:
+    /// stalled at a critical point; twelve: stalled with a live gradient.
     pub backtracks: usize,
 }
 
 /// The penalised log-likelihood and its gradient at a given point.
 ///
-/// Both are negated, matching nebula's `pml_ll_der_eigen`, because the R side
-/// hands them straight to a minimiser.
+/// Both are negated, as in nebula's `pml_ll_der_eigen`, for direct use by a
+/// minimiser.
 #[derive(Clone, Debug)]
 pub struct PmlObjective {
     /// Negative penalised log-likelihood.
@@ -394,10 +373,6 @@ enum Penalty {
 
 impl Penalty {
     /// Adds the prior's contribution to the log-likelihood.
-    ///
-    /// The association order is the C++'s, per variant, because the outer loop
-    /// compares improvements against an absolute tolerance and a reassociated
-    /// sum can flip the last iteration.
     ///
     /// ### Params
     ///
@@ -471,15 +446,12 @@ impl Penalty {
 
 /// Penalised maximum likelihood fit with a gamma random effect, NEBULA's NBGMM.
 ///
-/// Joint Newton iteration over `beta` and `log_w` with the random-effect block
-/// eliminated by a Schur complement, per-coordinate backtracking on a rejected
-/// step, and the higher-order Laplace corrections selected by
-/// [`PmlParams::ord`].
+/// Joint Newton iteration over `beta` and `log_w` (Schur complement,
+/// per-coordinate backtracking, Laplace corrections per [`PmlParams::ord`]).
 ///
-/// The random effect `w` carries a `Gamma(alpha, lambda)` prior with
-/// `alpha = 1 / (e^s - 1)` and `lambda = 1 / (sqrt(e^s) (e^s - 1))`, where
-/// `s` is [`PmlVariance::subject`]. That parametrisation gives `w` mean
-/// `sqrt(e^s)` and squared coefficient of variation `e^s - 1`.
+/// `w` has a `Gamma(alpha, lambda)` prior with `alpha = 1 / (e^s - 1)` and
+/// `lambda = 1 / (sqrt(e^s) (e^s - 1))`, `s` being [`PmlVariance::subject`]: mean
+/// `sqrt(e^s)`, squared coefficient of variation `e^s - 1`.
 ///
 /// ### Params
 ///
@@ -503,6 +475,30 @@ pub fn opt_pml(
     variance: &PmlVariance,
     params: Option<PmlParams>,
 ) -> Result<PmlResult, EdgeErrors> {
+    opt_pml_tabled(data, None, beta_init, variance, params)
+}
+
+/// [`opt_pml`], with the zero counts summed from the run's tables.
+///
+/// ### Params
+///
+/// * `data` - One gene's design, offsets, positive counts and subject blocks
+/// * `zeros` - The tables built from this `data`'s design, offsets and
+///   subjects, or `None` to sweep every cell
+/// * `beta_init` - Starting fixed effects, length `n_beta`
+/// * `variance` - The two variance components, held fixed throughout
+/// * `params` - Tuning knobs, or `None` for nebula's defaults
+///
+/// ### Returns
+///
+/// As [`opt_pml`].
+pub(crate) fn opt_pml_tabled(
+    data: &PmlData<'_>,
+    zeros: Option<&ZeroCells>,
+    beta_init: &[f64],
+    variance: &PmlVariance,
+    params: Option<PmlParams>,
+) -> Result<PmlResult, EdgeErrors> {
     let exps = variance.subject.exp();
     if !(exps.is_finite() && exps > 1.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -516,6 +512,7 @@ pub fn opt_pml(
     };
     optimise(
         data,
+        zeros,
         beta_init,
         None,
         penalty,
@@ -527,11 +524,9 @@ pub fn opt_pml(
 /// Penalised maximum likelihood fit with a log-normal random effect, NEBULA's
 /// NBLMM.
 ///
-/// The same Newton loop as [`opt_pml`] with the gamma penalty replaced by
-/// `-log_w'log_w / (2 alpha) - (k/2) log alpha`, where `alpha` is
-/// [`PmlVariance::subject`] read as a variance. No higher-order Laplace
-/// correction is defined for this variant, so [`PmlResult::second_order`] is
-/// always zero and [`PmlParams::ord`] is ignored.
+/// The [`opt_pml`] loop with penalty `-log_w'log_w / (2 alpha) - (k/2) log alpha`,
+/// `alpha` being [`PmlVariance::subject`] read as a variance.
+/// [`PmlResult::second_order`] is always zero and [`PmlParams::ord`] is ignored.
 ///
 /// ### Params
 ///
@@ -561,6 +556,7 @@ pub fn opt_pml_nbm(
     };
     optimise(
         data,
+        None,
         beta_init,
         None,
         penalty,
@@ -572,11 +568,10 @@ pub fn opt_pml_nbm(
 /// Penalised log-likelihood and gradient at a point, nebula's
 /// `pml_ll_der_eigen`.
 ///
-/// This is the gradient-only entry the R side hands to `lbfgs` and `trust`, and
-/// it reads [`PmlVariance::subject`] differently again: as the shape of a
-/// `Gamma(alpha, alpha)` prior with mean one, so `alpha` plays the part of both
-/// the shape and the rate. That is nebula's own inconsistency with [`opt_pml`],
-/// reproduced rather than corrected.
+/// The entry the R side hands to `lbfgs` and `trust`. It reads
+/// [`PmlVariance::subject`] as the shape of a mean-one `Gamma(alpha, alpha)`
+/// prior (shape and rate both `alpha`), which is nebula's own inconsistency with
+/// [`opt_pml`], reproduced.
 ///
 /// ### Params
 ///
@@ -621,16 +616,14 @@ pub fn pml_log_likelihood_gradient(
         lambda: alpha,
     };
 
-    let mut work = Workspace::new(data);
-    work.seed(data, gamma);
-    let log_likelihood = work.evaluate(data, beta, log_w, gamma, penalty);
-    work.gradient_only(data, gamma, penalty, log_w);
+    let mut work = Workspace::new(data, None);
+    work.sweep_current(data, beta, log_w, gamma, penalty);
 
     let mut gradient = Vec::with_capacity(n_beta + k);
-    gradient.extend(work.db.iter().map(|v| -v));
-    gradient.extend(work.dw.iter().map(|v| -v));
+    gradient.extend(work.current.db.iter().map(|v| -v));
+    gradient.extend(work.current.dw.iter().map(|v| -v));
     Ok(PmlObjective {
-        objective: -log_likelihood,
+        objective: -work.current.log_likelihood,
         gradient,
     })
 }
@@ -638,11 +631,9 @@ pub fn pml_log_likelihood_gradient(
 /// [`opt_pml`], started from a given point rather than from zero random effects.
 ///
 /// The GPU path finds the optimum in `f32` and finishes it here in `f64`. From a
-/// point already at the optimum this takes one Newton step and stops, which
-/// costs about four passes over the cells against the fourteen or so of a cold
-/// fit, and what it returns is exactly what [`opt_pml`] returns: the same
-/// value, and the log-determinant at the penultimate iterate, which is nebula's
-/// convention and the one the profile objective is calibrated against.
+/// point at the optimum this takes one Newton step (about four passes over the
+/// cells against fourteen for a cold fit) and returns what [`opt_pml`] returns,
+/// including the log-determinant at the penultimate iterate.
 ///
 /// ### Params
 ///
@@ -677,6 +668,7 @@ pub(crate) fn opt_pml_from(
     };
     optimise(
         data,
+        None,
         beta_init,
         Some(log_w_init),
         penalty,
@@ -688,10 +680,9 @@ pub(crate) fn opt_pml_from(
 /// Largest move in a cell's linear predictor for which [`newton_finish`]
 /// updates the stored `exp` by series instead of taking it again.
 ///
-/// The second sweep of a step sits one converged Newton step from the first, so
-/// `exp(eta + z) = exp(eta) exp(z)` with `z` of order `1e-4`. To fifth order the
-/// truncation is `z^6 / 720`, `1.4e-21` relative at this bound and far under an
-/// ulp, for five multiply-adds against one `exp`.
+/// The second sweep is one converged Newton step from the first, so
+/// `exp(eta + z) = exp(eta) exp(z)` with `z` of order `1e-4`. The fifth-order
+/// truncation `z^6 / 720` is `1.4e-21` relative at this bound, under an ulp.
 #[cfg(feature = "gpu")]
 const EXP_SERIES_MAX: f64 = 1e-3;
 
@@ -699,11 +690,10 @@ const EXP_SERIES_MAX: f64 = 1e-3;
 /// rounding at a converged point rather than a step that went wrong.
 ///
 /// From the device's `f32` optimum the `f64` step gains less than the rounding
-/// of a sum over every cell, so its `likdif` comes out a few ulp negative on
-/// about 15 per cent of fits (S1: all 10804 of 73650 between `1e-16` and
-/// `1e-15` relative). Handing those to [`opt_pml_from`] only buys a backtracking
-/// search that ends at the same point. A step that genuinely overshoots loses
-/// orders of magnitude more than this.
+/// of a sum over all cells, so `likdif` is a few ulp negative on about 15 per
+/// cent of fits (S1: 10804 of 73650, between `1e-16` and `1e-15` relative).
+/// [`opt_pml_from`] would backtrack to the same point. A real overshoot loses
+/// orders of magnitude more.
 #[cfg(feature = "gpu")]
 const LIKDIF_ROUNDING: f64 = 1e-12;
 
@@ -724,10 +714,9 @@ fn exp_series(z: f64) -> f64 {
 
 /// Terms multiplied together before [`LogSum`] takes one logarithm.
 ///
-/// Each term is `extb + gamma`, bounded below by the cell-level size and in
-/// practice far inside `1e-38..1e38`, so eight of them cannot leave the `f64`
-/// range. A product that does overflow gives an infinite sum, which is what the
-/// per-term logarithm gives for the same input.
+/// Each term is `extb + gamma`, far inside `1e-38..1e38`, so eight cannot leave
+/// the `f64` range. An overflowing product gives an infinite sum, as the
+/// per-term logarithm would.
 #[cfg(feature = "gpu")]
 const LOG_PRODUCT_GROUP: u32 = 8;
 
@@ -735,9 +724,8 @@ const LOG_PRODUCT_GROUP: u32 = 8;
 /// [`LOG_PRODUCT_GROUP`] terms.
 ///
 /// The logarithm is the dearest operation in the dense sweep of
-/// [`newton_finish`], and the product costs a multiply. The rounding of a group
-/// is a few ulp relative on the product, so of order `1e-15` absolute on its
-/// logarithm, the same size as the per-term form's.
+/// [`newton_finish`]. Group rounding is `1e-15` absolute on the logarithm, the
+/// same as the per-term form.
 #[cfg(feature = "gpu")]
 struct LogSum {
     /// Logarithms of the finished groups.
@@ -816,22 +804,20 @@ pub(crate) struct NewtonFinish {
 /// Full `f64` Newton steps from a point already near the optimum, two fused
 /// passes over the cells per step.
 ///
-/// The common case of [`opt_pml_from`] on the GPU path: the device's point is
+/// The common case of [`opt_pml_from`] on the GPU path: the device point is
 /// converged to `f32`, one step settles it (two or three for a few per cent of
-/// fits), and no step needs damping. The loop in [`opt_pml`] is written for
-/// parity with nebula's C++: it allocates
-/// a workspace of `(5 + n_beta) * n_cells` per call and walks it in a dozen
-/// passes. Here the assembly is one pass per subject with nothing stored per
-/// cell, split as the device kernel splits it: a dense sweep over every cell at
-/// a count of zero, then a sparse sweep adding what the positive counts change.
-/// The sums therefore associate differently from [`opt_pml`] and agree with it
-/// to rounding, not to the bit.
+/// fits) and no step needs damping. [`opt_pml`] allocates
+/// `(5 + n_beta) * n_cells` per call and walks it in a dozen passes; here each
+/// step is two fused passes per subject with nothing stored per cell, split as
+/// the device kernel splits it: a dense sweep over every cell at a count of
+/// zero, then a sparse sweep adding what the positive counts change. Sums
+/// associate differently from [`opt_pml`], so results agree to rounding, not
+/// bitwise.
 ///
-/// The log-determinant is taken at the final iterate, where [`opt_pml`] follows
-/// nebula and reports the penultimate one. On the CPU the two iterates are both
-/// `f64` and a converged step apart. Here the penultimate iterate is the
-/// device's `f32` point, whose location error the log-determinant carries at
-/// first order, so the second pass accumulates the curvature weight as well.
+/// The log-determinant is taken at the final iterate, not the penultimate one as
+/// in [`opt_pml`]: here the penultimate iterate is the device's `f32` point,
+/// whose location error enters the log-determinant at first order, so the
+/// second pass also accumulates the curvature weight.
 ///
 /// ### Params
 ///
@@ -901,17 +887,14 @@ pub(crate) fn newton_finish(
 
 /// [`newton_finish`] for one design width.
 ///
-/// The sweeps spend their time in loops over the design columns, a handful of
-/// iterations each. With the width a run-time value those loops are never
-/// unrolled and every access is bounds-checked; with it a constant they
-/// disappear into straight-line code, and a subject's sums over the cells sit
-/// in `NB`-sized arrays the compiler keeps in registers, where heap
-/// accumulators cost a store-to-load round trip per cell.
+/// With the width a constant, the loops over design columns unroll and a
+/// subject's sums sit in `NB`-sized arrays held in registers, instead of heap
+/// accumulators with a store-to-load round trip per cell.
 ///
-/// The first sweep takes a subject's `exp` in a loop of its own, so the loop
-/// that accumulates has no call in it and the positive cells read the stored
-/// value back instead of taking it again. With the registers, 15.6 to 12.1 ns
-/// per cell for one step on a 20000-cell gene; the split alone is slower.
+/// The first sweep takes a subject's `exp` in its own loop, so the accumulating
+/// loop has no call in it and the positive cells read the stored value. Together
+/// with the registers: 15.6 to 12.1 ns per cell per step on a 20000-cell gene;
+/// the split alone is slower.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn newton_finish_width<const NB: usize>(
@@ -939,15 +922,7 @@ fn newton_finish_width<const NB: usize>(
     let alpha = 1.0 / (exps - 1.0);
     let lambda = 1.0 / (exps.sqrt() * (exps - 1.0));
 
-    // Where each subject's run of positive counts starts.
-    let mut run = vec![0usize; k + 1];
-    let mut at = 0usize;
-    for s in 0..=k {
-        while at < data.cell_index.len() && data.cell_index[at] < data.subject_start[s] {
-            at += 1;
-        }
-        run[s] = at;
-    }
+    let run = positive_runs(data.cell_index, data.subject_start);
 
     let mut beta = beta.to_vec();
     let mut log_w = log_w.to_vec();
@@ -1160,12 +1135,10 @@ fn newton_finish_width<const NB: usize>(
 /// nebula's `check_conv`, applied to a finished fit.
 ///
 /// [`opt_pml`] already runs this with `variance_at_bound` false and an initial
-/// code of [`CONV_SUCCESS`]. Re-run it from the outer overdispersion loop,
-/// which is the only place that knows whether a variance component landed on
-/// its box constraint or whether an earlier optimiser already failed.
-///
-/// The singular-information test overrides everything else, including
-/// [`CONV_AT_BOUND`], which is nebula's ordering.
+/// code of [`CONV_SUCCESS`]. The outer overdispersion loop re-runs it, as only
+/// it knows whether a variance component hit its bound or an earlier optimiser
+/// failed. The singular-information test overrides everything, including
+/// [`CONV_AT_BOUND`] (nebula's ordering).
 ///
 /// ### Params
 ///
@@ -1212,30 +1185,37 @@ pub fn check_convergence(
 // Workspace //
 ///////////////
 
-/// Every buffer the Newton loop needs, allocated once per call.
+/// Where each subject's run of positive counts starts.
 ///
-/// `x_phi` is the only one that scales with the data: it holds the design
-/// scaled row-wise by the curvature weights, `n_cells * n_beta` doubles. The
-/// C++ materialises the same matrix, and both the cross block and the
-/// fixed-effect block are read off it, so fusing it away would change the
-/// summation order for no memory that matters at NEBULA's design widths.
-struct Workspace {
-    /// `exp(offset + design*beta + log_w)`, one per cell.
-    extb: Vec<f64>,
-    /// `log(extb + gamma)`, one per cell.
-    extbphil: Vec<f64>,
-    /// Working weight, reused down the derivative chain, one per cell.
-    phi: Vec<f64>,
-    /// `gamma` plus the cell's count, one per cell. nebula's `gstar`.
-    gstar: Vec<f64>,
-    /// Scratch for the higher-order derivative summands, one per cell.
-    deriv: Vec<f64>,
-    /// Design scaled row-wise by `phi`, row-major `n_cells * n_beta`.
-    x_phi: Vec<f64>,
+/// ### Params
+///
+/// * `cells` - Cell index of each positive count, increasing
+/// * `starts` - Subject boundaries, length `k + 1`
+///
+/// ### Returns
+///
+/// For each boundary, the first positive count at or past it, length `k + 1`.
+pub(crate) fn positive_runs(cells: &[usize], starts: &[usize]) -> Vec<usize> {
+    starts
+        .iter()
+        .map(|&b| cells.partition_point(|&c| c < b))
+        .collect()
+}
+
+/// Widest design whose per-subject sums sit in fixed-size arrays, so the loops
+/// over design columns unroll and the sums stay in registers. Wider designs run
+/// the same sweep with the width read at run time and the sums on the heap.
+const MAX_UNROLLED_WIDTH: usize = 8;
+
+/// Penalised log-likelihood, gradient and curvature at one point.
+///
+/// One [`sweep`] fills all of it, so a trial point that is accepted already
+/// carries what the next Newton step needs.
+struct Sweep {
+    /// Penalised log-likelihood.
+    log_likelihood: f64,
     /// `exp(log_w)`, one per subject.
     w: Vec<f64>,
-    /// `X' y` over the positive counts, length `n_beta`.
-    yx: Vec<f64>,
     /// Fixed-effect gradient, length `n_beta`.
     db: Vec<f64>,
     /// Random-effect gradient, length `n_subjects`.
@@ -1246,6 +1226,50 @@ struct Workspace {
     vwb: Vec<f64>,
     /// Fixed-effect block of the information, row-major `n_beta * n_beta`.
     vb: Vec<f64>,
+}
+
+impl Sweep {
+    /// Zeroed buffers for one gene's shape.
+    ///
+    /// ### Params
+    ///
+    /// * `nb` - Number of fixed effects
+    /// * `k` - Number of subjects
+    ///
+    /// ### Returns
+    ///
+    /// The empty sweep.
+    fn new(nb: usize, k: usize) -> Self {
+        Self {
+            log_likelihood: 0.0,
+            w: vec![0.0; k],
+            db: vec![0.0; nb],
+            dw: vec![0.0; k],
+            vw: vec![0.0; k],
+            vwb: vec![0.0; k * nb],
+            vb: vec![0.0; nb * nb],
+        }
+    }
+}
+
+/// Every buffer the Newton loop needs, allocated once per call.
+struct Workspace<'z> {
+    /// The run's zero-count tables, or `None` to sweep every cell.
+    zeros: Option<&'z ZeroCells>,
+    /// `exp(offset + design*beta + log_w)` per cell at the last swept point.
+    /// With tables, only the positive and the loose cells are written.
+    stored: Vec<f64>,
+    /// Where each subject's run of positive counts starts, length `k + 1`.
+    run: Vec<usize>,
+    /// Per-subject sums for designs wider than [`MAX_UNROLLED_WIDTH`],
+    /// length `2 * n_beta + n_beta^2`.
+    wide: Vec<f64>,
+    /// The sweep at the current iterate.
+    current: Sweep,
+    /// The sweep at the trial point.
+    trial: Sweep,
+    /// `vw` the last Newton step used, for the log-determinant.
+    vw_step: Vec<f64>,
     /// Schur complement of the information, row-major `n_beta * n_beta`.
     vb2: Vec<f64>,
     /// Copy of `vb2`, destroyed by each factorisation.
@@ -1268,40 +1292,37 @@ struct Workspace {
     new_beta: Vec<f64>,
     /// Trial random effects, length `n_subjects`.
     new_log_w: Vec<f64>,
-    /// Third-derivative sums, length `n_subjects`.
-    third: Vec<f64>,
-    /// Fourth-derivative sums, length `n_subjects`.
-    fourth: Vec<f64>,
 }
 
-impl Workspace {
+impl<'z> Workspace<'z> {
     /// Allocates every buffer to the shape implied by `data`.
     ///
     /// ### Params
     ///
     /// * `data` - The gene whose shape sets the buffer sizes
+    /// * `zeros` - The run's zero-count tables, or `None`
     ///
     /// ### Returns
     ///
-    /// A zeroed workspace.
-    fn new(data: &PmlData<'_>) -> Self {
+    /// A zeroed workspace with the positive-count runs located.
+    fn new(data: &PmlData<'_>, zeros: Option<&'z ZeroCells>) -> Self {
         let n_cells = data.n_cells();
         let k = data.n_subjects();
         let nb = data.n_beta();
+        let run = positive_runs(data.cell_index, data.subject_start);
+
         Self {
-            extb: vec![0.0; n_cells],
-            extbphil: vec![0.0; n_cells],
-            phi: vec![0.0; n_cells],
-            gstar: vec![0.0; n_cells],
-            deriv: vec![0.0; n_cells],
-            x_phi: vec![0.0; n_cells * nb],
-            w: vec![0.0; k],
-            yx: vec![0.0; nb],
-            db: vec![0.0; nb],
-            dw: vec![0.0; k],
-            vw: vec![0.0; k],
-            vwb: vec![0.0; k * nb],
-            vb: vec![0.0; nb * nb],
+            zeros,
+            stored: vec![0.0; n_cells],
+            run,
+            wide: if nb > MAX_UNROLLED_WIDTH {
+                vec![0.0; 2 * nb + nb * nb]
+            } else {
+                Vec::new()
+            },
+            current: Sweep::new(nb, k),
+            trial: Sweep::new(nb, k),
+            vw_step: vec![0.0; k],
             vb2: vec![0.0; nb * nb],
             factor: vec![0.0; nb * nb],
             perm: vec![0; nb],
@@ -1313,35 +1334,10 @@ impl Workspace {
             damp_log_w: vec![0.0; k],
             new_beta: vec![0.0; nb],
             new_log_w: vec![0.0; k],
-            third: vec![0.0; k],
-            fourth: vec![0.0; k],
         }
     }
 
-    /// Fills the two quantities that do not change across iterations.
-    ///
-    /// ### Params
-    ///
-    /// * `data` - The gene
-    /// * `gamma` - Cell-level negative binomial size
-    fn seed(&mut self, data: &PmlData<'_>, gamma: f64) {
-        let nb = data.n_beta();
-        self.gstar.fill(gamma);
-        for (i, &c) in data.cell_index.iter().enumerate() {
-            self.gstar[c] += data.counts[i];
-        }
-        self.yx.fill(0.0);
-        for (i, &c) in data.cell_index.iter().enumerate() {
-            let row = &data.design[c * nb..(c + 1) * nb];
-            let y = data.counts[i];
-            for j in 0..nb {
-                self.yx[j] += row[j] * y;
-            }
-        }
-    }
-
-    /// Evaluates the penalised log-likelihood, leaving `extb`, `extbphil` and
-    /// `w` at the given point.
+    /// Sweeps the gene at `(beta, log_w)` into [`Self::current`].
     ///
     /// ### Params
     ///
@@ -1350,198 +1346,264 @@ impl Workspace {
     /// * `log_w` - Random effects on the log scale
     /// * `gamma` - Cell-level negative binomial size
     /// * `penalty` - Prior on the random effects
-    ///
-    /// ### Returns
-    ///
-    /// The penalised log-likelihood.
-    fn evaluate(
+    fn sweep_current(
         &mut self,
         data: &PmlData<'_>,
         beta: &[f64],
         log_w: &[f64],
         gamma: f64,
         penalty: Penalty,
-    ) -> f64 {
-        let nb = data.n_beta();
-        let n_cells = data.n_cells();
-        let k = data.n_subjects();
-
-        // The C++ evaluates `X*beta` into a temporary and adds the offset
-        // afterwards; keeping that order keeps the last-iteration comparison
-        // identical.
-        for r in 0..n_cells {
-            let row = &data.design[r * nb..(r + 1) * nb];
-            let mut acc = 0.0;
-            for j in 0..nb {
-                acc += row[j] * beta[j];
-            }
-            self.extb[r] = data.offset[r] + acc;
-        }
-
-        let mut log_likelihood = 0.0;
-        for (i, &c) in data.cell_index.iter().enumerate() {
-            log_likelihood += self.extb[c] * data.counts[i];
-        }
-        for s in 0..k {
-            log_likelihood += log_w[s] * data.subject_total[s];
-        }
-
-        for s in 0..k {
-            for e in &mut self.extb[data.subject_start[s]..data.subject_start[s + 1]] {
-                *e += log_w[s];
-            }
-        }
-        for e in &mut self.extb[..n_cells] {
-            *e = e.exp();
-        }
-
-        let mut sum_phil = 0.0;
-        for r in 0..n_cells {
-            self.extbphil[r] = (self.extb[r] + gamma).ln();
-            sum_phil += self.extbphil[r];
-        }
-        log_likelihood -= gamma * sum_phil;
-        for (i, &c) in data.cell_index.iter().enumerate() {
-            log_likelihood -= data.counts[i] * self.extbphil[c];
-        }
-
-        for s in 0..k {
-            self.w[s] = log_w[s].exp();
-        }
-        penalty.accumulate(log_likelihood, log_w, &self.w)
+    ) {
+        sweep(
+            data,
+            beta,
+            log_w,
+            gamma,
+            penalty,
+            self.zeros,
+            &mut self.stored,
+            &self.run,
+            &mut self.wide,
+            &mut self.current,
+        );
     }
 
-    /// Fills `db` and `dw` from the current `extb` and `w`.
-    ///
-    /// Leaves `phi` holding `gstar extb / (extb + gamma)`, the weight the
-    /// curvature assembly divides down again.
+    /// Sweeps the gene at `(new_beta, new_log_w)` into [`Self::trial`].
     ///
     /// ### Params
     ///
     /// * `data` - The gene
     /// * `gamma` - Cell-level negative binomial size
     /// * `penalty` - Prior on the random effects
-    /// * `log_w` - Current random effects, needed by the log-normal penalty
-    fn gradient_only(&mut self, data: &PmlData<'_>, gamma: f64, penalty: Penalty, log_w: &[f64]) {
-        let nb = data.n_beta();
-        let n_cells = data.n_cells();
-        let k = data.n_subjects();
+    ///
+    /// ### Returns
+    ///
+    /// The penalised log-likelihood at the trial point.
+    fn sweep_trial(&mut self, data: &PmlData<'_>, gamma: f64, penalty: Penalty) -> f64 {
+        sweep(
+            data,
+            &self.new_beta,
+            &self.new_log_w,
+            gamma,
+            penalty,
+            self.zeros,
+            &mut self.stored,
+            &self.run,
+            &mut self.wide,
+            &mut self.trial,
+        );
+        self.trial.log_likelihood
+    }
+}
 
-        for r in 0..n_cells {
-            self.phi[r] = self.gstar[r] / (1.0 + gamma / self.extb[r]);
+/// Penalised log-likelihood, gradient and curvature at one point, in one pass
+/// per subject.
+///
+/// Each subject is a dense part over every cell as if its count were zero, then
+/// a sparse sweep adding what the positive counts change. Every per-cell term is
+/// linear in the count through `gstar = gamma + y`, so the split is exact.
+/// Without tables the dense part is two loops, the `exp` of every cell into
+/// `stored` and the accumulation; with them it is one lookup per group of
+/// [`ZeroCells`] and the accumulation over the loose cells. Sums associate
+/// differently from nebula's C++, so results agree to rounding, not bitwise.
+///
+/// ### Params
+///
+/// * `data` - The gene
+/// * `beta` - Fixed effects
+/// * `log_w` - Random effects on the log scale
+/// * `gamma` - Cell-level negative binomial size
+/// * `penalty` - Prior on the random effects
+/// * `zeros` - The run's zero-count tables, or `None` to sweep every cell
+/// * `stored` - Per-cell `exp`, overwritten
+/// * `run` - Start of each subject's positive counts, from [`Workspace::new`]
+/// * `wide` - Heap sums for designs wider than [`MAX_UNROLLED_WIDTH`]
+/// * `out` - Filled with the sweep
+#[allow(clippy::too_many_arguments)]
+fn sweep(
+    data: &PmlData<'_>,
+    beta: &[f64],
+    log_w: &[f64],
+    gamma: f64,
+    penalty: Penalty,
+    zeros: Option<&ZeroCells>,
+    stored: &mut [f64],
+    run: &[usize],
+    wide: &mut [f64],
+    out: &mut Sweep,
+) {
+    macro_rules! width {
+        ($nb:literal) => {
+            sweep_width::<$nb>(
+                data, beta, log_w, gamma, penalty, zeros, stored, run, wide, out,
+            )
+        };
+    }
+    match data.n_beta() {
+        1 => width!(1),
+        2 => width!(2),
+        3 => width!(3),
+        4 => width!(4),
+        5 => width!(5),
+        6 => width!(6),
+        7 => width!(7),
+        8 => width!(8),
+        _ => width!(0),
+    }
+}
+
+/// [`sweep`] for one design width, `NB == 0` meaning the width is read from
+/// `data` at run time.
+///
+/// ### Params
+///
+/// As [`sweep`].
+#[allow(clippy::too_many_arguments)]
+fn sweep_width<const NB: usize>(
+    data: &PmlData<'_>,
+    beta: &[f64],
+    log_w: &[f64],
+    gamma: f64,
+    penalty: Penalty,
+    zeros: Option<&ZeroCells>,
+    stored: &mut [f64],
+    run: &[usize],
+    wide: &mut [f64],
+    out: &mut Sweep,
+) {
+    let nb = if NB == 0 { data.n_beta() } else { NB };
+    let k = data.n_subjects();
+    let mut local = [0.0; 2 * MAX_UNROLLED_WIDTH + MAX_UNROLLED_WIDTH * MAX_UNROLLED_WIDTH];
+    let sums: &mut [f64] = if NB == 0 {
+        wide
+    } else {
+        &mut local[..2 * nb + nb * nb]
+    };
+
+    out.db.fill(0.0);
+    out.vb.fill(0.0);
+    let ln_gamma = gamma.ln();
+    let mut log_likelihood = 0.0;
+    for s in 0..k {
+        let cells = data.subject_start[s]..data.subject_start[s + 1];
+        let log_w_s = log_w[s];
+        let w_s = log_w_s.exp();
+        sums.fill(0.0);
+        let (score, rest) = sums.split_at_mut(nb);
+        let (first, second) = rest.split_at_mut(nb);
+        let mut resid = 0.0;
+        let mut weight = 0.0;
+        let mut sum_log = 0.0;
+        let mut linear = 0.0;
+        let mut weighted_log = 0.0;
+
+        // `d` adds to the gradient, `p` to the curvature, the latter before the
+        // factor of `gamma` the curvature blocks take at the end.
+        let mut fold = |row: &[f64], d: f64, p: f64| {
+            resid += d;
+            weight += p;
+            for a in 0..nb {
+                score[a] += row[a] * d;
+                let pa = p * row[a];
+                first[a] += pa;
+                for b in a..nb {
+                    second[a * nb + b] += pa * row[b];
+                }
+            }
+        };
+
+        match zeros {
+            None => {
+                // The `exp` in its own loop keeps the accumulating loop free of
+                // calls.
+                for r in cells.clone() {
+                    let row = &data.design[r * nb..(r + 1) * nb];
+                    let mut eta = data.offset[r];
+                    for j in 0..nb {
+                        eta += row[j] * beta[j];
+                    }
+                    stored[r] = (eta + log_w_s).exp();
+                }
+                for r in cells {
+                    let row = &data.design[r * nb..(r + 1) * nb];
+                    let extb = stored[r];
+                    let t = extb + gamma;
+                    sum_log += t.ln();
+                    let inv = 1.0 / t;
+                    let u = extb * inv;
+                    fold(row, -gamma * u, gamma * u * inv);
+                }
+            }
+            Some(z) => {
+                // Per group, `sum ln t = n ln gamma + L`, `sum u = A` and
+                // `sum gamma u / t = B`.
+                for g in &z.groups[z.subject_groups[s]..z.subject_groups[s + 1]] {
+                    let row = &data.design[g.row * nb..(g.row + 1) * nb];
+                    let mut log_tau = log_w_s - ln_gamma;
+                    for j in 0..nb {
+                        log_tau += row[j] * beta[j];
+                    }
+                    let [l, a, b] = g.eval::<0, 3>(log_tau);
+                    sum_log += g.n * ln_gamma + l;
+                    fold(row, -gamma * a, b);
+                }
+                for &r in &z.loose[z.subject_loose[s]..z.subject_loose[s + 1]] {
+                    let row = &data.design[r * nb..(r + 1) * nb];
+                    let mut eta = data.offset[r];
+                    for j in 0..nb {
+                        eta += row[j] * beta[j];
+                    }
+                    let extb = (eta + log_w_s).exp();
+                    stored[r] = extb;
+                    let t = extb + gamma;
+                    sum_log += t.ln();
+                    let inv = 1.0 / t;
+                    let u = extb * inv;
+                    fold(row, -gamma * u, gamma * u * inv);
+                }
+            }
         }
-
-        // `db = yx - X' phi`, accumulated in cell order so each component sums
-        // in the same order as the Eigen gemv.
-        self.db.copy_from_slice(&self.yx);
-        for r in 0..n_cells {
-            let row = &data.design[r * nb..(r + 1) * nb];
-            let p = self.phi[r];
+        for i in run[s]..run[s + 1] {
+            let c = data.cell_index[i];
+            let y = data.counts[i];
+            let row = &data.design[c * nb..(c + 1) * nb];
+            let mut eta = data.offset[c];
             for j in 0..nb {
-                self.db[j] -= row[j] * p;
+                eta += row[j] * beta[j];
             }
+            let extb = if zeros.is_some() {
+                let e = (eta + log_w_s).exp();
+                stored[c] = e;
+                e
+            } else {
+                stored[c]
+            };
+            let t = extb + gamma;
+            linear += eta * y;
+            weighted_log += y * t.ln();
+            let inv = 1.0 / t;
+            let u = extb * inv;
+            fold(row, y * (1.0 - u), y * u * inv);
         }
 
-        for s in 0..k {
-            let mut acc = 0.0;
-            for r in data.subject_start[s]..data.subject_start[s + 1] {
-                acc += self.phi[r];
+        log_likelihood += linear + log_w_s * data.subject_total[s] - gamma * sum_log - weighted_log;
+        out.w[s] = w_s;
+        out.dw[s] = resid + penalty.gradient(log_w_s, w_s);
+        out.vw[s] = gamma * weight + penalty.curvature(w_s);
+        for a in 0..nb {
+            out.db[a] += score[a];
+            out.vwb[s * nb + a] = gamma * first[a];
+            for b in a..nb {
+                out.vb[a * nb + b] += gamma * second[a * nb + b];
             }
-            self.dw[s] = (data.subject_total[s] - acc) + penalty.gradient(log_w[s], self.w[s]);
         }
     }
-
-    /// Fills `vw`, `vwb`, `vb` and `vb2` from the weight left in `phi`.
-    ///
-    /// ### Params
-    ///
-    /// * `data` - The gene
-    /// * `gamma` - Cell-level negative binomial size
-    /// * `penalty` - Prior on the random effects
-    fn curvature(&mut self, data: &PmlData<'_>, gamma: f64, penalty: Penalty) {
-        let nb = data.n_beta();
-        let n_cells = data.n_cells();
-        let k = data.n_subjects();
-
-        for r in 0..n_cells {
-            self.phi[r] /= self.extb[r] + gamma;
-        }
-
-        for s in 0..k {
-            let mut acc = 0.0;
-            for r in data.subject_start[s]..data.subject_start[s + 1] {
-                acc += self.phi[r];
-            }
-            self.vw[s] = gamma * acc + penalty.curvature(self.w[s]);
-        }
-
-        for r in 0..n_cells {
-            let row = &data.design[r * nb..(r + 1) * nb];
-            let p = self.phi[r];
-            let out = &mut self.x_phi[r * nb..(r + 1) * nb];
-            for j in 0..nb {
-                out[j] = row[j] * p;
-            }
-        }
-
-        for s in 0..k {
-            let dst = &mut self.vwb[s * nb..(s + 1) * nb];
-            dst.fill(0.0);
-            for r in data.subject_start[s]..data.subject_start[s + 1] {
-                let src = &self.x_phi[r * nb..(r + 1) * nb];
-                for j in 0..nb {
-                    dst[j] += src[j];
-                }
-            }
-            for v in dst.iter_mut() {
-                *v *= gamma;
-            }
-        }
-
-        self.vb.fill(0.0);
-        for r in 0..n_cells {
-            let row = &data.design[r * nb..(r + 1) * nb];
-            let scaled = &self.x_phi[r * nb..(r + 1) * nb];
-            for i in 0..nb {
-                for j in i..nb {
-                    self.vb[i * nb + j] += row[i] * scaled[j];
-                }
-            }
-        }
-        for i in 0..nb {
-            for j in i..nb {
-                let v = gamma * self.vb[i * nb + j];
-                self.vb[i * nb + j] = v;
-                self.vb[j * nb + i] = v;
-            }
-        }
-
-        // Schur complement in the square-rooted form the C++ uses: scale the
-        // cross block by `1/sqrt(vw)` and subtract its own Gram matrix, which
-        // keeps the result symmetric by construction.
-        for s in 0..k {
-            let scale = 1.0 / self.vw[s].sqrt();
-            for v in &mut self.vwb[s * nb..(s + 1) * nb] {
-                *v *= scale;
-            }
-        }
-        for i in 0..nb {
-            for j in 0..nb {
-                let mut acc = 0.0;
-                for s in 0..k {
-                    acc += self.vwb[s * nb + i] * self.vwb[s * nb + j];
-                }
-                self.vb2[i * nb + j] = self.vb[i * nb + j] - acc;
-            }
-        }
-        // Undo the scaling: the step needs the unscaled cross block.
-        for s in 0..k {
-            let scale = self.vw[s].sqrt();
-            for v in &mut self.vwb[s * nb..(s + 1) * nb] {
-                *v *= scale;
-            }
+    for a in 0..nb {
+        for b in (a + 1)..nb {
+            out.vb[b * nb + a] = out.vb[a * nb + b];
         }
     }
+    out.log_likelihood = penalty.accumulate(log_likelihood, log_w, &out.w);
 }
 
 ////////////
@@ -1550,11 +1612,16 @@ impl Workspace {
 
 /// The shared Newton loop behind [`opt_pml`] and [`opt_pml_nbm`].
 ///
+/// Each point is one [`sweep`]; an accepted trial point's sweep carries the
+/// gradient and curvature of the next Newton step.
+///
 /// ### Params
 ///
-/// * `data` - One gene's design, offsets, positive counts and subject blocks
+/// * `data` - The gene
+/// * `zeros` - The run's zero-count tables, or `None` to sweep every cell
 /// * `beta_init` - Starting fixed effects
-/// * `penalty` - Prior on the random effects, scalars already resolved
+/// * `log_w_init` - Starting random effects, or `None` for zeros
+/// * `penalty` - Prior on the random effects
 /// * `gamma` - Cell-level negative binomial size
 /// * `params` - Tuning knobs
 ///
@@ -1563,6 +1630,7 @@ impl Workspace {
 /// The fitted solution and its diagnostics.
 fn optimise(
     data: &PmlData<'_>,
+    zeros: Option<&ZeroCells>,
     beta_init: &[f64],
     log_w_init: Option<&[f64]>,
     penalty: Penalty,
@@ -1595,10 +1663,10 @@ fn optimise(
         }
         None => vec![0.0; k],
     };
-    let mut work = Workspace::new(data);
-    work.seed(data, gamma);
+    let mut work = Workspace::new(data, zeros);
+    work.sweep_current(data, &beta, &log_w, gamma, penalty);
 
-    let mut log_likelihood = work.evaluate(data, &beta, &log_w, gamma, penalty);
+    let mut log_likelihood = work.current.log_likelihood;
     let mut log_likelihood_prev = 0.0;
     let mut likdif = 0.0;
     let mut step = 0usize;
@@ -1609,19 +1677,31 @@ fn optimise(
         work.damp_beta.fill(1.0);
         work.damp_log_w.fill(1.0);
 
-        work.gradient_only(data, gamma, penalty, &log_w);
-        work.curvature(data, gamma, penalty);
-
+        let cur = &work.current;
+        work.vw_step.copy_from_slice(&cur.vw);
         for s in 0..k {
-            work.dwvw[s] = work.dw[s] / work.vw[s];
+            work.dwvw[s] = cur.dw[s] / cur.vw[s];
+        }
+        // Schur complement of the random-effect block, symmetric by
+        // construction.
+        for a in 0..nb {
+            for b in a..nb {
+                let mut acc = 0.0;
+                for s in 0..k {
+                    acc += cur.vwb[s * nb + a] * cur.vwb[s * nb + b] / cur.vw[s];
+                }
+                let v = cur.vb[a * nb + b] - acc;
+                work.vb2[a * nb + b] = v;
+                work.vb2[b * nb + a] = v;
+            }
         }
         // `rhs = db - vwb' (dw/vw)`, then one `nb` solve gives the whole step.
         for j in 0..nb {
             let mut acc = 0.0;
             for s in 0..k {
-                acc += work.vwb[s * nb + j] * work.dwvw[s];
+                acc += cur.vwb[s * nb + j] * work.dwvw[s];
             }
-            work.step_beta[j] = work.db[j] - acc;
+            work.step_beta[j] = cur.db[j] - acc;
         }
         work.factor.copy_from_slice(&work.vb2);
         ldlt_solve(
@@ -1634,9 +1714,9 @@ fn optimise(
         for s in 0..k {
             let mut acc = 0.0;
             for j in 0..nb {
-                acc += work.vwb[s * nb + j] * work.step_beta[j];
+                acc += cur.vwb[s * nb + j] * work.step_beta[j];
             }
-            work.step_log_w[s] = work.dwvw[s] - acc / work.vw[s];
+            work.step_log_w[s] = work.dwvw[s] - acc / cur.vw[s];
         }
 
         for j in 0..nb {
@@ -1647,7 +1727,7 @@ fn optimise(
         }
 
         log_likelihood_prev = log_likelihood;
-        log_likelihood = evaluate_trial(&mut work, data, gamma, penalty);
+        log_likelihood = work.sweep_trial(data, gamma, penalty);
         likdif = log_likelihood - log_likelihood_prev;
 
         backtracks = 0;
@@ -1659,17 +1739,16 @@ fn optimise(
             if backtracks > params.max_backtrack {
                 likdif = 0.0;
                 log_likelihood = log_likelihood_prev;
-                let grad_beta = work.db.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-                let grad_log_w = work.dw.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                let grad_beta = work.current.db.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                let grad_log_w = work.current.dw.iter().fold(0.0f64, |m, v| m.max(v.abs()));
                 if grad_beta > GRADIENT_TOLERANCE || grad_log_w > GRADIENT_TOLERANCE {
                     backtracks += 1;
                 }
                 break;
             }
 
-            // A step past the cutoff is not halved but replaced outright: at
-            // that magnitude the halvings would need forty rounds to reach a
-            // usable displacement, and the budget is ten.
+            // A step past the cutoff is replaced outright: halving would need
+            // forty rounds and the budget is ten.
             for j in 0..nb {
                 let d = work.step_beta[j];
                 if d < STEP_CUTOFF && d > -STEP_CUTOFF {
@@ -1693,21 +1772,20 @@ fn optimise(
                 }
             }
 
-            log_likelihood = evaluate_trial(&mut work, data, gamma, penalty);
+            log_likelihood = work.sweep_trial(data, gamma, penalty);
             likdif = log_likelihood - log_likelihood_prev;
         }
 
         beta.copy_from_slice(&work.new_beta);
         log_w.copy_from_slice(&work.new_log_w);
+        std::mem::swap(&mut work.current, &mut work.trial);
     }
 
-    // `vw` and `vb2` are the ones assembled at the previous iterate, which is
-    // what nebula reports. Recomputing them at the final point would be a
-    // different quantity, and the outer overdispersion objective is calibrated
-    // against this one.
+    // `vw` and `vb2` come from the previous iterate, as nebula reports; the
+    // outer objective is calibrated against that.
     let mut log_det = 0.0;
     for s in 0..k {
-        log_det += work.vw[s].abs().ln();
+        log_det += work.vw_step[s].abs().ln();
     }
     if params.reml {
         work.factor.copy_from_slice(&work.vb2);
@@ -1717,7 +1795,7 @@ fn optimise(
 
     let second_order = match penalty {
         Penalty::Gamma { lambda, .. } if params.ord > 1 => {
-            laplace_correction(&mut work, data, gamma, lambda, params.ord)
+            laplace_correction(&work, data, &beta, &log_w, gamma, lambda, params.ord)
         }
         _ => 0.0,
     };
@@ -1738,43 +1816,25 @@ fn optimise(
     Ok(result)
 }
 
-/// Evaluates the penalised log-likelihood at the trial point in the workspace.
-///
-/// ### Params
-///
-/// * `work` - Workspace holding `new_beta` and `new_log_w`
-/// * `data` - The gene
-/// * `gamma` - Cell-level negative binomial size
-/// * `penalty` - Prior on the random effects
-///
-/// ### Returns
-///
-/// The penalised log-likelihood, with `extb` and `w` left at the trial point.
-fn evaluate_trial(work: &mut Workspace, data: &PmlData<'_>, gamma: f64, penalty: Penalty) -> f64 {
-    let beta = std::mem::take(&mut work.new_beta);
-    let log_w = std::mem::take(&mut work.new_log_w);
-    let value = work.evaluate(data, &beta, &log_w, gamma, penalty);
-    work.new_beta = beta;
-    work.new_log_w = log_w;
-    value
-}
-
 /// Higher-order terms of the Laplace expansion of the marginal likelihood.
 ///
 /// The leading Laplace term is `-0.5 log|V|`; this returns the next correction,
 /// which the outer objective adds as `log(1 + second)`. `ord == 2` keeps only
 /// the third-derivative term `5 m3^2 / (24 V^3)`; `ord == 3` adds the
 /// fourth-derivative term `-m4 / (8 V^2)` and the mixed term
-/// `7 m5 m3 / (48 V^4)`. Every derivative is diagonal in the subjects, so this
-/// is a scan over cells and a sum over blocks.
+/// `7 m5 m3 / (48 V^4)`. Every derivative is diagonal in the subjects, and each
+/// per-cell summand is `gstar` times a function of the cell's `exp`, so this is
+/// one pass split dense and sparse as in [`sweep`].
 ///
-/// Recomputes the curvature at the final iterate rather than reusing the one
-/// the log-determinant was taken from, which is what nebula does.
+/// Recomputes the curvature at the final iterate, not the one the
+/// log-determinant used (as nebula does).
 ///
 /// ### Params
 ///
-/// * `work` - Workspace whose `extb` and `w` sit at the final iterate
+/// * `work` - Workspace whose `stored` and `current.w` sit at the final iterate
 /// * `data` - The gene
+/// * `beta` - Fixed effects at the final iterate
+/// * `log_w` - Random effects at the final iterate
 /// * `gamma` - Cell-level negative binomial size
 /// * `lambda` - Rate of the gamma prior
 /// * `ord` - Expansion order, greater than one
@@ -1783,90 +1843,95 @@ fn evaluate_trial(work: &mut Workspace, data: &PmlData<'_>, gamma: f64, penalty:
 ///
 /// The correction, nebula's `second`.
 fn laplace_correction(
-    work: &mut Workspace,
+    work: &Workspace<'_>,
     data: &PmlData<'_>,
+    beta: &[f64],
+    log_w: &[f64],
     gamma: f64,
     lambda: f64,
     ord: u32,
 ) -> f64 {
-    let n_cells = data.n_cells();
     let k = data.n_subjects();
-    let mut second = 0.0;
+    let nb = data.n_beta();
+    let ln_gamma = gamma.ln();
+    let high = ord > 2;
+    // The curvature and the three higher derivatives, per unit of `gstar`.
+    let terms = |e: f64| {
+        let t = e + gamma;
+        let p2 = e / (t * t);
+        let p3 = p2 / t;
+        let p4 = p3 / t;
+        let p5 = p4 / t;
+        let e2 = e * e;
+        [
+            p2,
+            p3 * (gamma - e),
+            p4 * (gamma * gamma + e2 - (4.0 * gamma) * e),
+            p5 * (gamma * gamma * gamma - (11.0 * gamma * gamma) * e + (11.0 * gamma) * e2
+                - e2 * e),
+        ]
+    };
 
-    for r in 0..n_cells {
-        work.phi[r] = work.gstar[r] / (1.0 + gamma / work.extb[r]);
-        work.extbphil[r] = work.extb[r] + gamma;
-        work.phi[r] /= work.extbphil[r];
-    }
+    let mut third_acc = 0.0;
+    let mut fourth_acc = 0.0;
+    let mut fifth_acc = 0.0;
     for s in 0..k {
-        let mut acc = 0.0;
-        for r in data.subject_start[s]..data.subject_start[s + 1] {
-            acc += work.phi[r];
-        }
-        work.vw[s] = gamma * acc + lambda * work.w[s];
-    }
-
-    for r in 0..n_cells {
-        work.phi[r] /= work.extbphil[r];
-        work.deriv[r] = work.phi[r] * (gamma - work.extb[r]);
-    }
-    for s in 0..k {
-        let mut acc = 0.0;
-        for r in data.subject_start[s]..data.subject_start[s + 1] {
-            acc += work.deriv[r];
-        }
-        work.third[s] = gamma * acc + lambda * work.w[s];
-    }
-    let mut acc = 0.0;
-    for s in 0..k {
-        let v = work.vw[s];
-        acc += work.third[s] * work.third[s] / (v * v * v);
-    }
-    second += 5.0 * acc / 24.0;
-
-    if ord > 2 {
-        for r in 0..n_cells {
-            work.phi[r] /= work.extbphil[r];
-            let e = work.extb[r];
-            work.deriv[r] = work.phi[r] * (gamma * gamma + e * e - (4.0 * gamma) * e);
-        }
-        for s in 0..k {
-            let mut acc = 0.0;
-            for r in data.subject_start[s]..data.subject_start[s + 1] {
-                acc += work.deriv[r];
+        let mut sums = [0.0; 4];
+        let mut dense = |e: f64| {
+            let f = terms(e);
+            for j in 0..4 {
+                sums[j] += gamma * f[j];
             }
-            work.fourth[s] = gamma * acc + lambda * work.w[s];
-        }
-        let mut acc = 0.0;
-        for s in 0..k {
-            let v = work.vw[s];
-            acc += work.fourth[s] / (v * v);
-        }
-        second -= acc / 8.0;
-
-        for r in 0..n_cells {
-            work.phi[r] /= work.extbphil[r];
-            let e = work.extb[r];
-            let e2 = e * e;
-            work.deriv[r] = work.phi[r]
-                * (gamma * gamma * gamma - (11.0 * gamma * gamma) * e + (11.0 * gamma) * e2
-                    - e2 * e);
-        }
-        for s in 0..k {
-            let mut acc = 0.0;
-            for r in data.subject_start[s]..data.subject_start[s + 1] {
-                acc += work.deriv[r];
+        };
+        match work.zeros {
+            None => {
+                for &e in &work.stored[data.subject_start[s]..data.subject_start[s + 1]] {
+                    dense(e);
+                }
             }
-            work.fourth[s] = gamma * acc + lambda * work.w[s];
+            Some(z) => {
+                for &r in &z.loose[z.subject_loose[s]..z.subject_loose[s + 1]] {
+                    dense(work.stored[r]);
+                }
+                // `gamma` times each factor sums to the group's `B`..`E`.
+                for g in &z.groups[z.subject_groups[s]..z.subject_groups[s + 1]] {
+                    let row = &data.design[g.row * nb..(g.row + 1) * nb];
+                    let mut log_tau = log_w[s] - ln_gamma;
+                    for j in 0..nb {
+                        log_tau += row[j] * beta[j];
+                    }
+                    let f = g.eval::<2, 4>(log_tau);
+                    for j in 0..4 {
+                        sums[j] += f[j];
+                    }
+                }
+            }
         }
-        let mut acc = 0.0;
-        for s in 0..k {
-            let vs = work.vw[s] * work.vw[s];
-            acc += work.fourth[s] * work.third[s] / (vs * vs);
+        for i in work.run[s]..work.run[s + 1] {
+            let y = data.counts[i];
+            let f = terms(work.stored[data.cell_index[i]]);
+            for j in 0..4 {
+                sums[j] += y * f[j];
+            }
         }
-        second += 7.0 * acc / 48.0;
+        let prior = lambda * work.current.w[s];
+        let vw = gamma * sums[0] + prior;
+        let third = gamma * sums[1] + prior;
+        third_acc += third * third / (vw * vw * vw);
+        if high {
+            let fourth = gamma * sums[2] + prior;
+            let fifth = gamma * sums[3] + prior;
+            let vs = vw * vw;
+            fourth_acc += fourth / vs;
+            fifth_acc += fifth * third / (vs * vs);
+        }
     }
 
+    let mut second = 5.0 * third_acc / 24.0;
+    if high {
+        second -= fourth_acc / 8.0;
+        second += 7.0 * fifth_acc / 48.0;
+    }
     second
 }
 
@@ -1876,16 +1941,11 @@ fn laplace_correction(
 
 /// Solves a small symmetric system in place by pivoted `LDL'`.
 ///
-/// The Schur complement is positive definite at any sensible optimum, but the
-/// backtracking path visits points where it is not, and a plain Cholesky would
-/// simply fail there. This mirrors Eigen's `LDLT`, which is what the C++ calls:
-/// symmetric pivoting on the largest remaining diagonal, and a solve that zeroes
-/// rather than divides by a vanishing pivot. That keeps a rank-deficient design
-/// producing a finite step instead of a NaN.
-///
-/// See [`crate::glm::levenberg`] for the unpivoted Cholesky used where positive
-/// definiteness is guaranteed; the extra pivoting here is not free and is only
-/// worth it because indefinite iterates are expected.
+/// Mirrors Eigen's `LDLT` as the C++ calls it: symmetric pivoting on the largest
+/// remaining diagonal, and a solve that zeroes a vanishing pivot instead of
+/// dividing. Backtracking visits indefinite points where plain Cholesky fails,
+/// and a rank-deficient design must still give a finite step. See
+/// [`crate::glm::levenberg`] for the unpivoted Cholesky.
 ///
 /// ### Params
 ///
@@ -1957,9 +2017,8 @@ fn ldlt_solve(a: &mut [f64], b: &mut [f64], n: usize, perm: &mut [usize], tmp: &
     }
     for i in 0..n {
         let d = a[i * n + i];
-        // Eigen's own tolerance: a pivot below the smallest normal double is
-        // treated as an exact zero and the component is dropped rather than
-        // blown up.
+        // Eigen's tolerance: a pivot below the smallest normal double is an
+        // exact zero and the component is dropped.
         b[i] = if d.abs() > f64::MIN_POSITIVE {
             b[i] / d
         } else {
@@ -1980,8 +2039,7 @@ fn ldlt_solve(a: &mut [f64], b: &mut [f64], n: usize, perm: &mut [usize], tmp: &
 
 /// Determinant of a small square matrix by partial-pivot `LU`.
 ///
-/// Returned as a product rather than a sum of logs, matching the C++, so an
-/// under- or overflowing determinant behaves the same way here as there.
+/// A product, not a sum of logs, as in the C++, so under- and overflow match.
 ///
 /// ### Params
 ///
@@ -2029,10 +2087,8 @@ fn determinant(a: &mut [f64], n: usize, perm: &mut [usize]) -> f64 {
 
 /// Smallest eigenvalue of a small symmetric matrix, by cyclic Jacobi.
 ///
-/// Only used for the identifiability test, where the answer is compared against
-/// [`EIGENVALUE_CUTOFF`] and nothing finer is needed. Jacobi is chosen over a
-/// faer decomposition because the matrices are a handful of columns wide and the
-/// dispatch would cost more than the sweeps.
+/// Used only for the identifiability test against [`EIGENVALUE_CUTOFF`]. Jacobi
+/// beats a faer decomposition on matrices a few columns wide.
 ///
 /// ### Params
 ///
@@ -2099,12 +2155,9 @@ fn min_eigenvalue(matrix: &[f64], n: usize) -> f64 {
 ///////////
 
 #[cfg(test)]
-// Reference values are pasted verbatim from R's 17-digit print so they can be
-// diffed against the generating script. Truncating them to the shortest
-// round-trip would change nothing numerically and lose that.
+// Reference values are pasted verbatim from R's 17-digit print.
 #[allow(clippy::excessive_precision)]
-// The fixture builders return the five parallel arrays PmlData borrows. Naming
-// the tuple would be one alias used once.
+// Fixture builders return the five parallel arrays `PmlData` borrows.
 #[allow(clippy::type_complexity)]
 mod tests {
     use super::*;
@@ -2145,13 +2198,10 @@ mod tests {
 
     /// Relative tolerance against the R package.
     ///
-    /// Three orders tighter than the 1e-8 this port was asked for, and reached
-    /// on every fixture below, converged and stalled alike. The binding
-    /// constraint is not this arithmetic but nebula's own `eps`: it stops on an
-    /// absolute improvement in the log-likelihood, so where a Newton step is a
-    /// near-tie, a summation order that shifts the comparison by one ulp adds or
-    /// drops a whole damped step and moves the answer by 1e-7. Fixtures here are
-    /// chosen away from those ties.
+    /// Three orders tighter than 1e-8, reached on every fixture below. The
+    /// binding constraint is nebula's own absolute `eps`: at a near-tie Newton
+    /// step, a one-ulp shift in summation adds or drops a whole damped step and
+    /// moves the answer by 1e-7. Fixtures avoid such ties.
     const TOL: f64 = 1e-11;
 
     /// Fixture A: a well-behaved gene.
@@ -2315,8 +2365,8 @@ mod tests {
 
     #[test]
     fn test_opt_pml_start_near_bound_backtracks() {
-        // beta[0] = 90 sits just inside nebula's box of plus or minus 100, so
-        // the first Newton step overshoots and the per-coordinate damping runs.
+        // beta[0] = 90 is just inside nebula's +-100 box: the first Newton step
+        // overshoots and per-coordinate damping runs.
         let data = fixture_a();
         let variance = PmlVariance {
             subject: 0.25,
@@ -2348,8 +2398,8 @@ mod tests {
 
     #[test]
     fn test_opt_pml_far_outside_bounds_uses_fixed_displacement() {
-        // Both coordinates start well outside the box, so the Newton step
-        // exceeds the cutoff and the fixed-displacement branch takes over.
+        // Both coordinates start well outside the box: the Newton step exceeds
+        // the cutoff and the fixed-displacement branch runs.
         let data = fixture_a();
         let variance = PmlVariance {
             subject: 0.25,
@@ -2364,12 +2414,9 @@ mod tests {
 
     #[test]
     fn test_opt_pml_critical_point_reports_minus_ten() {
-        // Backtracking is exhausted while every gradient stays under 0.01, so
-        // nebula calls it a critical point rather than a failure. The stall here
-        // is decisive: the rejected step is orders of magnitude from improving,
-        // not a near-tie. Near-tie stalls exist and are not testable to this
-        // tolerance, because whether the backtracking runs at all is then
-        // decided by the last ulp of a log-likelihood in the thousands.
+        // Backtracking is exhausted with every gradient under 0.01: a critical
+        // point, not a failure. The stall is decisive (orders of magnitude from
+        // improving); near-tie stalls are not testable to this tolerance.
         let data = fixture_a();
         let variance = PmlVariance {
             subject: 8.0,
@@ -2412,8 +2459,7 @@ mod tests {
 
     #[test]
     fn test_opt_pml_iteration_budget_reports_minus_twenty() {
-        // A negative eps makes the stopping test unsatisfiable, so the loop runs
-        // out its budget at an otherwise converged point.
+        // A negative eps is unsatisfiable: the loop exhausts its budget.
         let data = fixture_a();
         let variance = PmlVariance {
             subject: 0.25,
@@ -2570,9 +2616,8 @@ mod tests {
 
     /// Builds the wider fixture: 64 cells, 4 subjects, 3 coefficients.
     ///
-    /// Generated by an integer recurrence rather than embedded as literals, so
-    /// the R side reproduces it exactly with the same three expressions. Every
-    /// value is dyadic, so nothing is lost on the way in.
+    /// Generated by an integer recurrence so R reproduces it with the same three
+    /// expressions. Every value is dyadic.
     ///
     /// ### Returns
     ///
@@ -2775,5 +2820,85 @@ mod tests {
             ..data
         };
         assert!(opt_pml(&short, &[0.5, -0.25], &variance, None).is_err());
+    }
+
+    /// Three subjects of 400 cells, a subject-level group and a cell-level
+    /// indicator, offsets over two orders of magnitude, about a tenth of the
+    /// cells expressed.
+    fn categorical_gene() -> (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<f64>,
+        Vec<usize>,
+    ) {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(11);
+        let starts = vec![0usize, 400, 800, 1200];
+        let mut design = Vec::new();
+        let mut offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cell_index = Vec::new();
+        let mut subject_total = vec![0.0; 3];
+        for c in 0..1200 {
+            let s = c / 400;
+            let kind = f64::from(rng.random_bool(0.4));
+            design.extend([1.0, (s % 2) as f64, kind]);
+            let o: f64 = rng.random_range(-2.3..2.3);
+            offset.push(o);
+            if rng.random_bool(0.1 + 0.05 * kind) {
+                let y = rng.random_range(1..6) as f64;
+                counts.push(y);
+                cell_index.push(c);
+                subject_total[s] += y;
+            }
+        }
+        (design, offset, counts, cell_index, subject_total, starts)
+    }
+
+    #[test]
+    fn test_opt_pml_tables_match_the_dense_sweep() {
+        let (design, offset, counts, cell_index, subject_total, starts) = categorical_gene();
+        let data = PmlData {
+            design: &design,
+            offset: &offset,
+            counts: &counts,
+            cell_index: &cell_index,
+            subject_start: &starts,
+            subject_total: &subject_total,
+        };
+        let zeros = ZeroCells::build(&design, &offset, &starts, 3).expect("categorical");
+        for (subject, cell) in [(0.3, 0.05), (0.8, 2.0), (0.05, 40.0)] {
+            let variance = PmlVariance { subject, cell };
+            let params = PmlParams {
+                reml: true,
+                ord: 3,
+                ..Default::default()
+            };
+            let start = [-1.5, 0.2, 0.1];
+            let dense = opt_pml(&data, &start, &variance, Some(params)).expect("dense");
+            let tabled = opt_pml_tabled(&data, Some(&zeros), &start, &variance, Some(params))
+                .expect("tabled");
+            assert_eq!(dense.iterations, tabled.iterations);
+            for (a, b) in dense.beta.iter().zip(&tabled.beta) {
+                assert_relative_eq!(*a, *b, max_relative = 1e-11);
+            }
+            for (a, b) in dense.information.iter().zip(&tabled.information) {
+                assert_relative_eq!(*a, *b, max_relative = 1e-11);
+            }
+            assert_relative_eq!(
+                dense.log_likelihood,
+                tabled.log_likelihood,
+                max_relative = 1e-13
+            );
+            assert_relative_eq!(dense.log_det, tabled.log_det, max_relative = 1e-12);
+            assert_relative_eq!(
+                dense.second_order,
+                tabled.second_order,
+                max_relative = 1e-10
+            );
+        }
     }
 }

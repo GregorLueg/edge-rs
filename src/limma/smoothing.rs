@@ -1,50 +1,33 @@
 //! edgeR's column-wise smoothers, `locfitByCol` and `loessByCol`.
 //!
-//! Both take an `(n_rows, n_cols)` matrix and smooth **down each column
-//! independently** against one shared covariate of length `n_rows`. In
-//! `estimateDisp` the rows are genes and the columns are the points of the
-//! dispersion grid, so a single call smooths every gene's adjusted profile
-//! likelihood curve into a trend.
+//! Both smooth **down each column independently** an `(n_rows, n_cols)` matrix
+//! against one shared covariate. In `estimateDisp` the rows are genes and the
+//! columns are the dispersion grid points.
 //!
-//! The two are different algorithms despite the similar names:
+//! * [`locfit_by_col`] ports the `locfit` package as edgeR drives it:
+//!   `locfit(y ~ x, weights, alpha = span, deg = degree)` with the default
+//!   `rbox()` evaluation structure. It fits only at the corners of an adaptive
+//!   binary subdivision of the covariate range and interpolates between them
+//!   (linearly for `degree = 0`, cubic Hermite on the fitted slope for
+//!   `degree = 1`). A fit at every row differs from edgeR by a couple of
+//!   percent.
+//! * [`loess_by_col`] ports edgeR's `src/R_loess_by_col.cpp`: a tricube moving
+//!   average with a frame that slides forwards once across the data. It also
+//!   returns each row's leverage in its own fit, which `estimateDisp` needs.
 //!
-//! * [`locfit_by_col`] is a port of the `locfit` package as edgeR drives it:
-//!   `locfit(y ~ x, weights, alpha = span, deg = degree)` with locfit's default
-//!   `rbox()` evaluation structure. locfit does **not** fit at every row. It
-//!   builds an adaptive binary subdivision of the covariate range, fits at the
-//!   cell corners only, and interpolates in between, linearly for `degree = 0`
-//!   and by cubic Hermite on the fitted slope for `degree = 1`. Reproducing
-//!   that structure is what buys parity with edgeR; a local fit evaluated at
-//!   every row instead differs from edgeR by a couple of percent.
-//! * [`loess_by_col`] is a port of edgeR's own `src/R_loess_by_col.cpp`. It is
-//!   a tricube-weighted moving average with a frame that slides forwards once
-//!   across the data, and it also returns the leverage of each row in its own
-//!   fit, which `estimateDisp` needs for the weighted likelihood.
-//!
-//! ### No grid variants
-//!
-//! Neither function takes a set of evaluation points. Both edgeR routines are
-//! only ever asked for fitted values at the rows they were given, and
-//! `locfit_by_col` already evaluates on a grid internally, locfit's adaptive
-//! tree. Bolting a second, differently spaced grid on top of it would be a
-//! knob nothing calls that quietly stops agreeing with edgeR.
+//! Neither takes evaluation points: edgeR only asks for fitted values at the
+//! given rows.
 //!
 //! ### Parallelism
 //!
-//! Genes are the crate's usual parallel axis. Not here: the rows are the data
-//! points of one smooth, not independent units of work, and the columns are the
-//! independent ones. Columns are the wrong axis too, because there are only a
-//! couple of dozen of them and they share the expensive part of the work, the
-//! window search and the bandwidth. So both routines fuse all columns into one
-//! pass over the rows and split the rows instead:
+//! The rows are the data points of one smooth, and the columns share the
+//! window search and bandwidth, so both routines fuse all columns into one pass
+//! and split the rows instead:
 //!
-//! * `locfit_by_col` fans the vertex fits out over the tree's vertices, each of
-//!   which scans the rows once for every column at once, then fans the final
-//!   interpolation out over rows.
-//! * `loess_by_col` computes the sliding frame in one sequential `O(n_rows)`
-//!   sweep, because it is loop-carried, then fans the weighted sums out over
-//!   rows. Those sums are the `O(n_rows * span * n_rows * n_cols)` part and the
-//!   only part worth splitting.
+//! * `locfit_by_col` fans out over the tree's vertices (each scans the rows
+//!   once for all columns), then over rows for the interpolation.
+//! * `loess_by_col` runs the loop-carried frame in one sequential `O(n_rows)`
+//!   sweep, then fans the weighted sums out over rows.
 //!
 //! ### References
 //!
@@ -60,32 +43,30 @@ use crate::errors::EdgeErrors;
 
 /// Cell refinement threshold of locfit's `rbox()` evaluation structure.
 ///
-/// A cell is split while its width exceeds `cut` times the smallest bandwidth
-/// at its two corners, so a smaller `cut` means more vertices and a finer
-/// interpolation. locfit's default is `0.8` and edgeR never overrides it.
+/// A cell is split while its width exceeds `cut` times the smaller corner
+/// bandwidth, so a smaller `cut` means more vertices. locfit's default is
+/// `0.8`; edgeR never overrides it.
 const LOCFIT_CELL_CUT: f64 = 0.8;
 
 /// Roundoff guard inside locfit's nearest-neighbour count.
 ///
-/// locfit takes `k = (int)(n * alpha + 1e-12)`, so a span that ought to land on
-/// a whole number of points but comes out a hair under it is not truncated down
-/// by one. Dropping this changes `k` for spans like `0.3` on some `n`, and with
-/// it the bandwidth at every vertex.
+/// locfit takes `k = (int)(n * alpha + 1e-12)`, so a span that should land on a
+/// whole number of points is not truncated down by one. Dropping it changes `k`
+/// (and every vertex bandwidth) for spans like `0.3` on some `n`.
 const LOCFIT_NN_EPS: f64 = 1e-12;
 
 /// Degeneracy threshold lifted verbatim from edgeR's `utils.h` (`low_value`).
 ///
-/// Guards two comparisons in `loess_by_col`: the relative tolerance with which
-/// the sliding frame is allowed to move forwards through a run of near-equal
-/// covariate values, and the frame half-width below which every point in the
-/// frame is treated as coincident and given equal weight.
+/// Guards two comparisons in `loess_by_col`: the relative tolerance on the
+/// frame advancing through near-equal covariate values, and the half-width
+/// below which the frame's points count as coincident and get equal weight.
 const LOESS_LOW_VALUE: f64 = 1e-10;
 
 /// Work below which the fan-out over rows stays sequential.
 ///
-/// Measured as `n_rows * n_cols`, the size of the output. A rayon fork costs
-/// more than it saves on the few hundred rows a unit test uses; the 20 000
-/// genes by 21 grid points that `estimateDisp` produces is worth splitting.
+/// Measured as `n_rows * n_cols`. A rayon fork costs more than it saves on unit
+/// test sizes; the 20 000 genes by 21 grid points of `estimateDisp` is worth
+/// splitting.
 const PARALLEL_WORK_THRESHOLD: usize = 1 << 14;
 
 //////////////
@@ -97,9 +78,9 @@ const PARALLEL_WORK_THRESHOLD: usize = 1 << 14;
 pub struct LoessFit {
     /// Smoothed matrix, row-major `n_rows * n_cols`, same shape as the input.
     pub fitted: Vec<f64>,
-    /// Weight each row gave to itself in its own local fit, one per row. This
-    /// is the diagonal of the smoother matrix, which `estimateDisp` uses as the
-    /// effective number of observations behind each smoothed value.
+    /// Weight each row gave itself in its own fit, one per row (the diagonal
+    /// of the smoother matrix). `estimateDisp` uses it as the effective number
+    /// of observations behind each smoothed value.
     pub leverages: Vec<f64>,
 }
 
@@ -184,9 +165,9 @@ fn validate_weights(weights: Option<&[f64]>, n_rows: usize) -> Result<Vec<f64>, 
     Ok(w.to_vec())
 }
 
-////////////////////////////
-// locfit: local fitting  //
-////////////////////////////
+///////////////////////////
+// locfit: local fitting //
+///////////////////////////
 
 /// One evaluation vertex of locfit's adaptive tree.
 #[derive(Clone, Copy, Debug)]
@@ -222,9 +203,8 @@ struct Cell {
 
 /// locfit's tricube kernel, `W()` with `ker = WTCUB`.
 ///
-/// A zero bandwidth is not an error: it means every neighbour has collapsed
-/// onto the fitting point, and locfit then admits exactly the coincident
-/// observations at full weight.
+/// A zero bandwidth means every neighbour sits on the fitting point; locfit
+/// then admits exactly the coincident observations at full weight.
 ///
 /// ### Params
 ///
@@ -249,10 +229,8 @@ fn tricube(dist: f64, h: f64) -> f64 {
 
 /// Nearest-neighbour bandwidth at one fitting point.
 ///
-/// locfit's `compbandwid`: the distance to the `k`-th nearest observation. The
-/// greedy window walk in locfit's `nbhd1` gives the same number, since a window
-/// grown towards whichever neighbour is closer holds exactly the `k` nearest
-/// points and its half-width is their largest distance.
+/// locfit's `compbandwid`: the distance to the `k`-th nearest observation. Same
+/// number as the greedy window walk in locfit's `nbhd1`.
 ///
 /// ### Params
 ///
@@ -282,9 +260,8 @@ fn nn_bandwidth(xs: &[f64], xv: f64, k: usize, scratch: &mut Vec<f64>) -> f64 {
 /// How many vertices locfit will allocate room for.
 ///
 /// `atree_guessnv` with locfit's defaults (`cut = 0.8`, `maxk = 100`) in one
-/// dimension. Exceeding it makes locfit abort with "out of vertex space", so
-/// the same budget is enforced here rather than subdividing forever on a
-/// covariate with a pathologically tight cluster.
+/// dimension. locfit aborts with "out of vertex space" past it; the same budget
+/// stops runaway subdivision on tightly clustered covariates.
 ///
 /// ### Params
 ///
@@ -300,11 +277,9 @@ fn vertex_capacity(span: f64) -> usize {
 
 /// Decides whether a cell still needs splitting.
 ///
-/// locfit's `atree_split` in one dimension: score the cell by its width in
-/// units of the smaller of the two corner bandwidths and split while that
-/// exceeds [`LOCFIT_CELL_CUT`]. A cell whose corners both have zero bandwidth
-/// is scored against the full covariate range instead, which is locfit's way of
-/// still refining where the data is degenerate.
+/// locfit's `atree_split` in one dimension: split while the cell width, in units
+/// of the smaller corner bandwidth, exceeds [`LOCFIT_CELL_CUT`]. A cell with
+/// zero bandwidth at both corners is scored against the full covariate range.
 ///
 /// ### Params
 ///
@@ -314,8 +289,8 @@ fn vertex_capacity(span: f64) -> usize {
 ///
 /// ### Returns
 ///
-/// Whether to split. A non-finite score (an empty covariate range) is a `false`,
-/// matching C's comparison against `NaN`.
+/// Whether to split. A non-finite score (empty covariate range) gives `false`,
+/// as C's comparison against `NaN` does.
 fn needs_split(vertices: &[Vertex], cell: &Cell, range: f64) -> bool {
     let (hl, hr) = (vertices[cell.left].h, vertices[cell.right].h);
     let hmin = match (hl > 0.0, hr > 0.0) {
@@ -335,13 +310,10 @@ fn needs_split(vertices: &[Vertex], cell: &Cell, range: f64) -> bool {
 
 /// Builds locfit's adaptive tree over the covariate range.
 ///
-/// The root cell spans `[min(x), max(x)]` with a vertex at each end, and every
-/// split adds one vertex at the midpoint. Vertices are numbered depth-first,
-/// lower half before upper, exactly as locfit's `atree_grow` numbers them, so
-/// the vertex budget bites at the same point.
-///
-/// The tree depends only on the covariate, the span and the degree, never on
-/// the responses, so it is built once and shared by every column.
+/// The root cell spans `[min(x), max(x)]`; each split adds a midpoint vertex.
+/// Vertices are numbered depth-first, lower half first, as in locfit's
+/// `atree_grow`, so the vertex budget bites at the same point. The tree depends
+/// only on the covariate and span, so it is shared by every column.
 ///
 /// ### Params
 ///
@@ -423,16 +395,14 @@ fn build_tree(
 
 /// Fits the local polynomial at one vertex, for every column at once.
 ///
-/// The window search, the tricube weights and the moment sums `s0`, `s1`, `s2`
-/// depend only on the covariate, so they are computed once and shared across
-/// the columns; only the two right-hand sides are per column. That is the whole
-/// reason columns are not the parallel axis.
+/// The window search, tricube weights and moment sums `s0`, `s1`, `s2` depend
+/// only on the covariate and are shared across columns; only the two right-hand
+/// sides are per column.
 ///
 /// Degree zero is a weighted mean, degree one the weighted least-squares line
-/// in `x - xv` evaluated at `xv`, whose intercept and slope are what locfit
-/// stores at the vertex. A singular normal matrix, which happens when every
-/// point in the window sits on `xv`, falls back to the weighted mean and a zero
-/// slope; that is what locfit's eigenvalue-based solve produces there.
+/// in `x - xv` (intercept and slope are what locfit stores at the vertex). A
+/// singular normal matrix (every window point on `xv`) falls back to the
+/// weighted mean and a zero slope, as locfit's eigenvalue-based solve does.
 ///
 /// ### Params
 ///
@@ -508,9 +478,8 @@ fn fit_vertex(
 /// ### Returns
 ///
 /// `[phi0, phi1, phi2, phi3]`, weighting the left value, right value, left
-/// derivative and right derivative. Outside `[0, z]` it degenerates to a linear
-/// extrapolation off the nearer end, and a zero-width interval returns the left
-/// value alone.
+/// derivative and right derivative. Outside `[0, z]` it extrapolates linearly
+/// off the nearer end; a zero-width interval returns the left value alone.
 #[inline]
 fn hermite2(x: f64, z: f64) -> [f64; 4] {
     if z == 0.0 {
@@ -534,11 +503,9 @@ fn hermite2(x: f64, z: f64) -> [f64; 4] {
 
 /// Interpolates the vertex fits at one covariate value, for every column.
 ///
-/// locfit's `atree_int` followed by `rectcell_interp`: descend to the terminal
-/// cell containing `xq`, then blend its two corners. Degree zero has no
-/// derivative to blend with and falls back to linear interpolation, which is
-/// why an edgeR `locfitByCol` curve of degree zero is piecewise linear between
-/// tree vertices.
+/// locfit's `atree_int` then `rectcell_interp`: descend to the terminal cell
+/// containing `xq` and blend its two corners. Degree zero has no derivative, so
+/// it interpolates linearly between vertices.
 ///
 /// ### Params
 ///
@@ -599,26 +566,23 @@ fn interpolate_row(
 
 /// Local regression smoother for the columns of a matrix.
 ///
-/// Port of edgeR's `locfitByCol`, which is the `locfit` package driven with its
-/// default adaptive-tree evaluation structure. Each column of `y` is smoothed
-/// against the shared covariate `x`; the columns never interact.
+/// Port of edgeR's `locfitByCol`. Each column of `y` is smoothed against the
+/// shared covariate `x`; columns never interact.
 ///
-/// edgeR's own escape hatch is reproduced: when `span * n_rows < 2` or there is
-/// only one row, there is nothing to smooth and `y` is returned unchanged.
+/// Reproduces edgeR's escape hatch: if `span * n_rows < 2` or there is one row,
+/// `y` is returned unchanged.
 ///
-/// The smoother is an approximation to the exact local fit by construction, and
-/// deliberately so, because that is what edgeR gets from locfit. Local fits are
-/// performed only at the corners of an adaptively refined subdivision of the
-/// covariate range, typically a couple of dozen of them regardless of how many
-/// rows there are, and everything between is interpolated. See the module
-/// documentation.
+/// Local fits happen only at the corners of the adaptive subdivision (a couple
+/// of dozen, whatever `n_rows`) and the rest is interpolated, as in locfit. See
+/// the module header.
 ///
 /// ### Params
 ///
 /// * `y` - Row-major matrix of responses, `n_rows * n_cols`
 /// * `n_rows` - Number of rows, the points of each smooth
 /// * `n_cols` - Number of columns, each smoothed independently
-/// * `x` - Covariate, one value per row, in any order, or `None` for `1..=n_rows`
+/// * `x` - Covariate, one value per row, in any order, or `None` for
+///   `1..=n_rows`
 /// * `weights` - Prior weights, one per row, or `None` for all ones. Must be
 ///   non-negative.
 /// * `span` - Proportion of the rows behind each local bandwidth, in `(0, 1]`
@@ -693,9 +657,9 @@ pub fn locfit_by_col(
     Ok(fitted)
 }
 
-////////////////////////////
-// loess: moving average  //
-////////////////////////////
+///////////////////////////
+// loess: moving average //
+///////////////////////////
 
 /// The local frame around one row, as edgeR's C++ leaves it.
 #[derive(Clone, Copy, Debug)]
@@ -708,13 +672,11 @@ struct Frame {
 
 /// Slides edgeR's frame once across the sorted covariate.
 ///
-/// This is the loop-carried part of `R_loess_by_col.cpp` and the reason the
-/// routine is `O(n_rows)` here rather than `O(n_rows * span * n_rows)`: the
-/// frame only ever advances, because the frame that minimises the largest
-/// distance for one row can only be at or ahead of the one that minimised it
-/// for the previous row. The relative tolerance on the advance is edgeR's
-/// protection against a run of near-equal covariate values walling the frame
-/// off behind a rounding difference.
+/// The loop-carried part of `R_loess_by_col.cpp`. The frame only advances: the
+/// frame minimising the largest distance for one row is at or ahead of the one
+/// for the previous row. The relative tolerance on the advance is edgeR's guard
+/// against near-equal covariate values walling the frame off behind a rounding
+/// difference.
 ///
 /// ### Params
 ///
@@ -759,12 +721,9 @@ fn slide_frames(xs: &[f64], nspan: usize) -> Vec<Frame> {
 
 /// Fills one row of the fitted matrix and its leverage.
 ///
-/// Sums are accumulated from the far end of the frame back towards row zero,
-/// which is edgeR's order and therefore the one that reproduces its rounding.
-/// Rows below the frame's reach are skipped rather than visited and discarded:
-/// a point further than `max_dist` from the fitting point gets a negative
-/// tricube weight, which edgeR drops, so trimming the scan changes nothing but
-/// the running time.
+/// Sums run from the far end of the frame back towards row zero, edgeR's order,
+/// to reproduce its rounding. Rows beyond `max_dist` would get a negative
+/// tricube weight, which edgeR drops, so the scan skips them.
 ///
 /// ### Params
 ///
@@ -825,27 +784,24 @@ fn loess_row(
 
 /// Fits a degree-zero lowess curve to each column of a matrix.
 ///
-/// Port of edgeR's `loessByCol` and the `R_loess_by_col.cpp` behind it: a
-/// tricube-weighted moving average whose window is the tightest run of
-/// `floor(span * n_rows)` consecutive rows around each row. Alongside the
-/// smoothed matrix it returns the leverages, the weight each row gave itself,
-/// which is the diagonal of the smoother matrix.
+/// Port of edgeR's `loessByCol` (`R_loess_by_col.cpp`): a tricube moving
+/// average over the tightest run of `floor(span * n_rows)` consecutive rows
+/// around each row, plus the leverages (the smoother matrix diagonal).
 ///
-/// edgeR's C++ requires `x` to be sorted and does not check. This does not: the
-/// rows are sorted by `x` internally and the results mapped back, so `fitted`
-/// and `leverages` line up with the caller's own row order. On sorted input,
-/// which is how edgeR always calls it, that is the identity permutation and the
-/// answer is bit for bit edgeR's.
+/// edgeR's C++ requires sorted `x` and does not check. Here rows are sorted
+/// internally and results mapped back to the caller's order; on sorted input
+/// the answer is bit for bit edgeR's.
 ///
-/// As in edgeR, a span too small to hold two rows leaves `y` untouched and
-/// gives every row a leverage of one.
+/// As in edgeR, a span too small to hold two rows returns `y` unchanged with
+/// leverage one for every row.
 ///
 /// ### Params
 ///
 /// * `y` - Row-major matrix of responses, `n_rows * n_cols`
 /// * `n_rows` - Number of rows, the points of each smooth
 /// * `n_cols` - Number of columns, each smoothed independently
-/// * `x` - Covariate, one value per row, in any order, or `None` for `1..=n_rows`
+/// * `x` - Covariate, one value per row, in any order, or `None` for
+///   `1..=n_rows`
 /// * `span` - Proportion of the rows inside each window, in `(0, 1]`
 ///
 /// ### Returns
@@ -927,18 +883,15 @@ mod tests {
 
     /// Relative tolerance against edgeR, applied with no absolute floor.
     ///
-    /// The worst disagreement actually observed across every case below is
-    /// 2.6e-15 for `locfit_by_col` and 4.0e-16 for `loess_by_col`.
-    /// `loess_by_col` performs the same additions in the same order as edgeR's
-    /// C++ and comes back bit for bit identical on most of these cases;
-    /// `locfit_by_col` solves each local regression directly where locfit goes
-    /// through an eigendecomposition, which costs a few ulps. The tolerance is
-    /// loosened to 1e-12 only so a different optimiser or libm cannot make the
-    /// suite flaky.
+    /// Worst observed disagreement across the cases below is 2.6e-15 for
+    /// `locfit_by_col` (direct solve where locfit uses an eigendecomposition)
+    /// and 4.0e-16 for `loess_by_col` (same additions in the same order as the
+    /// C++). Set to 1e-12 so a different optimiser or libm cannot make the suite
+    /// flaky.
     const TOL: f64 = 1e-12;
 
     /// The shared 24-row, two-column fixture, built from exactly representable
-    /// arithmetic so that R and Rust construct bit-identical inputs.
+    /// arithmetic so R and Rust get bit-identical inputs.
     ///
     /// R: `i <- 1:24; x <- i/32;`
     /// `y1 <- 3*x - 2*x*x + ((i*i*37) %% 101)/500 - 0.1;`
@@ -1467,9 +1420,9 @@ mod tests {
         1.0, 1.0, 1.0
     ];
 
-    ////////////////////
-    // locfit_by_col  //
-    ////////////////////
+    ///////////////////
+    // locfit_by_col //
+    ///////////////////
 
     #[test]
     fn test_locfit_matches_edger_at_degree_0() {
@@ -1534,9 +1487,9 @@ mod tests {
         assert_eq!(same, plain);
     }
 
-    /// `None` means edgeR's `1:ntags`. Here that is an affine map of `i/32`,
-    /// and locfit is equivariant under an affine change of covariate, so the
-    /// answer is the same one the explicit covariate gives.
+    /// `None` means edgeR's `1:ntags`, an affine map of `i/32`; locfit is
+    /// equivariant under affine covariate changes, so the answer matches the
+    /// explicit covariate.
     #[test]
     fn test_locfit_default_covariate() {
         let (_, y, _) = fixture();
@@ -1556,8 +1509,7 @@ mod tests {
         }
     }
 
-    /// Tied covariate values share one fitted value, since the fit only ever
-    /// depends on the covariate.
+    /// Tied covariate values share one fitted value.
     #[test]
     fn test_locfit_ties_in_x() {
         let (x, y) = ties_fixture();
@@ -1624,10 +1576,8 @@ mod tests {
         assert_close(&fit, &want);
     }
 
-    /// The rayon fan-out must be bit-for-bit the sequential answer: every
-    /// vertex fit and every interpolated row is independent of the rest, so
-    /// splitting them changes no summation order. Eight columns crosses the
-    /// gate, four does not, and the columns are independent.
+    /// The rayon fan-out must be bit-for-bit the sequential answer. Eight
+    /// columns crosses the gate, four does not, and the columns are independent.
     #[test]
     fn test_locfit_parallel_path_agrees_with_sequential() {
         let (rows, cols) = (2048usize, 8usize);
@@ -1645,9 +1595,9 @@ mod tests {
         assert_eq!(seq, sliced);
     }
 
-    ////////////////////
-    // loess_by_col   //
-    ////////////////////
+    //////////////////
+    // loess_by_col //
+    //////////////////
 
     #[test]
     fn test_loess_matches_edger() {
@@ -1695,10 +1645,9 @@ mod tests {
         }
     }
 
-    /// Every covariate value identical. edgeR's frame still walks forwards
-    /// through the run, so row `i` is averaged over the first `max(i, nspan)`
-    /// rows and its leverage is one over that count. It is a quirk of the
-    /// C++, not a smoothing decision, and it is reproduced here deliberately.
+    /// Every covariate value identical. edgeR's frame still walks forwards, so
+    /// row `i` is averaged over the first `max(i, nspan)` rows and its leverage
+    /// is one over that count. A quirk of the C++, reproduced deliberately.
     #[test]
     fn test_loess_all_x_identical() {
         let (x, y) = flat_fixture();
@@ -1882,10 +1831,8 @@ mod tests {
         assert!(locfit_by_col(&y, 24, 2, Some(&x), Some(&zeroed), 0.5, 0).is_ok());
     }
 
-    /// locfit sizes its vertex array up front and aborts with "out of vertex
-    /// space" if the refinement wants more. The same budget is enforced here,
-    /// so a covariate whose clusters are too tight to tile is a refusal rather
-    /// than an endless subdivision.
+    /// locfit aborts with "out of vertex space" past its up-front budget; the
+    /// same budget makes a covariate with too-tight clusters an error here.
     #[test]
     fn test_tree_respects_locfits_vertex_budget() {
         assert_eq!(vertex_capacity(0.3), 43);

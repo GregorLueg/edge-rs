@@ -1,19 +1,17 @@
 //! Empirical Bayes shrinkage of the per-gene cell-level overdispersion.
 //!
-//! This has no upstream in edgeR, limma or `nebula`. It is edgePython's own
-//! addition (`sc_fit.py`, `shrink_sc_disp`).
+//! No upstream in edgeR, limma or `nebula`: this is edgePython's own addition
+//! (`sc_fit.py`, `shrink_sc_disp`).
 //!
-//! The idea is to treat `phi = 1 / dispersion` as if it were a sample variance
-//! on `df_residual` degrees of freedom and push it through limma's
-//! [`squeeze_var`]. That assumption is the weak part: `phi` is a maximum
-//! likelihood overdispersion, not a scaled chi-squared variance, so the prior
-//! degrees of freedom that come back are a shrinkage knob rather than a
-//! calibrated quantity. It works in the sense that it pulls extreme genes
-//! towards the middle. It does not have edgeR's `squeezeVar` guarantees.
+//! Treats `phi = 1 / dispersion` as a sample variance on `df_residual` degrees
+//! of freedom and passes it through limma's [`squeeze_var`]. The assumption is
+//! weak: `phi` is an ML overdispersion, not a scaled chi-squared variance, so
+//! the prior degrees of freedom are a shrinkage knob, not a calibrated
+//! quantity. It pulls extreme genes towards the middle without `squeezeVar`'s
+//! guarantees.
 //!
-//! The fallback ladder is edgePython's: trended, then untrended, then untrended
-//! and non-robust, then no shrinkage at all. Every step is a genuine numerical
-//! failure of the fit below it, not a preference.
+//! Fallback ladder (edgePython's): trended, untrended, untrended non-robust,
+//! then no shrinkage. Each rung is reached only on numerical failure above it.
 
 use crate::errors::EdgeErrors;
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
@@ -25,15 +23,11 @@ use crate::numeric::stats::median as numeric_median;
 
 /// Smallest `phi` fed to [`squeeze_var`].
 ///
-/// A gene whose dispersion overflows gives `phi = 0`, which `squeeze_var`
-/// accepts but which drags the moment estimate of the prior to zero. edgePython
-/// floors at the same value.
+/// `phi = 0` (overflowed dispersion) would drag the prior's moment estimate to
+/// zero. edgePython floors at the same value.
 const PHI_FLOOR: f64 = 1e-8;
 
-/// Fewest usable genes worth fitting a prior from.
-///
-/// Below this the moment estimator has nothing to work with, so the result is
-/// returned unshrunk rather than shrunk towards noise.
+/// Fewest usable genes to fit a prior from; below this the result is unshrunk.
 const MIN_GENES_FOR_PRIOR: usize = 3;
 
 /////////////////
@@ -43,10 +37,8 @@ const MIN_GENES_FOR_PRIOR: usize = 3;
 /// Tuning knobs for [`shrink_sc_dispersion`].
 #[derive(Clone, Copy, Debug)]
 pub struct ShrinkParams {
-    /// Whether to Winsorise the moments, protecting the prior from genes with
-    /// extreme dispersion. edgePython defaults this on, so this does too, and
-    /// it is the reason the fallback ladder exists: the robust fit is the one
-    /// that can fail.
+    /// Winsorise the moments to protect the prior from extreme genes. On by
+    /// default, as in edgePython; the robust fit is the one that can fail.
     pub robust: bool,
 }
 
@@ -62,20 +54,18 @@ pub struct ShrinkResult {
     /// `1 / dispersion` as fitted, before shrinkage. Infinite where the
     /// dispersion is zero.
     pub phi_raw: Vec<f64>,
-    /// Posterior `phi`. Genes that were excluded from the prior fit carry the
-    /// median prior rather than their own estimate.
+    /// Posterior `phi`. Genes excluded from the prior fit carry the median
+    /// prior.
     pub phi_post: Vec<f64>,
-    /// The prior `phi` each gene was shrunk towards. Constant unless a
-    /// covariate produced a trended prior.
+    /// Prior `phi` each gene was shrunk towards; constant unless trended.
     pub phi_prior: Vec<f64>,
     /// Residual degrees of freedom used for every gene.
     pub df_residual: f64,
-    /// Prior degrees of freedom from the empirical Bayes fit. Length one unless
-    /// the robust fit produced a per-gene vector, and all zero when the ladder
-    /// fell through to no shrinkage.
+    /// Prior degrees of freedom. Length one unless the robust fit gave a
+    /// per-gene vector; all zero when nothing was shrunk.
     pub df_prior: Vec<f64>,
-    /// `1 / phi_post`, the quantity callers actually substitute back into the
-    /// model. Infinite where `phi_post` is zero.
+    /// `1 / phi_post`, to substitute back into the model. Infinite where
+    /// `phi_post` is zero.
     pub dispersion_shrunk: Vec<f64>,
 }
 
@@ -85,9 +75,8 @@ pub struct ShrinkResult {
 
 /// Residual degrees of freedom for a NEBULA fit.
 ///
-/// `n_cells - n_coef - (n_subjects - 1)`, floored at one. The subject term is
-/// there because the random effect absorbs one degree of freedom per subject
-/// beyond the first.
+/// `n_cells - n_coef - (n_subjects - 1)`, floored at one. The random effect
+/// absorbs one degree of freedom per subject beyond the first.
 ///
 /// ### Params
 ///
@@ -109,12 +98,8 @@ pub fn sc_residual_df(n_cells: usize, n_coef: usize, n_subjects: usize) -> f64 {
 
 /// Shrinks per-gene cell-level dispersions towards an empirical Bayes prior.
 ///
-/// Only genes that converged and have a finite, positive `phi` contribute to
-/// the prior. Everything else is handed the median prior, which is the most
-/// honest thing to give a gene whose own estimate is not trustworthy.
-///
-/// See the module documentation: this procedure has no upstream reference and
-/// the chi-squared assumption behind it is not satisfied.
+/// Only converged genes with a finite, positive `phi` contribute to the prior.
+/// The rest get the median prior. See the module documentation for the caveats.
 ///
 /// ### Params
 ///
@@ -172,7 +157,7 @@ pub fn shrink_sc_dispersion(
         .map(|&d| if d > 0.0 { 1.0 / d } else { f64::INFINITY })
         .collect();
 
-    // A gene earns a say in the prior by converging and by having a finite phi.
+    // Converged and finite phi to contribute to the prior.
     let usable: Vec<usize> = (0..n_genes)
         .filter(|&g| convergence[g] == 1 && phi_raw[g].is_finite())
         .collect();
@@ -213,8 +198,7 @@ pub fn shrink_sc_dispersion(
         return Ok(unshrunk(phi_raw, df_residual, dispersion));
     };
 
-    // The prior a gene outside the fit gets. Trended priors give one value per
-    // usable gene, so the median is the only defensible single number.
+    // Prior for genes outside the fit: the median of the per-gene priors.
     let median_prior = median(&sv.var_prior);
 
     let mut phi_post = vec![median_prior; n_genes];

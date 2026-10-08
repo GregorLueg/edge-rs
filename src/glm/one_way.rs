@@ -1,14 +1,12 @@
 //! Closed-form fits for one-way layouts.
 //!
-//! edgeR's `mglmOneWay`. When the design has exactly one column per distinct
-//! design row, every group's mean is an independent intercept-only fit, so
-//! there is no linear system and no Levenberg damping: fit each group with
-//! Fisher scoring, then rotate the group means back into coefficient space with
-//! a single small solve shared by all genes.
+//! Ports edgeR's `mglmOneWay`. When the design has one column per distinct
+//! design row, each group is an independent intercept-only fit: Fisher scoring
+//! per group, then one small solve shared by all genes rotates the group means
+//! into coefficient space.
 //!
-//! This is the path `glmFit` takes for the overwhelming majority of bulk
-//! experiments, since a design built from a group factor always qualifies.
-//! [`crate::glm::levenberg`] is the fallback for anything else.
+//! This is the `glmFit` path for any design built from a group factor.
+//! [`crate::glm::levenberg`] is the fallback for everything else.
 
 use faer::MatRef;
 use faer::linalg::solvers::Solve;
@@ -26,9 +24,8 @@ use crate::utils::design::design_as_factor;
 
 /// Floor applied to group coefficients before they are used.
 ///
-/// A group whose counts are all zero fits to [`crate::glm::one_group`]'s empty
-/// gene fallback, and edgeR clamps here so the subsequent solve cannot produce
-/// an infinite coefficient from a finite design.
+/// An all-zero group fits to [`crate::glm::one_group`]'s empty-gene fallback.
+/// edgeR clamps here so the solve cannot return an infinite coefficient.
 const MIN_COEF: f64 = -1e8;
 
 ///////////////
@@ -50,9 +47,8 @@ pub struct OneWayFit {
 
 /// Whether a design is a plain group indicator.
 ///
-/// edgeR skips the rotation entirely in that case, since the group means already
-/// are the coefficients. The test counts entries rather than checking structure,
-/// matching edgeR: exactly one 1 per row and zeros everywhere else.
+/// edgeR skips the rotation then, as the group means are the coefficients. The
+/// test counts entries, as edgeR does: exactly one 1 per row, zeros elsewhere.
 ///
 /// ### Params
 ///
@@ -171,8 +167,7 @@ pub fn mglm_one_way<T: EdgeFloat>(
     }
     let needs_rotation = !is_group_indicator(&unique_rows, n_groups);
 
-    // Factorise the rotation once, outside the per-gene loop. It is the same
-    // `n_groups` by `n_groups` system for every gene.
+    // Same `n_groups` by `n_groups` system for every gene: factorise once.
     let rotation = needs_rotation
         .then(|| MatRef::from_row_major_slice(&unique_rows, n_groups, n_coef).partial_piv_lu());
 
@@ -205,8 +200,7 @@ pub fn mglm_one_way<T: EdgeFloat>(
                 .max(MIN_COEF);
             }
 
-            // Fitted values follow from the group means directly, before any
-            // rotation: rotating and re-expanding would only lose precision.
+            // Fitted values come from the group means, before rotation.
             for (g, group_members) in members.iter().enumerate() {
                 for &sample in group_members {
                     let eta =
@@ -327,8 +321,7 @@ mod tests {
         );
     }
 
-    /// The fitted values do not depend on the parametrisation, only the
-    /// coefficients do.
+    /// Fitted values are parametrisation-independent; coefficients are not.
     #[test]
     fn test_fitted_values_are_parametrisation_independent() {
         let (counts, n_genes, n_samples) = fixture();
@@ -363,9 +356,7 @@ mod tests {
         }
     }
 
-    /// The one-way fit and the general Levenberg fit describe the same model, so
-    /// they must land on the same answer. This is the check that matters: it
-    /// pins the fast path against the general one.
+    /// The one-way and Levenberg fits describe the same model and must agree.
     #[test]
     fn test_agrees_with_the_levenberg_fit() {
         use crate::glm::levenberg::mglm_levenberg;

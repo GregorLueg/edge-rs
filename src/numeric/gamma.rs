@@ -1,21 +1,15 @@
-//! The polygamma family in `f64`: the `scipy.special` calls edgeR and limma
-//! make.
+//! The polygamma family: the `scipy.special` calls edgeR and limma make.
 //!
-//! `ln_gamma` is delegated to `statrs`. Everything else is implemented here as
-//! upward recurrence to a fixed threshold followed by the asymptotic Bernoulli
-//! series. [`trigamma`] is literally [`polygamma`] at order one rather than a
-//! second implementation, so the two cannot drift apart.
+//! `ln_gamma` is delegated to `statrs`. The rest is upward recurrence to a
+//! threshold followed by the asymptotic Bernoulli series. [`trigamma`] is
+//! [`polygamma`] at order one, so the two cannot drift apart.
 //!
-//! [`logmdigamma`] exists because `ln(x) - digamma(x)` cancels catastrophically
-//! for large `x`: both terms are `ln(x)` to leading order and the answer is
-//! `1/(2x)`. At `x = 1e6` the naive form keeps about four digits. statmod
-//! carries the function for exactly this reason and limma leans on it.
+//! [`logmdigamma`] (statmod's `logmdigamma`) avoids the cancellation in
+//! `ln(x) - digamma(x)`: both terms are `ln(x)` to leading order and the answer
+//! is `1/(2x)`, so at `x = 1e6` the naive form keeps about four digits.
 //!
-//! ### Domain
-//!
-//! Everything here is defined for `x > 0` only, which is all edgeR ever asks
-//! for. Non-positive arguments return `NaN` rather than reflecting across the
-//! poles.
+//! All functions are defined for `x > 0` only, which is all edgeR asks for.
+//! Non-positive arguments return `NaN`.
 
 use statrs::function::gamma;
 
@@ -29,9 +23,8 @@ const RECURRENCE_THRESHOLD: f64 = 20.0;
 
 /// Highest polygamma order [`polygamma`] will evaluate.
 ///
-/// The asymptotic series carries factorials of `2k + n`, and past this order the
-/// truncation stops being negligible at the shifted argument. edgeR needs orders
-/// zero through two; ten is slack, not a target.
+/// Past this order the truncated series is no longer negligible at the shifted
+/// argument. edgeR needs orders zero to two.
 const POLYGAMMA_MAX_ORDER: usize = 10;
 
 /// Bernoulli numbers `B_2, B_4, ..., B_20`, used by the general polygamma
@@ -52,8 +45,7 @@ const BERNOULLI_EVEN: [f64; 10] = [
 /// Coefficients `B_2k / (2k)` for `k = 1..=8`, the asymptotic expansion of
 /// `ln(z) - digamma(z)` in powers of `z^-2`.
 ///
-/// Held separately from [`BERNOULLI_EVEN`] so the `digamma` path is a plain
-/// Horner evaluation with no factorial bookkeeping.
+/// Separate from [`BERNOULLI_EVEN`] so `digamma` is a plain Horner evaluation.
 const LOG_MINUS_DIGAMMA_COEFFS: [f64; 8] = [
     1.0 / 12.0,
     -1.0 / 120.0,
@@ -70,8 +62,7 @@ const TRIGAMMA_INVERSE_MAX_ITER: usize = 50;
 
 /// Relative step size at which [`trigamma_inverse`] declares convergence.
 ///
-/// limma stops at `1e-8`; the extra two digits cost at most one more iteration
-/// and put the round trip inside `f64` rounding.
+/// limma stops at `1e-8`; two more digits cost at most one more iteration.
 const TRIGAMMA_INVERSE_TOL: f64 = 1e-10;
 
 /// Above this, `trigamma_inverse(x)` is `1/sqrt(x)` to full precision, since
@@ -88,8 +79,7 @@ const TRIGAMMA_INVERSE_SMALL: f64 = 1e-6;
 
 /// Whether an argument falls outside the `x > 0` domain this module supports.
 ///
-/// Written out rather than as `!(x > 0.0)` so the `NaN` case is explicit: a
-/// `NaN` argument propagates, it does not silently take the positive branch.
+/// `NaN` counts as outside, so it propagates instead of taking the positive branch.
 ///
 /// ### Params
 ///
@@ -103,13 +93,11 @@ fn is_outside_domain(x: f64) -> bool {
     x.is_nan() || x <= 0.0
 }
 
-/// Walks `x` up in unit steps until it reaches `target`, accumulating the
-/// recurrence correction on the way.
+/// Walks `x` up in unit steps to `target`, accumulating the recurrence
+/// correction.
 ///
-/// Every function here shares the same shape: shift the argument into the range
-/// where the asymptotic series is good, and carry a sum of `(x + j)^-power` for
-/// the steps taken. The sum is accumulated from the largest `j` downwards so the
-/// small terms are not rounded away against the first one.
+/// The sum of `(x + j)^-power` is accumulated from the largest `j` downwards so
+/// the small terms are not rounded away against the first.
 ///
 /// ### Params
 ///
@@ -138,8 +126,7 @@ fn shift_to_threshold(x: f64, target: f64, power: i32) -> (f64, f64) {
 
 /// Asymptotic expansion of `ln(z) - psi(z)` for `z >= RECURRENCE_THRESHOLD`.
 ///
-/// `1/(2z) + sum_k B_2k / (2k z^2k)`, evaluated by Horner in `z^-2`. Both terms
-/// are positive-definite small quantities, so there is no cancellation to lose.
+/// `1/(2z) + sum_k B_2k / (2k z^2k)`, evaluated by Horner in `z^-2`.
 ///
 /// ### Params
 ///
@@ -161,9 +148,8 @@ fn log_minus_digamma_asymptotic(z: f64) -> f64 {
 
 /// Asymptotic Bernoulli series for `psi^(n)(z)`, order `n >= 1`.
 ///
-/// The factorial ratio `(2k + n - 1)! / (2k)!` is formed as the product of the
-/// `n - 1` integers above `2k`, which keeps it out of overflow range for every
-/// order this module accepts.
+/// The ratio `(2k + n - 1)! / (2k)!` is formed as a product of `n - 1` integers,
+/// avoiding overflow.
 ///
 /// ### Params
 ///
@@ -196,8 +182,7 @@ fn polygamma_asymptotic(n: usize, z: f64) -> f64 {
 
 /// Factorial of a small integer as `f64`.
 ///
-/// Only ever called with arguments up to [`POLYGAMMA_MAX_ORDER`], well inside
-/// the exactly representable range.
+/// Only called with arguments up to [`POLYGAMMA_MAX_ORDER`], so exact in `f64`.
 ///
 /// ### Params
 ///
@@ -231,9 +216,8 @@ pub fn ln_gamma(x: f64) -> f64 {
 
 /// Digamma function, the logarithmic derivative of the gamma function.
 ///
-/// Recurrence up to [`RECURRENCE_THRESHOLD`], then `ln(z)` minus the asymptotic
-/// expansion of `ln(z) - psi(z)`. Sharing that expansion with [`logmdigamma`]
-/// keeps the two mutually consistent.
+/// Recurrence up to `RECURRENCE_THRESHOLD`, then `ln(z)` minus the asymptotic
+/// expansion of `ln(z) - psi(z)`, shared with [`logmdigamma`].
 ///
 /// ### Params
 ///
@@ -276,12 +260,11 @@ pub fn trigamma(x: f64) -> f64 {
 ///                           + sum_k B_2k (2k+n-1)!/(2k)! z^-(2k+n) ]
 /// ```
 ///
-/// The shift target grows with `n` because the series is in `n/z` as much as in
-/// `1/z`.
+/// The shift target grows with `n` because the series is in `n/z` as much as `1/z`.
 ///
 /// ### Params
 ///
-/// * `n` - Order of differentiation. Orders above [`POLYGAMMA_MAX_ORDER`] give
+/// * `n` - Order of differentiation. Orders above `POLYGAMMA_MAX_ORDER` give
 ///   `NaN`; edgeR never asks past two.
 /// * `x` - Argument, must be strictly positive.
 ///
@@ -309,16 +292,10 @@ pub fn polygamma(n: usize, x: f64) -> f64 {
 
 /// Inverse of the trigamma function.
 ///
-/// A port of limma's `trigammaInverse()`. Newton's method is applied to
-/// `f(y) = 1/psi'(y) - 1/x` rather than to `psi'(y) - x`, because `1/psi'` is
-/// close to linear in `y`, which is what makes the `0.5 + 1/x` start good enough
-/// to converge in a handful of steps across the whole range. The two clamps
-/// cover the tails, where the starting value is already the answer.
-///
-/// Note that edgePython's `_trigamma_inverse` returns `1/x` in the `x > 1e7`
-/// branch. That is wrong: for large `x` the root is small, where
-/// `psi'(y) ~ 1/y^2`, so the answer is `1/sqrt(x)`. limma has it right and this
-/// follows limma.
+/// Port of limma's `trigammaInverse()`. Newton runs on `f(y) = 1/psi'(y) - 1/x`,
+/// which is near-linear in `y`, so the `0.5 + 1/x` start converges in a handful
+/// of steps. Two clamps cover the tails. For `x > 1e7` the root is `1/sqrt(x)`
+/// (edgePython returns `1/x`, which is wrong). See `UPSTREAM_DEVIATIONS.md` A9.
 ///
 /// ### Params
 ///
@@ -347,9 +324,8 @@ pub fn trigamma_inverse(x: f64) -> f64 {
         let tri = trigamma(y);
         let dif = tri * (1.0 - tri / x) / polygamma(2, y);
         y += dif;
-        // A Newton step can overshoot past the pole at zero on a bad start.
-        // limma has no such reset; this guard is ours, and restarting from `x`
-        // is cheaper than returning a root the function has no business having.
+        // A Newton step can overshoot past the pole at zero. limma has no
+        // such reset; this guard is ours.
         if y <= 0.0 {
             y = x;
         }
@@ -362,15 +338,14 @@ pub fn trigamma_inverse(x: f64) -> f64 {
 
 /// `ln(x) - digamma(x)`, computed without subtractive cancellation.
 ///
-/// The naive difference loses roughly `log10(x)` digits, because both terms are
-/// `ln(x)` to leading order while the result is `1/(2x)`. Here the shift is
-/// applied to the recurrence identity
+/// The naive difference loses about `log10(x)` digits. The shift is applied to
+/// the recurrence identity
 ///
 /// ```text
 /// ln(x) - psi(x) = ln(x/z) + [ln(z) - psi(z)] + sum_j 1/(x + j)
 /// ```
 ///
-/// so nothing large is ever subtracted from anything large.
+/// so nothing large is subtracted from anything large.
 ///
 /// ### Params
 ///
@@ -402,9 +377,8 @@ mod tests {
 
     /// `scipy.special.gammaln(x)` for each `x`.
     ///
-    /// Every reference table here is the shortest round-tripping `repr()` of
-    /// the scipy `float64`, so the literal is the same bit pattern scipy
-    /// produced.
+    /// Reference tables are the shortest round-tripping `repr()` of the scipy
+    /// `float64`.
     const LN_GAMMA_REF: [(f64, f64); 11] = [
         (0.001, 6.907178885383853),
         (0.1, 2.252712651734206),
@@ -483,9 +457,7 @@ mod tests {
     ];
 
     /// `mpmath.log(x) - mpmath.digamma(x)` at 40 decimal digits, rounded to
-    /// `f64`. mpmath rather than scipy because the point of `logmdigamma` is
-    /// that the naive `log(x) - digamma(x)` scipy would compute is itself the
-    /// thing under test.
+    /// `f64`. mpmath rather than scipy, as the naive difference is under test.
     const LOGMDIGAMMA_REF: [(f64, f64); 9] = [
         (0.001, 993.6678166528282),
         (0.5, 1.2703628454614782),
@@ -500,8 +472,8 @@ mod tests {
 
     #[test]
     fn test_ln_gamma_matches_scipy_across_magnitudes() {
-        // The Lanczos approximation in statrs is the loosest thing in this
-        // module: about 1e-14 relative, against 1e-15 for everything else.
+        // statrs' Lanczos approximation is the loosest here: about 1e-14
+        // relative, against 1e-15 elsewhere.
         for (x, expected) in LN_GAMMA_REF {
             assert_relative_eq!(ln_gamma(x), expected, max_relative = 1e-13, epsilon = 1e-15);
         }
@@ -551,9 +523,7 @@ mod tests {
     #[test]
     fn test_recurrence_boundary_agrees_from_both_sides() {
         // 19.5 takes a recurrence step, 20.5 goes straight to the series. The
-        // exact recurrence relating them is the sharpest available test that
-        // the two paths meet: a straddle test cannot distinguish a seam from
-        // the genuine change in the function over the interval.
+        // exact recurrence relating them tests that the two paths meet.
         let lo = RECURRENCE_THRESHOLD - 0.5;
         let hi = lo + 1.0;
         assert!(lo < RECURRENCE_THRESHOLD && hi >= RECURRENCE_THRESHOLD);
@@ -612,9 +582,7 @@ mod tests {
             assert_relative_eq!(logmdigamma(x), expected, max_relative = 1e-14);
         }
 
-        // The whole reason the function exists: at 1e10 the naive difference
-        // has nothing left. Assert the failure so the comparison is not
-        // wishful thinking.
+        // At 1e10 the naive difference has nothing left; assert that failure.
         let x: f64 = 1e10;
         let expected: f64 = 5.0000000000833335e-11;
         let naive = x.ln() - digamma(x);
@@ -658,10 +626,9 @@ mod tests {
         assert_relative_eq!(trigamma_inverse(1e12), 1e-6, max_relative = 1e-12);
         assert_relative_eq!(trigamma_inverse(1e-9), 1e9, max_relative = 1e-12);
 
-        // limma's clamps drop the next term of the expansion, so the round trip
-        // through the tails is only good to the size of that term: psi'(1/sqrt(x))
-        // carries an extra pi^2/6 on top of x, and psi'(1/x) an extra x^2/2.
-        // At the clamp boundaries that is ~1e-7 relative, not machine precision.
+        // limma's clamps drop the next expansion term: psi'(1/sqrt(x)) carries
+        // an extra pi^2/6 on top of x, and psi'(1/x) an extra x^2/2. At the
+        // boundaries that is ~1e-7 relative.
         for x in [2e7, 1e9, 1e14] {
             assert_relative_eq!(trigamma(trigamma_inverse(x)), x, max_relative = 1e-7);
         }

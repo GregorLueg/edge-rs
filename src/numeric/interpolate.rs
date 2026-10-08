@@ -1,18 +1,15 @@
 //! Interpolation: the layer edgeR gets from R's C sources.
 //!
-//! Three things live here: the Forsythe-Malcolm-Moler cubic spline, which is
-//! what R's `spline(method = "fmm")` fits and what edgeR's
-//! `maximizeInterpolant` is built on. The natural spline basis behind
-//! `dispCoxReidSplineTrend`. And plain piecewise-linear interpolation, which
-//! voom leans on for its mean-variance trend.
+//! Contents:
 //!
-//! [`maximize_interpolant`] is the key one: every tagwise dispersion in
-//! the package is the abscissa it returns. It reproduces edgeR's C `find_max`
-//! step for step rather than handing the curve to a general optimiser, because
-//! the grid is coarse and the answer has to be the same one edgeR would give,
-//! not merely a nearby stationary point.
+//! * the Forsythe-Malcolm-Moler cubic spline (R's `spline(method = "fmm")`),
+//!   which edgeR's `maximizeInterpolant` is built on
+//! * the natural spline basis behind `dispCoxReidSplineTrend`
+//! * piecewise-linear interpolation, for voom's mean-variance trend
 //!
-//! Per the crate numeric policy this module is `f64` only.
+//! [`maximize_interpolant`] returns every tagwise dispersion. It reproduces
+//! edgeR's C `find_max` step for step: on a coarse grid a general optimiser
+//! would land on a different stationary point.
 
 use rayon::prelude::*;
 
@@ -25,15 +22,12 @@ use crate::prelude::*;
 
 /// Fewest knots the FMM spline accepts.
 ///
-/// Two knots degenerate to a straight line, which R still calls a spline, so
-/// that is the floor rather than the four knots the full end conditions need.
+/// Two knots degenerate to a straight line, which R still fits.
 const MIN_SPLINE_KNOTS: usize = 2;
 
 /// Fewest columns [`natural_spline_basis`] will produce.
 ///
-/// One intercept plus one linear term. Anything smaller is not a spline basis,
-/// it is a rank-deficient design, so it is rejected rather than silently
-/// truncated.
+/// One intercept plus one linear term; anything smaller is rejected.
 const MIN_BASIS_DF: usize = 2;
 
 /// Fewest points the linear interpolators accept.
@@ -94,8 +88,7 @@ fn validate_interp_knots(xp: &[f64], fp: &[f64]) -> Result<(), EdgeErrors> {
 
 /// Checks that a vector is strictly increasing.
 ///
-/// Ties matter as much as inversions: a repeated abscissa makes a segment of
-/// zero width, and every routine here divides by that width.
+/// Ties are rejected too: a repeated abscissa gives a zero-width segment.
 ///
 /// ### Params
 ///
@@ -132,10 +125,9 @@ fn strictly_increasing(x: &[f64], name: &str) -> Result<(), EdgeErrors> {
 /// S(t) = y[i] + b[i] * t + c[i] * t^2 + d[i] * t^3,   t = x_eval - x[i]
 /// ```
 ///
-/// which is the layout R's `splines.c` writes and the one edgeR's `find_max`
-/// reads. All five vectors have the same length, one entry per knot; the last
-/// entry of `b`, `c` and `d` describes the extrapolating polynomial to the right
-/// of the final knot.
+/// the layout R's `splines.c` writes and edgeR's `find_max` reads. All vectors
+/// have one entry per knot; the last entry of `b`, `c` and `d` is the
+/// extrapolating polynomial right of the final knot.
 ///
 /// ### References
 ///
@@ -157,11 +149,9 @@ pub struct FmmSpline {
 
 /// Fits an FMM cubic spline through the given knots.
 ///
-/// Not-a-knot end conditions: the third derivative is matched across the second
-/// and second-to-last knots, so the end segments are cubics fitted to the four
-/// outermost points. With fewer than four knots the end conditions degenerate
-/// and the routine falls back to a parabola (three knots) or a straight line
-/// (two knots), exactly as R does.
+/// Not-a-knot end conditions: the end segments are cubics fitted to the four
+/// outermost points. With fewer than four knots it falls back to a parabola
+/// (three) or a straight line (two), as R does.
 ///
 /// ### Params
 ///
@@ -201,9 +191,9 @@ pub fn fmm_spline(x: &[f64], y: &[f64]) -> Result<FmmSpline, EdgeErrors> {
 impl FmmSpline {
     /// Evaluates the spline at one abscissa.
     ///
-    /// Outside the knot range the nearest end segment's cubic is extended, which
-    /// is what R's `spline_eval` does for `method = "fmm"`. That polynomial
-    /// diverges quickly, so treat values far outside the range as meaningless.
+    /// Outside the knot range the nearest end segment's cubic is extended, as
+    /// in R's `spline_eval`. It diverges quickly, so far-out values are
+    /// meaningless.
     ///
     /// ### Params
     ///
@@ -224,12 +214,11 @@ impl FmmSpline {
 
 /// Writes FMM spline coefficients into caller-supplied buffers.
 ///
-/// A direct transcription of R's `fmm_spline` in
-/// `src/library/stats/src/splines.c`. The tridiagonal system is assembled in
-/// place: `d` holds the knot spacings and then the off-diagonal, `b` the
-/// diagonal, `c` the right-hand side and then the solution. Every buffer entry
-/// is written before it is read, so the buffers can be reused across genes
-/// without clearing.
+/// Transcription of R's `fmm_spline` in `src/library/stats/src/splines.c`. The
+/// tridiagonal system is built in place: `d` holds the spacings then the
+/// off-diagonal, `b` the diagonal, `c` the right-hand side then the solution.
+/// Every entry is written before it is read, so buffers can be reused across
+/// genes without clearing.
 ///
 /// ### Params
 ///
@@ -309,19 +298,13 @@ fn fmm_coefficients(x: &[f64], y: &[f64], b: &mut [f64], c: &mut [f64], d: &mut 
 
 /// Locates the maximum of an FMM spline through a log-likelihood grid.
 ///
-/// edgeR's `maximizeInterpolant` for a single curve. The procedure is three
-/// steps and reproducing it exactly matters, because the tagwise dispersion is
-/// whatever this returns:
+/// edgeR's `maximizeInterpolant` for a single curve:
 ///
 /// 1. Take the grid point with the largest ordinate.
 /// 2. Fit the FMM cubic spline through the whole grid.
-/// 3. On each of the (at most two) segments touching that grid point, solve
-///    `b + 2ct + 3dt^2 = 0` analytically and keep the root that is a maximum.
-///    If it falls strictly inside the segment and beats the grid value, it
-///    wins.
-///
-/// A general-purpose optimiser would land somewhere else on a coarse grid, so
-/// it is not a substitute.
+/// 3. On each of the (at most two) segments touching that point, solve
+///    `b + 2ct + 3dt^2 = 0` and keep the maximising root. If it lies strictly
+///    inside the segment and beats the grid value, it wins.
 ///
 /// ### Params
 ///
@@ -351,12 +334,8 @@ pub fn maximize_interpolant(x: &[f64], y: &[f64]) -> Result<f64, EdgeErrors> {
 
 /// Locates the spline maximum of one log-likelihood curve per gene.
 ///
-/// The parallel axis is genes because that is where the work is: a dataset has
-/// tens of thousands of genes and a grid of a couple of dozen points, each gene
-/// is an independent spline fit, and each gene's row is contiguous in `y`. The
-/// grid itself is far too short to parallelise over and shared by everyone.
-/// Scratch buffers for the tridiagonal solve are allocated once per chunk
-/// rather than once per gene.
+/// Parallel over genes; the grid is too short to split. Scratch buffers for the
+/// tridiagonal solve are allocated once per chunk, not per gene.
 ///
 /// ### Params
 ///
@@ -444,9 +423,8 @@ fn find_max(x: &[f64], y: &[f64], b: &mut [f64], c: &mut [f64], d: &mut [f64]) -
 ///
 /// The derivative on segment `seg` is `b + 2ct + 3dt^2`, so the stationary
 /// points are `t = (-c +/- sqrt(c^2 - 3db)) / (3d)`. The negative branch is the
-/// maximum for the sign convention edgeR uses; a zero cubic coefficient is
-/// treated as "no interior root", matching the reference implementation, since
-/// the linear case has no interior stationary point to find anyway.
+/// maximum in edgeR's convention. A zero cubic coefficient means "no interior
+/// root", as in the reference.
 ///
 /// ### Params
 ///
@@ -498,29 +476,26 @@ fn refine_on_segment(
 
 /// Builds a natural cubic spline basis over `x`.
 ///
-/// The truncated power basis of Hastie, Tibshirani and Friedman, equations 5.4
-/// and 5.5: an intercept, a linear term, and `df - 2` terms of the form
+/// Truncated power basis of Hastie, Tibshirani and Friedman, equations 5.4 and
+/// 5.5: an intercept, a linear term, and `df - 2` terms of the form
 ///
 /// ```text
 /// d_j(x) - d_{K-1}(x),   d_j(x) = ((x - k_j)_+^3 - (x - k_K)_+^3) / (k_K - k_j)
 /// ```
 ///
-/// Boundary knots sit at the range of `x` and the `df - 2` internal knots at
-/// equally spaced quantiles, the same placement R's `ns(x, df = df,
-/// intercept = TRUE)` uses. This spans the same space as R's basis but is not
-/// column-for-column equal to it: R returns a B-spline parametrisation, this is
-/// the truncated power one. Fitted values from a linear model agree, individual
-/// coefficients do not.
+/// Boundary knots sit at the range of `x`, the `df - 2` internal knots at
+/// equally spaced quantiles, as in R's `ns(x, df = df, intercept = TRUE)`. The
+/// span matches R's but the columns do not (B-spline there, truncated power
+/// here): fitted values agree, coefficients do not. See
+/// `UPSTREAM_DEVIATIONS.md` A6.
 ///
-/// `x` need not be sorted. If every value of `x` is identical there is no range
-/// to place knots in, and the basis degenerates to `[1, x]`; the returned
-/// column count is then 2 rather than `df`, which is why the count is returned
-/// at all.
+/// If every `x` is identical the basis degenerates to `[1, x]` and the returned
+/// column count is 2, not `df`.
 ///
 /// ### Params
 ///
-/// * `x` - Covariate values, in any order
-/// * `df` - Requested number of basis columns, at least [`MIN_BASIS_DF`]
+/// * `x` - Covariate values, need not be sorted
+/// * `df` - Requested number of basis columns, at least `MIN_BASIS_DF`
 ///
 /// ### Returns
 ///
@@ -605,10 +580,8 @@ fn truncated_cube(x: f64, knot: f64) -> f64 {
 
 /// One `d_j` term of the truncated power basis.
 ///
-/// Coincident knots would divide by zero. R's knot placement cannot produce
-/// that unless `x` is so tied that a quantile lands on the upper boundary, in
-/// which case the term carries no information and is set to zero rather than to
-/// NaN.
+/// Coincident knots (a quantile landing on the upper boundary for heavily tied
+/// `x`) give a term with no information, set to zero instead of NaN.
 ///
 /// ### Params
 ///
@@ -619,7 +592,8 @@ fn truncated_cube(x: f64, knot: f64) -> f64 {
 ///
 /// ### Returns
 ///
-/// `(max(x - knot, 0)^3 - tail) / (xi_last - knot)`, or zero on a degenerate knot.
+/// `(max(x - knot, 0)^3 - tail) / (xi_last - knot)`, or zero on a degenerate
+/// knot.
 #[inline]
 fn truncated_power_term(x: f64, knot: f64, xi_last: f64, tail: f64) -> f64 {
     let span = xi_last - knot;
@@ -635,9 +609,7 @@ fn truncated_power_term(x: f64, knot: f64, xi_last: f64, tail: f64) -> f64 {
 
 /// Piecewise-linear interpolation with constant extension outside the range.
 ///
-/// Points below the first knot take `fp[0]` and points above the last take
-/// `fp[last]`, which is `numpy.interp`'s behaviour and therefore what voom's
-/// mean-variance trend lookup does in edgePython.
+/// Points outside the knots take `fp[0]` or `fp[last]`, as `numpy.interp` does.
 ///
 /// ### Params
 ///
@@ -841,7 +813,9 @@ mod tests {
     ///   print(np.interp([-3.0,-0.001,4.5,10.0],[0,1,2,4],[0,2,3,-1]))"
     const NP_INTERP_OUTSIDE: [f64; 4] = [0.0, 0.0, -1.0, -1.0];
 
-    // -- FMM spline --
+    // ---------- //
+    // FMM spline //
+    // ---------- //
 
     #[test]
     fn test_fmm_spline_matches_r_at_interior_points() {
@@ -895,7 +869,9 @@ mod tests {
         }
     }
 
-    // -- maximize_interpolant --
+    // -------------------- //
+    // maximize_interpolant //
+    // -------------------- //
 
     #[test]
     fn test_maximize_interpolant_finds_max_between_grid_points() {
@@ -969,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_maximize_interpolant_many_over_many_genes() {
-        // Enough genes that rayon actually splits the work into chunks.
+        // Enough genes for rayon to split into chunks.
         let n_genes = 500;
         let mut flat = Vec::with_capacity(n_genes * MI_GRID.len());
         for g in 0..n_genes {
@@ -985,7 +961,9 @@ mod tests {
         }
     }
 
-    // -- natural spline basis --
+    // -------------------- //
+    // natural spline basis //
+    // -------------------- //
 
     #[test]
     fn test_natural_spline_basis_matches_truncated_power_reference() {
@@ -1000,10 +978,8 @@ mod tests {
 
     #[test]
     fn test_natural_spline_basis_spans_the_same_space_as_r_ns() {
-        // R's ns() returns a B-spline parametrisation, ours the truncated power
-        // one. They are different matrices spanning the same column space, so
-        // the check is that each column of R's basis is an exact linear
-        // combination of ours.
+        // R's ns() is a B-spline basis, ours truncated power: same column
+        // space, so check each R column is an exact combination of ours.
         let n = 10;
         let df = 5;
         let x: Vec<f64> = (1..=n).map(|i| i as f64).collect();
@@ -1063,7 +1039,9 @@ mod tests {
         }
     }
 
-    // -- linear interpolation --
+    // -------------------- //
+    // linear interpolation //
+    // -------------------- //
 
     #[test]
     fn test_interp_linear_extrap_inside_the_range() {
@@ -1101,7 +1079,9 @@ mod tests {
         assert!(interp_linear_extrap(&[], &xp, &fp).unwrap().is_empty());
     }
 
-    // -- error branches --
+    // -------------- //
+    // error branches //
+    // -------------- //
 
     #[test]
     fn test_fmm_spline_rejects_empty_input() {
@@ -1229,7 +1209,9 @@ mod tests {
         ));
     }
 
-    // -- tiny dense helpers, tests only --
+    // ------------------------------ //
+    // tiny dense helpers, tests only //
+    // ------------------------------ //
 
     /// `A^T A` for a row-major `n` by `p` matrix.
     fn gram_matrix(a: &[f64], n: usize, p: usize) -> Vec<f64> {

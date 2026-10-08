@@ -1,20 +1,10 @@
 //! Wald tests on a NEBULA fit.
 //!
-//! A single coefficient is tested with `z = beta / se`, which needs only the
-//! diagonal of the covariance. A contrast is not: its variance is `c' V c`, and
-//! the off-diagonal terms are non-zero whenever the design columns are
-//! correlated, which is the normal case once a batch or a covariate is in the
-//! model.
-//!
-//! edgePython's `glm_sc_test` forms contrast standard errors as
-//! `sqrt(sum(se^2 c^2))`, which silently assumes `V` is diagonal. It has no
-//! choice, because its fit discards everything but the diagonal. The error runs
-//! in either direction depending on the sign of the covariance, so it is not
-//! even conservative. See `UPSTREAM_DEVIATIONS.md` entry 2.
-//!
-//! This crate keeps the full covariance per gene, so contrasts are correct. The
-//! R package supports the same through `covariance = TRUE`, which is what the
-//! tests validate against.
+//! A single coefficient needs only the diagonal of the covariance. A contrast
+//! has variance `c' V c`, so the off-diagonal terms matter whenever design
+//! columns are correlated. edgePython assumes `V` is diagonal; this crate keeps
+//! the full covariance per gene, as `nebula` does with `covariance = TRUE`. See
+//! `UPSTREAM_DEVIATIONS.md` A19.
 
 use crate::errors::EdgeErrors;
 use crate::numeric::dist::chisq_sf;
@@ -71,9 +61,8 @@ pub const fn packed_len(n_coef: usize) -> usize {
 
 /// Reads one entry of a packed upper-triangular covariance.
 ///
-/// The layout is the usual packed upper triangle in column-major order, so the
-/// entry `(i, j)` with `i <= j` sits at `j (j + 1) / 2 + i` and the index does
-/// not depend on `n_coef`. For three coefficients that is
+/// Packed upper triangle, column-major: `(i, j)` with `i <= j` sits at
+/// `j (j + 1) / 2 + i`, independent of `n_coef`. For three coefficients:
 /// `V11, V12, V22, V13, V23, V33`.
 ///
 /// ### Params
@@ -220,8 +209,8 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// Two genes, two coefficients. Covariance packed as `V11, V12, V22`, the
-    /// one width at which this crate's layout and the R package's coincide.
+    /// Two genes, two coefficients, covariance packed as `V11, V12, V22` (the
+    /// one width where this layout and the R package's coincide).
     fn fixture() -> (Vec<f64>, Vec<f64>) {
         let coefficients = vec![
             -3.625_170_366_404_492,
@@ -240,8 +229,8 @@ mod tests {
         (coefficients, covariance)
     }
 
-    /// Testing a coefficient reproduces the standard errors the R package
-    /// reports, which are the square roots of the covariance diagonal.
+    /// A single coefficient reproduces the R package's standard errors (the
+    /// square roots of the covariance diagonal).
     ///
     /// ```r
     /// nebula(..., covariance = TRUE)$summary$se_grp   # 0.24038464208685528, 0.28453735103741123
@@ -256,9 +245,8 @@ mod tests {
         assert_relative_eq!(out.log_fc[0], 0.751_566_378_617_826, max_relative = 1e-12);
     }
 
-    /// The point of keeping the full matrix. A contrast that mixes two
-    /// correlated coefficients must pick up the off-diagonal term, and the
-    /// diagonal-only formula edgePython uses gets a different answer.
+    /// A contrast mixing two correlated coefficients must pick up the
+    /// off-diagonal term, which edgePython's diagonal-only formula misses.
     #[test]
     fn test_contrast_uses_the_off_diagonal_term() {
         let (coefficients, covariance) = fixture();
@@ -279,7 +267,7 @@ mod tests {
         let expected = expected.sqrt();
         assert_relative_eq!(out.se[0], expected, max_relative = 1e-12);
 
-        // What edgePython would report: sqrt(se1^2 + se2^2), dropping 2 V12.
+        // edgePython: sqrt(se1^2 + se2^2), dropping 2 V12.
         let diagonal_only = (0.014_446_194_037_806_379 + 0.057_784_776_151_225_514f64).sqrt();
         let relative = (out.se[0] - diagonal_only).abs() / out.se[0];
         assert!(
@@ -290,8 +278,7 @@ mod tests {
         assert!(diagonal_only > out.se[0]);
     }
 
-    /// A contrast that isolates one coefficient must agree with testing it
-    /// directly, which pins the two paths against each other.
+    /// A contrast isolating one coefficient agrees with testing it directly.
     #[test]
     fn test_unit_contrast_agrees_with_the_coefficient() {
         let (coefficients, covariance) = fixture();
@@ -382,7 +369,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::LengthMismatch { .. }));
     }
 
-    /// A gene whose covariance collapsed reports no evidence rather than a NaN.
+    /// A gene with a collapsed covariance reports p = 1, not NaN.
     #[test]
     fn test_degenerate_covariance_gives_a_p_value_of_one() {
         let coefficients = vec![1.0, 2.0];

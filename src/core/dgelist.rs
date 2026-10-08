@@ -1,15 +1,11 @@
 //! The count container, edgeR's `DGEList`.
 //!
-//! Counts are dense and gene-major: `n_genes` rows of `n_samples` values,
-//! row-major, so one gene is a contiguous slice and the rayon fan-out over genes
-//! reads sequential memory. edgePython densifies every input on construction and
-//! this matches that, deliberately. The single-cell path does not come through
-//! here at all: NEBULA takes per-gene slices directly, which is what keeps this
-//! crate free of a dependency on any particular sparse container.
+//! Counts are dense and gene-major (`n_genes` rows of `n_samples`, row-major).
+//! Like edgePython, input is densified on construction. The single-cell path
+//! does not come through here: NEBULA takes per-gene slices directly.
 //!
-//! Counts carry the generic `T`. Everything derived from them, library sizes,
-//! normalisation factors, offsets and dispersions, is `f64` per the crate
-//! numeric policy.
+//! Counts carry the generic `T`; everything derived from them (library sizes,
+//! factors, offsets, dispersions) is `f64`.
 
 use crate::core::expression::column_sums;
 use crate::prelude::*;
@@ -20,8 +16,8 @@ use crate::prelude::*;
 
 /// Which dispersion estimate a [`DgeList`] currently carries.
 ///
-/// Ordered by how much structure it captures. [`DgeList::dispersion`] returns
-/// the most complex one available, matching edgeR's `getDispersion`.
+/// Ordered by structure. [`DgeList::dispersion`] returns the most structured
+/// one available, as edgeR's `getDispersion` does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DispersionKind {
     /// One dispersion per gene, shrunk towards the trend.
@@ -173,14 +169,12 @@ impl<T: EdgeFloat> DgeList<T> {
     /// The offsets a GLM fit should use.
     ///
     /// Returns the explicit offsets when set, otherwise
-    /// `log(lib_size * norm_factors)` as a per-sample recycled vector. Deriving
-    /// them keeps the common case at `n_samples` values rather than
-    /// `n_genes * n_samples`.
+    /// `log(lib_size * norm_factors)` as a per-sample recycled vector.
     ///
     /// ### Returns
     ///
     /// The offsets, or [`EdgeErrors::InvalidArgument`] if a derived library size
-    /// is not positive and finite, since its logarithm would not be usable.
+    /// is not positive and finite.
     pub fn offset(&self) -> Result<Recycled<f64>, EdgeErrors> {
         if let Some(offset) = &self.offset {
             return Ok(offset.clone());
@@ -198,8 +192,7 @@ impl<T: EdgeFloat> DgeList<T> {
 
     /// The most structured dispersion currently available.
     ///
-    /// Prefers tagwise, then trended, then common, matching edgeR's
-    /// `getDispersion`.
+    /// Prefers tagwise, then trended, then common.
     ///
     /// ### Returns
     ///
@@ -218,10 +211,9 @@ impl<T: EdgeFloat> DgeList<T> {
 
     /// Keeps only the genes flagged in `keep`.
     ///
-    /// Per-gene quantities are subset alongside the counts. Per-sample
-    /// quantities, including library sizes, are left untouched: edgeR does not
-    /// recompute them after filtering, so that the normalisation stays anchored
-    /// to the full library.
+    /// Per-gene quantities are subset with the counts. Per-sample quantities,
+    /// including library sizes, are left untouched: edgeR does not recompute
+    /// them after filtering.
     ///
     /// ### Params
     ///
@@ -264,8 +256,7 @@ impl<T: EdgeFloat> DgeList<T> {
             })
         };
 
-        // A full offset or weight matrix is per gene as well as per sample, so
-        // it has to follow the subset. The recycled forms do not.
+        // Only a full matrix and a by-gene vector vary along genes.
         let subset_recycled = |r: &Option<Recycled<f64>>| -> Option<Recycled<f64>> {
             r.as_ref().map(|rec| match rec {
                 Recycled::Full(values) => {

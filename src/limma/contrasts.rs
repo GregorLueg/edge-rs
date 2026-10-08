@@ -1,25 +1,22 @@
 //! limma's `contrasts.fit`, and enough of `makeContrasts` to build its input.
 //!
 //! Rotating a fit onto contrasts is a change of basis on the coefficient axis:
-//! `beta -> beta C` and `V -> C' V C`. What makes it more than two matrix
-//! products is the bookkeeping around it: aliased coefficients that a zero
-//! contrast entry should be allowed to ignore, coefficients no contrast touches
-//! at all, and the orthogonal case where the standard errors collapse to a
-//! second matrix product instead of a per-gene solve.
+//! `beta -> beta C` and `V -> C' V C`. The bookkeeping around it is the work:
+//! aliased coefficients a zero contrast entry should be allowed to ignore,
+//! coefficients no contrast touches, and the orthogonal case where the standard
+//! errors collapse to a matrix product instead of a per-gene solve.
 //!
-//! The per-gene branch is the one that costs anything, and it is the axis this
-//! crate parallelises everywhere else, so it is a rayon fan-out over genes.
-//! limma runs it as an R loop.
+//! The per-gene branch is a rayon fan-out over genes; limma runs it as an R
+//! loop.
 //!
 //! ### Approximate under probe weights
 //!
-//! `cov.coefficients` describes the design, not each gene's own weighted fit,
-//! so under voom weights these standard errors are an approximation. That is
-//! upstream's position, stated at `R/contrasts.R:5-6`, and
-//! [`crate::limma::lm_fit::lm_fit`] documents where the covariance comes from.
-//! Exact contrast standard errors need the model refitted per gene in the
-//! contrast basis, which is what limma 3.99's `lmFit(contrasts = )` added and
-//! this does not have.
+//! `cov.coefficients` describes the design, not each gene's weighted fit, so
+//! under voom weights these standard errors are an approximation. That is
+//! upstream's position (`R/contrasts.R:5-6`); [`crate::limma::lm_fit::lm_fit`]
+//! documents where the covariance comes from. Exact contrast standard errors
+//! need a per-gene refit in the contrast basis, which limma 3.99's
+//! `lmFit(contrasts = )` added and this does not have.
 
 use rayon::prelude::*;
 
@@ -36,19 +33,17 @@ const ORTHOGONAL_TOL: f64 = 1e-14;
 
 /// Standard deviation standing in for a non-estimable coefficient.
 ///
-/// limma sets aliased coefficients to zero and their unscaled standard
-/// deviation to this, so a contrast that gives the coefficient zero weight
-/// comes out finite while one that does not comes out enormous
-/// (`R/contrasts.R:89-94`). The result is then read back through
-/// [`NA_DETECT`].
+/// limma sets aliased coefficients to zero with this unscaled standard
+/// deviation, so a contrast giving the coefficient zero weight comes out finite
+/// and one that does not comes out enormous (`R/contrasts.R:89-94`). The result
+/// is read back through [`NA_DETECT`].
 const NA_SENTINEL: f64 = 1e30;
 
 /// Above this, a rotated standard deviation means the contrast touched an
 /// aliased coefficient, and both it and its coefficient go back to `NaN`.
 ///
-/// One tenth of the square root of [`NA_SENTINEL`] squared, which is to say
-/// limma's own `1e20` (`R/contrasts.R:128`): far above anything a real fit
-/// produces, far below the sentinel itself.
+/// limma's own `1e20` (`R/contrasts.R:128`): far above any real fit, far below
+/// [`NA_SENTINEL`].
 const NA_DETECT: f64 = 1e20;
 
 /////////////
@@ -77,9 +72,8 @@ fn subset_columns(x: &[f64], n_rows: usize, n_cols: usize, cols: &[usize]) -> Ve
 
 /// Multiplies a row-major matrix by a column-major one.
 ///
-/// `A B` with `A` row-major `n_rows * k` and `B` column-major `k * n_cols`,
-/// which is the layout the contrast matrix arrives in. Rayon over rows, since
-/// that is the gene axis.
+/// `A B` with `A` row-major `n_rows * k` and `B` column-major `k * n_cols`, the
+/// layout the contrast matrix arrives in. Rayon over rows (the gene axis).
 ///
 /// ### Params
 ///
@@ -108,9 +102,8 @@ fn gemm(a: &[f64], n_rows: usize, k: usize, b: &[f64], n_cols: usize) -> Vec<f64
 /// Forms `(L' C)' (L' C)` for a lower triangular `L`.
 ///
 /// With `V = L L'` this is `C' V C`, the covariance in the contrast basis.
-/// limma writes it as `crossprod(chol(V) %*% C)` with an upper factor
-/// (`R/contrasts.R:107-108`); the transpose of that factor is `L`, so the two
-/// are the same product.
+/// limma writes `crossprod(chol(V) %*% C)` with an upper factor
+/// (`R/contrasts.R:107-108`); its transpose is `L`, so the product is the same.
 ///
 /// ### Params
 ///
@@ -152,8 +145,7 @@ fn crossprod_whitened(chol: &[f64], contrasts: &[f64], n: usize, n_contrasts: us
 /// For gene `i` the answer is the column norms of `R diag(u_i) C`, with `R` the
 /// Cholesky factor of the coefficient correlation matrix. limma runs this as an
 /// R loop over genes (`R/contrasts.R:118-123`); here it is a rayon fan-out with
-/// a per-thread scratch buffer, which is the shape every other genewise loop in
-/// the crate takes.
+/// a per-thread scratch buffer.
 ///
 /// ### Params
 ///
@@ -209,19 +201,17 @@ fn correlated_stdev(
 ///////////////////
 
 /// Rotates a fit onto a set of contrasts.
-///
 /// Port of limma's `contrasts.fit`. The coefficient axis of the returned fit is
-/// the contrast axis: `n_coef` counts contrasts, and `cov_coefficients` is
-/// `n_contrasts` square. Any moderated statistic already on the fit is dropped,
-/// because it belonged to the old basis.
+/// the contrast axis: `n_coef` counts contrasts and `cov_coefficients` is
+/// `n_contrasts` square. Moderated statistics already on the fit are dropped,
+/// as they belonged to the old basis.
 ///
 /// ### Params
 ///
 /// * `fit` - The fit to rotate, consumed
 /// * `contrasts` - Contrast matrix, **column-major** `n_coef * n_contrasts`:
-///   contrast `k` occupies `contrasts[k * n_coef..(k + 1) * n_coef]`. This is
-///   the layout [`crate::utils::design::contrast_as_coef`] uses and what
-///   [`make_contrasts`] produces.
+///   contrast `k` occupies `contrasts[k * n_coef..(k + 1) * n_coef]`. The layout
+///   of [`crate::utils::design::contrast_as_coef`] and [`make_contrasts`].
 /// * `n_contrasts` - Number of contrasts
 ///
 /// ### Returns
@@ -259,11 +249,13 @@ pub fn contrasts_fit(
     fit.clear_tests();
     fit.contrasts = Some(contrasts.to_vec());
 
-    // -- reduce to the estimable coefficients --
+    // ------------------------------------ //
+    // reduce to the estimable coefficients //
+    // ------------------------------------ //
     //
-    // `cov_coefficients` only ever describes the accepted columns, so a rank
-    // deficient design needs the contrast rows lining up with those. A contrast
-    // that puts weight on a rejected column has no answer (`R/contrasts.R:64`).
+    // `cov_coefficients` only describes the accepted columns, so contrast rows
+    // must line up with those. A contrast weighting a rejected column has no
+    // answer (`R/contrasts.R:64`).
     let rank = fit.rank;
     let (contrasts, n_coef, coefficients, stdev_unscaled) = if rank < n_coef {
         let est = &fit.pivot[..rank];
@@ -296,10 +288,12 @@ pub fn contrasts_fit(
         )
     };
 
-    // -- drop coefficients no contrast touches --
+    // ------------------------------------- //
+    // drop coefficients no contrast touches //
+    // ------------------------------------- //
     //
-    // Not required for correctness; limma does it because it shrinks the
-    // per-gene loop below (`R/contrasts.R:77`).
+    // Not needed for correctness; limma does it to shrink the per-gene loop
+    // (`R/contrasts.R:77`).
     let keep: Vec<usize> = (0..n_coef)
         .filter(|&j| contrasts.chunks_exact(n_coef).any(|col| col[j] != 0.0))
         .collect();
@@ -329,7 +323,9 @@ pub fn contrasts_fit(
         )
     };
 
-    // -- let a zero contrast entry clobber an aliased coefficient --
+    // -------------------------------------------------------- //
+    // let a zero contrast entry clobber an aliased coefficient //
+    // -------------------------------------------------------- //
     let any_na = coefficients.iter().any(|v| v.is_nan());
     if any_na {
         for (c, s) in coefficients.iter_mut().zip(stdev_unscaled.iter_mut()) {
@@ -344,10 +340,14 @@ pub fn contrasts_fit(
     let orthogonal = n_coef < 2
         || (0..n_coef).all(|i| (0..i).all(|j| cormatrix[i * n_coef + j].abs() < ORTHOGONAL_TOL));
 
-    // -- new coefficients: beta C --
+    // ------------------------ //
+    // new coefficients: beta C //
+    // ------------------------ //
     let new_coef = gemm(&coefficients, fit.n_genes, n_coef, &contrasts, n_contrasts);
 
-    // -- new covariance: (L' C)' (L' C), with V = L L' --
+    // --------------------------------------------- //
+    // new covariance: (L' C)' (L' C), with V = L L' //
+    // --------------------------------------------- //
     let mut chol = cov.clone();
     if !cholesky_lower(&mut chol, n_coef, n_coef) {
         return Err(EdgeErrors::CholeskyFailed(
@@ -358,7 +358,9 @@ pub fn contrasts_fit(
     }
     let new_cov = crossprod_whitened(&chol, &contrasts, n_coef, n_contrasts);
 
-    // -- new unscaled standard deviations --
+    // -------------------------------- //
+    // new unscaled standard deviations //
+    // -------------------------------- //
     let mut new_stdev = if orthogonal {
         // sqrt(u^2 C^2), elementwise squares on both sides.
         let u2: Vec<f64> = stdev_unscaled.iter().map(|v| v * v).collect();
@@ -385,7 +387,9 @@ pub fn contrasts_fit(
         )
     };
 
-    // -- put the aliased entries back --
+    // ---------------------------- //
+    // put the aliased entries back //
+    // ---------------------------- //
     let mut new_coef = new_coef;
     if any_na {
         for (c, s) in new_coef.iter_mut().zip(new_stdev.iter_mut()) {
@@ -410,9 +414,8 @@ pub fn contrasts_fit(
 /// Recursive descent over the contrast grammar.
 ///
 /// The value of an expression is a vector over the levels, so the parser
-/// accumulates into one rather than returning numbers. Multiplication and
-/// division are only defined when one side is a bare number, which is exactly
-/// the restriction a linear contrast is under anyway.
+/// accumulates into one. Multiplication and division need a bare number on one
+/// side, the restriction a linear contrast is under anyway.
 struct Parser<'a> {
     /// Remaining characters, whitespace included.
     src: &'a [u8],
@@ -697,16 +700,13 @@ impl<'a> Parser<'a> {
 /// Builds a contrast matrix from linear expressions over the design columns.
 ///
 /// The numerical half of limma's `makeContrasts`. Upstream is R
-/// metaprogramming: `substitute`, then an environment mapping every level name
-/// to an indicator vector, then `eval(parse(text = ...))`
-/// (`R/modelmatrix.R:46-114`). None of that ports, and none of it is
-/// arithmetic. What ports is the grammar people actually write in:
-/// `+ - * / ( )`, decimal literals, and the column names.
+/// metaprogramming (`substitute`, an environment of indicator vectors,
+/// `eval(parse(text = ...))`, `R/modelmatrix.R:46-114`) and does not port. What
+/// ports is the grammar: `+ - * / ( )`, decimal literals and column names.
 ///
-/// So `"grpB"`, `"grpB - grpA"` and `"grpB - 0.5 * batb2"` all work, and
-/// anything requiring an R evaluator does not. A level named `(Intercept)` is
-/// matched as `Intercept` too, which is the rename limma does at
-/// `R/modelmatrix.R:54`.
+/// So `"grpB"`, `"grpB - grpA"` and `"grpB - 0.5 * batb2"` work; anything
+/// needing an R evaluator does not. A level named `(Intercept)` also matches
+/// `Intercept`, as limma renames it at `R/modelmatrix.R:54`.
 ///
 /// ### Params
 ///
@@ -825,8 +825,8 @@ mod tests {
 
     /// Two genes on a design whose two columns are orthogonal.
     fn orthogonal_fit() -> MArrayLm {
-        // Columns (1,1,-1,-1) and (1,-1,1,-1): orthogonal by construction, so
-        // the fast branch runs and the answer is checkable by hand.
+        // Columns (1,1,-1,-1) and (1,-1,1,-1) are orthogonal, so the fast branch
+        // runs and the answer is checkable by hand.
         let design = vec![
             1.0, 1.0, //
             1.0, -1.0, //

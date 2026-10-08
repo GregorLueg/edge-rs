@@ -1,14 +1,12 @@
 //! limma's `squeezeVar` and the `fitFDist` family underneath it.
 //!
-//! The empirical Bayes step that shrinks a genewise variance towards a fitted
-//! prior. `estimateDisp` uses it to choose the prior degrees of freedom and
-//! `glmQLFit` uses it for the quasi-likelihood dispersions, so it sits on the
-//! path of essentially every analysis.
+//! Empirical Bayes shrinkage of genewise variances towards a fitted prior.
+//! `estimateDisp` uses it for the prior degrees of freedom and `glmQLFit` for
+//! the quasi-likelihood dispersions.
 //!
-//! The model is `s2_g ~ s0^2 * F(df_g, df0)`. All three fits estimate `s0^2`
-//! and `df0` by matching moments of `z = log(s2)` rather than of `s2` itself,
-//! because `log` of a scaled F has finite moments for any `df0` while the F
-//! itself does not:
+//! The model is `s2_g ~ s0^2 * F(df_g, df0)`. The moment fits estimate `s0^2`
+//! and `df0` by matching moments of `z = log(s2)`, since `log` of a scaled F
+//! has finite moments for any `df0`:
 //!
 //! ```text
 //! E[z_g] = log(s0^2) - [log(df0/2) - psi(df0/2)] + [log(df_g/2) - psi(df_g/2)]
@@ -18,30 +16,23 @@
 //! So `e_g = z_g + logmdigamma(df_g/2)` has mean `log(s0^2) - logmdigamma(df0/2)`
 //! and variance `trigamma(df0/2)` plus the known genewise term. Subtracting the
 //! mean of `trigamma(df_g/2)` from the sample variance of `e` and inverting
-//! `trigamma` closes the fit. [`fit_f_dist`] takes the mean of `e` as a single
+//! `trigamma` closes the fit. [`fit_f_dist`] takes the mean of `e` as one
 //! number, [`fit_f_dist_trend`] as a natural cubic spline in a covariate, and
-//! [`fit_f_dist_robustly`] replaces the moments with Winsorised ones so a
-//! handful of wild genes cannot drag `df0` down for everyone.
+//! [`fit_f_dist_robustly`] uses Winsorised moments so a few wild genes cannot
+//! drag `df0` down.
 //!
 //! ### Which limma this is
 //!
 //! limma 3.66's `squeezeVar` dispatches on a `legacy` flag: `TRUE` gives
 //! `fitFDist`/`fitFDistRobustly`, `FALSE` gives `fitFDistUnequalDF1`, and the
-//! default picks `FALSE` when the residual degrees of freedom differ between
-//! genes. Both branches are here, with the same dispatch.
+//! default picks `FALSE` when residual degrees of freedom differ between genes.
+//! Both branches are here, with the same dispatch.
 //!
-//! [`fit_f_dist_unequal_df1`] is the non-legacy branch and is a different
-//! estimator, not a variant of the moment fits: it maximises the marginal
-//! likelihood over `df0` with the scale profiled out, so each gene may carry
-//! its own `df_g`. It is also the branch most real data takes, because
-//! `glmQLFit` produces unequal residual degrees of freedom as soon as a gene
-//! has structural zeros.
-//!
-//! ### Numeric policy
-//!
-//! `f64` throughout, per the crate policy for likelihood-adjacent code: the fit
-//! is a difference of logs closed by a Newton iteration on `trigamma`, and there
-//! is nothing here whose memory cost would justify `f32`.
+//! [`fit_f_dist_unequal_df1`] is a different estimator, not a moment variant:
+//! it maximises the marginal likelihood over `df0` with the scale profiled out,
+//! so each gene may carry its own `df_g`. Most real data takes this branch,
+//! since `glmQLFit` gives unequal residual degrees of freedom once a gene has
+//! structural zeros.
 //!
 //! ### References
 //!
@@ -64,6 +55,10 @@ use crate::numeric::optimise::{OPTIMIZE_TOL, brent_fmin, brentq};
 use crate::numeric::stats::{median, p_adjust_bh, quantile_type7, rank_average, trimmed_mean};
 use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span};
 
+////////////
+// Consts //
+////////////
+
 /// Fewer genes than this and limma refuses to fit anything, returning the input
 /// variances unmoderated with a prior of zero degrees of freedom.
 const MIN_GENES: usize = 3;
@@ -73,28 +68,23 @@ const DF1_TOL: f64 = 1e-15;
 
 /// Variances below this are treated as negative and dropped by `fitFDist`.
 ///
-/// limma tests `x > -1e-15` rather than `x >= 0` so that a variance that came
-/// back as a tiny negative number from a floating point cancellation is kept
-/// and then clamped, rather than silently costing a gene.
+/// limma tests `x > -1e-15` rather than `x >= 0`, so a tiny negative from
+/// floating point cancellation is kept and then clamped.
 const VAR_TOL: f64 = -1e-15;
 
 /// Fraction of the median variance that exact zeros are offset to.
 ///
-/// `log(0)` is the problem; limma lifts every variance to `1e-5 * median`
-/// before taking logs and warns that the eBayes step is unreliable when more
-/// than half of them needed it.
+/// limma lifts variances to `1e-5 * median` before taking logs.
 const ZERO_VAR_OFFSET: f64 = 1e-5;
 
 /// Smallest residual degrees of freedom `fitFDistRobustly` will keep.
 ///
-/// Looser than [`DF1_TOL`] because the robust fit needs enough genes with real
-/// residual degrees of freedom to estimate a tail from.
+/// Looser than [`DF1_TOL`].
 const ROBUST_DF1_TOL: f64 = 1e-6;
 
 /// Fraction of the median variance that the robust fit floors variances at.
 ///
-/// Tighter than [`ZERO_VAR_OFFSET`] because the robust fit only needs to keep
-/// `log(x)` finite, not to keep the moment estimate sane.
+/// Tighter than [`ZERO_VAR_OFFSET`]: the robust fit only needs `log(x)` finite.
 const ROBUST_VAR_FLOOR: f64 = 1e-12;
 
 /// Absolute slack below the largest `df1` within which degrees of freedom count
@@ -103,10 +93,8 @@ const DF1_TIE_TOL: f64 = 1e-14;
 
 /// Number of Gauss-Legendre nodes in the Winsorised moment integrals.
 ///
-/// limma calls `statmod::gauss.quad.prob(128, "uniform")`. The integrand is a
-/// smooth F density on a bounded, link-transformed interval, so 128 nodes is far
-/// past convergence; the count is here to match limma bit for bit, not because
-/// the integral needs it.
+/// Matches `statmod::gauss.quad.prob(128, "uniform")`. The integral converges
+/// well before 128; the count is for bit-level parity.
 const QUAD_NODES: usize = 128;
 
 /// Newton iteration budget when solving for the Legendre nodes.
@@ -118,16 +106,14 @@ const ROBUST_LOWESS_SPAN: f64 = 0.4;
 
 /// Robustness iterations for that lowess.
 ///
-/// `loessFit` defaults to `iterations = 4` and passes `iter = iterations - 1`
-/// to `stats::lowess`, which counts the robustness passes after the first fit.
+/// `loessFit` passes `iter = iterations - 1 = 3` to `stats::lowess`.
 const ROBUST_LOWESS_STEPS: usize = 3;
 
 /// Absolute tolerance for the `df2` root search, in the `d/(1+d)` link scale.
 ///
-/// limma passes `tol = 1e-8` to `uniroot`. This is tighter deliberately: the
-/// link squashes large `df2` into the top of `(0, 1)`, so a `1e-8` bracket in
-/// the link is worth `1e-4` on a `df2` of 100. Converging properly and letting
-/// limma be the one carrying truncation error is the better of the two errors.
+/// limma passes `tol = 1e-8` to `uniroot`. This is tighter on purpose: the link
+/// squashes large `df2` towards 1, so `1e-8` in the link is `1e-4` on a `df2`
+/// of 100.
 const ROOT_XTOL: f64 = 1e-15;
 
 /// Relative tolerance for the `df2` root search.
@@ -136,16 +122,14 @@ const ROOT_RTOL: f64 = 8.0 * f64::EPSILON;
 /// Iteration budget for the `df2` root search.
 const ROOT_MAX_ITER: usize = 200;
 
-/// Relative tolerance on the QR diagonal used to rank the spline basis, matching
-/// the default `tol` of R's `lm.fit`.
+/// Relative tolerance on the QR diagonal used to rank the spline basis,
+/// matching the default `tol` of R's `lm.fit`.
 const RANK_TOL: f64 = 1e-7;
 
-/// Gene count above which the per-gene tail probabilities fan out over rayon.
+/// Gene count above which the per-gene tail probabilities run over rayon.
 ///
-/// Each one is a regularised incomplete beta, a few hundred flops, so the fork
-/// only pays for itself once there are thousands of genes. Everything else in
-/// this module is either a reduction or a spline solve on a handful of columns
-/// and stays sequential.
+/// Each is a regularised incomplete beta, so the fork only pays off at
+/// thousands of genes. Everything else here stays sequential.
 const PARALLEL_THRESHOLD: usize = 4096;
 
 /// `log(0.5)`, the target tail probability that defines `df2_outlier`.
@@ -153,26 +137,25 @@ const LN_HALF: f64 = -std::f64::consts::LN_2;
 
 /// Smallest residual degrees of freedom `fitFDistUnequalDF1` will use.
 ///
-/// Below this a gene is given a zero prior weight and its `df1` is reset to one,
-/// rather than dropped, so it still gets a fitted trend value at the end.
+/// Below this a gene gets zero prior weight and `df1` reset to one, so it still
+/// receives a fitted trend value.
 const UNEQUAL_DF1_TOL: f64 = 0.01;
 
 /// Fraction of the median informative variance that variances are floored at
 /// before the logs are taken, `pmax(x, 1e-12 * m)` in limma.
 ///
-/// Seven orders of magnitude tighter than [`ZERO_VAR_OFFSET`]: the maximum
-/// likelihood fit only needs `log(x)` finite, whereas the moment fit needs the
-/// floor not to distort the sample variance.
+/// Much tighter than [`ZERO_VAR_OFFSET`]: the likelihood fit only needs
+/// `log(x)` finite.
 const UNEQUAL_ZERO_VAR_OFFSET: f64 = 1e-12;
 
 /// `small.n` in the `chooseLowessSpan(n, small.n = 500)` that
-/// `fitFDistUnequalDF1` uses, ten times limma's own default.
+/// `fitFDistUnequalDF1` uses, ten times limma's default.
 ///
-/// The span is therefore 1 for every gene set below 500 genes, and only starts
-/// tapering towards `min.span` above that.
+/// The span is 1 below 500 genes and tapers towards `min.span` above.
 const UNEQUAL_LOWESS_SMALL_N: usize = 500;
 
-/// Lower clamp on the lowess prior weights, `min.weight` in the `loessFit` call.
+/// Lower clamp on the lowess prior weights, `min.weight` in the `loessFit`
+/// call.
 const LOESS_MIN_WEIGHT: f64 = 1e-8;
 
 /// Upper clamp on the lowess prior weights, `max.weight` in the same call.
@@ -181,9 +164,9 @@ const LOESS_MAX_WEIGHT: f64 = 100.0;
 /// Spread below which `loessFit` calls the clamped weights equal and discards
 /// them, falling back to unweighted `stats::lowess`.
 ///
-/// This is `equal.weights.as.null = TRUE`, and it is not a corner case: equal
-/// `df1` with no prior weights makes every weight identical, so a trended
-/// non-legacy fit on a balanced design takes the unweighted branch.
+/// This is `equal.weights.as.null = TRUE`. Equal `df1` with no prior weights
+/// makes every weight identical, so a trended fit on a balanced design takes
+/// the unweighted branch.
 const EQUAL_WEIGHT_TOL: f64 = 1e-15;
 
 /// Lower end of the `d2 / (1 + d2)` link interval the likelihood is maximised
@@ -197,49 +180,40 @@ const UNEQUAL_PAR_UPPER: f64 = 0.9998;
 /// outlier at all, so it re-enters the fit at full weight.
 const ROBUST_FDR_CUTOFF: f64 = 0.3;
 
-/// Left tail probability below which limma recomputes it from the lower tail of
-/// the F rather than as `1 - RightP`, where the subtraction has cancelled.
+/// Left tail probability below which limma recomputes it from the lower tail
+/// of the F rather than as `1 - RightP`, where the subtraction has cancelled.
 const LEFT_TAIL_SWITCH: f64 = 0.001;
 
 /// Relative tolerance on the weighted normal equations of the two-column fit
 /// `loessFit` falls back to when there are too few points to smooth.
 ///
 /// Stands in for the pivoted QR rank test in R's `lm.wfit`: below this the
-/// covariate carries no weighted spread and the slope is dropped, leaving the
-/// weighted mean.
+/// covariate has no weighted spread and the slope is dropped.
 const WLS_RANK_TOL: f64 = 1e-14;
 
-/////////////////
-// Public API  //
-/////////////////
+////////////////
+// Public API //
+////////////////
 
-/// Tuning knobs for [`squeeze_var`].
-///
-/// The defaults are limma's: a non-robust fit with the Winsorising tail
-/// proportions it would use if asked for a robust one.
+/// Tuning knobs for [`squeeze_var`], defaulting to limma's.
 #[derive(Clone, Copy, Debug)]
 pub struct SqueezeVarParams {
-    /// Whether to Winsorise the moments so outlier genes cannot pull the prior
-    /// degrees of freedom down. Costs a quadrature and a root search, and turns
-    /// `df_prior` into a per-gene vector.
+    /// Winsorise the moments so outlier genes cannot pull the prior degrees of
+    /// freedom down. Makes `df_prior` a per-gene vector.
     pub robust: bool,
     /// Proportions Winsorised off the lower and upper tails of the log
-    /// variances. Only consulted when `robust` is set. Both must lie in
-    /// `[0, 0.5)`.
+    /// variances, each in `[0, 0.5)`. Only used when `robust` is set.
     pub winsor_tail_p: (f64, f64),
-    /// Span of the lowess trend fitted against the covariate. `None` lets each
-    /// fit pick its own default: [`ROBUST_LOWESS_SPAN`] on the legacy robust
-    /// path, `chooseLowessSpan(n, small.n = 500)` on the unequal-`df1` path.
+    /// Span of the lowess trend against the covariate. `None` picks each fit's
+    /// own default: `ROBUST_LOWESS_SPAN` on the legacy robust path,
+    /// `chooseLowessSpan(n, small.n = 500)` on the unequal-`df1` path.
     ///
-    /// Setting it forces `legacy` off, which is what limma does and which is
-    /// not only a dispatch detail: limma's `squeezeVar` never passes `span` to
-    /// `fitFDistRobustly` at all, so the legacy robust span is only reachable
-    /// with `legacy` set to `Some(true)` explicitly.
+    /// Setting it forces `legacy` off, as in limma, whose `squeezeVar` never
+    /// passes `span` to `fitFDistRobustly`.
     pub span: Option<f64>,
-    /// Which family of fits to use. `Some(true)` is `fitFDist` and
-    /// `fitFDistRobustly`, `Some(false)` is `fitFDistUnequalDF1`, and `None` is
-    /// limma's own rule: legacy exactly when every positive degrees of freedom
-    /// is the same, which is where the two families agree best.
+    /// `Some(true)` is `fitFDist`/`fitFDistRobustly`, `Some(false)` is
+    /// `fitFDistUnequalDF1`. `None` is limma's rule: legacy exactly when every
+    /// positive degrees of freedom is the same.
     pub legacy: Option<bool>,
 }
 
@@ -256,66 +230,58 @@ impl Default for SqueezeVarParams {
 
 /// What [`squeeze_var`] produces.
 ///
-/// The two prior vectors are length one whenever the prior is a single number,
-/// and length `n` when it varies by gene. `var_post` is always length `n`.
+/// The prior vectors have length one when the prior is a single number, else
+/// `n`. `var_post` always has length `n`.
 #[derive(Clone, Debug)]
 pub struct SqueezeVarResult {
-    /// Posterior variance per gene, the shrunken estimate callers actually use.
+    /// Posterior variance per gene.
     pub var_post: Vec<f64>,
-    /// Prior variance. Length one when the prior is a single number, which is
-    /// any untrended fit except the legacy robust one, and one value per gene
-    /// otherwise.
+    /// Prior variance. Length one for any untrended fit except the legacy
+    /// robust one, else one per gene.
     pub var_prior: Vec<f64>,
     /// Prior degrees of freedom. Length one unless the fit produced a per-gene
-    /// vector, which the legacy robust fit always does and the unequal-`df1`
-    /// robust fit does whenever it finds an outlier.
+    /// vector: always for the legacy robust fit, and for the unequal-`df1`
+    /// robust fit when it finds an outlier.
     pub df_prior: Vec<f64>,
 }
 
 /// Empirical Bayes moderation of genewise variances.
 ///
-/// Port of limma's `squeezeVar`. Fits a scaled F prior to the variances and
-/// returns the posterior
-/// `(df * var + df_prior * var_prior) / (df + df_prior)`, which is the
-/// precision-weighted blend of each gene's own variance with the fitted prior.
-/// An infinite `df_prior`, which the fit produces when the variances are close
-/// enough to constant that there is no excess dispersion to explain, collapses
-/// that blend onto the prior exactly.
+/// Port of limma's `squeezeVar`. Fits a scaled F prior and returns the
+/// precision-weighted posterior `(df * var + df_prior * var_prior) / (df +
+/// df_prior)`. An infinite `df_prior` (no excess dispersion) collapses onto the
+/// prior exactly.
 ///
-/// Two families of fit sit behind it. `params.legacy` picks between them, and
-/// its `None` default reproduces limma's rule: legacy when every positive `df`
-/// is the same, non-legacy otherwise, with a supplied `span` forcing non-legacy
-/// either way. Within the legacy family the arguments pick one of three:
+/// `params.legacy = None` reproduces limma's rule: legacy when every positive
+/// `df` is the same, non-legacy otherwise, and a supplied `span` forces
+/// non-legacy. Within the legacy family:
 ///
-/// * no covariate, `robust` clear - [`fit_f_dist`], a single prior for all genes
-/// * covariate, `robust` clear - [`fit_f_dist_trend`], a spline in the covariate
+/// * no covariate, `robust` clear - [`fit_f_dist`], a single prior for all
+///   genes
+/// * covariate, `robust` clear - [`fit_f_dist_trend`], a spline in the
+///   covariate
 /// * `robust` set - [`fit_f_dist_robustly`], with or without the covariate
 ///
-/// The non-legacy family is one function, [`fit_f_dist_unequal_df1`], which
-/// maximises the marginal likelihood directly instead of matching moments and
-/// so does not need the residual degrees of freedom to be shared. `glmQLFit`
-/// produces unequal degrees of freedom as soon as any gene has structural
-/// zeros, which is why this is the path most real data takes.
+/// The non-legacy family is [`fit_f_dist_unequal_df1`].
 ///
-/// Genes with `df == 0` carry no information. limma zeroes their variance
-/// first, drops them from the fit, and hands them back the prior; this does the
-/// same, but only when `df` is a per-gene vector, exactly as limma does.
+/// Genes with `df == 0` carry no information: as in limma, their variance is
+/// zeroed, they are dropped from the fit and handed the prior. This only
+/// happens when `df` is a per-gene vector.
 ///
 /// ### Params
 ///
 /// * `var` - Genewise variances, non-negative and finite
-/// * `df` - Residual degrees of freedom, either one value shared by every gene
-///   or one per gene. Non-negative and finite; zero is allowed and means the
-///   gene is uninformative.
+/// * `df` - Residual degrees of freedom, one shared value or one per gene.
+///   Non-negative and finite; zero marks an uninformative gene.
 /// * `covariate` - Covariate for a trended prior, one per gene, or `None`
 /// * `params` - Tuning knobs, or `None` for [`SqueezeVarParams::default`]
 ///
 /// ### Returns
 ///
-/// The posterior variances and the prior that produced them, or [`EdgeErrors`]
-/// if `var` is empty, `df` or `covariate` is the wrong length, a variance is
-/// negative or not finite, a degrees of freedom is negative or not finite, a
-/// covariate is `NaN`, or a Winsorising proportion is outside `[0, 0.5)`.
+/// The posterior variances and the prior behind them, or [`EdgeErrors`] on an
+/// empty `var`, a wrong-length `df` or `covariate`, a negative or non-finite
+/// variance or `df`, a `NaN` covariate, or a Winsorising proportion outside
+/// `[0, 0.5)`.
 ///
 /// ### References
 ///
@@ -373,10 +339,9 @@ pub fn squeeze_var(
         )));
     }
 
-    // limma zeroes the variance of every uninformative gene before doing
-    // anything else, and only when df is genewise. That is what makes an
-    // infinite or missing variance at df == 0 harmless, so it has to happen
-    // before the finiteness check below rather than after it.
+    // limma zeroes the variance of uninformative genes first (genewise df only),
+    // which makes an infinite or missing variance at df == 0 harmless. This must
+    // precede the finiteness check.
     let mut var = var.to_vec();
     if df.len() > 1 {
         for (v, &d) in var.iter_mut().zip(df) {
@@ -401,8 +366,7 @@ pub fn squeeze_var(
         });
     }
 
-    // limma's dispatch, in its order: a supplied span overrides an explicit
-    // legacy = TRUE, and only then does the automatic rule get a look in.
+    // limma's order: a supplied span overrides an explicit legacy = TRUE.
     let legacy = if params.span.is_some() {
         false
     } else {
@@ -442,29 +406,26 @@ pub fn squeeze_var(
 
 /// Fits a scaled F distribution to a set of variances by moment matching.
 ///
-/// Port of limma's `fitFDist` without a covariate. The sample mean and variance
-/// of `e_g = log(var_g) + logmdigamma(df_g / 2)` identify the prior: the
-/// variance of `e` in excess of `mean(trigamma(df_g / 2))` is `trigamma(df0/2)`,
-/// so `df0 = 2 * trigammaInverse(excess)`, and the scale follows from the mean.
-/// A non-positive excess means the variances are less dispersed than the
-/// residual degrees of freedom alone would imply, which is reported as an
-/// infinite `df2` and a scale equal to the mean variance.
+/// Port of limma's `fitFDist` without a covariate. The variance of
+/// `e_g = log(var_g) + logmdigamma(df_g / 2)` in excess of
+/// `mean(trigamma(df_g / 2))` is `trigamma(df0/2)`, so
+/// `df0 = 2 * trigammaInverse(excess)`; the scale follows from the mean. A
+/// non-positive excess gives an infinite `df2` and a scale equal to the mean
+/// variance.
 ///
 /// Genes with a non-finite or negligible `df1`, or a non-finite or negative
 /// variance, are dropped. Exact zeros among the survivors are lifted to
-/// [`ZERO_VAR_OFFSET`] times the median so their logs stay finite.
+/// `ZERO_VAR_OFFSET` times the median.
 ///
 /// ### Params
 ///
 /// * `x` - Genewise variances
-/// * `df1` - Residual degrees of freedom, either one value shared by every gene
-///   or one per gene
+/// * `df1` - Residual degrees of freedom, one shared value or one per gene
 ///
 /// ### Returns
 ///
-/// The prior scale `s0^2` and the prior degrees of freedom `df0`, or
-/// [`EdgeErrors`] if `x` is empty, `df1` is the wrong length, or nothing
-/// survives the filter.
+/// The prior scale `s0^2` and prior degrees of freedom `df0`, or [`EdgeErrors`]
+/// if `x` is empty, `df1` has the wrong length, or nothing survives the filter.
 pub fn fit_f_dist(x: &[f64], df1: &[f64]) -> Result<(f64, f64), EdgeErrors> {
     let n = check_fit_lengths("fit_f_dist", x, df1)?;
     if n == 1 {
@@ -507,47 +468,39 @@ pub fn fit_f_dist(x: &[f64], df1: &[f64]) -> Result<(f64, f64), EdgeErrors> {
 
 /// Fits a scaled F distribution whose scale follows a trend in a covariate.
 ///
-/// Port of limma's `fitFDist` with a covariate. Identical to [`fit_f_dist`]
-/// except that the mean of `e` is a natural cubic spline in the covariate
-/// rather than a single number, so the prior variance varies by gene while the
-/// prior degrees of freedom stay shared. The spline gets 2, 3 or 4 basis columns
-/// depending on how many genes survive the filter, capped at the number of
-/// distinct covariate values; below two it degenerates and the fit falls back to
-/// [`fit_f_dist`].
+/// Port of limma's `fitFDist` with a covariate. As [`fit_f_dist`], but the mean
+/// of `e` is a natural cubic spline in the covariate, so the prior variance
+/// varies by gene while the prior degrees of freedom stay shared. The spline
+/// gets 2, 3 or 4 basis columns by surviving gene count, capped at the number
+/// of distinct covariate values; below two it falls back to [`fit_f_dist`].
 ///
-/// Infinite covariate values are pushed one unit past the finite range, as
-/// limma does, so a gene with an undefined average abundance still lands at the
-/// correct end of the trend.
+/// Infinite covariates are pushed one unit past the finite range, as in limma.
 ///
 /// ### Deviation from limma
 ///
-/// The spline basis is built over the surviving genes' covariates, as limma
-/// does, so the fit itself and the prior of every surviving gene match limma to
-/// rounding. limma then evaluates that spline at the dropped genes' covariates
-/// with `predict.ns`; [`natural_spline_basis`] does not expose its knots, so the
-/// trend is instead read off the fitted values with [`extend_trend`]. A dropped
-/// gene therefore carries an interpolation error of order the local covariate
-/// spacing squared, around a part in `1e3` on forty genes and far less on a real
-/// gene set. Nothing is affected unless some `df1` is zero or some variance is
-/// not finite, which is the only way a gene is dropped.
+/// The spline is built over the surviving genes, as in limma, so surviving
+/// genes match to rounding. limma evaluates it at dropped genes with
+/// `predict.ns`; [`natural_spline_basis`] does not expose its knots, so the
+/// trend is read off the fitted values with `extend_trend`. Dropped genes carry
+/// an interpolation error of order the local covariate spacing squared
+/// (about `1e-3` on forty genes). Only affects fits where some `df1` is zero or
+/// some variance is not finite. See `UPSTREAM_DEVIATIONS.md` A6 and A10.
 ///
 /// ### Params
 ///
 /// * `var` - Genewise variances
-/// * `df1` - Residual degrees of freedom, either one value shared by every gene
-///   or one per gene
+/// * `df1` - Residual degrees of freedom, one shared value or one per gene
 /// * `covariate` - Covariate, one per gene, typically the average log CPM
-/// * `span` - Accepted for signature parity with the robust fit and otherwise
-///   unused: limma's trended `fitFDist` is a spline whose complexity is fixed by
-///   the gene count, and has no span to set. Validated to lie in `(0, 1]`.
+/// * `span` - Validated to lie in `(0, 1]` but otherwise unused: limma's trended
+///   `fitFDist` is a spline with no span. Kept for signature parity with the
+///   robust fit.
 ///
 /// ### Returns
 ///
-/// The per-gene prior scale and the shared prior degrees of freedom. The scale
-/// holds one value per gene, except when a single gene survives the filter and
-/// there is no trend to fit, where it collapses to one value for all of them.
-/// Errors as [`fit_f_dist`], plus [`EdgeErrors::LengthMismatch`] if `covariate`
-/// is the wrong length.
+/// The per-gene prior scale and shared prior degrees of freedom. The scale
+/// collapses to one value when a single gene survives the filter. Errors as
+/// [`fit_f_dist`], plus [`EdgeErrors::LengthMismatch`] for a wrong-length
+/// `covariate`.
 pub fn fit_f_dist_trend(
     var: &[f64],
     df1: &[f64],
@@ -625,40 +578,35 @@ pub fn fit_f_dist_trend(
 
 /// Fits a scaled F distribution with Winsorised moments.
 ///
-/// Port of limma's `fitFDistRobustly`. The moment estimate in [`fit_f_dist`] is
-/// not robust: one gene with a wildly inflated variance inflates the sample
-/// variance of `e`, which drives `df0` down and weakens the moderation for every
-/// gene. This replaces the sample mean and variance of the log residuals with
-/// Winsorised ones, clipped at the `winsor_tail_p` quantiles, and solves for the
-/// `df2` whose Winsorised moments match. The theoretical Winsorised moments have
-/// no closed form and come from a 128-node Gauss-Legendre rule over the F
-/// density, mapped onto `(0, 1)` by `d -> d / (1 + d)` so the tail is finite.
+/// Port of limma's `fitFDistRobustly`. One gene with a wildly inflated variance
+/// drags `df0` down for every gene in [`fit_f_dist`]. This clips the log
+/// residuals at the `winsor_tail_p` quantiles and solves for the `df2` whose
+/// Winsorised moments match. The theoretical Winsorised moments come from a
+/// 128-node Gauss-Legendre rule over the F density, mapped onto `(0, 1)` by
+/// `d -> d / (1 + d)`.
 ///
-/// Each gene then gets its own `df2`. A gene whose F statistic is further into
-/// the tail than its rank among the genes says it should be is downweighted
-/// towards `df2_outlier`, the degrees of freedom at which that observation would
-/// be unremarkable, and the resulting vector is made monotone in the tail
-/// probability so a more extreme gene never ends up with more prior support than
-/// a less extreme one.
+/// Each gene then gets its own `df2`: a gene further into the tail than its
+/// rank implies is downweighted towards `df2_outlier`, and the vector is made
+/// monotone in the tail probability so a more extreme gene never gets more
+/// prior support than a less extreme one.
 ///
 /// ### Params
 ///
 /// * `x` - Genewise variances
-/// * `df1` - Residual degrees of freedom, either one value shared by every gene
-///   or one per gene
+/// * `df1` - Residual degrees of freedom, one shared value or one per gene
 /// * `covariate` - Covariate for a trended prior, one per gene, or `None`. Must
-///   be finite when supplied, as limma requires.
+///   be finite, as in limma.
 /// * `winsor_tail_p` - Proportions Winsorised off the lower and upper tails,
-///   each in `[0, 0.5)`. When both are below `1 / n` there is nothing to clip
-///   and the non-robust fit is returned unchanged.
+///   each in `[0, 0.5)`. When both are below `1 / n` the non-robust fit is
+///   returned unchanged.
 ///
 /// ### Returns
 ///
-/// The prior scale, length one when untrended and one value per gene when
-/// trended, and the per-gene prior degrees of freedom. Errors as [`fit_f_dist`],
-/// plus [`EdgeErrors::InvalidArgument`] if fewer than two genes are supplied,
-/// the covariate is not finite, a Winsorising proportion is outside `[0, 0.5)`,
-/// or more than half the variances are non-positive.
+/// The prior scale (length one untrended, per gene trended) and the per-gene
+/// prior degrees of freedom. Errors as [`fit_f_dist`], plus
+/// [`EdgeErrors::InvalidArgument`] for fewer than two genes, a non-finite
+/// covariate, a Winsorising proportion outside `[0, 0.5)`, or more than half
+/// the variances non-positive.
 ///
 /// ### References
 ///
@@ -675,12 +623,11 @@ pub fn fit_f_dist_robustly(
 
 /// What [`fit_f_dist_unequal_df1`] produces.
 ///
-/// Mirrors the list limma returns, including the fact that the two robust
-/// fields are only present when the robust branch actually found an outlier.
+/// The robust fields are only present when the robust branch found an outlier.
 #[derive(Clone, Debug)]
 pub struct UnequalDf1Fit {
-    /// Prior scale `s0^2`. Length one without a covariate, one per gene with
-    /// one. A single `NaN` means the fit gave up for want of informative genes.
+    /// Prior scale `s0^2`: length one without a covariate, else one per gene. A
+    /// single `NaN` means the fit gave up for want of informative genes.
     pub scale: Vec<f64>,
     /// Shared prior degrees of freedom, `NaN` when the fit gave up.
     pub df2: f64,
@@ -688,66 +635,57 @@ pub struct UnequalDf1Fit {
     /// unless the robust branch ran to completion.
     pub df2_outlier: Option<f64>,
     /// Per-gene prior degrees of freedom. `None` unless the robust branch ran
-    /// to completion, in which case callers should prefer it over `df2`.
+    /// to completion, in which case prefer it over `df2`.
     pub df2_shrunk: Option<Vec<f64>>,
 }
 
 /// Fits a scaled F prior by maximum likelihood, with per-gene `df1`.
 ///
-/// Port of limma 3.66's `fitFDistUnequalDF1`. [`fit_f_dist`] matches the first
-/// two moments of `e_g = log(s2_g) + logmdigamma(df_g / 2)`, which needs one
-/// shared `df_g` to invert `trigamma` against; this instead maximises the
-/// marginal log likelihood of the scaled F directly, so every gene may carry
-/// its own residual degrees of freedom. `glmQLFit` hands out unequal degrees of
-/// freedom as soon as a gene has structural zeros, so this is the usual path.
+/// Port of limma 3.66's `fitFDistUnequalDF1`. Where [`fit_f_dist`] needs one
+/// shared `df_g` to invert `trigamma` against, this maximises the marginal log
+/// likelihood of the scaled F directly, so every gene may carry its own `df_g`.
 ///
-/// The likelihood is maximised over `par = d2 / (1 + d2)` on `[0.5, 0.9998]`,
-/// which bounds `df2` to `[2, 9998]` and turns an unbounded search into a
-/// bounded one. `s0^2` is profiled out rather than searched: at any `d2` the
-/// maximising scale is `exp(emean - logmdigamma(d2))`, where `emean` is the
-/// weight-weighted mean of `e` or, with a covariate, a lowess trend in it.
-/// The weights are `1 / trigamma(df_g / 2)`, the inverse variance of `e_g`.
+/// The likelihood is maximised over `par = d2 / (1 + d2)` on `[0.5, 0.9998]`
+/// (`df2` in `[2, 9998]`). `s0^2` is profiled out: at any `d2` the maximising
+/// scale is `exp(emean - logmdigamma(d2))`, where `emean` is the weighted mean
+/// of `e` (or a lowess trend in it with a covariate). The weights are
+/// `1 / trigamma(df_g / 2)`.
 ///
-/// Genes are handled rather than dropped. A `NaN` variance or a `df1` below
-/// [`UNEQUAL_DF1_TOL`] gets a zero prior weight and a placeholder `df1` of one,
-/// so it contributes nothing to the fit yet still comes back with a trend
-/// value. Variances are floored at [`UNEQUAL_ZERO_VAR_OFFSET`] times the median
-/// informative variance so their logs stay finite.
+/// Genes are down-weighted, not dropped. A `NaN` variance or a `df1` below
+/// `UNEQUAL_DF1_TOL` gets zero prior weight and a placeholder `df1` of one, so
+/// it still comes back with a trend value. Variances are floored at
+/// `UNEQUAL_ZERO_VAR_OFFSET` times the median informative variance.
 ///
-/// With `robust` set the whole fit runs twice: once to get a working prior, and
-/// again with the Benjamini-Hochberg adjusted two-sided F p-values as prior
-/// weights, so genes that look like outliers are held out of the second fit.
-/// Each gene then gets its own `df2`, interpolated between the fitted `df2` and
-/// the much smaller `df2_outlier` at which the single most extreme gene would
-/// be unremarkable, and the result is made monotone in the tail probability.
+/// With `robust` set the fit runs twice: the second pass uses the
+/// Benjamini-Hochberg adjusted two-sided F p-values as prior weights, holding
+/// out likely outliers. Each gene then gets its own `df2`, interpolated between
+/// the fitted `df2` and a much smaller `df2_outlier`, made monotone in the tail
+/// probability.
 ///
 /// ### Precision limit
 ///
-/// limma computes the outlier's tail probability with `pf(..., log.p = TRUE)`.
-/// [`crate::numeric::dist`] has no log-scale F tail, so this takes
-/// `f_sf(..).ln()` instead. The two agree to rounding until the tail underflows
-/// below `1e-308`, which needs an F statistic tens of orders of magnitude past
-/// anything a variance ratio produces; past that point `df2_outlier` here is
-/// wrong and limma's is right.
+/// limma uses `pf(..., log.p = TRUE)`. [`crate::numeric::dist`] has no
+/// log-scale F tail, so this takes `f_sf(..).ln()`. They agree to rounding
+/// until the tail underflows below `1e-308`, far past any real variance ratio;
+/// beyond that `df2_outlier` here is wrong and limma's is right.
 ///
 /// ### Params
 ///
 /// * `x` - Genewise variances, non-negative. `NaN` is read as missing.
-/// * `df1` - Residual degrees of freedom, either one value shared by every gene
-///   or one per gene
+/// * `df1` - Residual degrees of freedom, one shared value or one per gene
 /// * `covariate` - Covariate for a trended prior, one per gene, or `None`
 /// * `span` - Lowess span, or `None` for `chooseLowessSpan(n, small.n = 500)`.
-///   Only consulted when a covariate is supplied.
+///   Only used with a covariate.
 /// * `robust` - Whether to run the outlier-downweighted second pass
 /// * `prior_weights` - Non-negative weight per gene, or `None`. Used by the
-///   robust recursion and exposed because limma exposes it.
+///   robust recursion; exposed because limma exposes it.
 ///
 /// ### Returns
 ///
-/// The fit, or [`EdgeErrors`] if `x` is empty, `df1`, `covariate` or
-/// `prior_weights` is the wrong length, a covariate or prior weight is `NaN`,
-/// or a prior weight is negative. Fewer than two informative genes is not an
-/// error: it comes back as a `NaN` scale and `df2`, exactly as limma does.
+/// The fit, or [`EdgeErrors`] on an empty `x`, a wrong-length `df1`,
+/// `covariate` or `prior_weights`, a `NaN` covariate or `df1`, or a negative
+/// prior weight. Fewer than two informative genes is not an error: as in limma
+/// it returns a `NaN` scale and `df2`.
 ///
 /// ### References
 ///
@@ -810,17 +748,15 @@ pub fn fit_f_dist_unequal_df1(
     )
 }
 
-///////////////////////
-// Posterior blend   //
-///////////////////////
+/////////////////////
+// Posterior blend //
+/////////////////////
 
 /// Blends each gene's variance with the prior, limma's internal `.squeezeVar`.
 ///
-/// `(df * var + df_prior * var_prior) / (df + df_prior)` wherever every
-/// `df_prior` is finite. An infinite prior sends a gene to `var_prior` exactly,
-/// which is why the infinite case is a separate branch rather than a division
-/// that happens to converge: the finite genes still need the blend, and
-/// `inf * var_prior / inf` would be `NaN`.
+/// `(df * var + df_prior * var_prior) / (df + df_prior)` wherever `df_prior` is
+/// finite. Infinite priors take a separate branch that sends the gene to
+/// `var_prior` exactly, since `inf * var_prior / inf` is `NaN`.
 ///
 /// ### Params
 ///
@@ -847,9 +783,7 @@ fn posterior_var(var: &[f64], df: &[f64], var_prior: &[f64], df_prior: &[f64]) -
     }
 
     let mut out: Vec<f64> = (0..n).map(|i| at(var_prior, i)).collect();
-    // limma treats anything past 1e100 as infinite here, so a prior that is
-    // merely enormous still collapses the blend rather than producing a
-    // posterior that differs from the prior in the last bits.
+    // limma treats anything past 1e100 as infinite here.
     let smallest = df_prior.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     if smallest > 1e100 {
         return out;
@@ -864,9 +798,9 @@ fn posterior_var(var: &[f64], df: &[f64], var_prior: &[f64], df_prior: &[f64]) -
     out
 }
 
-///////////////////
-// Robust fit    //
-///////////////////
+////////////////
+// Robust fit //
+////////////////
 
 /// Everything `fitFDistRobustly` returns that the recursion needs.
 #[derive(Clone, Debug)]
@@ -946,9 +880,9 @@ fn robust_fit_inner(
         }
     }
 
-    // Two genes cannot support a tail estimate, so limma hands the job to the
-    // non-robust fit. limma then omits df2.shrunk entirely, which makes the
-    // result unusable by its own caller; this fills it with the shared df2.
+    // Two genes cannot support a tail estimate, so limma hands over to the
+    // non-robust fit. It then omits df2.shrunk, which its own caller needs; this
+    // fills it with the shared df2.
     if n == 2 {
         return Ok(match covariate {
             Some(cov) => {
@@ -1103,9 +1037,9 @@ fn robust_fit_inner(
 
 /// Handles the genes `fitFDistRobustly` cannot use, then recurses on the rest.
 ///
-/// Dropped genes take the shared `df2` rather than a shrunken one, and, when the
-/// fit is trended, a scale interpolated from the fitted trend on the log scale
-/// and held constant beyond its ends, which is R's `approx(..., rule = 2)`.
+/// Dropped genes take the shared `df2`. When trended, they take a scale
+/// interpolated from the fitted trend on the log scale and held constant past
+/// its ends (R's `approx(..., rule = 2)`).
 ///
 /// ### Params
 ///
@@ -1172,13 +1106,11 @@ fn robust_fit_dropping(
     })
 }
 
-/// The branch where the Winsorised spread is already at or below its value at
+/// The branch where the Winsorised spread is at or below its value at
 /// `df2 = Inf`, so no finite prior can explain it.
 ///
-/// The prior degrees of freedom are infinite for every gene that is not an
-/// outlier. Outliers are given `ProbNotOutlier * n * df1`, the pooled degrees of
-/// freedom scaled by how unsurprising the gene is, and the result is made
-/// monotone in the tail probability.
+/// Non-outliers get infinite prior degrees of freedom. Outliers get
+/// `ProbNotOutlier * n * df1`, made monotone in the tail probability.
 ///
 /// ### Params
 ///
@@ -1236,17 +1168,15 @@ fn robust_infinite_df2(
 
 /// Turns the shared `df2` into a per-gene one by discounting outliers.
 ///
-/// A gene whose F statistic sits further into the tail than its rank predicts is
-/// evidence against the fitted prior for that gene alone. `ProbNotOutlier` is
-/// the ratio of its tail probability to the uniform one its rank implies, capped
-/// at one, and each gene's prior is the mixture of `df2` and `df2_outlier`
-/// weighted by it. `df2_outlier` is the degrees of freedom at which the most
-/// extreme gene would sit at the median, found by one rescaling step.
+/// `ProbNotOutlier` is the ratio of a gene's tail probability to the uniform
+/// one its rank implies, capped at one. Each gene's prior is the mixture of
+/// `df2` and `df2_outlier` weighted by it. `df2_outlier` is the degrees of
+/// freedom at which the most extreme gene would sit at the median, found by one
+/// rescaling step.
 ///
-/// The final `cummax` in tail-probability order, preceded by flattening the
-/// leading run to its running mean, is limma's: without it the per-gene prior is
-/// not monotone in the evidence, and a gene could end up better supported than a
-/// less extreme neighbour.
+/// The final `cummax` in tail-probability order, after flattening the leading
+/// run to its running mean, is limma's. It keeps the prior monotone in the
+/// evidence.
 ///
 /// ### Params
 ///
@@ -1296,11 +1226,10 @@ fn shrink_df2(
 
 /// Rescales the variances of genes with fewer degrees of freedom than the rest.
 ///
-/// The Winsorised moments are derived for a single `df1`, so a genewise `df1`
-/// has to be collapsed first. limma maps each low-`df1` variance through its own
-/// F distribution and back through the one at the largest `df1`, matching on
-/// whichever tail is smaller so the transformation never runs through a
-/// cancelled probability.
+/// The Winsorised moments assume one `df1`. As in limma, each low-`df1`
+/// variance is mapped through its own F distribution and back through the one
+/// at the largest `df1`, matching on the smaller tail to avoid cancelled
+/// probabilities.
 ///
 /// ### Params
 ///
@@ -1324,8 +1253,8 @@ fn unify_df1(x: &mut [f64], df1: &[f64], scale: &[f64], df2: f64) -> Result<f64,
         return Ok(df1[0]);
     }
     if !df2.is_finite() {
-        // An infinite df2 leaves nothing to map through; limma would produce
-        // NaN quantiles here, so keep the variances as they are.
+        // Infinite df2 leaves nothing to map through; limma would give NaN
+        // quantiles, so keep the variances as they are.
         return Ok(df1max);
     }
     for &i in &low {
@@ -1343,15 +1272,14 @@ fn unify_df1(x: &mut [f64], df1: &[f64], scale: &[f64], df2: f64) -> Result<f64,
     Ok(df1max)
 }
 
-//////////////////////////
-// Unequal df1 fit      //
-//////////////////////////
+/////////////////////
+// Unequal df1 fit //
+/////////////////////
 
 /// The body of `fitFDistUnequalDF1`, recursing once for the robust pass.
 ///
-/// Split from [`fit_f_dist_unequal_df1`] so the recursion skips revalidating
-/// inputs it has just built itself, and so `df1` arrives already recycled to
-/// full length. Everything here is limma's, in limma's order.
+/// Split from [`fit_f_dist_unequal_df1`] so the recursion skips revalidation
+/// and `df1` arrives already recycled to full length.
 ///
 /// ### Params
 ///
@@ -1380,9 +1308,8 @@ fn unequal_df1_inner(
     let mut covariate = covariate;
     let mut robust = robust;
 
-    // A missing variance is not dropped. It is zeroed and given no weight, so
-    // the gene contributes nothing to the fit yet still comes back with a
-    // trend value.
+    // A missing variance is zeroed and given no weight, not dropped, so the
+    // gene still comes back with a trend value.
     if x.iter().any(|v| v.is_nan()) {
         let mask: Vec<bool> = x.iter().map(|v| v.is_nan()).collect();
         zero_out_weights(&mut prior_weights, &mask);
@@ -1392,8 +1319,8 @@ fn unequal_df1_inner(
             }
         }
     }
-    // Same treatment for a gene with no usable residual degrees of freedom,
-    // except that df1 is reset to one so trigamma and lgamma stay finite.
+    // Same for a gene with no usable df1, except df1 is reset to one so
+    // trigamma and lgamma stay finite.
     if df1.iter().any(|&d| d < UNEQUAL_DF1_TOL) {
         let mask: Vec<bool> = df1.iter().map(|&d| d < UNEQUAL_DF1_TOL).collect();
         zero_out_weights(&mut prior_weights, &mask);
@@ -1404,8 +1331,8 @@ fn unequal_df1_inner(
         }
     }
 
-    // limma latches `PriorWeights` here, after the two blocks above may have
-    // created the weights, and never clears it again. That matters below.
+    // limma latches `PriorWeights` here, after the blocks above may have
+    // created them, and never clears it. That matters below.
     let weighted = prior_weights.is_some();
 
     let informative: Vec<bool> = (0..n)
@@ -1437,8 +1364,7 @@ fn unequal_df1_inner(
     let w: Vec<f64> = match (weighted, prior_weights.as_ref()) {
         // `w * prior.weights` with the weights cleared by the n.informative == 2
         // branch but the flag still set. R's zero-length recycling empties the
-        // vector rather than erroring, which sends every reduction below to
-        // 0 / 0. Reproduced, not repaired.
+        // vector, sending every reduction below to 0 / 0. Reproduced on purpose.
         (true, None) => Vec::new(),
         (true, Some(p)) => d1
             .iter()
@@ -1501,14 +1427,12 @@ fn unequal_df1_inner(
         });
     }
 
-    // Two-sided F p-values against the prior just fitted. A gene whose variance
-    // is far into either tail is evidence that the prior is being dragged, so
-    // the second pass holds it out in proportion to its FDR.
+    // Two-sided F p-values against the prior just fitted. Genes far into either
+    // tail are held out of the second pass in proportion to their FDR.
     let f_stat: Vec<f64> = (0..n).map(|g| x[g] / at(&s20, g)).collect();
-    // Elementwise, so the fork is exactly reproducible. The likelihood sum
-    // above deliberately is not forked: a tree reduction would reassociate it
-    // and move `df2` in the last few digits, which on a likelihood this flat is
-    // visible in the answer.
+    // Elementwise, so the fork is exactly reproducible. The likelihood sum above
+    // is deliberately not forked: a tree reduction reassociates it and moves
+    // `df2` in the last digits.
     let right_p: Vec<f64> = if n >= PARALLEL_THRESHOLD {
         (0..n)
             .into_par_iter()
@@ -1543,14 +1467,13 @@ fn unequal_df1_inner(
         });
     }
 
-    // limma leaves `span` out of this call, so a caller-supplied span applies to
-    // the first pass only and the second always uses chooseLowessSpan.
+    // limma leaves `span` out of this call: a supplied span applies to the first
+    // pass only, the second uses chooseLowessSpan.
     let outpw = unequal_df1_inner(&x, &df1, covariate, None, false, Some(fdr))?;
     let scale = outpw.scale;
     df2 = outpw.df2;
 
-    // How surprising each gene's tail probability is given its rank. A gene
-    // sitting exactly where the uniform order statistics say it should gives 1
+    // A gene sitting exactly where the uniform order statistics put it gives 1
     // and keeps the full prior.
     let ranks = rank_average(&f_stat);
     let n_f = n as f64;
@@ -1582,9 +1505,8 @@ fn unequal_df1_inner(
                 .collect::<Vec<_>>(),
         )
     } else {
-        // Two passes of the same idea: find the df2 at which the most extreme
-        // gene would sit at the median of its own null, starting from a
-        // log-linear guess and correcting once.
+        // Find the df2 at which the most extreme gene would sit at the median
+        // of its null: log-linear guess, corrected once.
         let first = LN_HALF / min_right_p.ln() * df2;
         let new_log_right_p = f_sf(f_stat[imin], df1[imin], first)?.ln();
         let outlier = LN_HALF / new_log_right_p * first;
@@ -1598,9 +1520,8 @@ fn unequal_df1_inner(
     };
 
     // Make the per-gene prior monotone in the tail probability: level the
-    // leading block off at its smallest running mean, then run a maximum
-    // through the rest, so a more extreme gene never keeps more prior support
-    // than a less extreme one.
+    // leading block at its smallest running mean, then run a maximum through
+    // the rest.
     let order = stable_order(&right_p);
     flatten_then_cummax(&mut df2_shrunk, &order);
 
@@ -1614,8 +1535,7 @@ fn unequal_df1_inner(
 
 /// Zeroes the flagged prior weights, creating the vector if there was none.
 ///
-/// limma's idiom for retiring a gene without dropping it: `prior.weights[i] <- 0`
-/// when weights exist, `as.numeric(!i)` when they do not.
+/// limma's idiom: `prior.weights[i] <- 0`, or `as.numeric(!i)` when absent.
 ///
 /// ### Params
 ///
@@ -1661,9 +1581,8 @@ fn which_min(v: &[f64]) -> usize {
 
 /// Whether every strictly positive degrees of freedom is the same value.
 ///
-/// limma's automatic `legacy` rule. An empty set of positive degrees of freedom
-/// gives `false`, because R's `min` and `max` of an empty vector are `Inf` and
-/// `-Inf` and it compares them for identity.
+/// limma's automatic `legacy` rule. No positive values gives `false`, as R
+/// compares `Inf` and `-Inf`.
 ///
 /// ### Params
 ///
@@ -1684,9 +1603,8 @@ fn all_positive_df_equal(df: &[f64]) -> bool {
 
 /// Lower tail of the F distribution, R's `pf(q, df1, df2, lower.tail = TRUE)`.
 ///
-/// Formed from whichever side of the incomplete beta has not been squeezed
-/// against one, which is the switch R makes and the reason this is not simply
-/// `1 - f_sf`.
+/// Uses whichever side of the incomplete beta is not squeezed against one, as R
+/// does, so it is not simply `1 - f_sf`.
 ///
 /// ### Params
 ///
@@ -1711,18 +1629,16 @@ fn f_cdf(x: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
     }
 }
 
-//////////////////////////
-// Winsorised moments   //
-//////////////////////////
+////////////////////////
+// Winsorised moments //
+////////////////////////
 
 /// Mean and variance of the Winsorised log F distribution.
 ///
-/// The Winsorised log statistic is `log(F)` clipped at its `p1` and `1 - p2`
-/// quantiles, so its moments are an integral of `log(F)` over the central part
-/// of the density plus point masses `p1` and `p2` at the two clipped values. The
-/// integral runs in the link scale `q = f / (1 + f)`, which maps `[0, inf)` onto
-/// `[0, 1)` and turns the upper tail into a finite interval; the Jacobian is the
-/// `1 / (1 - q)^2` factor on the density.
+/// The moments are an integral of `log(F)` over the central part of the density
+/// plus point masses `p1` and `p2` at the clipped values. The integral runs in
+/// the link scale `q = f / (1 + f)`, which makes the upper tail a finite
+/// interval; the Jacobian is the `1 / (1 - q)^2` factor on the density.
 ///
 /// ### Params
 ///
@@ -1779,10 +1695,9 @@ fn winsorized_moments(
 
 /// Gauss-Legendre nodes and weights on `(0, 1)`, weights summing to one.
 ///
-/// `statmod::gauss.quad.prob(n, "uniform")`. The nodes are the roots of the
-/// `n`-th Legendre polynomial found by Newton from the Chebyshev-like starting
-/// guess `cos(pi (i - 1/4) / (n + 1/2))`, which is accurate enough that three or
-/// four steps reach machine precision, then mapped from `[-1, 1]` onto `[0, 1]`.
+/// `statmod::gauss.quad.prob(n, "uniform")`. Roots of the `n`-th Legendre
+/// polynomial by Newton from `cos(pi (i - 1/4) / (n + 1/2))`, mapped from
+/// `[-1, 1]` onto `[0, 1]`.
 ///
 /// ### Params
 ///
@@ -1856,9 +1771,9 @@ fn link_inv(p: f64) -> f64 {
     p / (1.0 - p)
 }
 
-/////////////////////////////
-// F distribution helpers  //
-/////////////////////////////
+////////////////////////////
+// F distribution helpers //
+////////////////////////////
 
 /// F quantile that also accepts an infinite denominator.
 ///
@@ -1912,10 +1827,9 @@ fn f_density(x: f64, df1: f64, df2: f64) -> f64 {
 
 /// Inverse of the F survival function.
 ///
-/// Built from the beta quantile rather than as `f_ppf(1 - p)`, which would round
-/// a small upper-tail probability straight to one and return `inf`. Since
-/// `sf(x) = I(df2 / (df1 x + df2); df2/2, df1/2)`, the quantile is recovered
-/// from the beta quantile of `p` at the swapped shapes.
+/// Built from the beta quantile, since `f_ppf(1 - p)` rounds a small upper-tail
+/// probability to one and returns `inf`. Uses
+/// `sf(x) = I(df2 / (df1 x + df2); df2/2, df1/2)`.
 ///
 /// ### Params
 ///
@@ -1934,9 +1848,9 @@ fn f_isf(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
     Ok(df2 * (1.0 - w) / (df1 * w))
 }
 
-//////////////////
-// Spline fit   //
-//////////////////
+////////////////
+// Spline fit //
+////////////////
 
 /// Smallest usable spline basis; below this the trended fit degenerates.
 const MIN_SPLINE_DF: usize = 2;
@@ -1944,8 +1858,7 @@ const MIN_SPLINE_DF: usize = 2;
 /// Number of spline basis columns limma gives the trended fit.
 ///
 /// `1 + (n >= 3) + (n >= 6) + (n >= 30)`, capped at the number of distinct
-/// covariate values because a basis cannot have more columns than the covariate
-/// has support points.
+/// covariate values.
 ///
 /// ### Params
 ///
@@ -1965,9 +1878,9 @@ fn spline_columns(nok: usize, covariate: &[f64]) -> usize {
 
 /// Least squares fit of `e` on a spline basis.
 ///
-/// The rank comes from the QR diagonal at [`RANK_TOL`], matching R's `lm.fit`,
-/// because it is the divisor of the residual variance and an over-counted rank
-/// would inflate the estimated prior degrees of freedom.
+/// The rank comes from the QR diagonal at [`RANK_TOL`], as in R's `lm.fit`. It
+/// is the divisor of the residual variance, so over-counting it would inflate
+/// the prior degrees of freedom.
 ///
 /// ### Params
 ///
@@ -2012,13 +1925,12 @@ fn spline_fit(basis: &[f64], ncol: usize, e: &[f64]) -> Result<(Vec<f64>, f64, u
 
 /// Spreads a trend fitted on the surviving genes over all of them.
 ///
-/// limma evaluates the fitted natural spline at the dropped genes' covariates
-/// with `predict.ns`. The basis in [`crate::numeric::interpolate`] does not
-/// expose its knots, so the curve is instead read off the fitted values
-/// themselves: a natural cubic spline is exactly linear beyond its boundary
-/// knots, so a dropped gene outside the surviving covariate range gets the same
-/// value limma would give it, and one inside is interpolated between its two
-/// neighbours with an error of order the local covariate spacing squared.
+/// limma uses `predict.ns` at the dropped genes' covariates. The basis in
+/// [`crate::numeric::interpolate`] does not expose its knots, so the curve is
+/// read off the fitted values instead. A natural cubic spline is linear beyond
+/// its boundary knots, so dropped genes outside the surviving range match
+/// limma; those inside are interpolated with error of order the local covariate
+/// spacing squared.
 ///
 /// ### Params
 ///
@@ -2061,9 +1973,9 @@ fn extend_trend(
 
 /// Piecewise-linear interpolation that keeps the end slopes outside the range.
 ///
-/// [`interp_linear_extrap`] holds the end values constant, which is R's
-/// `approx(rule = 2)` and the wrong shape for a natural spline: those are linear
-/// past their boundary knots, not flat.
+/// [`interp_linear_extrap`] holds the end values flat (R's `approx(rule = 2)`),
+/// the wrong shape for a natural spline, which is linear past its boundary
+/// knots.
 ///
 /// ### Params
 ///
@@ -2088,31 +2000,28 @@ fn interp_linear_extend(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
     fp[lo] + t * (fp[hi] - fp[lo])
 }
 
-///////////////
-// Lowess    //
-///////////////
+////////////
+// Lowess //
+////////////
 
 /// limma's `loessFit` with prior weights, as `fitFDistUnequalDF1` calls it.
 ///
-/// `loessFit`'s `method` argument is a red herring here. It defaults to
-/// `weightedLowess`, but there is an early return before the switch: with no
-/// weights it is `stats::lowess` and nothing else. `fitFDistUnequalDF1` does
-/// supply weights, so the `weightedLowess` branch is normally the live one, but
-/// `equal.weights.as.null = TRUE` discards weights that are all equal after
-/// clamping and drops it back into `stats::lowess`. Equal `df1` with no prior
-/// weights does exactly that, so both branches matter.
+/// Both limma branches matter here. With weights the call goes to
+/// `weightedLowess`, but `equal.weights.as.null = TRUE` discards weights that
+/// are all equal after clamping and falls back to `stats::lowess`. Equal `df1`
+/// with no prior weights does exactly that.
 ///
-/// The weights arrive unscaled and are divided by their upper quartile here,
-/// then clamped to `[LOESS_MIN_WEIGHT, LOESS_MAX_WEIGHT]`, matching the
-/// `min.weight` and `max.weight` limma passes.
+/// Weights are divided by their upper quartile, then clamped to
+/// `[LOESS_MIN_WEIGHT, LOESS_MAX_WEIGHT]`, matching limma's `min.weight` and
+/// `max.weight`.
 ///
 /// ### Deviation from limma
 ///
-/// The too-few-points fallback is a weighted straight line fitted from the
-/// normal equations, where limma uses `lm.wfit`'s pivoted QR. The fitted values
-/// agree to rounding whenever the covariate has any weighted spread, and the
-/// rank test is [`WLS_RANK_TOL`] rather than the QR's own. It only runs when
-/// there are fewer than `4 + 1 / span` points, which needs three or four genes.
+/// The too-few-points fallback is a weighted straight line from the normal
+/// equations, where limma uses `lm.wfit`'s pivoted QR. Fitted values agree to
+/// rounding whenever the covariate has weighted spread; the rank test is
+/// [`WLS_RANK_TOL`]. It only runs below `4 + 1 / span` points, so for three or
+/// four genes.
 ///
 /// ### Params
 ///
@@ -2194,10 +2103,9 @@ fn loess_fit_weighted(
 
 /// Fitted values of a weighted straight line, `lm.wfit(cbind(1, x), y, w)`.
 ///
-/// Solved from the two-by-two weighted normal equations. When the covariate has
-/// no weighted spread the slope is dropped and every fitted value is the
-/// weighted mean, which is what the pivoted QR in `lm.wfit` does with a rank
-/// deficient design.
+/// Solved from the two-by-two weighted normal equations. Without weighted spread
+/// in the covariate the slope is dropped and every fit is the weighted mean, as
+/// `lm.wfit` does for a rank deficient design.
 ///
 /// ### Params
 ///
@@ -2224,9 +2132,9 @@ fn weighted_line_fitted(x: &[f64], y: &[f64], w: &[f64]) -> Vec<f64> {
     x.iter().map(|&v| intercept + slope * v).collect()
 }
 
-//////////////////////
-// Small utilities  //
-//////////////////////
+/////////////////////
+// Small utilities //
+/////////////////////
 
 /// Checks that `x` is non-empty and `df1` is length one or matches it.
 ///
@@ -2308,8 +2216,8 @@ fn informative_mask(x: &[f64], df1: &[f64], df_tol: f64) -> Vec<bool> {
 fn offset_from_zero(x: &[f64]) -> Vec<f64> {
     let mut out: Vec<f64> = x.iter().map(|&v| v.max(0.0)).collect();
     let m = median(&out);
-    // More than half the variances are exactly zero: limma warns that eBayes is
-    // unreliable and carries on with a unit scale.
+    // More than half the variances are exactly zero: limma warns that eBayes
+    // is unreliable and carries on with a unit scale.
     let m = if m == 0.0 { 1.0 } else { m };
     let floor = ZERO_VAR_OFFSET * m;
     for v in &mut out {
@@ -2413,9 +2321,8 @@ fn subset(v: &[f64], ok: &[bool]) -> Vec<f64> {
 
 /// Keeps the flagged entries of a vector that may be length one.
 ///
-/// A length-one vector is expanded to the number of flagged entries rather than
-/// left alone, so callers can zip it against the subset without silently
-/// truncating to one element.
+/// A length-one vector is expanded to the flagged count, so zipping against the
+/// subset does not truncate to one element.
 ///
 /// ### Params
 ///
@@ -2448,9 +2355,8 @@ fn mean(x: &[f64]) -> f64 {
 
 /// Mean of `trigamma(df / 2)` over the given degrees of freedom.
 ///
-/// This is the part of the observed variance of `e` that the genewise residual
-/// degrees of freedom already explain, and subtracting it is what leaves the
-/// prior's own contribution behind.
+/// The part of the observed variance of `e` that the genewise residual degrees
+/// of freedom already explain.
 ///
 /// ### Params
 ///
@@ -2495,9 +2401,9 @@ fn cummax_in_order(v: &mut [f64], order: &[usize]) {
 /// Flattens the leading run to its smallest running mean, then takes a
 /// [`cummax_in_order`] through the rest.
 ///
-/// limma's per-gene prior monotonicity trick: without the flatten, the most
-/// extreme gene could keep more prior support than a less extreme one, since a
-/// bare cummax only enforces monotonicity from that point onward.
+/// limma's monotonicity trick for the per-gene prior. A bare cummax only
+/// enforces monotonicity from its start, so the most extreme gene could keep
+/// more prior support than a less extreme one.
 ///
 /// ### Params
 ///
@@ -2523,7 +2429,7 @@ fn flatten_then_cummax(v: &mut [f64], order: &[usize]) {
 /// Sorts knots ascending and averages the ordinates at duplicate abscissae.
 ///
 /// R's `approx(..., ties = mean)`; [`interp_linear_extrap`] needs strictly
-/// increasing knots and a covariate can easily repeat a value.
+/// increasing knots.
 ///
 /// ### Params
 ///
@@ -2585,8 +2491,7 @@ mod tests {
     use approx::assert_relative_eq;
 
     /// Variances for fixture A, `k / 64` with `k = ((i * 37) mod 97) + 1` for
-    /// `i` in `1..=24`. Every value is an exact `f64`, so R and Rust see the
-    /// same bits and only the outputs need embedding.
+    /// `i` in `1..=24`. Exact `f64`, so R and Rust see the same bits.
     fn fixture_a() -> Vec<f64> {
         (1..=24)
             .map(|i| (((i * 37) % 97) + 1) as f64 / 64.0)
@@ -2616,8 +2521,8 @@ mod tests {
     }
 
     /// Nearly constant variances, `1 + (((j * 17) mod 7) - 3) / 4096` for `j` in
-    /// `1..=60`. Dispersed far less than a chi-square on six degrees of freedom
-    /// would be, which is what drives the robust fit to `df2 = Inf`.
+    /// `1..=60`. Far less dispersed than a chi-square on six degrees of freedom,
+    /// which drives the robust fit to `df2 = Inf`.
     fn fixture_d() -> Vec<f64> {
         (1..=60)
             .map(|j| 1.0 + ((((j * 17) % 7) as f64) - 3.0) / 4096.0)
@@ -2636,7 +2541,9 @@ mod tests {
         }
     }
 
-    // -- fitFDist, untrended --
+    // ------------------- //
+    // fitFDist, untrended //
+    // ------------------- //
 
     /// `Rscript -e 'suppressMessages(library(limma)); i <- 1:24; x <- (((i*37) %% 97)+1)/64;
     ///  r <- limma:::fitFDist(x, df1=rep(4,24)); cat(sprintf("%.17g %.17g", r$scale, r$df2))'`
@@ -2738,8 +2645,7 @@ mod tests {
 
     #[test]
     fn test_squeeze_var_with_unequal_df_matches_limma_legacy() {
-        // Unequal df would send the default straight to fitFDistUnequalDF1, so
-        // the legacy fit these numbers came from has to be asked for.
+        // Unequal df would default to fitFDistUnequalDF1, so ask for legacy.
         let df: Vec<f64> = (0..24).map(|i| [2.0, 4.0, 7.0, 11.0][i % 4]).collect();
         let out = squeeze_var(
             &fixture_a(),
@@ -2756,7 +2662,9 @@ mod tests {
         assert_slices_close(&out.var_post, &A_VAR_POST_UNEQUAL, 1e-12);
     }
 
-    // -- fitFDist, trended --
+    // ----------------- //
+    // fitFDist, trended //
+    // ----------------- //
 
     /// `Rscript -e 'suppressMessages(library(limma)); i <- 1:24; x <- (((i*37) %% 97)+1)/64;
     ///  a <- ((i*53) %% 101)/8; s <- squeezeVar(x, df=rep(4,24), covariate=a, legacy=TRUE);
@@ -2836,17 +2744,17 @@ mod tests {
         assert_slices_close(&scale, &A_TREND_VAR_PRIOR, 1e-12);
     }
 
-    // -- fitFDistRobustly --
+    // ---------------- //
+    // fitFDistRobustly //
+    // ---------------- //
 
     /// Every robust reference below comes from limma with its `uniroot` call
     /// converged past its own default.
     ///
-    /// `fitFDistRobustly` solves for `df2` with `uniroot(..., tol = 1e-8)`, and
-    /// `1e-8` is a bracket width in the `d / (1 + d)` link, worth roughly `1e-4`
-    /// on a `df2` of 100. limma's stock answer therefore sits a few parts in
-    /// `1e8` from the root of its own objective. Converging properly and
-    /// comparing against limma's own converged value is the sharper test; the
-    /// stock output is checked at the tolerance it deserves by
+    /// `fitFDistRobustly` solves for `df2` with `uniroot(..., tol = 1e-8)`, a
+    /// bracket width in the `d / (1 + d)` link worth roughly `1e-4` on a `df2` of
+    /// 100. Comparing against limma's converged value is the sharper test; the
+    /// stock output is checked in
     /// `test_robust_fit_matches_stock_limma_to_its_own_root_tolerance`.
     ///
     /// Every command below assumes this preamble:
@@ -2926,8 +2834,7 @@ mod tests {
         let (scale, shrunk) = fit_f_dist_robustly(&fixture_b(), &[4.0], None, (0.05, 0.1)).unwrap();
         assert_relative_eq!(scale[0], B_ROBUST_SCALE_STOCK, max_relative = 1e-7);
         assert_relative_eq!(shrunk[0], B_ROBUST_DF2_STOCK, max_relative = 1e-7);
-        // And closer to limma's converged root than limma's own default
-        // tolerance gets, which is the point of the exercise.
+        // And closer to limma's converged root than its default tolerance gets.
         let ours = (shrunk[0] - B_ROBUST_DF2).abs();
         let stock = (B_ROBUST_DF2_STOCK - B_ROBUST_DF2).abs();
         assert!(ours < stock, "ours {ours:e} should beat limma's {stock:e}");
@@ -3037,8 +2944,8 @@ mod tests {
 
     #[test]
     fn test_squeeze_var_robust_unequal_df_matches_limma() {
-        // As above: these are `legacy = TRUE` numbers and unequal df no longer
-        // reaches that fit by default.
+        // These are `legacy = TRUE` numbers; unequal df no longer reaches that
+        // fit by default.
         let df: Vec<f64> = (0..40).map(|i| [3.0, 5.0, 8.0, 12.0][i % 4]).collect();
         let out = squeeze_var(
             &fixture_b(),
@@ -3055,9 +2962,9 @@ mod tests {
     }
 
     /// `Rscript -e '... s <- squeezeVar(x, df=rep(4,40), covariate=a, robust=TRUE, legacy=TRUE)'`
-    /// with `a <- ((i*29) %% 97)/8`. The Winsorised spread of the residuals about
-    /// the lowess trend is already below its value at `df2 = Inf`, so the fit
-    /// takes the infinite branch and only the three outliers get a finite prior.
+    /// with `a <- ((i*29) %% 97)/8`. The Winsorised residual spread is already
+    /// below its value at `df2 = Inf`, so the fit takes the infinite branch and
+    /// only the three outliers get a finite prior.
     const B_ROBUST_TREND_VAR_PRIOR: [f64; 40] = [
         1.465_770_201_514_433,
         2.358_668_761_366_851,
@@ -3194,7 +3101,9 @@ mod tests {
         }
     }
 
-    // -- degrees of freedom of zero --
+    // -------------------------- //
+    // degrees of freedom of zero //
+    // -------------------------- //
 
     /// `Rscript -e '... d <- rep(4,40); d[c(3,17,29)] <- 0;
     ///  s <- squeezeVar(x, df=d, legacy=TRUE); cat(sprintf("%.17g %.17g", s$df.prior, s$var.prior))'`
@@ -3304,7 +3213,9 @@ mod tests {
         }
     }
 
-    // -- zero variance --
+    // ------------- //
+    // zero variance //
+    // ------------- //
 
     /// `Rscript -e '... x[5] <- 0; x[19] <- 0;
     ///  s <- suppressWarnings(squeezeVar(x, df=rep(4,40), legacy=TRUE));
@@ -3365,7 +3276,9 @@ mod tests {
         );
     }
 
-    // -- infinite prior degrees of freedom --
+    // --------------------------------- //
+    // infinite prior degrees of freedom //
+    // --------------------------------- //
 
     /// `Rscript -e 'suppressMessages(library(limma)); s <- squeezeVar(rep(0.5,20), df=rep(4,20),
     ///  legacy=TRUE); cat(s$df.prior, s$var.prior, s$var.post[1])'`
@@ -3374,7 +3287,7 @@ mod tests {
         let out = squeeze_var(&[0.5; 20], &[4.0; 20], None, None).unwrap();
         assert!(out.df_prior[0].is_infinite());
         assert_eq!(out.var_prior[0], 0.5);
-        // The posterior must be the prior bit for bit, not merely close to it.
+        // The posterior must be the prior bit for bit.
         for &v in &out.var_post {
             assert_eq!(v, 0.5);
         }
@@ -3409,7 +3322,9 @@ mod tests {
         }
     }
 
-    // -- small inputs --
+    // ------------ //
+    // small inputs //
+    // ------------ //
 
     #[test]
     fn test_fewer_than_three_genes_returns_the_input_unmoderated() {
@@ -3431,7 +3346,9 @@ mod tests {
         assert_eq!(df2, 0.0);
     }
 
-    // -- error branches --
+    // -------------- //
+    // error branches //
+    // -------------- //
 
     #[test]
     fn test_empty_input_is_an_error() {
@@ -3598,7 +3515,9 @@ mod tests {
         assert!(fit_f_dist(&[1.0, 2.0, 3.0], &[0.0, 0.0, 0.0]).is_err());
     }
 
-    // -- trended fits with some genes dropped --
+    // ------------------------------------ //
+    // trended fits with some genes dropped //
+    // ------------------------------------ //
 
     /// `Rscript -e 'suppressMessages(library(limma)); i <- 1:40;
     ///  x <- (((i*37) %% 251)+1)/64; x[7] <- 40; x[23] <- 60; x[31] <- 25;
@@ -3695,11 +3614,10 @@ mod tests {
 
     #[test]
     fn test_squeeze_var_trended_with_zero_df_tracks_limma() {
-        // The fit itself is exact: the basis is built over the surviving
-        // covariates, so limma's knots are reproduced. Only the three dropped
-        // genes are read off the fitted curve by interpolation instead of by
-        // limma's `predict.ns`, and those sit inside the covariate range where
-        // the spline is a cubic rather than a line.
+        // The fit is exact: the basis is built over the surviving covariates,
+        // so limma's knots are reproduced. Only the three dropped genes are read
+        // off the fitted curve instead of by `predict.ns`, and they sit inside
+        // the covariate range where the spline is a cubic.
         let cov = covariate_b();
         let mut df = vec![4.0; 40];
         for i in [2, 16, 28] {
@@ -3811,9 +3729,9 @@ mod tests {
     }
 
     /// The same fixture with the dropped genes moved to the ends of the
-    /// covariate range, which is where the knot-placement deviation
-    /// documented on [`fit_f_dist_trend`] actually bites: limma's boundary
-    /// knots then sit at the surviving covariates rather than at all of them.
+    /// covariate range, where the knot-placement deviation on
+    /// [`fit_f_dist_trend`] bites: limma's boundary knots sit at the surviving
+    /// covariates.
     ///
     /// `Rscript -e 'suppressMessages(library(limma)); i <- 1:40;
     ///  x <- (((i*37) %% 251)+1)/64; x[7] <- 40; x[23] <- 60; x[31] <- 25;
@@ -3866,10 +3784,9 @@ mod tests {
 
     #[test]
     fn test_squeeze_var_trended_with_dropped_edge_genes_tracks_limma() {
-        // The fit is exact for every surviving gene however the dropped ones
-        // are placed. The three dropped here are the smallest, second smallest
-        // and largest covariate, so they are the worst case for reading the
-        // trend off the fitted values: two of them are extrapolated.
+        // Exact for every surviving gene wherever the dropped ones sit. Here they
+        // are the smallest, second smallest and largest covariate, the worst case
+        // for reading the trend off the fitted values: two are extrapolated.
         let cov = covariate_b();
         let mut df = vec![4.0; 40];
         for i in [36, 9, 26] {
@@ -3891,15 +3808,16 @@ mod tests {
         }
     }
 
-    // -- scale --
+    // ----- //
+    // scale //
+    // ----- //
 
     #[test]
     fn test_robust_fit_over_the_parallel_threshold_stays_consistent() {
-        // Past PARALLEL_THRESHOLD the tail probabilities fan out over rayon.
-        // There is no limma fixture at this size worth embedding, so the check
-        // is the invariant every posterior has to satisfy: it is a weighted
-        // average of the gene's own variance and the prior, so it lies between
-        // them.
+        // Past PARALLEL_THRESHOLD the tail probabilities run over rayon. No
+        // limma fixture at this size, so check the invariant: the posterior is a
+        // weighted average of the gene's variance and the prior, so it lies
+        // between them.
         let n = 5_000;
         assert!(n > PARALLEL_THRESHOLD);
         let var: Vec<f64> = (1..=n)
@@ -3936,7 +3854,9 @@ mod tests {
         }
     }
 
-    // -- component checks --
+    // ---------------- //
+    // component checks //
+    // ---------------- //
 
     /// `Rscript -e 'g <- statmod::gauss.quad.prob(128, dist="uniform");
     ///  cat(sprintf("%.17g", c(g$nodes[1], g$nodes[64], g$nodes[128], sum(g$weights),
@@ -4005,11 +3925,12 @@ mod tests {
         assert_relative_eq!(out[2], 3.0, max_relative = 1e-15);
     }
 
-    // -- fitFDistUnequalDF1 --
+    // ------------------ //
+    // fitFDistUnequalDF1 //
+    // ------------------ //
     //
-    // Every reference below comes from limma 3.66 under R 4.5, generated with
-    // the command in the doc comment above it. The two fixtures are set up once
-    // for the whole block:
+    // References come from limma 3.66 under R 4.5, generated with the command in
+    // the doc comment above each. Fixtures:
     //
     //   i <- 1:24; xa <- (((i*37) %% 97)+1)/64;  ca <- ((i*53) %% 101)/8
     //   dfa <- rep(c(2,4,7,11),6)
@@ -4019,16 +3940,13 @@ mod tests {
 
     /// Relative tolerance for the unequal-`df1` references.
     ///
-    /// Two orders of magnitude looser than the legacy fits get, and the reason
-    /// is not this module. `crate::numeric::gamma::logmdigamma` is a more
-    /// accurate function than statmod's: `logmdigamma(1)` should be the
-    /// Euler-Mascheroni constant `0.5772156649015329`, this crate returns
-    /// `0.5772156649015328` and statmod returns `0.5772156649015084`, wrong in
-    /// the fourteenth digit. `ln_gamma` differs from R's by a similar margin.
-    /// Those feed `emean`, and `emean` is exponentiated into the scale, so a
-    /// relative error of `1e-13` in `emean` is a relative error of `1e-13` in
-    /// the scale before anything else happens. Matching limma any closer would
-    /// mean reproducing statmod's error, not fixing anything.
+    /// Two orders of magnitude looser than the legacy fits. `logmdigamma` here is
+    /// more accurate than statmod's: `logmdigamma(1)` should be the
+    /// Euler-Mascheroni constant `0.5772156649015329`; this crate returns
+    /// `0.5772156649015328`, statmod `0.5772156649015084`. `ln_gamma` differs
+    /// from R's by a similar margin. Both feed `emean`, which is exponentiated
+    /// into the scale, so `1e-13` in `emean` is `1e-13` in the scale. Matching
+    /// closer would mean reproducing statmod's error.
     ///
     /// Worst observed disagreement on any scale, prior or posterior variance in
     /// this block is `3e-11`.
@@ -4036,16 +3954,15 @@ mod tests {
 
     /// Relative tolerance where the likelihood is flat enough to amplify that.
     ///
-    /// The log likelihood is quadratic in `par` near its maximum with a small
+    /// The log likelihood is quadratic in `par` near its maximum with small
     /// curvature, so an error of `eps` in the objective moves the maximiser by
-    /// far more than `eps`. Substituting R's own `emean` into the objective
-    /// here takes the `df2` disagreement on fixture A from `1.3e-11` to
-    /// `7.4e-12`, which is what leaves `logmdigamma` and `lgamma` as the
-    /// binding constraint rather than `optimize`'s `tol` or the search.
+    /// far more than `eps`. Substituting R's own `emean` takes the `df2`
+    /// disagreement on fixture A from `1.3e-11` to `7.4e-12`, so `logmdigamma`
+    /// and `lgamma` are the binding constraint, not `optimize`'s `tol`.
     ///
     /// Worst observed disagreement on a `df2` below ten is `1.6e-10`. Larger
-    /// `df2` is flatter still: the six hundred gene robust fixture lands on
-    /// `123.71`, where the disagreement is `4.1e-09`.
+    /// `df2` is flatter: the six hundred gene robust fixture lands on `123.71`,
+    /// with a disagreement of `4.1e-09`.
     const UNEQUAL_FLAT_TOL: f64 = 1e-8;
 
     /// Unequal residual degrees of freedom for fixture A.
@@ -4141,8 +4058,8 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_with_covariate_matches_limma() {
-        // Unequal df1 makes the lowess weights genuinely unequal, so this is
-        // the weightedLowess branch of loessFit.
+        // Unequal df1 makes the lowess weights unequal: the weightedLowess
+        // branch of loessFit.
         let fit = fit_f_dist_unequal_df1(
             &fixture_a(),
             &df_a(),
@@ -4210,9 +4127,9 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_falls_back_to_plain_lowess_on_equal_weights() {
-        // Equal df1 and no prior weights makes every lowess weight identical,
-        // so `equal.weights.as.null` throws them away and loessFit becomes a
-        // bare `stats::lowess`. Different smoother, different answer.
+        // Equal df1 and no prior weights make every lowess weight identical, so
+        // `equal.weights.as.null` discards them and loessFit becomes a bare
+        // `stats::lowess`.
         let fit = fit_f_dist_unequal_df1(
             &fixture_b(),
             &[4.0; 40],
@@ -4382,8 +4299,7 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_with_two_informative_genes_matches_limma() {
-        // Two informative genes drops the covariate, so the scale is a single
-        // number even though a covariate was supplied.
+        // Two informative genes drops the covariate: the scale is one number.
         let mut x = vec![0.0; 24];
         x[2] = 0.5;
         x[8] = 2.0;
@@ -4406,9 +4322,8 @@ mod tests {
     fn test_fit_f_dist_unequal_df1_with_two_informative_genes_and_prior_weights() {
         // limma clears `prior.weights` here but leaves `PriorWeights` set, so
         // `w * prior.weights` recycles a zero-length vector and every reduction
-        // that follows is 0 / 0. The scale comes back NaN and the flat
-        // likelihood sends `optimize` to its usual near-boundary point. This
-        // reproduces limma rather than repairing it.
+        // is 0 / 0. The scale comes back NaN and `optimize` lands near the
+        // boundary. Reproduced, not repaired.
         //
         // `Rscript -e '... pw <- rep(0,24); pw[c(3,9)] <- 1;
         //  r <- limma:::fitFDistUnequalDF1(xa, df1=dfa, prior.weights=pw);
@@ -4439,9 +4354,8 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_with_a_zero_variance_matches_limma() {
-        // A zero variance is not informative but is not dropped either: it is
-        // floored at 1e-12 times the median and still carries full weight into
-        // the likelihood.
+        // A zero variance is floored at 1e-12 times the median and keeps full
+        // weight in the likelihood.
         let mut x = fixture_a();
         x[4] = 0.0;
         let fit = fit_f_dist_unequal_df1(&x, &df_a(), None, None, false, None).unwrap();
@@ -4475,8 +4389,8 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_masks_tiny_df1_matches_limma() {
-        // df1 below 0.01 is retired with a zero prior weight and a placeholder
-        // df1 of one, which also latches `PriorWeights` on for the whole fit.
+        // df1 below 0.01 gets zero prior weight and a placeholder df1 of one,
+        // which also latches `PriorWeights` on for the whole fit.
         let mut df = df_a();
         df[1] = 0.0;
         df[10] = 0.0;
@@ -4529,9 +4443,9 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_robust_drops_the_span_in_the_recursion() {
-        // limma leaves `span` out of the `Recall`, so the second pass smooths at
-        // chooseLowessSpan while the first used 0.5. Passing the span through
-        // instead, as edgePython does, gives a different `df2`.
+        // limma leaves `span` out of the `Recall`, so the second pass uses
+        // chooseLowessSpan while the first used 0.5. Passing it through, as
+        // edgePython does, gives a different `df2`.
         let fit = fit_f_dist_unequal_df1(
             &fixture_b(),
             &df_b(),
@@ -4569,8 +4483,7 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_robust_returns_early_when_nothing_is_an_outlier() {
-        // No gene clears the FDR cutoff, so the second pass never runs and the
-        // per-gene degrees of freedom are never built.
+        // No gene clears the FDR cutoff, so the second pass never runs.
         let df: Vec<f64> = (0..60).map(|i| [5.0, 6.0][i % 2]).collect();
         let fit = fit_f_dist_unequal_df1(&fixture_d(), &df, None, None, true, None).unwrap();
         assert_relative_eq!(
@@ -4595,8 +4508,8 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_takes_the_weighted_line_fallback() {
-        // Four points and a span of one is below loessFit's `4 + 1/span`, so it
-        // drops to `lm.wfit` on an intercept and the covariate.
+        // Four points and span 1 is below loessFit's `4 + 1/span`, so it drops
+        // to `lm.wfit` on an intercept and the covariate.
         let fit = fit_f_dist_unequal_df1(
             &[0.4, 1.1, 2.7, 0.9],
             &[2.0, 5.0, 3.0, 9.0],
@@ -4629,8 +4542,7 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_on_six_hundred_genes_matches_limma() {
-        // The only fixture past `small.n = 500`, so the only one whose span is
-        // not pinned at 1.
+        // The only fixture past `small.n = 500`, so the span is not pinned at 1.
         let (_, min_span, power) = LIMMA_LOWESS_DEFAULTS;
         assert_relative_eq!(
             choose_lowess_span(600, UNEQUAL_LOWESS_SMALL_N, min_span, power),
@@ -4683,7 +4595,9 @@ mod tests {
         );
     }
 
-    // -- squeezeVar dispatch --
+    // ------------------- //
+    // squeezeVar dispatch //
+    // ------------------- //
 
     /// `Rscript -e '... s <- squeezeVar(xa, df=dfa, legacy=FALSE);
     ///  cat(sprintf("%.17g %.17g", s$var.prior, s$df.prior), "\n");
@@ -4717,8 +4631,7 @@ mod tests {
 
     #[test]
     fn test_squeeze_var_dispatches_to_the_unequal_df1_fit() {
-        // Unequal df with no legacy flag: limma's automatic rule sends this to
-        // fitFDistUnequalDF1, and so does this.
+        // Unequal df with no legacy flag goes to fitFDistUnequalDF1.
         let out = squeeze_var(&fixture_a(), &df_a(), None, None).unwrap();
         assert_eq!(out.var_prior.len(), 1);
         assert_relative_eq!(
@@ -4904,9 +4817,8 @@ mod tests {
 
     #[test]
     fn test_a_supplied_span_forces_the_unequal_df1_fit() {
-        // Equal df would normally pick the legacy spline fit. limma sets
-        // `legacy <- FALSE` the moment a span is supplied, before the automatic
-        // rule gets a look in, so this goes to fitFDistUnequalDF1 instead.
+        // Equal df would pick the legacy spline fit, but limma sets
+        // `legacy <- FALSE` as soon as a span is supplied.
         let out = squeeze_var(
             &fixture_a(),
             &[4.0; 24],
@@ -4969,8 +4881,8 @@ mod tests {
 
     #[test]
     fn test_unequal_df1_with_nothing_informative_is_reported_as_nan() {
-        // limma returns NA rather than erroring, and squeeze_var turns that into
-        // the "could not estimate prior df" error on the way out.
+        // limma returns NA; squeeze_var turns that into the "could not estimate
+        // prior df" error.
         let fit =
             fit_f_dist_unequal_df1(&[0.0, 0.0, 1.5], &[4.0, 4.0, 4.0], None, None, false, None)
                 .unwrap();
@@ -4993,8 +4905,8 @@ mod tests {
     #[test]
     fn test_brent_fmin_reproduces_r_optimize_on_a_flat_objective() {
         // R's optimize on a constant function walks to a fixed point just inside
-        // the upper bound. Reproducing it is the cheapest check that the
-        // convergence test is R's and not scipy's.
+        // the upper bound. Reproducing it checks the convergence test is R's, not
+        // scipy's.
         let par = brent_fmin(UNEQUAL_PAR_LOWER, UNEQUAL_PAR_UPPER, |_| 0.0, OPTIMIZE_TOL);
         assert_relative_eq!(
             2.0 * par / (1.0 - par),
@@ -5024,8 +4936,8 @@ mod tests {
 
     #[test]
     fn test_fit_f_dist_unequal_df1_treats_nan_variances_as_missing() {
-        // limma zeroes a missing variance and takes its prior weight away
-        // rather than dropping the gene, so it still gets a trend value.
+        // limma zeroes a missing variance and removes its prior weight rather
+        // than dropping the gene, so it still gets a trend value.
         let mut x = fixture_a();
         x[3] = f64::NAN;
         x[14] = f64::NAN;
@@ -5054,8 +4966,8 @@ mod tests {
         assert_relative_eq!(fit.scale[0], A_SCALAR_DF1_SCALE, max_relative = UNEQUAL_TOL);
         assert_relative_eq!(fit.df2, A_SCALAR_DF1_DF2, max_relative = UNEQUAL_FLAT_TOL);
 
-        // A scalar df1 below the cutoff retires every gene at once, which
-        // leaves nothing informative. limma returns NA; so does this.
+        // A scalar df1 below the cutoff retires every gene, leaving nothing
+        // informative. limma returns NA; so does this.
         let fit = fit_f_dist_unequal_df1(&fixture_a(), &[0.005], None, None, false, None).unwrap();
         assert!(fit.scale[0].is_nan());
         assert!(fit.df2.is_nan());
@@ -5063,8 +4975,8 @@ mod tests {
 
     #[test]
     fn test_unequal_df1_robust_over_the_parallel_threshold_stays_consistent() {
-        // Past PARALLEL_THRESHOLD the tail probabilities fan out over rayon.
-        // They are an elementwise map, so the answer must not depend on it.
+        // Past PARALLEL_THRESHOLD the tail probabilities run over rayon. They are
+        // an elementwise map, so the answer must not depend on it.
         let n = PARALLEL_THRESHOLD + 64;
         let x: Vec<f64> = (1..=n)
             .map(|k| (((k * 37) % 1009) + 1) as f64 / 64.0)

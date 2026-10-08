@@ -1,8 +1,7 @@
 //! Levenberg-damped iteratively reweighted least squares for negative binomial
 //! GLMs.
 //!
-//! This is edgeR's `mglmLevenberg` and the hottest path in the crate: one fit
-//! per gene, tens of thousands of genes, a design of a handful of columns.
+//! Ports edgeR's `mglmLevenberg`, the hottest path in the crate.
 //!
 //! ### References
 //!
@@ -30,8 +29,7 @@ const MIN_DAMPING: f64 = 1e-10;
 
 /// Largest damping factor, reached after repeated rejections.
 ///
-/// At this point the step is effectively along the gradient with a tiny length,
-/// and the fit is not going to improve.
+/// At this point the step is a tiny gradient step and the fit will not improve.
 const MAX_DAMPING: f64 = 1e10;
 
 /// Added to the diagonal before damping so an all-zero column cannot make the
@@ -47,12 +45,11 @@ const DIAGONAL_FLOOR: f64 = 1e-10;
 pub enum StartMethod {
     /// Fit an intercept-only model from the total counts and total library size.
     ///
-    /// Cheap and robust, and what edgeR uses by default.
+    /// Cheap, and edgeR's default.
     Null,
     /// Regress the log of the normalised counts on the design.
     ///
-    /// Closer to the answer when the design explains a lot, but undefined for
-    /// zero counts, which have to be floored first.
+    /// Closer when the design explains a lot, but zero counts must be floored.
     LogCounts,
 }
 
@@ -68,8 +65,8 @@ pub struct LevenbergParams {
     /// Relative tolerance on the deviance.
     ///
     /// A gene stops when an accepted step changes the deviance by less than
-    /// `tol * (|deviance| + 0.1)`. The additive term is what lets a gene whose
-    /// deviance is legitimately near zero converge at all.
+    /// `tol * (|deviance| + 0.1)`. The additive term lets near-zero deviances
+    /// converge.
     pub tol: f64,
     /// How to initialise the coefficients.
     pub start_method: StartMethod,
@@ -168,9 +165,8 @@ impl Scratch {
 
 /// Solves a small symmetric positive definite system in place by Cholesky.
 ///
-/// The systems here are `n_coef` by `n_coef` with `n_coef` in the low single
-/// digits for essentially every RNA-seq design, so a factorisation call into
-/// faer would be dominated by its own dispatch overhead. Row-major throughout.
+/// The systems are `n_coef` square with `n_coef` in the low single digits, so a
+/// faer call would be dominated by its dispatch overhead. Row-major.
 ///
 /// ### Params
 ///
@@ -180,8 +176,8 @@ impl Scratch {
 ///
 /// ### Returns
 ///
-/// `false` if a pivot is not positive, meaning the matrix is not positive
-/// definite and the caller should treat the step as failed.
+/// `false` if a pivot is not positive: the matrix is not positive definite and
+/// the step has failed.
 fn solve_spd_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
     for i in 0..n {
         for j in 0..=i {
@@ -190,8 +186,7 @@ fn solve_spd_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
                 sum -= a[i * n + k] * a[j * n + k];
             }
             if i == j {
-                // Rejects NaN as well as a non-positive pivot, which a bare
-                // `sum > 0.0` negation would hide.
+                // Rejects NaN as well as a non-positive pivot.
                 if sum <= 0.0 || sum.is_nan() {
                     return false;
                 }
@@ -285,11 +280,9 @@ fn deviance_of(
 
 /// Least-squares projection of a per-sample target onto the design.
 ///
-/// Solves `design * beta = z` in the least-squares sense through the normal
-/// equations, which is what edgeR's start does with a QR. The system is
-/// `n_coef` square and `n_coef` is a handful of columns for any real design, so
-/// the normal equations cost nothing and lose no accuracy that survives the
-/// damped iteration afterwards.
+/// Solves `design * beta = z` through the normal equations where edgeR's start
+/// uses a QR. `n_coef` is small, so the lost accuracy does not survive the
+/// damped iteration.
 ///
 /// ### Params
 ///
@@ -336,23 +329,20 @@ fn project_onto_design(
 
 /// Chooses starting coefficients for one gene.
 ///
-/// Port of edgeR's `.cxx_get_levenberg_start`. Both methods build a per-sample
-/// target on the log scale and project it onto the design by least squares:
+/// Ports edgeR's `.cxx_get_levenberg_start`. Both methods build a per-sample
+/// log-scale target and project it onto the design by least squares:
 ///
-/// * [`StartMethod::Null`] uses a single working-weighted log rate shared by
-///   every sample, `log(sum(cw * y/N) / sum(cw))` with `cw = w N / (1 + phi N)`.
-///   That weighting is why the dispersion and the weights are needed; the
-///   unweighted ratio of totals agrees only when every library is the same size.
+/// * [`StartMethod::Null`] uses one working-weighted log rate for every sample,
+///   `log(sum(cw * y/N) / sum(cw))` with `cw = w N / (1 + phi N)`. This differs
+///   from the plain ratio of totals unless all libraries are equal.
 /// * [`StartMethod::LogCounts`] uses each sample's own log rate.
 ///
-/// The projection is the part that is easy to skip and must not be. Writing the
-/// scalar into `beta[0]` and zeroing the rest is only equivalent when the first
-/// design column is an intercept. On `~0 + group + covariate` it leaves every
-/// sample outside the first column starting at `mu` equal to its library size,
-/// which for a dispersion below
-/// [`crate::glm::deviance::POISSON_REGIME`] sits inside the region where the
-/// unit deviance underflows to zero. That is the global minimum of the fitter's
-/// objective, so the iteration never leaves it.
+/// The projection is required. Putting the scalar in `beta[0]` and zeroing the
+/// rest is only right when the first column is an intercept. On
+/// `~0 + group + covariate` it starts samples outside the first column at
+/// `mu` equal to the library size, which for a dispersion below
+/// [`crate::glm::deviance::POISSON_REGIME`] lies where the unit deviance
+/// underflows to zero: a global minimum the iteration never leaves.
 ///
 /// ### Params
 ///
@@ -408,11 +398,9 @@ pub(crate) fn initial_coefficients(
     };
 
     if !project_onto_design(design, &target, n_samples, n_coef, beta) {
-        // Rank deficient. edgeR's QR pivots through this; the normal equations
-        // cannot, so fall back to putting the whole rate on the first column.
-        // The damped iteration recovers from a poor start, just not from one
-        // inside the zero-deviance basin, and a rank-deficient design has no
-        // such basin to fall into.
+        // Rank deficient: edgeR's QR pivots through this, the normal equations
+        // cannot. Put the whole rate on the first column; the damped iteration
+        // recovers from a poor start.
         beta.fill(0.0);
         beta[0] = target[0];
     }
@@ -463,7 +451,6 @@ pub(crate) fn fit_one_gene(
     let mut dev_current = deviance_of(&scratch.y, &scratch.mu, dispersion, weights);
 
     for iteration in 0..params.max_iter {
-        // Working weights and residuals.
         for j in 0..n_samples {
             let mu_j = scratch.mu[j];
             let w_j = weights.map_or(1.0, |w| w.get(j));
@@ -471,8 +458,7 @@ pub(crate) fn fit_one_gene(
             scratch.working[j] = (w_j * mu_j / denom).max(MIN_POSITIVE);
         }
 
-        // Normal equations. The design row is reused for both accumulations, so
-        // this is one pass over the samples rather than two.
+        // Normal equations, accumulated in one pass over the samples.
         scratch.xtwx.fill(0.0);
         scratch.xtwz.fill(0.0);
         for j in 0..n_samples {
@@ -488,7 +474,6 @@ pub(crate) fn fit_one_gene(
                 }
             }
         }
-        // Mirror the lower triangle into the upper.
         for a in 0..n_coef {
             for b in 0..a {
                 scratch.xtwx[b * n_coef + a] = scratch.xtwx[a * n_coef + b];
@@ -556,12 +541,10 @@ pub(crate) fn fit_one_gene(
 
 /// Fits genewise negative binomial GLMs with Levenberg damping.
 ///
-/// Each gene is fitted independently, so the work is a plain rayon fan-out over
-/// genes with no shared mutable state. Damping starts at
-/// [`INITIAL_DAMPING`], divides by ten on an accepted step and multiplies by ten
-/// on a rejected one, exactly as edgeR does. A step is accepted when it does not
-/// increase the deviance, which is what makes the method monotone and removes
-/// the need for a line search.
+/// Damping starts at `INITIAL_DAMPING`, divides by ten on an accepted step and
+/// multiplies by ten on a rejected one, as in edgeR. A step is accepted when it
+/// does not increase the deviance, so the iteration is monotone and needs no
+/// line search.
 ///
 /// ### Params
 ///
@@ -727,11 +710,10 @@ mod tests {
         (counts, design, 2, 6, 2)
     }
 
-    /// Parity against edgeR 4.8.2 itself.
+    /// Parity against edgeR 4.8.2.
     ///
-    /// A continuous covariate is used deliberately: `designAsFactor` gives six
-    /// distinct groups for six samples, so edgeR cannot take its one-way
-    /// shortcut and runs the Levenberg fitter, which is what this module is.
+    /// The continuous covariate gives six distinct design rows for six samples,
+    /// so edgeR runs the Levenberg fitter instead of its one-way shortcut.
     ///
     /// ```r
     /// y <- matrix(c(10,12,11,40,44,38, 50,48,52,49,51,50, 2,0,5,1,3,0),
@@ -741,22 +723,16 @@ mod tests {
     ///        offset = matrix(0, 3, 6), prior.count = 0)
     /// ```
     ///
-    /// Agreement is asserted to 1e-7 absolute rather than tighter, because
-    /// neither side is at its own maximum at the shared nominal `tol = 1e-6`.
-    /// On the flat gene edgeR reports a slope of -0.021851123519974 while the
-    /// true maximum likelihood estimate is -0.021851159884, confirmed
-    /// independently with
-    /// `glm(y ~ x, family = negative.binomial(theta = 10), epsilon = 1e-14)`.
+    /// Agreement is asserted to 1e-7 absolute: at the shared `tol = 1e-6`
+    /// neither side sits at its own maximum. On the flat gene edgeR reports a
+    /// slope of -0.021851123519974 against a true MLE of -0.021851159884
+    /// (`glm(y ~ x, family = negative.binomial(theta = 10), epsilon = 1e-14)`).
     ///
-    /// The algorithm is edgeR's, but the damping schedule and the break
-    /// condition are not identical, and this one stops the earlier of the two:
-    /// on a 40 by 6 fixture at `dispersion = 0.5` it sits 5.7e-4 from its own
-    /// `tol = 1e-14` answer where `mglmLevenberg` at its own `tol = 1e-6` sits
-    /// 2.6e-4 from the same point. Tightened, the two land on each other to
-    /// 1.2e-7, so it is the stopping rule that differs and not the fit. The
-    /// practical consequence is that coefficients agree with edgeR to a few
-    /// parts in 1e3 on overdispersed data, and the tolerance here reflects that
-    /// as much as edgeR's own residual convergence error.
+    /// The damping schedule and break condition differ slightly from edgeR's, and
+    /// this one stops earlier: on a 40 by 6 fixture at `dispersion = 0.5` it sits
+    /// 5.7e-4 from its own `tol = 1e-14` answer, `mglmLevenberg` 2.6e-4. Tightened,
+    /// the two agree to 1.2e-7, so only the stopping rule differs. Expect
+    /// agreement with edgeR to a few parts in 1e3 on overdispersed data.
     #[test]
     fn test_matches_edger_glmfit_on_a_continuous_design() {
         let counts = vec![
@@ -896,8 +872,8 @@ mod tests {
         );
     }
 
-    /// Offsets shift the fit on the log scale, so doubling every library size
-    /// must halve the fitted rate while leaving the group contrast alone.
+    /// Doubling every library size must halve the fitted rate and leave the
+    /// group contrast alone.
     #[test]
     fn test_offsets_shift_the_intercept_not_the_contrast() {
         let (counts, design, n_genes, n_samples, n_coef) = fixture();
@@ -940,9 +916,7 @@ mod tests {
         );
     }
 
-    /// A saturated design fits the data exactly, so the residual deviance is
-    /// not zero only because of the dispersion. What must hold is that a higher
-    /// dispersion gives a smaller deviance for the same residuals.
+    /// A higher dispersion must give a smaller deviance for the same residuals.
     #[test]
     fn test_higher_dispersion_shrinks_the_deviance() {
         let (counts, design, n_genes, n_samples, n_coef) = fixture();
@@ -1055,13 +1029,10 @@ mod tests {
         }
         assert_relative_eq!(warm.deviance[0], cold.deviance[0], max_relative = 1e-10);
 
-        // Note that warm starting does not reduce the iteration count, and can
-        // increase it. Convergence is only tested after an accepted step, so a
-        // fit that begins at the optimum has nothing left to improve: its steps
-        // are rejected, damping climbs, and it only stops once `delta` has
-        // collapsed far enough for the deviance to come back exactly equal.
-        // edgePython has the same structure. The value of a warm start here is
-        // reaching the same optimum reliably, not reaching it in fewer steps.
+        // A warm start can raise the iteration count: convergence is only tested
+        // after an accepted step, so a fit starting at the optimum has its steps
+        // rejected until `delta` is small enough for the deviance to match
+        // exactly. The point of a warm start is the same optimum, not fewer steps.
         assert!(warm.iterations[0] <= 20);
     }
 
@@ -1105,8 +1076,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::MustBePositive(_)));
     }
 
-    /// Fitting one gene alone must give the same answer as fitting it inside a
-    /// batch, which pins the parallel path against the serial one.
+    /// A gene fitted alone must match the same gene fitted in a batch.
     #[test]
     fn test_batched_and_single_fits_agree() {
         let (counts, design, n_genes, n_samples, n_coef) = fixture();
@@ -1149,12 +1119,10 @@ mod tests {
 
     /// The starting coefficients, against edgeR's `.cxx_get_levenberg_start`.
     ///
-    /// `maxit = 0` returns the start unchanged, which is how these were read out
-    /// of edgeR. The design deliberately has no intercept column: with one, any
-    /// implementation that drops the scalar into `beta[0]` and zeroes the rest
-    /// happens to be right, so an intercept-bearing fixture cannot tell a
-    /// correct start from a broken one. The weighted case is here for the same
-    /// reason, since the working weights only bite when the libraries differ.
+    /// `maxit = 0` returns the start unchanged. The design has no intercept
+    /// column on purpose: with one, dropping the scalar into `beta[0]` happens to
+    /// be right. The weighted case is included because the working weights only
+    /// bite when the libraries differ.
     ///
     /// ```r
     /// # Rscript, edgeR 4.8.2
@@ -1200,8 +1168,7 @@ mod tests {
             Some(stopped),
         )
         .unwrap();
-        // Both group columns carry the rate; edgeR projects, it does not just
-        // fill the first column.
+        // Both group columns carry the rate: edgeR projects.
         assert_relative_eq!(
             fit.coefficients[0],
             -7.797_403_899_938_82,

@@ -1,37 +1,29 @@
 //! The classic two-group exact test, edgeR's `exactTest`.
 //!
-//! This is the pre-GLM path and still the one people reach for on a simple
-//! two-group design. It has three parts:
+//! Three parts:
 //!
-//! * [`q2q_nbinom`] maps a count from one negative binomial mean to another
-//!   through matched quantiles, averaging a normal and a gamma approximation.
-//! * [`equalize_lib_sizes`] runs that mapping over a whole matrix to produce
-//!   pseudo-counts that all sit on one common library size.
-//! * [`exact_test`] fits the fold change, builds the pseudo-counts and then
-//!   sums the conditional negative binomial mass over one of three rejection
-//!   regions.
+//! * [`q2q_nbinom`] maps a count from one NB mean to another through matched
+//!   quantiles, averaging a normal and a gamma approximation.
+//! * [`equalize_lib_sizes`] runs that mapping over a matrix to produce
+//!   pseudo-counts on one common library size.
+//! * [`exact_test`] fits the fold change, builds the pseudo-counts and sums the
+//!   conditional NB mass over one of three rejection regions.
 //!
-//! Genes are the parallel axis throughout, per the crate rule: one gene is a
-//! contiguous row and every kernel here is a rayon fan-out over rows with a
-//! per-thread scratch buffer for the convolution.
+//! Every kernel is a rayon fan-out over genes with a per-thread scratch buffer
+//! for the convolution.
 //!
-//! ### Where the tails come from
+//! ### Departures
 //!
-//! `q2qnbinom` is the fiddly part. edgeR evaluates both approximations with
-//! `log.p = TRUE` so a quantile fifty standard deviations out still round-trips.
-//! Two things are done differently here and both are documented at their call
-//! sites: the normal round trip is replaced by the linear map it is algebraically
-//! equal to, and the upper gamma tail goes through a log-space incomplete gamma
-//! defined in this module, because [`crate::numeric::dist`] exposes only
-//! `gamma_cdf` and `gamma_ppf` on the natural scale and `1 - cdf` is a flat zero
-//! well before edgeR gives up.
-//!
-//! ### Where this departs from edgePython
-//!
-//! `edgepython/exact_test.py` stubs `exact_test_by_deviance` and
-//! `exact_test_by_small_p` out to the double-tail test. They are genuinely
-//! different tests whenever the two groups differ in size, and both are
-//! implemented here against edgeR.
+//! * edgePython stubs the deviance and small-p regions out to the double-tail
+//!   test; both are implemented here against edgeR. See
+//!   `UPSTREAM_DEVIATIONS.md` A15.
+//! * `q2qnbinom` stays in log space like edgeR's `log.p = TRUE`. The normal
+//!   round trip is replaced by the linear map it equals, and the upper gamma
+//!   tail uses a log-space incomplete gamma defined here, because
+//!   [`crate::numeric::dist`] only has natural-scale `gamma_cdf` and
+//!   `gamma_ppf`. See `UPSTREAM_DEVIATIONS.md` A16.
+//! * `exactTestBySmallP` and `binomTest` have bugs in edgeR that are not
+//!   reproduced. See `UPSTREAM_DEVIATIONS.md` B3 and B4.
 
 use std::f64::consts::LN_2;
 
@@ -53,50 +45,44 @@ use crate::prelude::*;
 /// Row sum above which, in both groups, the beta approximation replaces the
 /// convolution.
 ///
-/// edgeR's `big.count` default. The convolution is `O(s)` per gene, so a gene
-/// with a million reads in each group would otherwise dominate the whole
-/// analysis; past this the beta approximation is accurate to well under the
-/// resolution anyone reads a p-value at.
+/// edgeR's `big.count` default. The convolution is `O(s)` per gene, so past this
+/// the beta approximation takes over.
 pub const BIG_COUNT_DEFAULT: f64 = 900.0;
 
 /// Prior count added before the fold change is fitted.
 ///
-/// edgeR's `exactTest` default. It is small on purpose: this prior only damps
-/// the fold change of a gene that is zero in one group, and a larger value would
-/// visibly shrink real effects.
+/// edgeR's `exactTest` default. Small on purpose: it only damps the fold change
+/// of a gene that is zero in one group.
 pub const PRIOR_COUNT_DEFAULT: f64 = 0.125;
 
 /// Prior count [`exact_test`] passes to `aveLogCPM` for the reported log-CPM.
 ///
-/// edgeR's `aveLogCPM` default, and a different quantity from
-/// [`PRIOR_COUNT_DEFAULT`]: this one only sets the floor of the abundance
-/// covariate, where 2 counts per million is the usual choice.
+/// edgeR's `aveLogCPM` default. Not [`PRIOR_COUNT_DEFAULT`]: this only sets the
+/// floor of the abundance covariate.
 const AVE_LOG_CPM_PRIOR: f64 = 2.0;
 
 /// Below this, a mean is treated as zero by [`q2q_nbinom`] and nudged.
 ///
-/// edgeR's `eps`. Both means are nudged together when either trips it, which is
-/// what keeps the mapping the identity for a gene that is fitted at zero.
+/// edgeR's `eps`. Both means are nudged together when either trips it, which
+/// keeps the mapping the identity for a gene fitted at zero.
 const Q2Q_EPS: f64 = 1e-14;
 
 /// Nudge added to a mean that fell below [`Q2Q_EPS`].
 ///
-/// edgeR's 0.25. It is a quarter of a count, small enough not to move a real
-/// pseudo-count and large enough to keep the gamma shape away from zero.
+/// edgeR's 0.25: small enough not to move a real pseudo-count, large enough to
+/// keep the gamma shape away from zero.
 const Q2Q_ZERO_NUDGE: f64 = 0.25;
 
 /// Relative convergence tolerance for the upper gamma quantile, in `ln(x)`.
 ///
-/// Roughly 4 ulp, matching the tolerance [`crate::numeric::dist::gamma_ppf`]
-/// uses on the lower tail. Tightening further only cycles on the last bit of the
-/// continued fraction.
+/// Roughly 4 ulp, as [`crate::numeric::dist::gamma_ppf`] uses on the lower tail.
+/// Tighter only cycles on the last bit of the continued fraction.
 const GAMMA_ISF_REL_TOL: f64 = 1e-15;
 
 /// Iteration budget for the upper gamma quantile and its bracket search.
 ///
-/// The bracket walks outwards one nat at a time and then halves, so a bracket
-/// 128 wide in `ln(x)` covers everything an `f64` can represent. This is a
-/// runaway guard, not a working limit.
+/// A bracket 128 wide in `ln(x)` covers everything an `f64` can represent, so
+/// this is a runaway guard, not a working limit.
 const GAMMA_ISF_MAX_ITER: usize = 256;
 
 /// Floor for the modified Lentz continued fraction, guarding a zero pivot.
@@ -112,12 +98,9 @@ const LENTZ_EPS: f64 = 2.220446049250313e-16;
 /// Slack allowed when deciding whether an outcome is as improbable as the
 /// observed one, in [`binom_test_one`].
 ///
-/// R's own `binom.test` carries the same `1 + 1e-7`. It is not a fudge factor
-/// for sloppy arithmetic: for a `p` of one third and a total of `3k + 2`, the
-/// outcomes `k` and `k + 1` are *exactly* equiprobable, and which side of the
-/// comparison each lands on is then decided by the last bit of whichever
-/// routine evaluated the mass. Without the slack the p-value for two
-/// mathematically identical situations differs by a whole term.
+/// R's `binom.test` carries the same `1 + 1e-7`. For `p = 1/3` and a total of
+/// `3k + 2`, outcomes `k` and `k + 1` are *exactly* equiprobable, and the last
+/// bit of the mass routine would otherwise decide which side each lands on.
 const BINOM_TIE_TOL: f64 = 1.0 + 1e-7;
 
 /////////////////////
@@ -126,15 +109,14 @@ const BINOM_TIE_TOL: f64 = 1.0 + 1e-7;
 
 /// Which set of outcomes counts as "at least as extreme as observed".
 ///
-/// All three condition on the total count and sum negative binomial mass over a
-/// rejection region; they differ only in how that region is chosen. When the
-/// two groups have the same number of samples the regions coincide and edgeR
-/// routes [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`]
-/// straight to the double-tail test, which this does too.
+/// All three condition on the total count and sum NB mass over a region. With
+/// equal group sizes the regions coincide and, as in edgeR,
+/// [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`] go straight to
+/// the double-tail test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectionRegion {
-    /// Double the smaller tail. edgeR's default, and the only one with the
-    /// beta approximation for large counts.
+    /// Double the smaller tail. edgeR's default, and the only region with the
+    /// large-count beta approximation.
     DoubleTail,
     /// Every split whose negative binomial deviance is at least the observed
     /// one.
@@ -213,11 +195,9 @@ impl ExactTestParams {
 
 /// Modified Lentz evaluation of the continued fraction behind `Q(a, x)`.
 ///
-/// Returns the fraction alone, without the `exp(a ln x - x - ln Gamma(a))`
-/// prefactor, so the caller can keep that part in logs. The fraction itself is
-/// of order `1 / x` and never underflows over the range this module uses.
-///
-/// Only valid for `x >= a + 1`, where the fraction converges quickly.
+/// Returns the fraction without the `exp(a ln x - x - ln Gamma(a))` prefactor,
+/// so the caller can keep that in logs. Only valid for `x >= a + 1`, where it
+/// converges quickly.
 ///
 /// ### Params
 ///
@@ -260,17 +240,13 @@ fn gamma_cont_frac(a: f64, x: f64) -> f64 {
 
 /// Log of the regularised upper incomplete gamma, `ln Q(a, x)`.
 ///
-/// The reason this exists rather than `gamma_sf(...).ln()`: `q2qnbinom` maps a
-/// count that can sit hundreds of standard deviations above its fitted mean, and
-/// R evaluates the whole round trip with `log.p = TRUE` for exactly that reason.
-/// A count of 6000 against a fitted mean of 1000 at dispersion 0.001 has
-/// `Q = e^-1605`, which is a flat zero on the natural scale and would send the
-/// inverse to `+inf`.
+/// Exists instead of `gamma_sf(...).ln()` because `q2qnbinom` can map counts
+/// hundreds of standard deviations above the fitted mean: 6000 against a mean
+/// of 1000 at dispersion 0.001 has `Q = e^-1605`, a flat zero on the natural
+/// scale.
 ///
-/// Two branches, split where each is well conditioned. Below `x = a + 1` the
-/// upper tail is a decent fraction of the mass, so `chisq_sf` computes it
-/// directly and the logarithm is taken afterwards. Above it the prefactor is
-/// kept in logs and only the continued fraction, which is order one, is
+/// Below `x = a + 1` `chisq_sf` is computed directly and logged. Above it the
+/// prefactor stays in logs and only the order-one continued fraction is
 /// exponentiated.
 ///
 /// ### Params
@@ -295,14 +271,13 @@ fn ln_reg_gamma_upper(a: f64, x: f64) -> Result<f64, EdgeErrors> {
 
 /// Starting point for [`ln_reg_gamma_upper_inv`], in `x` at unit scale.
 ///
-/// For `x` well past the mean, `ln Q(a, x) ~ (a - 1) ln x - x - ln Gamma(a)`.
-/// Rearranged that is `x = c + (a - 1) ln x` with `c = -ln q - ln Gamma(a)`,
-/// which converges in a handful of fixed-point steps whenever `c` exceeds the
-/// shape. When it does not, the quantile is at or below the mean and the shape
-/// itself is a good enough start.
+/// For `x` well past the mean, `ln Q(a, x) ~ (a - 1) ln x - x - ln Gamma(a)`,
+/// i.e. `x = c + (a - 1) ln x` with `c = -ln q - ln Gamma(a)`, which converges
+/// in a few fixed-point steps when `c` exceeds the shape. Otherwise the shape
+/// itself is the start.
 ///
-/// The result only has to land in roughly the right decade: the caller brackets
-/// it and bisects, so a poor guess costs iterations, never correctness.
+/// The caller brackets and bisects, so a poor guess costs iterations, not
+/// correctness.
 ///
 /// ### Params
 ///
@@ -330,10 +305,9 @@ fn gamma_isf_start(ln_q: f64, a: f64) -> f64 {
 
 /// Inverts [`ln_reg_gamma_upper`] at unit scale.
 ///
-/// Newton in `t = ln x` on a bracketed, monotonically decreasing residual, with
-/// a bisection fallback whenever the Newton step leaves the bracket. The
-/// derivative `d ln Q / dt = -x f(x) / Q` is formed entirely in logs, so it
-/// stays representable at the same depth the residual does.
+/// Newton in `t = ln x` on a bracketed, decreasing residual, falling back to
+/// bisection when a step leaves the bracket. The derivative
+/// `d ln Q / dt = -x f(x) / Q` is formed in logs.
 ///
 /// ### Params
 ///
@@ -460,8 +434,7 @@ fn check_non_negative(name: &str, values: &[f64]) -> Result<(), EdgeErrors> {
 
 /// Maps one count from one negative binomial mean to another.
 ///
-/// The scalar kernel behind [`q2q_nbinom`]; see there for the algorithm and for
-/// where it departs from edgeR's arithmetic.
+/// The scalar kernel behind [`q2q_nbinom`], which documents the algorithm.
 ///
 /// ### Params
 ///
@@ -505,29 +478,22 @@ fn q2q_one(x: f64, input_mean: f64, output_mean: f64, dispersion: f64) -> Result
 /// Quantile-to-quantile mapping between two negative binomial means.
 ///
 /// edgeR's `q2qnbinom`. Each count is placed at its quantile under
-/// `NB(input_mean, dispersion)` and read back off
-/// `NB(output_mean, dispersion)`. The negative binomial quantile has no closed
-/// form, so edgeR maps through two continuous approximations and averages them:
-/// a normal with the matching mean and variance, and a gamma with the matching
-/// mean and variance. Neither is good on its own, since the normal is symmetric
-/// and the gamma has the wrong behaviour near zero, and the average of the two
-/// is what edgeR's pseudo-counts are actually built from.
+/// `NB(input_mean, dispersion)` and read back off `NB(output_mean, dispersion)`.
+/// The NB quantile has no closed form, so edgeR averages a normal and a gamma
+/// approximation with matching mean and variance.
 ///
-/// The tail is chosen per element by `x >= input_mean`, so whichever side of
-/// the mean the count sits on is the side that is evaluated, and the small
-/// probability is never formed as one minus a large one.
+/// The tail is chosen per element by `x >= input_mean`, so the small probability
+/// is never formed as one minus a large one.
 ///
 /// ### Notes
 ///
-/// **Two departures from edgeR's arithmetic**
+/// **Two departures from edgeR's arithmetic** (see `UPSTREAM_DEVIATIONS.md`
+/// A16):
 ///
 /// * The normal half is the linear map `output_mean + sd_out (x - input_mean) /
-///   sd_in`, which is what `qnorm(pnorm(...))` reduces to exactly. edgeR forms
-///   it as a round trip through log probabilities; the answers agree to the
-///   last bit or two and this one cannot lose any.
-/// * The upper gamma tail goes through [`ln_reg_gamma_upper`] and its inverse
-///   rather than through `gamma_cdf` and `gamma_ppf`, because those work on the
-///   natural scale and R uses `log.p = TRUE` here for a reason.
+///   sd_in`, which `qnorm(pnorm(...))` reduces to. Agrees to the last bit or two.
+/// * The upper gamma tail uses `ln_reg_gamma_upper` and its inverse, not
+///   `gamma_cdf` and `gamma_ppf`.
 ///
 /// ### Params
 ///
@@ -536,9 +502,9 @@ fn q2q_one(x: f64, input_mean: f64, output_mean: f64, dispersion: f64) -> Result
 ///   non-negative
 /// * `output_mean` - Mean to map each count onto, same length as `x`,
 ///   non-negative
-/// * `dispersion` - Dispersion shared by every element, non-negative and finite.
-///   A per-gene dispersion is applied by calling this once per gene, which is
-///   how [`equalize_lib_sizes`] uses it.
+/// * `dispersion` - Dispersion shared by every element, non-negative and
+///   finite. Per-gene dispersions mean one call per gene, as in
+///   [`equalize_lib_sizes`].
 ///
 /// ### Returns
 ///
@@ -588,9 +554,7 @@ pub fn q2q_nbinom(
 
 /// Distinct labels in first-appearance order, with a mask per label.
 ///
-/// R's `unique` on a factor keeps first-appearance order, and
-/// `equalizeLibSizes` loops over it, so this does the same. The order only
-/// affects which columns are written first, never the values.
+/// First-appearance order, as R's `unique` on a factor.
 ///
 /// ### Params
 ///
@@ -646,9 +610,8 @@ fn select_columns<T: EdgeFloat>(
 
 /// Expands a recycled dispersion into one value per gene.
 ///
-/// Only the gene axis is meaningful for the exact test, so a
-/// [`Recycled::BySample`] or [`Recycled::Full`] form is an error rather than
-/// something to average over.
+/// Only the gene axis is meaningful here, so [`Recycled::BySample`] and
+/// [`Recycled::Full`] are errors.
 ///
 /// ### Params
 ///
@@ -689,39 +652,29 @@ fn per_gene_dispersion(dispersion: &Recycled<f64>, n_genes: usize) -> Result<Vec
 
 /// Pseudo-counts on a common library size, edgeR's `equalizeLibSizes`.
 ///
-/// The classic path cannot condition on the total count unless every sample has
-/// the same library size, so edgeR manufactures that. Within each group it fits
-/// an intercept-only negative binomial GLM to get a per-gene rate, forms the
-/// fitted mean each observation was drawn under and the fitted mean it would
-/// have had at the common library size, and maps between the two with
-/// [`q2q_nbinom`]. The common size is the geometric mean of the library sizes,
-/// which keeps the pseudo-counts on roughly the scale of the originals.
+/// Conditioning on the total count needs equal library sizes, so within each
+/// group this fits an intercept-only NB GLM per gene, forms the fitted mean at
+/// the observed and at the common library size (their geometric mean), and maps
+/// between the two with [`q2q_nbinom`].
 ///
-/// Negative pseudo-counts are clamped to zero, as edgeR does. The normal half
-/// of the mapping is unbounded below and will go negative for a zero count
-/// mapped onto a much larger library.
-///
-/// Genes are the parallel axis for the mapping. The per-group GLM fits are
-/// already parallel over genes inside [`mglm_one_group`].
+/// Negative pseudo-counts are clamped to zero, as in edgeR; the normal half of
+/// the mapping is unbounded below.
 ///
 /// ### Params
 ///
 /// * `counts` - Row-major counts, `n_genes * n_samples`
 /// * `n_genes` - Number of genes
 /// * `n_samples` - Number of samples
-/// * `group` - One label per sample, or `None` to treat every sample as one
-///   group
-/// * `dispersion` - Dispersion, recycled over genes and samples. A
-///   [`Recycled::BySample`] or [`Recycled::Full`] form is rejected: the mapping
-///   is defined per gene, and edgeR has no notion of a sample-varying
-///   dispersion here.
+/// * `group` - One label per sample, or `None` for a single group
+/// * `dispersion` - Dispersion, recycled over genes. [`Recycled::BySample`] and
+///   [`Recycled::Full`] are rejected.
 /// * `lib_size` - Library size per sample, or `None` for the column sums
 ///
 /// ### Returns
 ///
-/// Pseudo-counts, row-major `n_genes * n_samples`. The common library size they
-/// sit on is `exp(mean(ln(lib_size)))` and is not returned, being a one-line
-/// function of the input. Errors are [`EdgeErrors::EmptyCounts`] for a zero
+/// Pseudo-counts, row-major `n_genes * n_samples`, on the common library size
+/// `exp(mean(ln(lib_size)))` (not returned). Errors are
+/// [`EdgeErrors::EmptyCounts`] for a zero
 /// dimension, [`EdgeErrors::LengthMismatch`] for a `group` or `lib_size` of the
 /// wrong length, [`EdgeErrors::InvalidDispersion`] for a negative dispersion
 /// and [`EdgeErrors::InvalidArgument`] for a non-positive library size.
@@ -785,8 +738,8 @@ pub fn equalize_lib_sizes<T: EdgeFloat>(
 
     let common_lib_size = (lib_size.iter().map(|l| l.ln()).sum::<f64>() / n_samples as f64).exp();
 
-    // Fitted rate per gene, one fit per group. Written back into a full
-    // n_genes by n_samples layout so the mapping below is one pass over rows.
+    // One fit per group, written back into a full n_genes by n_samples layout
+    // so the mapping below is one pass over rows.
     let mut input_mean = vec![0.0_f64; n_genes * n_samples];
     let mut output_mean = vec![0.0_f64; n_genes * n_samples];
     for columns in group_columns(group) {
@@ -837,9 +790,8 @@ pub fn equalize_lib_sizes<T: EdgeFloat>(
 
 /// Log of a sum of exponentials, shifted by the maximum.
 ///
-/// The convolution below sums thousands of negative binomial masses whose
-/// product can be `e^-800` apiece, so the sum is formed in logs rather than
-/// accumulated on the natural scale as edgeR's R loop does.
+/// The convolution sums thousands of masses that can be `e^-800` apiece, so it
+/// is formed in logs, unlike edgeR's natural-scale R loop.
 ///
 /// ### Params
 ///
@@ -881,30 +833,25 @@ fn binom_ln_pmf(k: f64, n: f64, ln_p: f64, ln_q: f64) -> f64 {
 
 /// Exact binomial test on one gene's split, edgeR's `binomTest`.
 ///
-/// The Poisson limit of the exact test: at zero dispersion the conditional
-/// distribution of the first group's count given the total is exactly binomial,
-/// so no convolution is needed.
+/// The Poisson limit: at zero dispersion the first group's count given the
+/// total is exactly binomial, so no convolution is needed.
 ///
-/// Two branches, as in edgeR. At `p = 0.5` the distribution is symmetric and
-/// twice the smaller tail is the answer in closed form. Otherwise it is the
-/// small-probability rule: sum every outcome no more probable than the observed
-/// one.
+/// At `p = 0.5` the distribution is symmetric and the answer is twice the
+/// smaller tail. Otherwise it sums every outcome no more probable than the
+/// observed one.
 ///
 /// ### Notes
 ///
-/// **Departure from edgeR**
+/// **Departures from edgeR** (see `UPSTREAM_DEVIATIONS.md` B4):
 ///
-/// edgeR replaces the enumeration with a Yates-corrected two-by-two chi-square
-/// test once the total exceeds 10000, and the two-by-two it builds uses the
-/// column totals of whichever subset of genes happened to be passed in, so the
-/// answer for one gene depends on the others. That is a speed shortcut with a
-/// bug attached. The enumeration is `O(total)` and is used here at every size.
-///
-/// Ties are admitted within [`BINOM_TIE_TOL`], as R's `binom.test` does, rather
-/// than resolved by `order` on raw masses as edgeR's `binomTest` does. Where
-/// the two disagree it is because two outcomes are exactly equiprobable and
-/// edgeR's `dbinom` put them one ulp apart; the p-value then depends on which
-/// of the two was observed, which it should not.
+/// * edgeR switches to a Yates-corrected chi-square above a total of 10000, and
+///   the 2x2 table it builds uses column totals across whichever genes were
+///   passed in, so one gene's answer depends on the others. The enumeration
+///   (`O(total)`) is used at every size here.
+/// * Ties are admitted within [`BINOM_TIE_TOL`], as in R's `binom.test`, not
+///   resolved by `order` on raw masses. edgeR's `dbinom` can put exactly
+///   equiprobable outcomes one ulp apart, so its p-value depends on which was
+///   observed.
 ///
 /// ### Params
 ///
@@ -936,25 +883,22 @@ fn binom_test_one(y1: f64, y2: f64, p: f64) -> Result<f64, EdgeErrors> {
 
     let threshold = masses[y1 as usize] * BINOM_TIE_TOL;
     let mut kept: Vec<f64> = masses.into_iter().filter(|m| *m <= threshold).collect();
-    // Ascending, so the sum starts from the terms that would otherwise be lost
-    // under the mode. This is also the order R's `cumsum(d[order(d)])` uses.
+    // Ascending, as R's `cumsum(d[order(d)])`, so small terms are not lost
+    // under the mode.
     kept.sort_by(f64::total_cmp);
     Ok(kept.iter().sum::<f64>().min(1.0))
 }
 
 /// Beta approximation to the double-tail test, edgeR's `exactTestBetaApprox`.
 ///
-/// For a gene with thousands of reads in each group the convolution is
-/// thousands of terms and the conditional distribution of the first group's
-/// share is already indistinguishable from a beta with the matching first two
+/// For genes with thousands of reads per group the conditional distribution of
+/// the first group's share is indistinguishable from a beta with matching
 /// moments. Both tails carry a half-count continuity correction and are
-/// compared against the beta median rather than its mean, so the split matches
-/// the discrete distribution's own centre.
+/// compared against the beta median.
 ///
-/// The sums used here are the raw pseudo-counts, not the rounded ones. edgeR
-/// decides *whether* to take this path from the rounded sums and then hands the
-/// unrounded matrix over, and the correction is a half count, so the difference
-/// shows.
+/// The sums are the raw pseudo-counts, not the rounded ones: edgeR decides
+/// *whether* to take this path from the rounded sums, then passes the unrounded
+/// matrix.
 ///
 /// ### Params
 ///
@@ -996,20 +940,13 @@ fn beta_approx_one(
 
 /// Double-tail exact p-value for one gene, edgeR's `exactTestDoubleTail`.
 ///
-/// Conditioning on the total, the first group's count follows a known
-/// distribution; the p-value is twice the mass in whichever tail the observation
-/// falls in. Doubling the smaller tail rather than summing two genuinely
-/// two-sided tails is what makes this the "double tail" test, and it is what
-/// edgeR reports by default.
+/// The p-value is twice the mass in whichever tail the observation falls in.
 ///
-/// Three paths, chosen exactly as edgeR chooses them: the exact binomial at zero
-/// dispersion, the beta approximation when both rounded sums exceed `big_count`,
-/// and the convolution otherwise.
-///
-/// The convolution is accumulated in logs rather than on the natural scale.
-/// edgeR sums `dnbinom` products directly, which silently returns zero once
-/// every term has underflowed; a gene with a few thousand reads and a small
-/// dispersion gets there.
+/// Three paths, chosen as in edgeR: the exact binomial at zero dispersion, the
+/// beta approximation when both rounded sums exceed `big_count`, and the
+/// convolution otherwise. The convolution is accumulated in logs; edgeR sums
+/// `dnbinom` products directly and silently returns zero once every term
+/// underflows.
 ///
 /// ### Params
 ///
@@ -1033,8 +970,7 @@ fn double_tail_one(
     let (n1, n2) = (y1.len(), y2.len());
     let raw1: f64 = y1.iter().sum();
     let raw2: f64 = y2.iter().sum();
-    // R's round is half-to-even, and a pseudo-count landing on a half is not
-    // as rare as it looks: an all-zero group sums to exactly zero.
+    // R's round is half-to-even.
     let s1 = raw1.round_ties_even();
     let s2 = raw2.round_ties_even();
 
@@ -1056,8 +992,8 @@ fn double_tail_one(
     let size1 = n1 as f64 / dispersion;
     let size2 = n2 as f64 / dispersion;
     let size_total = n_total / dispersion;
-    // The same success probability everywhere, since mu1 / size1, mu2 / size2
-    // and total / size_total are all the dispersion times the per-sample mean.
+    // Same success probability everywhere: mu1 / size1, mu2 / size2 and
+    // total / size_total are all the dispersion times the per-sample mean.
     let prob1 = size1 / (size1 + mu1);
     let prob2 = size2 / (size2 + mu2);
     let prob_total = size_total / (size_total + total);
@@ -1082,21 +1018,16 @@ fn double_tail_one(
 
 /// Deviance-based exact p-value for one gene, edgeR's `exactTestByDeviance`.
 ///
-/// The rejection region is every split of the total whose negative binomial
-/// deviance is at least the observed one. Unlike the double-tail test this is a
-/// genuinely two-sided region rather than one tail doubled, so it can only
-/// differ when the two groups have different numbers of samples: with equal
-/// group sizes the deviance is symmetric about the midpoint and the two regions
-/// coincide, which is why edgeR short-circuits that case.
+/// The region is every split of the total whose NB deviance is at least the
+/// observed one. It differs from the double-tail test only when the groups have
+/// different sizes.
 ///
-/// The scan walks out from both ends and stops at the first split inside the
-/// acceptance region, which is what edgeR's C++ does. That relies on the
-/// deviance being unimodal in the split, which it is.
+/// The scan walks in from both ends and stops at the first split inside the
+/// acceptance region, as edgeR's C++ does. This relies on the deviance being
+/// unimodal in the split.
 ///
-/// The conditional mass has the same success probability in every factor, so it
-/// cancels between the numerator and the denominator; this keeps edgeR's form
-/// anyway, since the cancellation is exact to the last bit or two and the
-/// explicit form is easier to check against the reference.
+/// The common success probability cancels in the mass ratio; edgeR's explicit
+/// form is kept for ease of checking.
 ///
 /// ### Params
 ///
@@ -1166,20 +1097,16 @@ fn deviance_one(
 
 /// Small-probability exact p-value for one gene, edgeR's `exactTestBySmallP`.
 ///
-/// The rejection region is every split no more probable than the observed one,
-/// which is the textbook definition of an exact test and the most expensive of
-/// the three: there is no monotonicity to exploit, so every split is evaluated.
-/// As with the deviance region this only differs from the double-tail test when
-/// the groups differ in size.
+/// The region is every split no more probable than the observed one. It is the
+/// most expensive region (every split is evaluated) and differs from the
+/// double-tail test only when the groups have different sizes.
 ///
 /// ### One departure from edgeR
 ///
-/// `exactTestBySmallP` ends on `min(pvals, 1)`, and `min` in R reduces a vector
-/// to a scalar. Every gene therefore comes back carrying the smallest p-value
-/// in the whole matrix. It is a typo for `pmin`, and it is not reproduced: this
-/// caps each gene's own value. Calling edgeR one gene at a time recovers what
-/// the function was meant to return, and that is what the fixtures here compare
-/// against.
+/// `exactTestBySmallP` ends on `min(pvals, 1)`, which in R reduces to a scalar:
+/// every gene returns the smallest p-value in the matrix. This caps each gene's
+/// own value (`pmin`), and the fixtures call edgeR one gene at a time. See
+/// `UPSTREAM_DEVIATIONS.md` B3.
 ///
 /// ### Params
 ///
@@ -1234,13 +1161,10 @@ fn small_p_one(
 
 /// Runs one of the three rejection regions over every gene.
 ///
-/// The rayon fan-out for the whole test. Each thread keeps one convolution
-/// buffer, which grows to the largest total it sees and is then reused.
+/// Each thread keeps one convolution buffer, grown to the largest total it sees.
 ///
 /// [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`] fall back to
-/// the double-tail test when the groups have the same number of samples, as
-/// edgeR does: the regions are identical there, and the double-tail path is the
-/// only one with the large-count shortcut.
+/// the double-tail test when the groups have equal size, as in edgeR.
 ///
 /// ### Params
 ///
@@ -1294,10 +1218,9 @@ fn exact_pvalues(
 
 /// Fits the abundance of one group with prior counts added.
 ///
-/// edgeR's rule: the prior is scaled by each library's size relative to the
-/// mean over the pair, added to the counts, and the offset is raised to
-/// `log(lib + 2 * prior)` so that adding the prior does not by itself move the
-/// fitted level.
+/// The prior is scaled by each library size relative to the mean over the pair
+/// and added to the counts; the offset becomes `log(lib + 2 * prior)` so the
+/// prior does not move the fitted level.
 ///
 /// ### Params
 ///
@@ -1350,7 +1273,7 @@ fn augmented_abundance(
     )
 }
 
-/// Glues two per-group matrices back into one, first group's columns first.
+/// Joins two per-group matrices, first group's columns first.
 ///
 /// ### Params
 ///
@@ -1381,31 +1304,27 @@ fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> V
 /// Exact test for differential expression between two groups, edgeR's
 /// `exactTest`.
 ///
-/// The classic two-group path. It reports three things per gene, and they come
-/// from three different places:
+/// Per gene, three things from three places:
 ///
-/// * the log2 fold change, from two intercept-only negative binomial GLMs with a
-///   small prior count added, one per group;
-/// * the average log2-CPM, from `aveLogCPM` over the whole object, both groups
-///   and any samples outside the pair included;
+/// * the log2 fold change, from one intercept-only NB GLM per group with a small
+///   prior count;
+/// * the average log2-CPM, from `aveLogCPM` over the whole object, including
+///   samples outside the pair;
 /// * the p-value, from pseudo-counts equalised onto a common library size and
-///   then summed over a rejection region.
+///   summed over a rejection region.
 ///
-/// The pseudo-counts are built the way `exactTest` builds them and not the way
-/// [`equalize_lib_sizes`] does: one pooled fit across both groups rather than a
-/// fit per group, and the common library size is the geometric mean over the
-/// pair rather than over every sample. That difference is deliberate in edgeR
-/// and reproduced here.
+/// The pseudo-counts follow `exactTest`, not [`equalize_lib_sizes`]: one pooled
+/// fit across both groups, and the common library size is the geometric mean
+/// over the pair only.
 ///
 /// ### Params
 ///
 /// * `y` - Counts and the per-sample quantities. Must carry a `group`.
-/// * `pair` - The two group labels to compare, as `(first, second)`. The fold
-///   change is reported for the second over the first, matching edgeR's
-///   `pair = c(a, b)` giving `logFC` of `b` against `a`. Samples in neither
-///   group are dropped for the test but still count towards the log-CPM.
+/// * `pair` - The two group labels, `(first, second)`. The fold change is
+///   second over first, as edgeR's `pair = c(a, b)`. Samples in neither group
+///   are dropped for the test but still count towards the log-CPM.
 /// * `dispersion` - Dispersion, recycled over genes. `None` takes the most
-///   structured estimate on `y`, as edgeR's `dispersion = "auto"` does.
+///   structured estimate on `y`, as edgeR's `dispersion = "auto"`.
 /// * `params` - Tuning knobs, or [`ExactTestParams::default`]
 ///
 /// ### Returns
@@ -1467,7 +1386,6 @@ pub fn exact_test<T: EdgeFloat>(
     }
     let (n1, n2) = (columns1.len(), columns2.len());
 
-    // Effective library sizes for the pair, in group order.
     let effective = y.norm_lib_sizes();
     if let Some(bad) = effective.iter().find(|v| !v.is_finite() || **v <= 0.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -1485,8 +1403,7 @@ pub fn exact_test<T: EdgeFloat>(
     let y1 = select_columns(&y.counts, y.n_genes, y.n_samples, &columns1);
     let y2 = select_columns(&y.counts, y.n_genes, y.n_samples, &columns2);
 
-    // Fold change: one intercept-only fit per group on prior-augmented counts,
-    // with the offset raised to match so the prior does not shift the level.
+    // Fold change: one intercept-only fit per group on prior-augmented counts.
     let abundance1 = augmented_abundance(
         &y1,
         y.n_genes,
@@ -1509,8 +1426,8 @@ pub fn exact_test<T: EdgeFloat>(
         .map(|(a1, a2)| (a2 - a1) / LN_2)
         .collect();
 
-    // Pseudo-counts: one pooled fit over both groups, then the quantile map onto
-    // the geometric mean library size.
+    // Pseudo-counts: one pooled fit, then the quantile map onto the geometric
+    // mean library size.
     let pooled = interleave(&y1, &y2, y.n_genes, n1, n2);
     let pooled_offset: Vec<f64> = lib1.iter().chain(lib2.iter()).map(|l| l.ln()).collect();
     let abundance = mglm_one_group(
@@ -1567,8 +1484,8 @@ pub fn exact_test<T: EdgeFloat>(
             v.clone()
         }
         None => {
-            // edgeR's aveLogCPM.DGEList: the *common* dispersion, not the one
-            // the test itself runs on, and every sample rather than the pair.
+            // As edgeR's aveLogCPM.DGEList: the *common* dispersion and every
+            // sample, not the pair.
             let alc_dispersion = y.common_dispersion.map(Recycled::scalar);
             ave_log_cpm(
                 &y.counts,
@@ -1595,10 +1512,8 @@ pub fn exact_test<T: EdgeFloat>(
 
 #[cfg(test)]
 mod tests {
-    // Every reference below is pasted verbatim from R's 17-digit output. The
-    // last digit or two is past what an f64 can hold and clippy would rather
-    // they were rounded, but keeping them exactly as printed is what makes them
-    // checkable against the `Rscript` line quoted above each test.
+    // References are pasted verbatim from R's 17-digit output so they stay
+    // checkable against the `Rscript` line above each test.
     #![allow(clippy::excessive_precision)]
 
     use super::*;
@@ -1606,17 +1521,12 @@ mod tests {
 
     /// Agreement target against edgeR.
     ///
-    /// Far looser than what is achieved, and deliberately so: two of the three
-    /// numbers here come out of an iterative fit, and pinning a test to the
-    /// convergence tolerance of a routine in another module makes it a tripwire
-    /// rather than a check.
+    /// Looser than what is achieved, since two of the three numbers come from
+    /// an iterative fit.
     ///
-    /// What is actually achieved, over every fixture in this module: every
-    /// p-value, pseudo-count and quantile map holds to 1e-12 relative or better.
-    /// The log fold changes hold to 2e-11, and that gap is
-    /// [`mglm_one_group`]'s own `tol = 1e-10` on the coefficient step rather
-    /// than anything here; edgeR stops on the same criterion and the two land a
-    /// step apart.
+    /// Achieved over every fixture here: p-values, pseudo-counts and quantile
+    /// maps hold to 1e-12 relative or better; log fold changes to 2e-11, which
+    /// is [`mglm_one_group`]'s own `tol = 1e-10` on the coefficient step.
     const TOL: f64 = 1e-9;
 
     /// 6 genes by 6 samples. Gene 4 is zero in the first group, gene 5 is above
@@ -1673,9 +1583,9 @@ mod tests {
         }
     }
 
-    ////////////////
-    // q2qnbinom  //
-    ////////////////
+    ///////////////
+    // q2qnbinom //
+    ///////////////
 
     /// `x <- c(0,1,5,20,100,900,3,0.5)`
     /// `im <- c(2,2,10,10,50,500,3,1e-16)`
@@ -1736,8 +1646,8 @@ mod tests {
     }
 
     /// The branch that needs a log-space upper incomplete gamma. At dispersion
-    /// 0.001 the first element sits at `Q = e^-1605`, which is a flat zero on
-    /// the natural scale and would send the inverse to infinity.
+    /// 0.001 the first element sits at `Q = e^-1605`, a flat zero on the natural
+    /// scale.
     ///
     /// `cat(format(edgeR:::q2qnbinom(c(6000,6000,2000), c(1000,200,40),`
     /// `c(1500,400,55), dispersion=0.001), digits=17), sep=", ")`
@@ -1778,15 +1688,14 @@ mod tests {
         let x = [0.0, 3.0, 17.0, 900.0];
         let means = [5.0_f64; 4];
         let got = q2q_nbinom(&x, &means, &means, 0.1).unwrap();
-        // R reports 1.5365178734079724e-16 for the zero, which is its own gamma
-        // round trip rounding rather than a real difference.
+        // R reports 1.5365178734079724e-16 for the zero: its own gamma round
+        // trip rounding.
         for (g, w) in got.iter().zip(x.iter()) {
             assert_relative_eq!(g, w, epsilon = 1e-9, max_relative = TOL);
         }
     }
 
-    /// A mean below `eps` nudges both sides by a quarter, so the mapping stays
-    /// the identity rather than dividing by zero.
+    /// A mean below `eps` nudges both sides by a quarter, keeping the identity.
     #[test]
     fn test_q2q_nbinom_nudges_a_vanishing_mean() {
         let got = q2q_nbinom(&[0.5], &[1e-16], &[1e-16], 0.1).unwrap();
@@ -1846,7 +1755,7 @@ mod tests {
     }
 
     /// The inverse round-trips to the last few bits, including where the tail
-    /// probability itself is unrepresentable.
+    /// probability is unrepresentable.
     #[test]
     fn test_ln_reg_gamma_upper_inv_round_trips() {
         for &a in &[0.5_f64, 1.0, 3.0, 20.0, 500.0] {
@@ -1857,9 +1766,9 @@ mod tests {
         }
     }
 
-    /////////////////////////
-    // equalize_lib_sizes  //
-    /////////////////////////
+    ////////////////////////
+    // equalize_lib_sizes //
+    ////////////////////////
 
     /// `m <- matrix(c(10,12,11,40,44,38, 50,48,52,49,51,50, 2,0,5,1,3,0),`
     /// `nrow=3, byrow=TRUE)`
@@ -1941,8 +1850,8 @@ mod tests {
     }
 
     /// `eq3 <- equalizeLibSizes(m, group=c(1,1,1,2,2,2), dispersion=0.05,`
-    /// `lib.size=NULL)`. Without library sizes the column sums are tiny, the
-    /// fitted means fall under `eps`, and the quarter-count nudge shows.
+    /// `lib.size=NULL)`. Without library sizes the fitted means fall under `eps`
+    /// and the quarter-count nudge shows.
     #[test]
     fn test_equalize_lib_sizes_falls_back_to_the_column_sums() {
         let want = [
@@ -2046,8 +1955,7 @@ mod tests {
     // Rejection regions //
     ///////////////////////
 
-    /// Six genes split two against four, straight into the kernels with no
-    /// pipeline in front.
+    /// Six genes split two against four, straight into the kernels.
     /// ```r
     /// y1 <- matrix(c(10,12, 50,48, 2,0, 0,0, 300,290, 5,7), nrow=6, byrow=TRUE)
     /// y2 <- matrix(c(40,44,38,41, 49,51,50,52, 1,3,0,2, 7,9,8,6,
@@ -2118,9 +2026,9 @@ mod tests {
         assert_close(&got, &want);
     }
 
-    /// edgeR's `exactTestBySmallP` ends on `min(pvals, 1)` rather than `pmin`,
-    /// so a whole matrix comes back carrying the smallest p-value in it. The
-    /// reference here is that function called one gene at a time:
+    /// edgeR's `exactTestBySmallP` ends on `min(pvals, 1)` rather than `pmin`
+    /// (see `UPSTREAM_DEVIATIONS.md` B3). The reference is the function called
+    /// one gene at a time:
     /// `for (i in 1:6) edgeR:::exactTestBySmallP(y1[i,,drop=FALSE],`
     /// `y2[i,,drop=FALSE], dispersion=disp[i])`
     #[test]
@@ -2246,9 +2154,8 @@ mod tests {
         assert_close(&got, &want);
     }
 
-    /// Above `big_count` the double-tail test hands over to the beta
-    /// approximation, and the p-value moves. Gene 2 of the pipeline fixture is
-    /// the one that changes when the threshold is dropped to 100.
+    /// Above `big_count` the double-tail test uses the beta approximation. Gene 2
+    /// of the pipeline fixture changes when the threshold drops to 100.
     #[test]
     fn test_big_count_threshold_switches_paths() {
         let y1 = [1200.0, 1100.0, 1300.0];
@@ -2257,8 +2164,7 @@ mod tests {
         let exact = double_tail_one(&y1, &y2, 0.08, 1e12, &mut buf).unwrap();
         let approx = double_tail_one(&y1, &y2, 0.08, BIG_COUNT_DEFAULT, &mut buf).unwrap();
         assert_relative_eq!(approx, 3.1654679012061791e-03, max_relative = TOL);
-        // The convolution and the approximation agree to about three digits,
-        // which is the whole reason edgeR is willing to make the swap.
+        // Convolution and approximation agree to about three digits.
         assert_relative_eq!(exact, approx, max_relative = 1e-2);
         assert!(exact != approx);
     }
@@ -2266,12 +2172,12 @@ mod tests {
     /// At zero dispersion every region routes through the exact binomial test.
     /// `cat(format(edgeR:::exactTestDoubleTail(y1, y2, dispersion=0), digits=17), sep=", ")`
     ///
-    /// Gene 6 is the one exception, and it is edgeR that is wrong. Its split is
-    /// 12 against 23 at `p = 1/3`, and a total of 35 makes the outcomes 11 and
-    /// 12 *exactly* equiprobable, so every outcome is at most as probable as the
-    /// observed one and the p-value is 1. edgeR reports 0.86009048828607226,
-    /// having dropped one of the two tied terms on a one-ulp difference in
-    /// `dbinom`. R's own `binom.test(12, 35, 1/3)` returns 1, and so does this.
+    /// Gene 6 is the exception, and edgeR is wrong (see
+    /// `UPSTREAM_DEVIATIONS.md` B4). The split is 12 against 23 at `p = 1/3`;
+    /// a total of 35 makes outcomes 11 and 12 *exactly* equiprobable, so the
+    /// p-value is 1. edgeR reports 0.86009048828607226, having dropped a tied
+    /// term on a one-ulp difference in `dbinom`. R's `binom.test(12, 35, 1/3)`
+    /// returns 1, as does this.
     #[test]
     fn test_zero_dispersion_uses_the_binomial_test() {
         let want = [
@@ -2319,11 +2225,10 @@ mod tests {
             );
         }
 
-        // Index 1 is a 3 against 5 split at p = 1/3, where a total of 8 makes
-        // the outcomes 2 and 3 exactly equiprobable. edgeR reports
-        // 0.72687090382563635, having dropped the tied term; `binom.test(3, 8,
-        // 1/3)` reports 1, and so does this. Every other entry agrees with
-        // edgeR to the tolerance.
+        // Index 1 is a 3 against 5 split at p = 1/3: outcomes 2 and 3 are
+        // exactly equiprobable. edgeR reports 0.72687090382563635 (dropped tied
+        // term); `binom.test(3, 8, 1/3)` and this report 1. Every other entry
+        // agrees with edgeR to the tolerance.
         let want_third = [
             1.0000000000000000e+00,
             1.0000000000000000e+00,
@@ -2457,9 +2362,9 @@ mod tests {
         assert_close(&got.p_value, &want_dev);
     }
 
-    /// edgeR's `exactTestBySmallP` cannot be read straight off `exactTest` for
-    /// more than one gene, per its `min` bug, so this checks the region does
-    /// something different from the other two and stays a probability.
+    /// `exactTestBySmallP` cannot be read off `exactTest` for more than one gene
+    /// (its `min` bug), so this checks only that the region differs from the
+    /// other two and stays a probability.
     #[test]
     fn test_exact_test_small_p_region_runs_on_unequal_groups() {
         let y = fixture(vec![1, 1, 2, 2, 2, 2]);
@@ -2495,8 +2400,8 @@ mod tests {
         assert_close(&got.p_value, &want);
     }
 
-    /// The prior count only moves the fold change, and it moves gene 4 most,
-    /// which is the one that is zero in the first group.
+    /// The prior count only moves the fold change, most for gene 4 (zero in the
+    /// first group).
     /// `cat(format(exactTest(d, dispersion=disp, prior.count=0.5)$table$logFC, digits=17))`
     #[test]
     fn test_exact_test_honours_the_prior_count() {
@@ -2515,8 +2420,7 @@ mod tests {
         assert_close(&got.log_fc, &want);
     }
 
-    /// Reversing the pair flips the sign of the fold change and leaves the
-    /// p-value alone.
+    /// Reversing the pair flips the fold change sign and leaves the p-value.
     #[test]
     fn test_exact_test_pair_order_flips_the_fold_change() {
         let y = fixture(vec![1, 1, 1, 2, 2, 2]);
@@ -2540,7 +2444,7 @@ mod tests {
         assert_close(&got.p_value, &want.p_value);
     }
 
-    /// `f32` counts must land on the same answer to single precision.
+    /// `f32` counts agree to single precision.
     #[test]
     fn test_exact_test_is_generic_over_the_count_type() {
         let counts32: Vec<f32> = COUNTS.iter().map(|v| *v as f32).collect();

@@ -1,41 +1,46 @@
 //! End-to-end parity for the single-cell chain: `nebula`, then the Wald test on
 //! its output, then the dispersion shrinkage.
 //!
-//! Two realistic datasets, sitting either side of the thirty-cells-per-subject
-//! threshold that decides between NEBULA-LN and NEBULA-HL:
+//! Two realistic datasets, either side of the thirty-cells-per-subject threshold
+//! that decides between NEBULA-LN and NEBULA-HL:
 //!
-//! * `sc`, 300 genes over 1005 cells and 15 subjects, so 67 cells per subject.
-//!   `method = "LN"` survives and all three of nebula's sub-algorithms appear
-//!   in one run.
-//! * `sc_small`, 120 genes over 300 cells and 15 subjects, so 20 per subject.
+//! * `sc`, 300 genes over 1005 cells and 15 subjects (67 cells per subject).
+//!   `method = "LN"` survives and all three of nebula's sub-algorithms appear.
+//! * `sc_small`, 120 genes over 300 cells and 15 subjects (20 per subject).
 //!   `method = "LN"` is silently downgraded and every gene takes the HL path.
 //!
-//! Then five small ones, thirty genes each, aimed at the corners of the GPU
-//! kernel. All but `sc_blocks` run HL, which is what sends every gene through
-//! stage two and so onto the device:
+//! Five small sets (thirty genes each) target corners of the GPU kernel. All but
+//! `sc_blocks` run HL, which sends every gene through stage two and so onto the
+//! device:
 //!
-//! * `sc_k2`: two subjects of 23 and 41 cells. Every gene pins `sigma^2` on
-//!   its lower bound, in R as here.
+//! * `sc_k2`: two subjects of 23 and 41 cells. Every gene pins `sigma^2` on its
+//!   lower bound, in R as here.
 //! * `sc_blocks`: eight subjects of 5, 31, 32, 33, 127, 128, 129 and 160 cells,
 //!   either side of a 32-lane plane and of the four-plane unroll. LN, with all
 //!   three sub-algorithms, plus planted genes: one silent in a subject, two on
 //!   the third-order Laplace path, one at `mincp` and one filtered below it.
 //! * `sc_intercept`: intercept only, no offset.
-//! * `sc_wide`: eight columns, the kernel's cap, over 40 subjects of 12 cells.
+//! * `sc_wide`: eight columns (the kernel's cap), 40 subjects of 12 cells.
 //! * `sc_high`: means of `1e3` to `1e4` on offsets around `5e3`.
 //!
-//! The in-crate golden is eight genes at 25 cells per subject, so it only ever
-//! reaches HL, and reaches LN only through a relabelling trick on the same 150
-//! cells.
+//! Three more have a categorical cell type in place of the continuous
+//! cell-level column, so the CPU kernels sum the zero counts from tables:
 //!
-//! Tolerances follow the reasoning in `src/sc/nebula.rs`, which documented why
-//! they cannot be tightened: nebula stops its optimiser on a profile likelihood
-//! that is itself discontinuous at the stopping tolerance, so two of its own
+//! * `sc_cat_ln`: LN over eight subjects of 60 to 400 cells, offsets over two
+//!   orders of magnitude, the planted genes.
+//! * `sc_cat_hl`: HL, one subject fifteen times the smallest, `1 / size` of 3
+//!   to 10, and a rare type in three subjects whose groups are too small to
+//!   table, so tabled and swept cells mix.
+//! * `sc_cat_sparse`: HL at means low enough for the third-order Laplace
+//!   correction.
+//!
+//! The in-crate golden is eight genes at 25 cells per subject: it reaches HL
+//! only, and LN only through a relabelling trick on the same 150 cells.
+//!
+//! Tolerances follow `src/sc/nebula.rs`: nebula stops its optimiser on a profile
+//! likelihood that is discontinuous at the stopping tolerance, so two of its own
 //! runs from different starting points disagree by as much. The values here are
-//! one to two decades looser than that module's, and are measured on these
-//! fixtures rather than carried over, because three hundred genes over a
-//! thousand cells reach corners that eight genes over a hundred and fifty do
-//! not.
+//! one to two decades looser than that module's, measured on these fixtures.
 
 mod common;
 
@@ -62,97 +67,78 @@ const TOL_SE: Tol = Tol::rel(1e-4);
 /// relative error. Needs `2.3e-4`.
 const TOL_COV: Tol = Tol::new(1e-3, 1e-12);
 
-/// Subject-level overdispersion. The profile likelihood is far flatter in this
-/// direction than in the cell-level one, so the same jitter moves it further.
-/// Needs `3.8e-5`.
-const TOL_SUBJECT: Tol = Tol::rel(2e-4);
+/// Subject-level overdispersion. The profile likelihood is flatter in this
+/// direction than in the cell-level one. Needs `5.9e-5` relative
+/// (`sc_cat_sparse`), except near the lower bound: BOBYQA stops at a radius of
+/// `1e-6` times its first step, so a small `sigma^2` is resolved to a few `1e-7`
+/// absolute, by nebula as by this crate (`sc_intercept` gene 18: `2.2e-4`
+/// relative, `3.2e-7` absolute).
+const TOL_SUBJECT: Tol = Tol::new(2e-4, 1e-6);
 
 /// Cell-level overdispersion. Needs `2.2e-5`.
 const TOL_CELL: Tol = Tol::rel(1e-4);
 
-/// Wald p-values. These amplify whatever error is in the standard error by
-/// roughly `z^2`, because the tail of a normal falls like `exp(-z^2/2)`: at
-/// `p = 1e-16` the score is `z = 8.2`, so a `2e-5` relative error in the
-/// standard error arrives as `1.4e-3` in the p-value. Needs `1.5e-3`, which is
-/// that arithmetic exactly.
+/// Wald p-values. The normal tail falls like `exp(-z^2/2)`, so the standard
+/// error's relative error is amplified by roughly `z^2`: at `p = 1e-16`, `z = 8.2`
+/// and a `2e-5` error in the SE arrives as `1.4e-3`. Needs `1.5e-3`.
 const TOL_P_VALUE: Tol = Tol::new(1e-2, 1e-300);
 
-// Longer Claude explanation. Left it in, because this took time to find, debug.
+// The LN+HL path is gated apart because the two optimisers pick different basins.
 //
-// The LN+HL path, held apart because the two optimisers pick different basins
-//
-// nebula picks one of three sub-paths per gene. Measured on the 1005-cell set,
-// worst relative disagreement on the coefficients:
+// nebula picks one of three sub-paths per gene. Worst relative disagreement on
+// the coefficients, 1005-cell set:
 //
 //   NBGMM (LN)      11 genes    3.0e-6
 //   NBGMM (HL)       6 genes    3.8e-7      (118 genes at 7.4e-6 on sc_small)
 //   NBGMM (LN+HL)  281 genes    5.9e-1
 //
-// The cause is not the LN+HL refit itself. That refit's objective was compared
-// against `nebula:::pql_gamma_ll` at identical `(sigma, phi)` on three affected
-// genes over an eight-point grid: the two agree to `6e-10` absolute, `2e-12`
-// relative, so the profile likelihood, the inner PML solve, `reml`, `ord` and
-// the sign convention are all faithful, and the one-dimensional search finds
-// that objective's minimum.
+// The LN+HL refit itself is faithful: its objective agrees with
+// `nebula:::pql_gamma_ll` at identical `(sigma, phi)` to `6e-10` absolute,
+// `2e-12` relative, on three affected genes over an eight-point grid.
 //
 // The divergence is in stage one, the joint optimisation over
-// `[beta, sigma, phi]`. R runs nlopt's `LD_LBFGS` there and this crate runs
-// L-BFGS-B, and on 37 of the 281 genes the two finish in different places.
-// LN+HL then holds stage one's `phi` fixed and refits only `sigma`, so the
-// choice propagates into both variance components and, through the `-sigma/2`
-// intercept shift, into the coefficients.
+// `[beta, sigma, phi]`. R runs nlopt's `LD_LBFGS`, this crate L-BFGS-B, and on
+// 37 of the 281 genes they finish in different places. LN+HL then holds stage
+// one's `phi` fixed and refits only `sigma`, so the choice propagates into both
+// variance components and, through the `-sigma/2` intercept shift, into the
+// coefficients.
 //
-// The two places are not two local minima. R's is the lower bound on `sigma`,
-// and the marginal likelihood is still strictly decreasing there: lower the
-// bound from `1e-4` to `1e-8` and 13 of the 19 genes that sat on it follow it
-// straight down. R is on a legitimate Karush-Kuhn-Tucker point of the box
-// constraint, reached by sliding down a monotone descent onto the wall, and
-// `sigma = 1e-4` is the constraint rather than an estimate. This crate stops at
-// the one genuine interior stationary point. There is a real second basin
-// around `0.03` to `0.15` separated by a ridge near `0.01`; what there is not
-// is a minimum at the bound.
+// R's endpoint is the lower bound on `sigma`, where the marginal likelihood is
+// still strictly decreasing: lowering the bound from `1e-4` to `1e-8` pulls 13
+// of the 19 genes on it straight down. It is a KKT point of the box constraint,
+// reached by sliding onto the wall. This crate stops at the genuine interior
+// stationary point; a second basin sits around `0.03` to `0.15`, behind a ridge
+// near `0.01`.
 //
-// Neither optimiser is broken; both satisfy KKT and both are converged, and R
-// reaching the lower marginal negative log-likelihood on 27 of the 37 against
-// this crate's 9 is not the endorsement it looks like, because it wins by
-// descending into a degeneracy. Sigma on the bound means no subject-level
-// variance at all, i.e. the mixed model collapsed to a plain negative binomial
-// GLM, in an approximation the LN+HL path exists precisely because it
-// distrusts.
+// Both are converged, but R's lower NLL on 27 of the 37 (this crate's 9) is not
+// an endorsement: sigma on the bound means no subject variance, i.e. a plain NB
+// GLM, in an approximation LN+HL exists to distrust. Against nebula's own
+// `method = "HL"` (both variance components on the profile likelihood), this
+// crate is closer on 29 of the 37 for `sigma`, 29 for `phi`, 32 for the SEs and
+// 32 for the p-values; worst-case `sigma` error over all 281 genes is 15.8% here
+// against 84.4% for R. Multi-start taking the lowest NLL is counterproductive:
+// it lands on the bound on 30 of the 37, moves away from HL, and costs +81%
+// runtime.
 //
-// The tiebreak is nebula's own `method = "HL"`, which fits both variance
-// components against the profile likelihood. Against that reference this crate
-// is closer on 29 of the 37 for `sigma`, 29 for `phi`, 32 for the standard
-// errors and 32 for the p-values; worst-case `sigma` error over all 281 genes is
-// 15.8% here against 84.4% for R. So the answers are not equally good, and the
-// obvious "multi-start and take the lower NLL" fix is measurably counter-
-// productive: it lands on the bound on 30 of the 37 and moves *away* from the HL
-// reference, for +81% runtime. It optimises the wrong objective harder.
+// R also disagrees with itself: `opt = "trust"` moves the subject
+// overdispersion by more than 1% on 78 of the 281 genes, twice the 37 where this
+// crate differs from `opt = "lbfgs"`, and on those 37 it lands on this crate's
+// answer (22 agree to `1e-6`, 32 to `1e-4`; none agree with `lbfgs` to `1e-6`).
+// Matching the fixture would mean reproducing nlopt's LD_LBFGS trajectory,
+// including the overshoot clipped onto the `sigma` bound that carries it over
+// the ridge.
 //
-// R also disagrees with itself: nebula's own documented `opt = "trust"`
-// moves the subject overdispersion by more than one per cent on 78 of the 281
-// genes, twice as many as the 37 where this crate differs from `opt = "lbfgs"`,
-// and on those 37 it lands on this crate's answer rather than on `lbfgs`'s:
-// 22 agree to `1e-6` and 32 to `1e-4`, against none agreeing with `lbfgs` to
-// `1e-6`. Matching the fixture would mean reproducing nlopt's LD_LBFGS
-// trajectory step for step, including the overshoot that gets clipped onto the
-// `sigma` bound and is what carries it over the ridge.
+// `gene_id` 299 is not stage one: both optimisers agree on `[beta, sigma, phi]`
+// to `3e-7`, and R's `nlminb` inside the refit returns the lower bound `1e-4`
+// with `convergence == 0` where its own `pql_gamma_ll` is still falling.
 //
-// One gene is not stage one at all. On `gene_id` 299 both optimisers agree on
-// `[beta, sigma, phi]` to `3e-7`, and it is R's `nlminb` inside the refit that
-// fails: it returns the lower bound `1e-4` with `convergence == 0` at a point
-// where its own `pql_gamma_ll` is still falling.
-//
-// The two constants below are gated on their absolute legs, which is what makes
-// them falsifiable. Stated as pure relative bounds they would not be: the
-// comparator normalises by `max(|a|, |b|)`, so a relative difference cannot
-// exceed 2 and any `max_relative` at or above that can never fail. An earlier
-// revision had the subject bound at 6.0, which was exactly that mistake.
+// The two constants below are gated on their absolute legs. The comparator
+// normalises by `max(|a|, |b|)`, so a relative difference cannot exceed 2 and
+// any `max_relative` at or above that can never fail.
 
-/// Coefficients on the LN+HL path. Needs `0` beyond a `1e-2` absolute floor;
-/// the worst absolute disagreement across all 281 genes is `4.4e-3` in
-/// log-fold-change units. The headline `5.9e-1` relative figure is a
-/// coefficient of magnitude `8.6e-4` and is not meaningful.
+/// Coefficients on the LN+HL path. Needs `0` beyond a `1e-2` absolute floor; the
+/// worst absolute disagreement across all 281 genes is `4.4e-3` in log fold
+/// change. The `5.9e-1` relative figure is a coefficient of magnitude `8.6e-4`.
 const LN_HL_COEF: Tol = Tol::new(1e-5, 1e-2);
 
 /// Subject-level overdispersion on the LN+HL path. Needs `7.9e-2` beyond a
@@ -162,10 +148,10 @@ const LN_HL_SUBJECT: Tol = Tol::new(2.5e-1, 1e-3);
 /// Shrunk dispersions from `shrink_sc_dispersion`, against limma's `squeezeVar`
 /// on the same inputs. Needs `7.7e-14`.
 ///
-/// This is the tightest thing in the file, and it should be: the test hands the
-/// crate R's own cell overdispersions, so the only thing under comparison is the
-/// empirical Bayes step. `shrink_sc_dispersion` has no upstream of its own,
-/// being edgePython's invention, so limma applied directly is the reference.
+/// The tightest tolerance in the file: the test feeds the crate R's own cell
+/// overdispersions, so only the empirical Bayes step is compared.
+/// `shrink_sc_dispersion` has no upstream of its own (edgePython's invention), so
+/// limma applied directly is the reference.
 const TOL_SHRINK: Tol = Tol::rel(1e-12);
 
 /// Prior degrees of freedom from that shrinkage. Needs `8.3e-13`.
@@ -204,24 +190,27 @@ const CPU_TOLS: NebulaTols = NebulaTols {
     p_value: TOL_P_VALUE,
 };
 
-/// A path's gates for one dataset: `base` as it stands, loosened only where the
-/// dataset measurably needs it. Every loosening is an absolute floor, so the
-/// gate can still fail.
+/// A path's gates for one dataset: `base`, loosened only where the dataset
+/// measurably needs it. Every loosening is an absolute floor, so the gate can
+/// still fail.
 ///
 /// * `sc_blocks`: one pure-LN gene, R's `gene_id` 29, where stage one puts
 ///   `phi` on its upper bound of 1000 and R stops at 414. Both call the gene
 ///   near-Poisson. Needs `3.2e-5` on the coefficients, `1.4e-3` absolute on the
 ///   cell overdispersion, and a p-value `1.2e-2` off at `p = 6e-238`, which the
 ///   `1e-12` floor absorbs.
-/// * `sc_high`: one HL gene, `gene_id` 6, where this crate pins `sigma^2` at
-///   `1e-4` and R stops at `5.0e-3`. Worst absolute needs, CPU and GPU alike:
-///   coefficients `6.8e-3`, standard errors `7.8e-3`, `sigma^2` `4.9e-3`,
-///   covariance `2.0e-3`, p-values `5.9e-3` (0.011 against 0.017), and `1.8e-3`
-///   relative on the cell overdispersion. The other high-count genes need up to
-///   `1.7e-4` relative on the coefficients, well inside the floor.
+/// * `sc_cat_ln`: the same planted near-Poisson gene, `gene_id` 29, where R
+///   stops at `phi = 322`. Needs `5.6e-4` on the coefficients and on
+///   `sigma^2`, and `2.1e-3` absolute on the cell overdispersion. The gates are
+///   per dataset, so the other five pure genes are held to them too.
+/// * `sc_high`: means of `1e3` to `1e4`, the set most sensitive to how the
+///   platform's `exp` and `log` round: the profile likelihood's `1e-6` jitter
+///   carries an ulp into the optimum. Needs, macOS then Linux: `6.1e-5` and
+///   `1.24e-4` on the coefficients, `2.1e-4` and `8.5e-4` on `sigma^2`,
+///   `3.5e-3` and `1.1e-2` on the covariance.
 ///
-/// Neither gene has been settled as a port fault or an R one; the misses were
-/// judged too small downstream to chase.
+/// The `sc_blocks` and `sc_cat_ln` gene is not settled as a port fault or an R
+/// one.
 ///
 /// ### Params
 ///
@@ -239,13 +228,16 @@ fn tols(tag: &str, base: NebulaTols) -> NebulaTols {
             p_value: Tol::new(base.p_value.max_relative, 1e-12),
             ..base
         },
+        "sc_cat_ln" => NebulaTols {
+            coef: Tol::new(base.coef.max_relative.max(1e-3), base.coef.epsilon),
+            subject: Tol::new(base.subject.max_relative.max(1e-3), base.subject.epsilon),
+            cell: Tol::new(base.cell.max_relative, 3e-3),
+            ..base
+        },
         "sc_high" => NebulaTols {
-            coef: Tol::new(base.coef.max_relative, 1.5e-2),
-            se: Tol::new(base.se.max_relative, 1.5e-2),
-            cov: Tol::new(base.cov.max_relative, 5e-3),
-            subject: Tol::new(base.subject.max_relative, 1e-2),
-            cell: Tol::new(base.cell.max_relative.max(5e-3), base.cell.epsilon),
-            p_value: Tol::new(base.p_value.max_relative, 1.5e-2),
+            coef: Tol::new(base.coef.max_relative.max(3e-4), base.coef.epsilon),
+            subject: Tol::new(base.subject.max_relative.max(2e-3), base.subject.epsilon),
+            cov: Tol::new(base.cov.max_relative.max(2.5e-2), base.cov.epsilon),
             ..base
         },
         _ => base,
@@ -262,8 +254,8 @@ struct Dataset {
     tag: &'static str,
     /// The method R was asked for.
     method: NebulaMethod,
-    /// Whether the LN path is expected to survive the cells-per-subject check.
-    /// Only read when `method` is LN.
+    /// Whether LN is expected to survive the cells-per-subject check (read only
+    /// when `method` is LN).
     expect_ln: bool,
     /// Whether R was given the offsets in the meta file.
     has_offset: bool,
@@ -278,12 +270,11 @@ struct Dataset {
 /// Coefficient suffixes of the two realistic datasets.
 const NAMES_SC: &[&str] = &["int", "grp", "cov2"];
 
-/// Coefficient suffixes of the edge datasets, which R numbers.
+/// Coefficient suffixes of the edge datasets (numbered by R).
 const NAMES_EDGE: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
 
-/// Every single-cell dataset. `sc` is first; the tests that only need one
-/// realistic set read it by index.
-const DATASETS: [Dataset; 7] = [
+/// Every single-cell dataset. `sc` is first; single-set tests read it by index.
+const DATASETS: [Dataset; 10] = [
     Dataset {
         tag: "sc",
         method: NebulaMethod::Ln,
@@ -334,6 +325,30 @@ const DATASETS: [Dataset; 7] = [
     },
     Dataset {
         tag: "sc_high",
+        method: NebulaMethod::Hl,
+        expect_ln: true,
+        has_offset: true,
+        names: NAMES_EDGE.split_at(3).0,
+        design_file: true,
+    },
+    Dataset {
+        tag: "sc_cat_ln",
+        method: NebulaMethod::Ln,
+        expect_ln: true,
+        has_offset: true,
+        names: NAMES_EDGE.split_at(4).0,
+        design_file: true,
+    },
+    Dataset {
+        tag: "sc_cat_hl",
+        method: NebulaMethod::Hl,
+        expect_ln: true,
+        has_offset: true,
+        names: NAMES_EDGE.split_at(4).0,
+        design_file: true,
+    },
+    Dataset {
+        tag: "sc_cat_sparse",
         method: NebulaMethod::Hl,
         expect_ln: true,
         has_offset: true,
@@ -413,8 +428,8 @@ fn load(d: &Dataset) -> Loaded {
     }
 }
 
-/// The CPU fit of one dataset at the parameters its fixture was made with,
-/// computed once per test binary and shared by every test that reads it.
+/// The CPU fit of one dataset at its fixture's parameters, computed once per test
+/// binary.
 ///
 /// ### Params
 ///
@@ -424,7 +439,8 @@ fn load(d: &Dataset) -> Loaded {
 ///
 /// The fit.
 fn cpu_fit(i: usize) -> &'static NebulaFit {
-    static FITS: [OnceLock<NebulaFit>; DATASETS.len()] = [const { OnceLock::new() }; 7];
+    static FITS: [OnceLock<NebulaFit>; DATASETS.len()] =
+        [const { OnceLock::new() }; DATASETS.len()];
     FITS[i].get_or_init(|| {
         let d = &DATASETS[i];
         let l = load(d);
@@ -463,11 +479,11 @@ fn golden_params(d: &Dataset) -> NebulaParams {
 
 /// Reorders one gene's R covariance row into the crate's packing.
 ///
-/// R returns `lower.tri(diag = TRUE)` column-major: column `j` holds rows
-/// `j..n`, so three coefficients read `V11, V21, V31, V22, V32, V33`. The crate
-/// packs the upper triangle column-major, entry `(i, j)` with `i <= j` at
-/// `j * (j + 1) / 2 + i`, which reads `V11, V12, V22, V13, V23, V33`. The two
-/// coincide for two coefficients and diverge from three.
+/// R returns `lower.tri(diag = TRUE)` column-major, so three coefficients read
+/// `V11, V21, V31, V22, V32, V33`. The crate packs the upper triangle
+/// column-major, entry `(i, j)` with `i <= j` at `j * (j + 1) / 2 + i`:
+/// `V11, V12, V22, V13, V23, V33`. The two coincide for two coefficients and
+/// diverge from three.
 ///
 /// ### Params
 ///
@@ -492,14 +508,13 @@ fn repack(row: &[f64], n: usize) -> Vec<f64> {
 
 /// Asserts a convergence code against the R package's.
 ///
-/// nebula grades a fit by how many times the last Newton step had to be halved,
-/// and at a converged point that count is settled by rounding, so a gene the R
-/// package calls converged may come back as `CONV_CRITICAL_POINT` here. This is
-/// the same leniency `src/sc/nebula.rs` applies to the in-crate golden.
+/// nebula grades a fit by how often the last Newton step was halved, which at a
+/// converged point is settled by rounding, so a gene R calls converged may come
+/// back as `CONV_CRITICAL_POINT` here (same leniency as `src/sc/nebula.rs`).
 ///
-/// Where R's own outer optimiser failed (`-50`) and this crate converged, the
-/// crate is not held to R's failure: on `sc_blocks` gene 3, R's search gives up
-/// where ours finishes, as R's `nlminb` does on `sc` gene 299.
+/// Where R's outer optimiser failed (`-50`) and this crate converged, the crate
+/// is not held to R's failure: `sc_blocks` gene 3, and `sc` gene 299 for R's
+/// `nlminb`.
 ///
 /// ### Params
 ///
@@ -551,9 +566,8 @@ fn test_nebula_matches_the_r_package() {
 
 /// Gates one NEBULA fit against the R package's output for its dataset.
 ///
-/// Shared by the CPU test and the GPU one, so the device path is held to
-/// exactly the gates the CPU path is, and the tolerance report shows both
-/// under their own labels.
+/// Shared by the CPU and GPU tests, so both run the same checks and the report
+/// shows each under its own label.
 ///
 /// ### Params
 ///
@@ -589,9 +603,8 @@ fn check_against_r(
         let n = fit.gene_index.len();
         let algorithm = want.column("algorithm");
 
-        // nebula picks a sub-path per gene and the three do not agree equally
-        // well, so they are gated separately rather than under one tolerance.
-        // See LN_HL_* below for why the mixed path is held apart.
+        // The three sub-paths agree unequally well, so they are gated separately
+        // (see the LN+HL note above).
         let pure: Vec<bool> = (0..n).map(|g| algorithm[g] as usize != 2).collect();
         let mixed: Vec<bool> = (0..n).map(|g| algorithm[g] as usize == 2).collect();
 
@@ -638,8 +651,7 @@ fn check_against_r(
             &format!("{label}/cell_overdispersion_pure"),
         );
 
-        // The mixed path, at the tolerance it currently earns rather than the
-        // one it should. This is a recorded gap, not an accepted one.
+        // The mixed path, at the tolerance it currently earns. A recorded gap.
         if mixed.iter().any(|k| *k) {
             assert_close(
                 &pick(&fit.coefficients, &mixed, n_coef),
@@ -663,8 +675,8 @@ fn check_against_r(
                 .collect();
             want_packed.extend(repack(&row, n_coef));
         }
-        // The covariance packing is what this checks, so only the pure genes,
-        // whose values agree, can say anything about it.
+        // This checks the packing, so only the pure genes (whose values agree)
+        // are used.
         assert_close(
             &pick(&fit.covariance, &pure, packed),
             &pick(&want_packed, &pure, packed),
@@ -680,14 +692,10 @@ fn check_against_r(
 
 #[test]
 fn test_sigma_at_bound_marks_the_collapsed_fits() {
-    // The flag is the only thing in either implementation that tells a caller
-    // their mixed model has no random effect. nebula's `check_conv` tests the
-    // upper bound on `sigma^2` and not the lower, so these genes come back
-    // reporting convergence.
-    //
-    // Cross-checked against R rather than against the crate's own output: the
-    // fixture's `Subject` column is R's, and a gene is pinned there exactly when
-    // it is pinned here.
+    // The flag is the only signal that a mixed model has no random effect:
+    // nebula's `check_conv` tests the upper bound on `sigma^2`, not the lower, so
+    // these genes report convergence. Checked against R's `Subject` column: a
+    // gene is pinned there exactly when it is pinned here.
     let s = common::scalars();
     let mut total = 0;
     for (i, d) in DATASETS.iter().enumerate() {
@@ -726,24 +734,19 @@ fn test_sigma_at_bound_marks_the_collapsed_fits() {
         );
         total += flagged;
     }
-    // Nothing pinned anywhere would make this test vacuous.
+    // Guard against a vacuous test.
     assert!(total > 0, "nothing pinned, so this gates nothing");
 }
 
 /// Genes whose subject-level variance finishes on the lower bound, per dataset.
 ///
-/// Recorded rather than derived, so a change in how many collapse is a test
-/// failure rather than a silent drift. These are R's numbers as much as this
-/// crate's: R pins the same 18 on `sc`, plus gene 299 where its `nlminb` fails,
-/// and the same 40 on `sc_small`.
+/// Recorded, not derived, so a change in how many collapse fails. R pins the same
+/// 18 on `sc` (plus gene 299, where its `nlminb` fails) and the same 40 on
+/// `sc_small`, a third of its genes: twenty cells per subject is too little
+/// between-subject replication, so the model collapses to a plain NB GLM and
+/// nebula reports every one as converged.
 ///
-/// The `sc_small` figure is the interesting one. A third of its genes come back
-/// with no fitted subject-level variance, which is what twenty cells per subject
-/// buys: there is too little between-subject replication to estimate the random
-/// effect, so the model collapses to a plain negative binomial GLM. nebula
-/// reports every one of them as converged.
-///
-/// The edge datasets read R's own count, `n_pinned` in the scalars.
+/// The edge datasets read R's `n_pinned` from the scalars.
 ///
 /// ### Params
 ///
@@ -757,17 +760,14 @@ fn s_pinned(tag: &str, s: &common::Scalars) -> usize {
     match tag {
         "sc" => 18,
         "sc_small" => 40,
-        // R's `n_pinned` is 0; this crate also pins gene 6, see `tols`.
-        "sc_high" => 1,
         _ => s.get_usize(tag, "n_pinned"),
     }
 }
 
 #[test]
 fn test_nebula_ln_and_hl_are_genuinely_different_paths() {
-    // Asking for HL on the large dataset has to give a different answer, or the
-    // LN fixture is not gating anything. On this data the two disagree by around
-    // 50% on the group coefficient, so the check is not delicate.
+    // HL on the large dataset must differ from LN (around 50% on the group
+    // coefficient), or the LN fixture gates nothing.
     let l = load(&DATASETS[0]);
     let ln = cpu_fit(0);
 
@@ -800,9 +800,9 @@ fn test_nebula_ln_and_hl_are_genuinely_different_paths() {
     );
 }
 
-////////////////
-// Wald test  //
-////////////////
+///////////////
+// Wald test //
+///////////////
 
 #[test]
 fn test_glm_sc_test_reproduces_the_r_p_values() {
@@ -812,8 +812,7 @@ fn test_glm_sc_test_reproduces_the_r_p_values() {
 
         let n = fit.gene_index.len();
         let algorithm = want.column("algorithm");
-        // Only the genes whose fit agrees can say anything about the Wald test;
-        // the LN+HL ones would just re-report that gap one step downstream.
+        // Pure genes only: the LN+HL ones would re-report the fit gap.
         let pure: Vec<bool> = (0..n).map(|g| algorithm[g] as usize != 2).collect();
         let keep = |v: &[f64]| -> Vec<f64> {
             v.iter()
@@ -849,18 +848,17 @@ fn test_glm_sc_test_reproduces_the_r_p_values() {
     }
 }
 
-//////////////////
-// Shrinkage    //
-//////////////////
+///////////////
+// Shrinkage //
+///////////////
 
 #[test]
 fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
-    // `shrink_sc_dispersion` has no upstream of its own: it is edgePython's
-    // invention, so the reference is limma's `squeezeVar` applied directly to the
-    // reciprocal cell overdispersions on the residual degrees of freedom
-    // `sc_residual_df` computes. The generator runs exactly that, through the
-    // converged-`uniroot` `squeezeVar`, and this is the one fixture in the suite
-    // where that override changes the answer.
+    // `shrink_sc_dispersion` is edgePython's invention, so the reference is
+    // limma's `squeezeVar` on the reciprocal cell overdispersions at the df from
+    // `sc_residual_df`, through the converged-`uniroot` `squeezeVar`
+    // (UPSTREAM_DEVIATIONS.md B2). This is the one fixture where that override
+    // changes the answer.
     let s = common::scalars();
     let l = load(&DATASETS[0]);
     let want = common::table("sc_shrink.csv");
@@ -874,11 +872,8 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
         "sc/residual_df",
     );
 
-    // The inputs are R's, not the crate's. Feeding the crate its own nebula
-    // output would drag the LN+HL divergence documented above into a test that
-    // is supposed to be about the shrinkage, and the shrinkage is a joint fit
-    // over every usable gene, so one bad input moves every output. This is the
-    // same isolation the bulk GLM and QL files use.
+    // Inputs are R's: the shrinkage is a joint fit over every usable gene, so the
+    // LN+HL divergence above would move every output.
     let dispersion: Vec<f64> = nebula_fixture.column("Cell").to_vec();
     let convergence: Vec<i32> = nebula_fixture
         .column("convergence")
@@ -897,8 +892,7 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
     )
     .expect("shrink_sc_dispersion failed");
 
-    // R writes only the usable genes, the ones nebula converged on with a
-    // positive cell overdispersion, so the comparison is indexed by gene.
+    // R writes only usable genes (converged, positive cell overdispersion).
     let gene_ids: Vec<usize> = nebula_fixture
         .column_usize("gene_id")
         .iter()
@@ -921,10 +915,9 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
     let mut phi_post = Vec::with_capacity(want_ids.len());
     let mut phi_prior = Vec::with_capacity(want_ids.len());
     let mut df_prior = Vec::with_capacity(want_ids.len());
-    // `phi_raw`, `phi_post` and `phi_prior` are indexed by gene, but `df_prior`
-    // is indexed by *usable* gene: the robust fit returns one entry per gene it
-    // actually fitted, not one per gene it was handed. Conflating the two reads
-    // the right numbers off the wrong rows and looks like a 94% disagreement.
+    // `phi_raw`, `phi_post` and `phi_prior` are indexed by gene, `df_prior` by
+    // *usable* gene (the robust fit returns one entry per gene it fitted).
+    // Conflating them reads the right numbers off the wrong rows.
     assert_eq!(
         shrunk.df_prior.len(),
         want_ids.len(),
@@ -969,32 +962,32 @@ fn test_shrink_sc_dispersion_matches_limma_squeeze_var() {
     );
 }
 
-/// The GPU path's gates, read off the NEEDS column of its own tolerance report.
+/// The GPU path's gates, read off the NEEDS column of its own report.
 ///
-/// Stage two's penalised fits run in `f32` on the device and are finished in
-/// `f64` on the host, so the variance components land within about `1e-4` of
-/// R, which is the floor for any inner-fit trajectory other than R's own: the
-/// CPU restarted from a point perturbed by `1e-4` needs the same. Worst
-/// measured needs, across both fixtures, against R:
+/// Stage two's penalised fits run in `f32` on the device and finish in `f64` on
+/// the host, so the variance components land within about `1e-4` of R. That is
+/// the floor for any inner-fit trajectory other than R's own: the CPU restarted
+/// from a point perturbed by `1e-4` needs the same. Worst measured needs across
+/// both fixtures, against R:
 ///
 /// * coefficients `2.4e-4`, standard errors `2.4e-4`, cell-level
 ///   overdispersion `1.5e-4`;
-/// * covariance entries `4.8e-4` above an absolute `1e-6`, `1.6e-3` without
-///   it. The floor is for entries like `cov(intercept, cov2) = 6.9e-7` on a gene
-///   whose diagonals are `1.8e-2` and `6.9e-3`: a correlation of `6e-5`, on
-///   which a relative error measures nothing, and which needed `3.6e-1` before
-///   the finish took its log-determinant at the stepped point;
-/// * subject-level overdispersion within an absolute `1e-3`, the floor
-///   the CPU's own mixed-path gate uses; `1.7e-3` relative without it. The
-///   floor is for genes R and the CPU put just above the `1e-4` bound and the
-///   GPU may put on it. Both say the gene has no subject effect.
+/// * covariance entries `4.8e-4` above an absolute `1e-6`, `1.6e-3` without it.
+///   The floor is for entries like `cov(intercept, cov2) = 6.9e-7` on a gene
+///   with diagonals `1.8e-2` and `6.9e-3` (a correlation of `6e-5`), which
+///   needed `3.6e-1` before the finish took its log-determinant at the stepped
+///   point;
+/// * subject-level overdispersion within an absolute `1e-3` (the CPU's
+///   mixed-path floor); `1.7e-3` relative without it. The floor is for genes R
+///   and the CPU put just above the `1e-4` bound and the GPU may put on it; all
+///   say the gene has no subject effect.
 ///
-/// The mixed LN-then-HL path is held to the CPU's own gates, which the GPU meets
-/// as well as the CPU does (`7.9e-2`, as the CPU).
+/// The mixed LN-then-HL path uses the CPU's gates, which the GPU meets equally
+/// (`7.9e-2`).
 ///
-/// The gates sit well above those needs on purpose. The kernel's `f32` code is
-/// whatever the shader compiler makes of it, and two builds that differ only in
-/// dead code have measured up to five times apart on the hardest gene.
+/// The gates sit well above these needs on purpose: two builds differing only in
+/// dead code have measured up to five times apart on the hardest gene, since the
+/// `f32` code is whatever the shader compiler makes of it.
 #[cfg(feature = "gpu-tests")]
 const GPU_TOLS: NebulaTols = NebulaTols {
     coef: Tol::new(1e-2, 1e-9),
@@ -1010,8 +1003,7 @@ const GPU_TOLS: NebulaTols = NebulaTols {
 /// The GPU path, against the same R goldens as the CPU path.
 ///
 /// Stage two's penalised fits run on the device in `f32`; the optimum's value,
-/// the search, and stage three stay in `f64` on the host. See
-/// `edge_rs::gpu::stage_two`.
+/// the search and stage three stay in `f64` on the host (`edge_rs::gpu::stage_two`).
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn test_gpu_nebula_matches_the_r_package() {

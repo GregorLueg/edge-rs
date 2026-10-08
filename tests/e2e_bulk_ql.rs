@@ -1,23 +1,17 @@
 //! End-to-end parity for the quasi-likelihood chain: `glmQLFit` then
 //! `glmQLFTest`.
 //!
-//! This is the gate the original port plan named and never built: match
-//! edgeR's `s2.post`, `F` and `PValue` columns on a real dataset.
-//!
-//! The abundances the fit keys off come from the fixture rather than from a
-//! fresh `estimate_disp` run, so a failure here is the quasi-likelihood stage
-//! and not the dispersion estimation feeding it. `estimate_disp` has its own
-//! gate in `e2e_bulk_classic.rs`.
+//! Matches edgeR's `s2.post`, `F` and `PValue` columns. Abundances come from the
+//! fixture, not a fresh `estimate_disp` run (gated in `e2e_bulk_classic.rs`).
 //!
 //! Both pipelines are covered. The current one carries `df.residual.adj`,
 //! `deviance.adj` and `average.ql.dispersion`; the legacy one carries
 //! `df.residual.zeros` instead, and is the only one where the Poisson bound
-//! does anything. That last point is why the near-Poisson dataset exists: on it
-//! the bound moves 83 of 226 p-values under the legacy pipeline and exactly
-//! none under the current one, matching edgeR, which quietly forces the flag
-//! off when `df.residual.zeros` is absent.
+//! acts. On the near-Poisson dataset the bound moves 83 of 226 p-values under
+//! the legacy pipeline and none under the current one, matching edgeR, which
+//! forces the flag off when `df.residual.zeros` is absent.
 //!
-//! Tolerances are measured, not guessed:
+//! Tolerances come from
 //! `EDGE_RS_TOL_REPORT=1 cargo test --release --test e2e_bulk_ql -- --nocapture`.
 
 mod common;
@@ -32,9 +26,9 @@ use edge_rs::prelude::Recycled;
 // Tolerances //
 ////////////////
 
-/// Coefficients from the quasi-likelihood fit. Same story as the plain GLM: the
-/// stopping rule is on the deviance, so the absolute leg is the honest one.
-/// Needs `0` beyond a `2e-3` absolute floor.
+/// Coefficients from the quasi-likelihood fit. As for the plain GLM, the stopping
+/// rule is on the deviance, so the absolute leg does the work. Needs `0` beyond
+/// a `2e-3` absolute floor.
 const TOL_COEF: Tol = Tol::new(1e-5, 2e-3);
 
 /// Residual deviance. Needs `3.2e-6`.
@@ -44,30 +38,27 @@ const TOL_DEVIANCE: Tol = Tol::new(1e-5, 1e-9);
 /// degrees of freedom. These run the deviance through the Chebyshev
 /// approximation in `src/ql/chebyshev.rs` and then through `squeezeVar`.
 ///
-/// Needs `4.4e-5`, and the binding quantity is `df_residual_adj` on the
-/// unbalanced set rather than `s2_post`, which needs only `3.9e-6`. An earlier
-/// revision sat at `1e-4` against that same `4.4e-5`, i.e. inside a factor of
-/// three of failing, which is close enough to flake on a different BLAS.
+/// Needs `4.4e-5`, bound by `df_residual_adj` on the unbalanced set; `s2_post`
+/// needs only `3.9e-6`.
 const TOL_S2: Tol = Tol::new(2e-4, 1e-9);
 
 /// Prior degrees of freedom from the empirical Bayes fit. Needs `3.3e-6`.
 const TOL_DF_PRIOR: Tol = Tol::new(1e-5, 1e-9);
 
-/// F statistics. Needs `0` beyond a `1e-4` absolute floor, which covers genes
-/// whose F is around `1e-4` and is a p-value of one whichever implementation
-/// computed it.
+/// F statistics. Needs `0` beyond a `1e-4` absolute floor, which covers F around
+/// `1e-4` (a p-value of one either way).
 const TOL_F: Tol = Tol::new(1e-5, 1e-4);
 
-/// The top-abundance proportion used when the negative binomial dispersion is
-/// estimated rather than supplied. It comes off its own lowess span, so it is
-/// coarser than the quantities it feeds. Needs `2.4e-4`.
+/// Top-abundance proportion used when the NB dispersion is estimated rather than
+/// supplied. It comes off its own lowess span, so it is coarser than what it
+/// feeds. Needs `2.4e-4`.
 const TOL_TOP_PROPORTION: Tol = Tol::rel(1e-3);
 
 /// P-values on the natural scale. Needs `1.6e-4`.
 const TOL_P_VALUE: Tol = Tol::new(1e-3, 1e-300);
 
-/// P-values as `log(p)`. Needs `0` beyond a `1e-3` absolute floor, which covers
-/// the near-one end where `log p` approaches zero.
+/// P-values as `log(p)`. Needs `0` beyond a `1e-3` absolute floor (covers `p`
+/// near one).
 const TOL_LOG_P: Tol = Tol::new(1e-5, 1e-3);
 
 /////////////
@@ -114,7 +105,7 @@ struct Loaded {
     offset: Recycled<f64>,
     /// Average log-CPM per gene, as `estimateDisp` reported it.
     ave_log_cpm: Vec<f64>,
-    /// Trended dispersion, which the legacy pipeline has to be handed.
+    /// Trended dispersion, which the legacy pipeline requires.
     trended: Vec<f64>,
 }
 
@@ -163,10 +154,9 @@ fn test_glm_ql_fit_matches_edger() {
         let l = load(d);
         let want = common::table(&format!("{}_ql.csv", d.tag));
 
-        // `dispersion = None` is the path that estimates the negative binomial
-        // dispersion from the most abundant genes and reports `top_proportion`.
-        // The R fixture uses glmQLFit.default for the same reason: the DGEList
-        // method precomputes its own scalar from a hardcoded top decile instead.
+        // `dispersion = None` estimates the NB dispersion from the most abundant
+        // genes and reports `top_proportion`. The fixture uses glmQLFit.default
+        // for the same reason: the DGEList method hardcodes a top decile.
         let fit = glm_ql_fit(
             &l.counts,
             l.n_genes,
@@ -202,9 +192,7 @@ fn test_glm_ql_fit_matches_edger() {
             &format!("{}/resolved_dispersion", d.tag),
         );
 
-        // Every gene, unmasked. Unlike the plain GLM fit these coefficients are
-        // shrunk by the prior count, which bounds the empty-group genes instead
-        // of letting them run to infinity, so there is nothing to exclude.
+        // Every gene, unmasked: the prior count bounds the empty-group genes.
         let mut want_coef = Vec::with_capacity(l.n_genes * l.n_coef);
         for g in 0..l.n_genes {
             for c in 0..l.n_coef {
@@ -231,8 +219,8 @@ fn test_glm_ql_fit_matches_edger() {
             &format!("{}/ql_deviance", d.tag),
         );
 
-        // s2.prior and df.prior are length one or length n_genes depending on
-        // whether the fit was trended or robust, so both are compared recycled.
+        // s2.prior and df.prior are length one or n_genes (trended vs robust),
+        // so both are compared recycled.
         let n = l.n_genes;
         let s2_prior: Vec<f64> = (0..n)
             .map(|g| fit.s2_prior[g % fit.s2_prior.len()])
@@ -385,9 +373,8 @@ fn test_glm_ql_ftest_matches_edger() {
 
 #[test]
 fn test_glm_ql_fit_legacy_matches_edger() {
-    // The legacy pipeline is the only one that reports `df.residual.zeros`, and
-    // it errors in R if no dispersion is supplied, so the trended dispersion is
-    // handed to it explicitly.
+    // Legacy is the only pipeline reporting `df.residual.zeros`. R errors without
+    // a supplied dispersion, so the trended one is passed.
     let l = load(&DATASETS[2]);
     let want = common::table("pois_ql_legacy.csv");
     let s = common::scalars();
@@ -462,10 +449,9 @@ fn test_glm_ql_fit_legacy_matches_edger() {
 
 #[test]
 fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
-    // edgeR forces `poisson.bound` off when `df.residual.zeros` is absent, so
-    // the flag is live on the legacy fit and dead on the current one. The
-    // near-Poisson dataset is the one where the bound actually bites: it moves
-    // 83 of 226 p-values there.
+    // edgeR forces `poisson.bound` off when `df.residual.zeros` is absent: live on
+    // the legacy fit, dead on the current one. On the near-Poisson dataset it
+    // moves 83 of 226 p-values.
     let l = load(&DATASETS[2]);
     let want = common::table("pois_ql_legacy.csv");
     let s = common::scalars();
@@ -531,7 +517,7 @@ fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
         "pois/legacy_F_bound",
     );
 
-    // The bound has to actually do something, or this test is vacuous.
+    // Guard against a vacuous test.
     let moved = (0..l.n_genes)
         .filter(|&g| bounded.p_value[g] != unbounded.p_value[g])
         .count();
@@ -597,17 +583,16 @@ fn test_poisson_bound_moves_p_values_only_on_the_legacy_pipeline() {
     );
 }
 
-/////////////////////////////
-// The seam the plan named //
-/////////////////////////////
+//////////////
+// LRT seam //
+//////////////
 
 #[test]
 fn test_lrt_and_ftest_disagree_as_they_should() {
-    // A quasi-likelihood fit stores the undivided dispersion but fits with
-    // `dispersion / average.ql.dispersion`, so a likelihood ratio test on that
-    // fit has to divide again before refitting the null. Getting that wrong is
-    // silent: the p-values stay plausible and are simply on the wrong scale.
-    // Passing the summary through is what makes the two agree with edgeR.
+    // A QL fit stores the undivided dispersion but fits with
+    // `dispersion / average.ql.dispersion`, so an LRT on it must divide again
+    // before refitting the null. Getting that wrong is silent (plausible
+    // p-values on the wrong scale); passing the summary matches edgeR.
     let l = load(&DATASETS[0]);
 
     let fit = glm_ql_fit(

@@ -1,9 +1,8 @@
 //! `filterByExpr`: dropping genes with too little expression to model.
 //!
-//! A gene is kept when it clears two cutoffs at once: it reaches a CPM of
-//! `min_count` counts in the median-sized library, in at least as many samples
-//! as the smallest group has, and its total across all samples reaches
-//! `min_total_count`.
+//! A gene is kept when it reaches a CPM equivalent to `min_count` in the
+//! median-sized library in at least as many samples as the smallest group has,
+//! and its total count reaches `min_total_count`.
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -19,9 +18,8 @@ use crate::utils::design::{hat_diagonal, matrix_rank};
 
 /// Slack allowed on both cutoffs.
 ///
-/// edgeR compares against `cutoff - tol` so that a gene sitting exactly on a
-/// threshold, which for the total-count rule is the common case since counts are
-/// integers, is not dropped by a rounding error in the CPM.
+/// edgeR compares against `cutoff - tol` so a gene sitting exactly on a
+/// threshold is not dropped by rounding.
 const CUTOFF_TOLERANCE: f64 = 1e-14;
 
 //////////////////
@@ -31,8 +29,8 @@ const CUTOFF_TOLERANCE: f64 = 1e-14;
 /// Tuning knobs for [`filter_by_expr`].
 #[derive(Clone, Copy, Debug)]
 pub struct FilterParams {
-    /// Counts a gene must reach in the median-sized library, expressed on the
-    /// raw count scale and converted to a CPM cutoff internally.
+    /// Counts a gene must reach in the median-sized library (converted to a CPM
+    /// cutoff internally).
     pub min_count: f64,
     /// Total count across all samples a gene must reach.
     pub min_total_count: f64,
@@ -40,18 +38,15 @@ pub struct FilterParams {
     pub large_n: f64,
     /// Fraction of the excess over [`FilterParams::large_n`] that still counts.
     ///
-    /// A very large experiment does not need a gene expressed in *every*
-    /// replicate of the smallest group, so the requirement grows at this rate
-    /// beyond `large_n` rather than linearly.
+    /// Beyond `large_n` the sample requirement grows at this rate, not
+    /// linearly.
     pub min_prop: f64,
 }
 
 impl FilterParams {
     /// Builds a parameter set.
     ///
-    /// No validation happens here; [`filter_by_expr`] checks the domains so that
-    /// a bad value surfaces at the call that uses it rather than at
-    /// construction.
+    /// No validation here; [`filter_by_expr`] checks the domains.
     ///
     /// ### Params
     ///
@@ -87,9 +82,8 @@ impl Default for FilterParams {
 
 /// Rejects parameters outside their domain.
 ///
-/// edgeR does no checking here, but a negative `min_prop` or a non-finite
-/// `min_count` silently turns the filter into something other than a filter, so
-/// it is worth catching.
+/// edgeR does no checking, but a negative `min_prop` or non-finite `min_count`
+/// silently breaks the filter.
 ///
 /// ### Params
 ///
@@ -125,15 +119,13 @@ fn check_params(params: &FilterParams) -> Result<(), EdgeErrors> {
 
 /// How many samples a gene must be expressed in, before the `large_n` damping.
 ///
-/// edgeR's precedence in `filterByExpr.default`, in order:
+/// Precedence as in `filterByExpr.default`:
 ///
-/// 1. `group`, when supplied: the size of the smallest non-empty group. A
-///    supplied `group` wins even if a `design` is also given, because edgeR
-///    tests `is.null(group)` first.
-/// 2. `design`, otherwise: `1 / max(hat(design))`, the reciprocal of the
-///    largest leverage. For a one-way layout that is exactly the smallest group
-///    size, and for anything else it is the natural continuous generalisation.
-/// 3. Neither: every sample is treated as one group, so `n_samples`.
+/// 1. `group`, when supplied (it wins over `design`): the smallest non-empty
+///    group size.
+/// 2. `design`: `1 / max(hat(design))`. For a one-way layout this is the
+///    smallest group size.
+/// 3. Neither: `n_samples`.
 ///
 /// ### Params
 ///
@@ -162,8 +154,6 @@ fn resolve_min_sample_size(
         for label in labels {
             *sizes.entry(*label).or_insert(0) += 1;
         }
-        // Every observed label has at least one member, so the "n > 0" filter
-        // edgeR applies to `tabulate` output is already satisfied.
         let smallest = sizes.values().min().copied().unwrap_or(n_samples);
         return Ok(smallest as f64);
     }
@@ -187,10 +177,10 @@ fn resolve_min_sample_size(
 /// Leverages of a design, matching R's `hat(design)`.
 ///
 /// `hat` prepends a column of ones, then takes the row sums of squares of the
-/// first `rank` columns of `Q`. Prepending only matters when the intercept is
-/// not already in the column space, so this checks which case it is and hands
-/// the full rank matrix to [`hat_diagonal`]: a rank deficient matrix would give
-/// a thin `Q` with arbitrary extra columns and inflate every leverage.
+/// first `rank` columns of `Q`. This checks whether the intercept is already in
+/// the column space and hands a full rank matrix to [`hat_diagonal`]: a rank
+/// deficient one would give a thin `Q` with arbitrary extra columns and inflate
+/// every leverage. See `UPSTREAM_DEVIATIONS.md` A2.
 ///
 /// ### Params
 ///
@@ -294,8 +284,7 @@ pub fn filter_by_expr<T: EdgeFloat>(
         min_sample_size = params.large_n + (min_sample_size - params.large_n) * params.min_prop;
     }
 
-    // The median library defines the cutoff, so one enormous sample does not
-    // drag the threshold up for everything else.
+    // Median library, so one enormous sample does not drag the cutoff up.
     let median_lib_size = quantile_type7(&lib_size, 0.5)?;
     if !median_lib_size.is_finite() || median_lib_size <= 0.0 {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -335,8 +324,7 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// 8 genes by 6 samples, the fixture every reference below was generated
-    /// from:
+    /// 8 genes by 6 samples, the fixture for every reference below:
     /// ```r
     /// y <- matrix(c(
     ///   0,0,0,0,0,0, 1,0,2,1,0,1, 10,12,11,40,44,38, 50,48,52,49,51,50,
@@ -389,8 +377,7 @@ mod tests {
         );
     }
 
-    /// `cat(filterByExpr(y))`. Every sample is one group, so a gene has to clear
-    /// the CPM cutoff in all six.
+    /// `cat(filterByExpr(y))`. One group: a gene must clear the cutoff in all six.
     #[test]
     fn test_filter_without_group_or_design_matches_edger() {
         let keep = filter_by_expr(&COUNTS, 8, 6, None, None, None, None).unwrap();
@@ -449,8 +436,7 @@ mod tests {
         );
     }
 
-    /// `group` is tested before `design` in edgeR, so it wins when both are
-    /// given.
+    /// `group` wins over `design` when both are given.
     #[test]
     fn test_group_takes_precedence_over_design() {
         let design = [0.1, 0.2, 0.3, 0.4, 0.5, 0.9];
@@ -460,8 +446,7 @@ mod tests {
         assert_eq!(with_both, with_group);
     }
 
-    /// Group labels need not be contiguous or start at zero; only the counts
-    /// matter.
+    /// Group labels need not be contiguous or start at zero.
     #[test]
     fn test_group_labels_need_not_be_contiguous() {
         let sparse = [7, 7, 7, 42, 42, 42];
@@ -503,15 +488,15 @@ mod tests {
         assert_eq!(keep, vec![false, true]);
     }
 
-    /// The three-per-group design gives a leverage of 1/3 everywhere, so the
-    /// design branch recovers the group size exactly.
+    /// Three per group gives leverage 1/3 everywhere, so the design branch
+    /// recovers the group size.
     #[test]
     fn test_design_branch_recovers_the_group_size() {
         let from_design = resolve_min_sample_size(6, None, Some((&DESIGN, 2))).unwrap();
         assert_relative_eq!(from_design, 3.0, max_relative = 1e-12);
     }
 
-    /// `f32` counts must give the same flags.
+    /// `f32` counts give the same flags.
     #[test]
     fn test_is_generic_over_the_count_type() {
         let counts32: Vec<f32> = COUNTS.iter().map(|v| *v as f32).collect();
@@ -565,8 +550,7 @@ mod tests {
         ));
     }
 
-    /// A design whose columns are collinear even after the intercept is added
-    /// has no well-defined leverage.
+    /// A design collinear even after adding the intercept has no leverage.
     #[test]
     fn test_rejects_a_rank_deficient_design() {
         let design = [

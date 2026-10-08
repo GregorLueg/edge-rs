@@ -1,20 +1,19 @@
 //! Scalar minimisation, root finding and derivative-free simplex search.
 //!
-//! Between them these cover every `scipy.optimize` call in edgePython except
-//! the bounded quasi-Newton, which lives in [`crate::numeric::lbfgsb`]:
+//! Covers the `scipy.optimize` calls in edgePython except the bounded
+//! quasi-Newton, which lives in [`crate::numeric::lbfgsb`]:
 //!
-//! * `brentq` becomes [`brentq`], used by `disp_pearson`, `disp_deviance` and
+//! * `brentq` is [`brentq`], used by `disp_pearson`, `disp_deviance` and
 //!   limma's `fitFDist`
-//! * `minimize(method = 'Nelder-Mead')` becomes [`nelder_mead`], used by the
-//!   spline and power trend fitters
+//! * `minimize(method = 'Nelder-Mead')` is [`nelder_mead`], used by the spline
+//!   and power trend fitters
 //!
-//! [`brent_fmin`] is a separate, R-derived bounded minimiser (not a
-//! `scipy.optimize` port), used by `disp_cox_reid` and limma's `squeezeVar`
-//! where matching R's own `Brent_fmin` stopping point matters.
+//! [`brent_fmin`] is R's `Brent_fmin` (not a `scipy.optimize` port), used by
+//! `disp_cox_reid` and limma's `squeezeVar`, where stopping at R's point
+//! matters.
 //!
-//! The initial simplex in [`nelder_mead`] reproduces scipy's construction
-//! exactly, because a derivative-free search on a flat likelihood surface is
-//! sensitive to it and the trend fits are exactly that shape.
+//! [`nelder_mead`] reproduces scipy's initial simplex exactly: the trend fits
+//! minimise a nearly flat objective and are sensitive to it.
 
 use std::cmp::Ordering;
 
@@ -37,27 +36,23 @@ const BRENT_GOLDEN: f64 = 0.381_966_011_250_105_15;
 
 /// Relative step used to build scipy's initial Nelder-Mead simplex.
 ///
-/// scipy perturbs each coordinate by 5% of its value. Matching this matters:
-/// the trend fitters minimise a nearly flat objective, where a different
-/// starting simplex converges to a visibly different point.
+/// scipy perturbs each coordinate by 5% of its value.
 const NELDER_MEAD_STEP: f64 = 0.05;
 
 /// Absolute perturbation used where a starting coordinate is exactly zero.
 ///
-/// A relative step cannot move a zero, so scipy substitutes this constant.
+/// A relative step cannot move a zero.
 const NELDER_MEAD_ZERO_STEP: f64 = 0.000_25;
 
 /// Simplex extent, in units of `f64::EPSILON` times the best vertex's largest
 /// coordinate, below which Nelder-Mead stops whatever the objective says.
 ///
-/// Both of scipy's tolerances must pass, which a discontinuous objective can
-/// make impossible: NEBULA's profile likelihood jumps by a few `1e-7` wherever
-/// an inner Newton loop changes its step count, and a simplex that has shrunk
-/// onto such a jump to adjacent floating-point numbers then cycles through the
-/// same handful of points until the iteration cap. Measured on one gene in 500:
-/// vertices two ulp apart, a `4.5e-7` jump against an `fatol` of `1e-7`, and
-/// 1650 wasted evaluations. No move is left to a simplex this small, so
-/// stopping returns the same minimiser to the last few bits.
+/// scipy needs both tolerances to pass, which a discontinuous objective can
+/// prevent: NEBULA's profile likelihood jumps by a few `1e-7` wherever an inner
+/// Newton loop changes its step count, and a simplex shrunk onto such a jump
+/// cycles until the iteration cap. Measured on one gene in 500: vertices two ulp
+/// apart, a `4.5e-7` jump against an `fatol` of `1e-7`, 1650 wasted evaluations.
+/// Stopping returns the same minimiser to the last few bits.
 const NELDER_MEAD_COLLAPSED_ULPS: f64 = 16.0;
 
 //////////////////
@@ -66,9 +61,8 @@ const NELDER_MEAD_COLLAPSED_ULPS: f64 = 16.0;
 
 /// Finds a root of a continuous function on a bracketing interval.
 ///
-/// Brent's method: bisection guaranteed, accelerated by inverse quadratic
-/// interpolation and the secant rule where they behave. This is
-/// `scipy.optimize.brentq`.
+/// Port of `scipy.optimize.brentq`: bisection, accelerated by inverse quadratic
+/// interpolation and the secant rule.
 ///
 /// ### Params
 ///
@@ -191,11 +185,8 @@ where
 
 /// Minimises a scalar function on a closed interval, as R's `optimize` does.
 ///
-/// A line-by-line port of R's `Brent_fmin`, including its convergence test
-/// (`sqrt(eps) * |x| + tol / 3`). Matching limma to more than its own `tol`
-/// requires stopping exactly where limma stops, on a likelihood flat enough
-/// that a differently-tuned Brent search would land on a visibly different
-/// answer.
+/// Line-by-line port of R's `Brent_fmin`, including its convergence test
+/// (`sqrt(eps) * |x| + tol / 3`), so it stops where limma stops.
 ///
 /// ### Params
 ///
@@ -342,10 +333,9 @@ pub struct NelderMeadResult {
 
 /// Derivative-free minimisation by the Nelder-Mead simplex method.
 ///
-/// The initial simplex is scipy's: the starting point, plus one vertex per
-/// coordinate perturbed by 5%, or by a small absolute step where the coordinate
-/// is zero. Reflection, expansion, contraction and shrink use the textbook
-/// coefficients 1, 2, 0.5 and 0.5.
+/// The initial simplex is scipy's: the start plus one vertex per coordinate,
+/// perturbed by 5% or a small absolute step at zero. Reflection, expansion,
+/// contraction and shrink use the coefficients 1, 2, 0.5 and 0.5.
 ///
 /// ### Params
 ///
@@ -392,12 +382,10 @@ enum NelderMeadPhase {
 
 /// [`nelder_mead`] as a reverse-communication state machine.
 ///
-/// The caller asks for the next point, evaluates it however it likes, and tells
-/// the stepper the value. That is what lets many independent searches advance
-/// in lockstep with their evaluations batched together, which a closure-driven
-/// search cannot do. The sequence of points asked for, and every floating-point
-/// operation on them, is exactly that of the closure-driven form: [`nelder_mead`]
-/// is this stepper driven by a closure.
+/// The caller asks for the next point, evaluates it, and reports the value, so
+/// many independent searches can advance in lockstep with batched evaluations.
+/// Points and arithmetic are identical to the closure-driven form:
+/// [`nelder_mead`] is this stepper driven by a closure.
 #[derive(Clone, Debug)]
 pub struct NelderMeadStepper {
     /// Tuning knobs.
@@ -409,8 +397,7 @@ pub struct NelderMeadStepper {
     /// Objective at each vertex.
     values: Vec<f64>,
     /// Vertex indices, sorted by value at the top of every iteration. Kept
-    /// across iterations because the sort is stable and ties keep the previous
-    /// order.
+    /// across iterations so the stable sort keeps the previous order on ties.
     order: Vec<usize>,
     /// Index of the next iteration to run.
     next_iter: usize,
@@ -773,8 +760,8 @@ mod tests {
         assert!(matches!(err, EdgeErrors::MustBePositive(_)));
     }
 
-    /// The original closure-driven Nelder-Mead, kept as the specification
-    /// [`NelderMeadStepper`] is checked against bit for bit.
+    /// Closure-driven Nelder-Mead, the specification [`NelderMeadStepper`] is
+    /// checked against bit for bit.
     fn nelder_mead_reference<F>(
         mut f: F,
         x0: &[f64],

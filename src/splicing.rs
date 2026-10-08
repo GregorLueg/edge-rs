@@ -1,35 +1,30 @@
 //! `diffSpliceDGE`: differential exon usage.
 //!
-//! Where the rest of the crate asks whether a gene changed, this asks whether
-//! one exon changed *relative to the rest of its gene*. The gene's own
-//! log-fold-change is estimated from the summed counts, folded into the offsets
-//! as a fixed shift, and the exon is then tested for whatever fold change is
-//! left over. That leftover is alternative splicing.
+//! Tests whether one exon changed *relative to the rest of its gene*. The
+//! gene's log-fold-change is estimated from the summed counts and folded into
+//! the offsets as a fixed shift; the exon is then tested for the fold change
+//! left over.
 //!
 //! Three entry points: [`diff_splice`] takes a fitted GLM and does the work,
 //! [`diff_splice_dge`] is the [`DgeList`] wrapper that fits first, and
-//! [`splice_variants`] is edgeR's older per-gene interaction test, which unrolls
-//! each gene into one row of an exon-by-group layout and runs a single
-//! likelihood ratio test on the interaction.
+//! [`splice_variants`] is edgeR's per-gene interaction test (one likelihood
+//! ratio test on an exon-by-group layout). See `UPSTREAM_DEVIATIONS.md` A17
+//! and A18.
 //!
 //! ### Parallelism
 //!
-//! Both axes are used, each where its work lives. The two refits fan out over
-//! rows inside [`glm_fit`], and those rows are exons for the exon-level fit and
-//! genes for the gene-level one. On top of that the per-exon tail probabilities
-//! fan out over exons, and the per-gene aggregation, which has to sort each
-//! gene's p-values for the Simes step, fans out over genes. The scatter that
-//! sums exon quantities into genes stays sequential: it is one pass of `+=` over
-//! an index vector, and a parallel reduction over gene groups costs more in
-//! synchronisation than the additions are worth.
+//! Both axes are used. The refits fan out over rows inside [`glm_fit`] (exons
+//! for the exon-level fit, genes for the gene-level one), per-exon tail
+//! probabilities fan out over exons, and the per-gene aggregation (which sorts
+//! p-values for Simes) fans out over genes. The scatter that sums exons into
+//! genes is sequential; a parallel reduction costs more than it saves.
 //!
 //! ### Layout
 //!
-//! Exons take the place of genes in the crate's row-major convention: counts
-//! are `n_exons * n_samples`, and `gene_id` labels each row. Exons need not be
-//! sorted or even contiguous by gene; genes come out in first-appearance order.
-//! edgeR sorts by gene id first, so the two agree whenever the input is sorted,
-//! which is how exon-level counts arrive in practice.
+//! Exons take the place of genes in the row-major convention: counts are
+//! `n_exons * n_samples` and `gene_id` labels each row. Rows need not be sorted
+//! or contiguous by gene; genes come out in first-appearance order. edgeR sorts
+//! by gene id first, so the two agree on sorted input.
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -48,10 +43,9 @@ use crate::utils::design::contrast_as_coef;
 
 /// Dispersion the gene-level fit runs at.
 ///
-/// edgeR hard-codes this. The gene-level coefficient is only ever used as a
-/// fixed offset for the exon-level test, so its standard error never reaches a
-/// p-value and a plausible round number does the job. Estimating one per gene
-/// would double the cost of the routine and change nothing downstream.
+/// Hard-coded in edgeR. The gene-level coefficient only serves as a fixed
+/// offset for the exon-level test, so its standard error never reaches a
+/// p-value.
 const GENE_LEVEL_DISPERSION: f64 = 0.05;
 
 //////////////////////
@@ -61,14 +55,13 @@ const GENE_LEVEL_DISPERSION: f64 = 0.05;
 /// Tuning knobs for [`diff_splice`] and [`diff_splice_dge`].
 #[derive(Clone, Copy, Debug)]
 pub struct DiffSpliceParams {
-    /// Prior count for the gene-level fit's log-fold-change shrinkage. Only the
-    /// gene-level fit sees it; the exon-level fit was done by the caller and the
-    /// reduced-model refit never needs shrunk coefficients.
+    /// Prior count for the gene-level fit's log-fold-change shrinkage. The
+    /// exon-level fit is the caller's and the reduced-model refit needs no
+    /// shrunk coefficients.
     pub prior_count: f64,
     /// Whether the gene-level empirical Bayes step Winsorises its moments.
-    /// `None` follows edgeR: robust exactly when the quasi-likelihood fit
-    /// produced a per-gene `df_prior`. Ignored on the likelihood ratio path,
-    /// which does no squeezing.
+    /// `None` follows edgeR: robust when the quasi-likelihood fit produced a
+    /// per-gene `df_prior`. Ignored on the likelihood ratio path.
     pub robust: Option<bool>,
 }
 
@@ -108,7 +101,7 @@ impl Default for DiffSpliceParams {
 /// The quasi-likelihood quantities [`diff_splice`] needs from `glmQLFit`.
 ///
 /// Passing `Some` switches the exon and gene tests from chi-squared to
-/// moderated F. Every field maps onto one of `crate::glm::ql_fit::QlFit`:
+/// moderated F. Fields map onto `crate::glm::ql_fit::QlFit`:
 ///
 /// | field | legacy pipeline | current pipeline |
 /// |---|---|---|
@@ -117,13 +110,12 @@ impl Default for DiffSpliceParams {
 /// | `legacy_zeros` | `true` | `false` |
 /// | `average_ql_dispersion` | `None` | `average_ql_dispersion` |
 ///
-/// The fit's own `s2_post` is deliberately absent: `diffSpliceDGE` throws the
-/// exon-level squeezing away and squeezes again at the gene level, because the
-/// unit being tested is a gene's worth of exons rather than a single row.
+/// The fit's `s2_post` is absent: `diffSpliceDGE` discards the exon-level
+/// squeezing and squeezes again at the gene level.
 #[derive(Clone, Copy, Debug)]
 pub struct DiffSpliceQl<'a> {
     /// Prior degrees of freedom from the fit, one value or one per exon. Only
-    /// its length is read, and only to default `robust`.
+    /// its length is read, to default `robust`.
     pub df_prior: &'a [f64],
     /// Residual degrees of freedom per exon that go with `deviance`.
     pub df_residual: &'a [f64],
@@ -132,14 +124,13 @@ pub struct DiffSpliceQl<'a> {
     /// Whether `df_residual` came from `df.residual.zeros`.
     ///
     /// Switches on edgeR's chi-squared floor: an exon in a gene whose posterior
-    /// quasi-dispersion fell below one is not allowed a p-value smaller than the
-    /// unmoderated chi-squared would give it. Only the legacy pipeline, which
-    /// drops structural zeros from the degrees of freedom, can push a gene there
-    /// spuriously, so only the legacy pipeline gets the floor.
+    /// quasi-dispersion fell below one gets no p-value smaller than the
+    /// unmoderated chi-squared gives. Only the legacy pipeline (which drops
+    /// structural zeros from the df) can land there spuriously.
     pub legacy_zeros: bool,
-    /// `average.ql.dispersion`, which the negative binomial dispersion is
-    /// divided by before the reduced model is refitted so that the two models
-    /// sit on the same scale. `None` on the legacy pipeline, which has none.
+    /// `average.ql.dispersion`, which divides the dispersion before the reduced
+    /// model is refitted so both models share a scale. `None` on the legacy
+    /// pipeline.
     pub average_ql_dispersion: Option<f64>,
 }
 
@@ -150,26 +141,21 @@ pub struct DiffSpliceQl<'a> {
 /// Result of a differential exon usage analysis.
 ///
 /// Exon-level vectors have one entry per input exon, in input order. Gene-level
-/// vectors have one entry per *testable* gene, in first-appearance order: a gene
-/// with a single exon has no within-gene contrast to test and is dropped rather
-/// than errored on.
+/// vectors have one entry per *testable* gene, in first-appearance order.
+/// Single-exon genes have no within-gene contrast and are dropped.
 #[derive(Clone, Debug)]
 pub struct DiffSpliceResult {
     /// Exon-level log fold change relative to the gene.
     ///
-    /// The exon's coefficient minus its gene's, on the **natural** log scale,
-    /// matching edgeR's `coefficients` slot. `topSpliceDGE` prints this column
-    /// as `logFC`, which is a misnomer there and stays one here rather than
-    /// silently disagreeing with edgeR by a factor of `ln 2`.
+    /// The exon's coefficient minus its gene's, on the **natural** log scale as
+    /// in edgeR's `coefficients` slot. (`topSpliceDGE` labels this `logFC`.)
     ///
-    /// Zero for an exon whose gene was dropped: such an exon *is* its gene, so
-    /// its usage relative to the gene cannot move.
+    /// Zero for an exon whose gene was dropped.
     pub exon_log_fc: Vec<f64>,
     /// Exon-level test statistic and p-value.
     ///
-    /// The statistic is a likelihood ratio when `ql` was `None` and a moderated
-    /// F otherwise. An exon whose gene was dropped carries a zero statistic and
-    /// a p-value of one.
+    /// A likelihood ratio when `ql` was `None`, a moderated F otherwise. Exons
+    /// of dropped genes get a zero statistic and a p-value of one.
     pub exon_statistic: Vec<f64>,
     /// Exon-level p-value. See [`DiffSpliceResult::exon_statistic`].
     pub exon_p_value: Vec<f64>,
@@ -178,14 +164,10 @@ pub struct DiffSpliceResult {
     /// Gene-level Simes and F tests.
     ///
     /// The Simes p-value is `min over k of (n * p_(k) / k)` on the gene's
-    /// sorted exon p-values. It answers "does this gene contain any
-    /// differentially used exon", which is a different question from the joint
-    /// test below and is usually the more sensitive of the two.
+    /// sorted exon p-values: does the gene contain any differentially used exon.
     pub gene_simes_p: Vec<f64>,
-    /// Joint gene-level statistic: the summed exon statistics, read off a
-    /// chi-squared on the likelihood ratio path and an F on the
-    /// quasi-likelihood path. Named for the quasi-likelihood case, which is
-    /// edgeR's default.
+    /// Joint gene-level statistic: the summed exon statistics, tested against a
+    /// chi-squared (likelihood ratio) or an F (quasi-likelihood).
     pub gene_f_statistic: Vec<f64>,
     /// P-value for [`DiffSpliceResult::gene_f_statistic`].
     pub gene_f_p_value: Vec<f64>,
@@ -195,27 +177,22 @@ pub struct DiffSpliceResult {
 
 /// Tests for differential exon usage.
 ///
-/// Port of edgeR's `diffSpliceDGE`. Given a negative binomial GLM already fitted
-/// at the exon level, it
+/// Port of edgeR's `diffSpliceDGE`. Given an exon-level negative binomial GLM:
 ///
-/// 1. sums each gene's exon counts and fits the same design to the totals,
-///    which gives the gene's own log-fold-change `betabar`,
-/// 2. folds `betabar * design[, coef]` into the exon-level offsets, so the
-///    gene-level change is now a fixed, known part of every exon's expectation,
-/// 3. refits each exon under the reduced design with `coef` dropped, and
-/// 4. reads the deviance difference as the evidence that this exon moved by
-///    something other than its gene's amount.
+/// 1. sum each gene's exon counts and fit the same design to the totals, giving
+///    the gene's log-fold-change `betabar`,
+/// 2. fold `betabar * design[, coef]` into the exon-level offsets,
+/// 3. refit each exon under the reduced design with `coef` dropped, and
+/// 4. read the deviance difference as evidence that the exon moved by more
+///    than its gene did.
 ///
-/// The exon-level test therefore compares each exon's coefficient against the
-/// gene's average, which is why the design is rewritten per gene rather than
-/// once. Genes with a single exon have nothing to compare against and are
-/// dropped.
+/// Single-exon genes are dropped.
 ///
 /// ### Params
 ///
 /// * `input` - Counts, design and recycled matrices behind the fit, with exons
-///   in the place of genes: `input.n_genes` is the exon count and
-///   `input.counts` is `n_exons * n_samples`
+///   as rows: `input.n_genes` is the exon count, `input.counts` is
+///   `n_exons * n_samples`
 /// * `fit` - The exon-level fit, from [`glm_fit`] or `glmQLFit`. Only its
 ///   coefficients, deviance and residual degrees of freedom are read
 /// * `gene_id` - Gene label per exon, one per row of `input.counts`
@@ -229,8 +206,8 @@ pub struct DiffSpliceResult {
 /// ### Returns
 ///
 /// The exon and gene level tests, or [`EdgeErrors`] if a shape disagrees, the
-/// design has fewer than two columns, the tested coefficient is out of range,
-/// the contrast is rank deficient, or no gene has more than one exon.
+/// design has fewer than two columns, the coefficient is out of range, the
+/// contrast is rank deficient, or no gene has more than one exon.
 ///
 /// ### References
 ///
@@ -334,9 +311,8 @@ pub fn diff_splice<T: EdgeFloat>(
         &dispersion,
         &Recycled::full(offset_new, n_kept_exons, n_samples)?,
         weights.as_ref(),
-        // edgeR leaves `prior.count` at its default here, but glmFit keeps the
-        // unshrunk deviance and only the deviance is read, so shrinking would
-        // buy a second fit and change nothing.
+        // edgeR leaves `prior.count` at its default, but only the unshrunk
+        // deviance is read, so shrinking would change nothing.
         0.0,
     )?;
 
@@ -398,15 +374,13 @@ pub fn diff_splice<T: EdgeFloat>(
 
 /// Fits a [`DgeList`] of exon counts and tests it for differential usage.
 ///
-/// The [`DgeList`] wrapper around [`diff_splice`], in the same relation to it
-/// as `glm_fit_dge` is to `glm_fit`: it fits the exon-level GLM from the
-/// container's own offsets and dispersion and then hands the fit straight on.
-/// The fit uses [`DEFAULT_PRIOR_COUNT`], as `glmFit` does;
-/// `params.prior_count` belongs to the gene-level fit inside [`diff_splice`]
-/// and is a separate knob.
+/// The [`DgeList`] wrapper around [`diff_splice`], as `glm_fit_dge` is to
+/// `glm_fit`. It fits the exon-level GLM from the container's offsets and
+/// dispersion with [`DEFAULT_PRIOR_COUNT`], as `glmFit` does;
+/// `params.prior_count` only reaches the gene-level fit.
 ///
-/// This is the likelihood ratio flavour. For the quasi-likelihood one, run
-/// `glm_ql_fit` yourself and call [`diff_splice`] with a [`DiffSpliceQl`].
+/// Likelihood ratio flavour only. For quasi-likelihood, run `glm_ql_fit` and
+/// call [`diff_splice`] with a [`DiffSpliceQl`].
 ///
 /// ### Params
 ///
@@ -452,48 +426,40 @@ pub fn diff_splice_dge<T: EdgeFloat>(
 
 /// Identifies genes carrying splice variants.
 ///
-/// Port of edgeR's `spliceVariants`, which predates `diffSpliceDGE` and asks
-/// the question in one shot rather than exon by exon. Each gene is unrolled
-/// into a single row of `n_exons * n_samples` counts, laid out exon block by
-/// exon block, and fitted with `~ exon + group + exon:group`. The interaction
-/// is the splice signal: it is exactly the claim that the exon profile differs
-/// between groups. A likelihood ratio test on all
+/// Port of edgeR's `spliceVariants`. Each gene is unrolled into one row of
+/// `n_exons * n_samples` counts, exon block by exon block, and fitted with
+/// `~ exon + group + exon:group`. A likelihood ratio test on the
 /// `(n_exons - 1) * (n_groups - 1)` interaction coefficients gives one
 /// statistic per gene.
 ///
-/// Genes are batched by exon count, since every gene with the same number of
-/// exons shares a design and can be fitted in one call.
+/// Genes are batched by exon count, as same-sized genes share a design.
 ///
-/// Two edgeR behaviours are kept deliberately. Exons whose counts are zero in
-/// every sample are dropped first, which can shrink or empty a gene. And the
-/// fit runs with no offset at all, so library sizes are not corrected for;
-/// within a gene they are common to every exon and cancel out of the
+/// Two edgeR behaviours are kept. Exons that are zero in every sample are
+/// dropped first, which can shrink or empty a gene. The fit has no offset;
+/// library sizes are common to every exon of a gene and cancel out of the
 /// interaction.
 ///
 /// ### Params
 ///
 /// * `counts` - Exon counts, row-major `n_exons * n_samples`
-/// * `n_exons` - Number of exons, that is, rows
-/// * `n_samples` - Number of samples, that is, columns
+/// * `n_exons` - Number of exons (rows)
+/// * `n_samples` - Number of samples (columns)
 /// * `gene_id` - Gene label per exon
-/// * `group` - Group label per sample. At least two distinct labels are needed
-///   for the interaction to exist
-/// * `dispersion` - Negative binomial dispersion, either one value shared by
-///   every gene or one per gene in first-appearance order. edgeR's
-///   `estimateExonGenewiseDisp` front end is not ported; supply the dispersion
+/// * `group` - Group label per sample, at least two distinct
+/// * `dispersion` - One shared dispersion, or one per gene in first-appearance
+///   order. edgeR's `estimateExonGenewiseDisp` is not ported
 ///
 /// ### Returns
 ///
-/// A [`DiffSpliceResult`] carrying gene-level results only: `gene_f_statistic`
-/// holds the likelihood ratio, `gene_f_p_value` its chi-squared p-value, and
-/// `gene_simes_p` repeats that p-value, since `spliceVariants` has no Simes
-/// stage. The exon-level vectors are empty. Unlike [`diff_splice`], single-exon
-/// genes are reported rather than dropped, with a zero statistic and a p-value
-/// of one, which is what edgeR does.
+/// A [`DiffSpliceResult`] with gene-level results only: `gene_f_statistic` is
+/// the likelihood ratio, `gene_f_p_value` its chi-squared p-value, and
+/// `gene_simes_p` repeats it (`spliceVariants` has no Simes stage). Exon-level
+/// vectors are empty. Unlike [`diff_splice`], single-exon genes are kept with a
+/// zero statistic and a p-value of one, as in edgeR.
 ///
 /// Or [`EdgeErrors`] if a shape disagrees, fewer than two groups are supplied,
-/// a dispersion is negative, or a gene's unrolled design is too large for the
-/// samples available.
+/// a dispersion is negative, or the unrolled design is too large for the
+/// samples.
 pub fn splice_variants<T: EdgeFloat>(
     counts: &[T],
     n_exons: usize,
@@ -552,8 +518,7 @@ pub fn splice_variants<T: EdgeFloat>(
         })
         .collect();
 
-    // edgeR drops exons that are zero everywhere before anything else, which can
-    // shrink a gene or remove it outright.
+    // edgeR drops all-zero exons first, which can shrink or remove a gene.
     let nonzero: Vec<usize> = (0..n_exons)
         .filter(|e| {
             counts[e * n_samples..(e + 1) * n_samples]
@@ -585,8 +550,7 @@ pub fn splice_variants<T: EdgeFloat>(
     sizes.sort_unstable();
     sizes.dedup();
     for n_exon in sizes {
-        // One exon means no exon factor and so no interaction to test. edgeR
-        // still reports the gene, with no evidence.
+        // One exon: no interaction to test. edgeR still reports the gene.
         if n_exon < 2 {
             continue;
         }
@@ -636,8 +600,7 @@ struct GeneGroups {
 
 /// Groups row indices by their gene label.
 ///
-/// Order of first appearance, which is what `rowsum(..., reorder = FALSE)`
-/// gives. Rows need not be contiguous by gene.
+/// First-appearance order, as `rowsum(..., reorder = FALSE)` gives.
 ///
 /// ### Params
 ///
@@ -680,9 +643,8 @@ struct SpliceTests {
 
 /// Chi-squared tests on the raw deviance differences.
 ///
-/// The likelihood ratio flavour, taken when the fit carries no quasi-likelihood
-/// summary. Both levels read straight off a chi-squared, the gene level with as
-/// many degrees of freedom as it has exons.
+/// The likelihood ratio flavour, used when the fit carries no quasi-likelihood
+/// summary. The gene level has as many df as it has exons.
 ///
 /// ### Params
 ///
@@ -721,11 +683,9 @@ fn lrt_tests(
 /// Moderated F tests against a gene-level squeezed dispersion.
 ///
 /// The quasi-likelihood flavour. Each gene's exon deviances are pooled into one
-/// residual variance, those variances are squeezed towards a fitted prior
-/// across genes, and the deviance differences are divided by the result. The
-/// denominator degrees of freedom are capped at the experiment's total residual
-/// degrees of freedom, so a large prior cannot claim more information than the
-/// data hold.
+/// residual variance, squeezed towards a fitted prior across genes, and the
+/// deviance differences are divided by the result. Denominator df are capped at
+/// the experiment's total residual df.
 ///
 /// ### Params
 ///
@@ -825,8 +785,7 @@ fn ql_tests(
 /// Simes' combined p-value.
 ///
 /// `min over k of (n * p_(k) / k)` on the sorted p-values. The `k = n` term is
-/// the largest p-value itself, so the result never exceeds one and needs no
-/// clamp.
+/// the largest p-value, so the result never exceeds one.
 ///
 /// ### Params
 ///
@@ -859,11 +818,10 @@ fn simes(p: &[f64]) -> f64 {
 
 /// Fits and tests one batch of genes that share an exon count.
 ///
-/// Every gene in the batch is unrolled into a row of `n_exon * n_samples`
-/// counts, ordered exon block by exon block, and the shared design
-/// `~ exon + group + exon:group` is built once. The interaction columns are
-/// then dropped and the deviance difference read off a chi-squared, which is
-/// exactly `glmLRT` on the trailing coefficients.
+/// Genes are unrolled into rows of `n_exon * n_samples` counts (exon block by
+/// exon block) and share one design `~ exon + group + exon:group`. Dropping the
+/// interaction columns and reading the deviance difference off a chi-squared is
+/// `glmLRT` on the trailing coefficients.
 ///
 /// ### Params
 ///
@@ -979,9 +937,8 @@ struct ResolvedCoef {
 
 /// Picks out the tested coefficient, rotating the design if it is a contrast.
 ///
-/// edgeR takes only the first entry of `coef` and only the first column of
-/// `contrast`, warning as it does so. There is no warning channel here, so the
-/// same silent truncation happens and is documented on [`diff_splice`].
+/// edgeR takes only the first entry of `coef` and first column of `contrast`,
+/// with a warning. Here the truncation is silent; see [`diff_splice`].
 ///
 /// ### Params
 ///
@@ -1271,7 +1228,7 @@ mod tests {
         (fit, offset)
     }
 
-    /// The exon and gene level likelihood ratio tests, against edgeR 4.8.2:
+    /// Exon and gene level likelihood ratio tests, against edgeR 4.8.2:
     /// ```r
     /// y <- matrix(c(8,16,32,64,128,256, 4,4,8,8,16,16, 64,64,64,128,128,128,
     ///               12,20,28,40,56,72, 100,110,90,220,200,240, 6,6,6,12,12,12),
@@ -1510,8 +1467,8 @@ mod tests {
     /// s <- diffSpliceDGE(qf, geneid = gid)
     /// ```
     ///
-    /// The fit is edgeR's own, embedded as literals rather than routed through
-    /// `glm_ql_fit`, so that this exercises `diff_splice` and nothing else.
+    /// The fit is edgeR's, embedded as literals so only `diff_splice` is
+    /// exercised.
     #[test]
     fn test_matches_edger_quasi_likelihood_f_tests() {
         let (counts, gene_id, design) = mixed();
@@ -1735,8 +1692,7 @@ mod tests {
         }
     }
 
-    /// Testing a contrast that picks out the same column must reproduce the
-    /// coefficient path exactly, since the rotation leaves that column alone.
+    /// A contrast picking out the same column reproduces the coefficient path.
     #[test]
     fn test_contrast_reproduces_the_coefficient_path() {
         let (counts, gene_id, design) = gate();
@@ -1782,8 +1738,7 @@ mod tests {
         }
     }
 
-    /// Genes are grouped by label, not by position, so shuffling the exon rows
-    /// permutes the answers rather than changing them.
+    /// Genes are grouped by label, so shuffling exon rows permutes the answers.
     #[test]
     fn test_gene_grouping_is_independent_of_row_order() {
         let (counts, gene_id, design) = gate();
@@ -1848,7 +1803,7 @@ mod tests {
         }
     }
 
-    /// The `DgeList` wrapper must reproduce the explicit call.
+    /// The `DgeList` wrapper reproduces the explicit call.
     #[test]
     fn test_dge_wrapper_matches_the_explicit_call() {
         let (counts, gene_id, design) = gate();
@@ -1918,12 +1873,10 @@ mod tests {
             0.020_483_411_823_205_97,
             4.652_580_238_805_525e-11,
         ];
-        // The unrolled full model is a one-way layout and fits in closed form,
-        // but the null model that drops the interaction is not, so it goes
-        // through the damped iteration. The likelihood ratio is a difference of
-        // two deviances near 10^2 and inherits the fitter's own convergence
-        // tolerance rather than machine precision; 1e-6 is what that buys. The
-        // rest of this module agrees with edgeR to 1e-9.
+        // The full model is a one-way layout (closed form), but the null model
+        // goes through the damped iteration. The LR is a difference of two
+        // deviances near 10^2 and inherits the fitter's convergence tolerance,
+        // so 1e-6. The rest of this module agrees with edgeR to 1e-9.
         for g in 0..5 {
             assert_relative_eq!(
                 out.gene_f_statistic[g],
@@ -1936,7 +1889,7 @@ mod tests {
         }
     }
 
-    /// A per-gene dispersion vector must be accepted and must move the answer.
+    /// A per-gene dispersion vector is accepted and moves the answer.
     #[test]
     fn test_splice_variants_accepts_a_genewise_dispersion() {
         let (counts, gene_id, _) = mixed();
@@ -1953,8 +1906,7 @@ mod tests {
         assert!(genewise.gene_f_statistic[3] < common.gene_f_statistic[3]);
     }
 
-    /// Simes on a single p-value is that p-value, and the largest term bounds
-    /// the result by one.
+    /// Simes on one p-value is that p-value, and the result never exceeds one.
     #[test]
     fn test_simes_bounds() {
         assert_relative_eq!(simes(&[0.4]), 0.4, max_relative = 1e-12);
@@ -2288,8 +2240,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::EmptyCounts { .. }));
     }
 
-    /// `f32` counts must run the same algorithm; every derived statistic is
-    /// `f64` either way, so only the count conversion differs.
+    /// `f32` counts run the same algorithm; only the count conversion differs.
     #[test]
     fn test_runs_on_f32_counts() {
         let (counts, gene_id, design) = gate();

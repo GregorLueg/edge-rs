@@ -1,18 +1,14 @@
 //! Distribution tails: everything edgePython calls `scipy.stats` for.
 //!
-//! Normal, chi-squared, Student's t, F, beta, gamma and the negative binomial,
-//! each as plain functions rather than distribution objects. edgeR only ever
-//! wants a tail probability or a quantile, so there is nothing worth carrying
-//! state for.
+//! Normal, chi-squared, Student's t, F, beta, gamma and negative binomial, as
+//! plain functions (edgeR only needs tail probabilities and quantiles).
 //!
 //! ### Survival functions, not `1 - cdf`
 //!
-//! Every p-value edgeR reports is an upper tail. `1 - cdf` is exact only down
-//! to about 1e-16 and returns a flat `0.0` below that, so `chisq_sf(200, 1)`
-//! would come back as zero instead of 2.09e-45. Each `_sf` here goes through
-//! the complement directly: the upper regularised incomplete gamma for the
-//! normal and chi-squared, and the regularised incomplete beta with its
-//! arguments swapped for t, F and beta. None of them subtracts from one.
+//! Every edgeR p-value is an upper tail, and `1 - cdf` returns a flat `0.0`
+//! below about 1e-16: `chisq_sf(200, 1)` is 2.09e-45. Each `_sf` evaluates the
+//! upper tail directly: the upper incomplete gamma for normal and chi-squared,
+//! the incomplete beta with swapped arguments for t, F and beta.
 
 use statrs::function::beta::{beta_reg, inv_beta_reg, ln_beta};
 use statrs::function::erf::erfc_inv;
@@ -27,18 +23,14 @@ use crate::errors::EdgeErrors;
 /// `sqrt(2)`, the scale between the standard normal and the error function.
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
 
-/// Relative convergence tolerance for the incomplete gamma series and
-/// continued fraction. One ulp; both recurrences reach it in a few tens of
-/// terms over the range edgeR uses.
+/// Relative convergence tolerance for the incomplete gamma series and continued
+/// fraction: one ulp.
 const INC_GAMMA_EPS: f64 = 2.220446049250313e-16;
 
 /// Iteration budget for the incomplete gamma recurrences.
 ///
-/// The series needs roughly `sqrt(a)` terms near the mean, so this covers
-/// shapes into the millions. It is a runaway guard, not a working limit: on
-/// exhaustion the best available partial sum is returned rather than an error,
-/// because every caller here is a tail probability that is already converged to
-/// well past `f64` resolution by then.
+/// A runaway guard: the series needs about `sqrt(a)` terms near the mean. On
+/// exhaustion the partial sum is returned, not an error.
 const INC_GAMMA_MAX_ITER: usize = 10_000;
 
 /// Floor for the modified Lentz continued fraction, guarding a zero pivot.
@@ -50,9 +42,7 @@ const LENTZ_TINY: f64 = 1e-300;
 
 /// Iteration budget for the polished incomplete beta inverse.
 ///
-/// The bracket is expanded with a doubling step and then halved whenever
-/// Newton leaves it, so this is a runaway guard rather than a working limit;
-/// convergence from an AS 109 start is normally two or three steps.
+/// A runaway guard: convergence from an AS 109 start takes two or three steps.
 const INV_BETA_MAX_ITER: usize = 128;
 
 /// Relative convergence tolerance for the incomplete beta inverse, in `ln(x)`.
@@ -60,26 +50,21 @@ const INV_BETA_REL_TOL: f64 = 1e-15;
 
 /// Iteration budget for the hand-rolled gamma quantile.
 ///
-/// The safeguarded step always halves a bracket in log-space when Newton
-/// misbehaves, so a bracket 40 wide in `ln(x)` is exhausted long before this.
-/// The cap only exists so a pathological shape cannot spin forever.
+/// A runaway guard against pathological shapes.
 const GAMMA_PPF_MAX_ITER: usize = 128;
 
 /// Crossover on `x^2` between the two incomplete beta forms of the t tails.
 ///
-/// The mass inside `(0, |x|)` and the mass beyond `|x|` are equal at the upper
-/// quartile, which runs from 1.0 at `df = 1` down to 0.4549 as `df` grows. Take
-/// the inner form below this and the outer form above it and the quantity being
-/// evaluated directly is always the smaller of the two, so the other one is
-/// recovered from `0.5 - .` while it is still the larger. Sitting between the
-/// two extremes, 0.7 leaves neither branch worse than a factor of about two
-/// from balanced for any `df`.
+/// The masses inside `(0, |x|)` and beyond `|x|` are equal at the upper
+/// quartile, which runs from 1.0 at `df = 1` down to 0.4549 as `df` grows.
+/// Using the inner form below this and the outer form above evaluates the
+/// smaller mass directly; the larger comes from `0.5 - .`. At 0.7 neither branch
+/// is worse than about a factor of two from balanced for any `df`.
 const T_INNER_OUTER_SWITCH: f64 = 0.7;
 
 /// Relative convergence tolerance for the gamma quantile, in `ln(x)`.
 ///
-/// Roughly 4 ulp. Tightening further just cycles on the last bit of the
-/// incomplete gamma, which is itself only good to a few ulp.
+/// About 4 ulp; tighter just cycles on the last bit of the incomplete gamma.
 const GAMMA_PPF_REL_TOL: f64 = 1e-15;
 
 ////////////////
@@ -130,8 +115,8 @@ fn check_probability(name: &str, value: f64) -> Result<(), EdgeErrors> {
 
 /// The shared prefactor `exp(a ln x - x - ln Gamma(a))` of both branches.
 ///
-/// Formed in logs so it underflows cleanly to zero in the far tail rather than
-/// overflowing on `x^a` first.
+/// Formed in logs so it underflows to zero in the far tail instead of
+/// overflowing on `x^a`.
 ///
 /// ### Params
 ///
@@ -151,8 +136,7 @@ fn inc_gamma_prefactor(a: f64, x: f64) -> f64 {
 /// which is where each converges fastest and neither cancels.
 ///
 /// Unlike `statrs::function::gamma::gamma_lr` there is no cutoff at small `x`:
-/// the series prefactor is evaluated in logs, so `P(0.3, 1e-30)` comes back as
-/// 1e-9 rather than zero.
+/// `P(0.3, 1e-30)` is 1e-9, not zero.
 ///
 /// ### Params
 ///
@@ -179,8 +163,8 @@ fn reg_gamma_lower(a: f64, x: f64) -> f64 {
 
 /// Regularised upper incomplete gamma `Q(a, x)`.
 ///
-/// The continued fraction above `x = a + 1`, evaluated directly, which is what
-/// keeps `chisq_sf(1000, 1)` at 1.8e-219 rather than zero.
+/// The continued fraction above `x = a + 1`, evaluated directly, so
+/// `chisq_sf(1000, 1)` is 1.8e-219, not zero.
 ///
 /// ### Params
 ///
@@ -208,7 +192,6 @@ fn reg_gamma_upper(a: f64, x: f64) -> f64 {
 /// Series representation of `P(a, x)`, for `x < a + 1`.
 ///
 /// `P(a, x) = exp(a ln x - x - ln Gamma(a)) * sum_{n>=0} x^n / (a (a+1)...(a+n))`.
-/// Every term is positive, so there is nothing to cancel.
 ///
 /// ### Params
 ///
@@ -235,8 +218,7 @@ fn gamma_series(a: f64, x: f64) -> f64 {
 
 /// Continued fraction representation of `Q(a, x)`, for `x >= a + 1`.
 ///
-/// Evaluated by modified Lentz, which is stable where the naive recurrence
-/// overflows.
+/// Evaluated by modified Lentz.
 ///
 /// ### Params
 ///
@@ -273,9 +255,9 @@ fn gamma_cont_frac(a: f64, x: f64) -> f64 {
     h * inc_gamma_prefactor(a, x)
 }
 
-/////////////////////////////
-// Log incomplete beta     //
-/////////////////////////////
+/////////////////////////
+// Log incomplete beta //
+/////////////////////////
 
 /// Iteration budget for the incomplete beta continued fraction.
 const BETA_CF_MAX_ITER: usize = 300;
@@ -285,24 +267,21 @@ const BETA_CF_EPS: f64 = 3e-16;
 
 /// Log of the smallest positive probability an `f64` can hold.
 ///
-/// Below this, `exp(ln_p)` is zero and the AS 109 starting point is useless, so
-/// the small-`x` asymptote has to seed the search instead.
+/// Below this, `exp(ln_p)` is zero and AS 109 cannot seed the search; the
+/// small-`x` asymptote does instead.
 const MIN_REPRESENTABLE_LN: f64 = -745.0;
 
 /// Shape above which the beta log-normaliser goes through Stirling.
 ///
-/// `ln_beta` forms `lnGamma(a) + lnGamma(b) - lnGamma(a + b)`, and the first
-/// and last of those agree to many digits once `a` is large: at `a = 5e5` they
-/// are both about 6.0e6 and differ by 6.5, so the difference keeps barely nine
-/// digits. Above this the difference is built from a series instead, where
-/// nothing cancels. Below it the plain form loses at most `lnGamma(30) * eps`,
-/// which is 7e-15.
+/// `ln_beta` forms `lnGamma(a) + lnGamma(b) - lnGamma(a + b)`, where the first
+/// and last cancel for large `a`: at `a = 5e5` both are about 6.0e6 and differ
+/// by 6.5, leaving barely nine digits. Above this a series is used instead.
+/// Below it the plain form loses at most `lnGamma(30) * eps`, 7e-15.
 const LN_BETA_STIRLING_MIN: f64 = 30.0;
 
 /// Stirling's correction, `lnGamma(z) - [(z - 1/2) ln z - z + ln(2 pi) / 2]`.
 ///
-/// Asymptotic series, used only above [`LN_BETA_STIRLING_MIN`] where the first
-/// dropped term is past the last bit.
+/// Asymptotic series, used above [`LN_BETA_STIRLING_MIN`].
 ///
 /// ### Params
 ///
@@ -318,9 +297,8 @@ fn stirlerr(z: f64) -> f64 {
 
 /// Log of the beta function, stable for a large shape.
 ///
-/// Symmetric in its arguments. For a large shape it evaluates
-/// `lnGamma(a + b) - lnGamma(a)` from Stirling's series, where the leading
-/// terms cancel analytically instead of numerically.
+/// Symmetric in its arguments. For a large shape, `lnGamma(a + b) - lnGamma(a)`
+/// comes from Stirling's series, cancelling the leading terms analytically.
 ///
 /// ### Params
 ///
@@ -346,8 +324,7 @@ fn ln_beta_stable(a: f64, b: f64) -> f64 {
 /// Modified Lentz evaluation of the incomplete beta continued fraction.
 ///
 /// Numerical Recipes' `betacf`, valid where `x < (a + 1) / (a + b + 2)`. The
-/// value is `O(1)`, so all the dynamic range lives in the prefactor its caller
-/// applies.
+/// value is `O(1)`; the dynamic range is in the caller's prefactor.
 ///
 /// ### Params
 ///
@@ -414,11 +391,9 @@ fn beta_cf(a: f64, b: f64, x: f64) -> f64 {
 
 /// Log of the regularised incomplete beta.
 ///
-/// `ln I(x; a, b)` without ever forming `I` itself, so a tail of 1e-4000 comes
-/// back as roughly `-9210` rather than as `-inf`. This is R's
-/// `pbeta(log.p = TRUE)`, and it is what lets the unequal-degrees-of-freedom
-/// conversion in `tmixture.vector` survive a moderated t of 40 against a
-/// near-infinite `df.total`.
+/// `ln I(x; a, b)` without forming `I`, so a tail of 1e-4000 is about `-9210`,
+/// not `-inf`. R's `pbeta(log.p = TRUE)`. Needed by the unequal-df conversion in
+/// `tmixture.vector` for a moderated t of 40 against a near-infinite `df.total`.
 ///
 /// ### Params
 ///
@@ -435,14 +410,13 @@ fn ln_beta_reg(x: f64, a: f64, b: f64) -> f64 {
 
 /// Log of the regularised incomplete beta, given both `x` and `1 - x`.
 ///
-/// The prefactor is `a ln x + b ln(1 - x)`, so when one of the two is close to
-/// one, forming its log from the *other* one is what keeps the result
-/// accurate. `a` here is half the degrees of freedom, which for a moderated t
-/// against an infinite prior runs into the millions: an absolute error of 1e-16
-/// in `ln x` comes out multiplied by that.
+/// The prefactor is `a ln x + b ln(1 - x)`; when one of `x`, `1 - x` is near one,
+/// its log is taken from the other. `a` is half the degrees of freedom, which
+/// runs into the millions for a moderated t, so an absolute error of 1e-16 in
+/// `ln x` is multiplied by that.
 ///
-/// A caller that can compute the complement without cancellation should, and
-/// [`t_sf_log`] can: `1 - df / (df + x^2)` is `x^2 / (df + x^2)` exactly.
+/// Callers should compute the complement without cancellation where they can, as
+/// [`t_sf_log`] does: `1 - df / (df + x^2)` is `x^2 / (df + x^2)`.
 ///
 /// ### Params
 ///
@@ -462,8 +436,7 @@ fn ln_beta_reg_pair(x: f64, one_minus_x: f64, a: f64, b: f64) -> f64 {
         return 0.0;
     }
 
-    // `ln1p` of the complement beats `ln` of the value itself whenever the
-    // value is the one near one, and the two agree elsewhere.
+    // `ln1p` of the complement is more accurate when the value is near one.
     let ln_x = if x > 0.5 {
         (-one_minus_x).ln_1p()
     } else {
@@ -475,9 +448,8 @@ fn ln_beta_reg_pair(x: f64, one_minus_x: f64, a: f64, b: f64) -> f64 {
         one_minus_x.ln()
     };
 
-    // The continued fraction converges quickly only on one side of this
-    // switchover; past it, evaluate the complement and take `ln(1 - .)`. The
-    // complement is then at least about a half, so the subtraction is safe.
+    // The continued fraction converges quickly only below this switchover;
+    // past it, evaluate the complement and take `ln(1 - .)`.
     if x < (a + 1.0) / (a + b + 2.0) {
         let ln_pre = a * ln_x + b * ln_1mx - ln_beta_stable(a, b);
         ln_pre + (beta_cf(a, b, x) / a).ln()
@@ -494,20 +466,14 @@ fn ln_beta_reg_pair(x: f64, one_minus_x: f64, a: f64, b: f64) -> f64 {
 
 /// Inverts the regularised incomplete beta on its lower half.
 ///
-/// `inv_beta_reg` from `statrs` is Algorithm AS 109, which carries an explicit
-/// `1e-30` floor and drifts by orders of magnitude below roughly `p = 1e-12`
-/// for small shapes. It is taken here only as a starting point, then polished
-/// by Newton on `ln I(x; a, b) = ln p` in `t = ln x`.
-///
-/// The log-log form is what makes the polish cheap. For small `x`,
-/// `I ~ x^a / (a B(a, b))`, so `d ln I / d ln x -> a`: the residual is close to
-/// linear in `t` however many decades the start is out by, and two or three
-/// steps land it. A bracket doubled outwards from the start keeps a bad start
-/// from diverging.
+/// `statrs`' `inv_beta_reg` (AS 109) has a `1e-30` floor and drifts by orders of
+/// magnitude below about `p = 1e-12` for small shapes. It is used as a start,
+/// then polished by Newton on `ln I(x; a, b) = ln p` in `t = ln x`. For small
+/// `x`, `I ~ x^a / (a B(a, b))`, so the residual is near-linear in `t` and two
+/// or three steps land it. A bracket doubled outwards guards a bad start.
 ///
 /// Only the lower half is solved. Callers wanting a quantile above the median
-/// flip the shapes and the probability and take the complement, which is what
-/// keeps the returned value free of cancellation on whichever side is small.
+/// flip the shapes and probability and take the complement.
 ///
 /// ### Params
 ///
@@ -532,10 +498,8 @@ fn inv_beta_reg_lower(a: f64, b: f64, p: f64) -> Result<f64, EdgeErrors> {
 
 /// Inverts the regularised incomplete beta from a log probability.
 ///
-/// The body of [`inv_beta_reg_lower`], which already worked in
-/// `ln I(x; a, b) = ln p`; taking the target in logs simply lets it reach
-/// probabilities that cannot be represented at all. Everything below
-/// `ln p = -745` is only addressable this way.
+/// The body of [`inv_beta_reg_lower`]. Taking the target in logs reaches
+/// probabilities below `ln p = -745`, which are not representable otherwise.
 ///
 /// ### Params
 ///
@@ -643,9 +607,8 @@ fn inv_ln_beta_reg_lower(a: f64, b: f64, ln_p: f64) -> Result<f64, EdgeErrors> {
 
 /// Inverts the regularised incomplete beta, returning both `x` and `1 - x`.
 ///
-/// Solving whichever side is below the median and complementing gives the
-/// small quantity to full relative accuracy, which is what the F and t
-/// quantiles need: both divide by it.
+/// Solving the side below the median and complementing gives the small quantity
+/// to full relative accuracy, which the F and t quantiles divide by.
 ///
 /// ### Params
 ///
@@ -674,9 +637,8 @@ fn inv_beta_reg_pair(a: f64, b: f64, p: f64) -> Result<(f64, f64), EdgeErrors> {
 /// Standard normal CDF.
 ///
 /// `erfc(z) = Q(1/2, z^2)`, so this is the incomplete gamma at `x^2 / 2`,
-/// halved. Below zero it reads the upper branch and above zero the lower one,
-/// so the near tail is always the one being computed and the far tail is the
-/// one being added to a half.
+/// halved. Below zero it uses the upper branch, above zero the lower, so the
+/// small tail is always computed directly.
 ///
 /// ### Params
 ///
@@ -697,9 +659,8 @@ pub fn norm_cdf(x: f64) -> f64 {
 
 /// Standard normal survival function.
 ///
-/// The mirror of [`norm_cdf`], never `1 - norm_cdf(x)`. The difference shows
-/// from about `x = 8` onwards, where the tail drops below `f64` resolution
-/// near one; `norm_sf(37)` is 5.7e-300 and the subtraction gives a flat zero.
+/// The mirror of [`norm_cdf`], not `1 - norm_cdf(x)`: `norm_sf(37)` is 5.7e-300
+/// and the subtraction gives zero from about `x = 8`.
 ///
 /// ### Params
 ///
@@ -719,9 +680,7 @@ pub fn norm_sf(x: f64) -> f64 {
 
 /// Standard normal quantile function.
 ///
-/// `-sqrt(2) * erfc_inv(2p)`, so a tiny `p` is handled in the tail branch of
-/// the inverse rather than by inverting a CDF value that has already rounded
-/// to zero.
+/// `-sqrt(2) * erfc_inv(2p)`, so a tiny `p` uses the tail branch of the inverse.
 ///
 /// ### Params
 ///
@@ -743,9 +702,8 @@ pub fn norm_ppf(p: f64) -> Result<f64, EdgeErrors> {
 
 /// Chi-squared survival function.
 ///
-/// The upper regularised incomplete gamma `Q(df/2, x/2)` directly, so the far
-/// tail stays accurate: `chisq_sf(200, 1)` is 2.09e-45, where `1 - cdf` returns
-/// a flat zero. This is the tail every LRT p-value in edgeR comes out of.
+/// The upper incomplete gamma `Q(df/2, x/2)` directly: `chisq_sf(200, 1)` is
+/// 2.09e-45. Every edgeR LRT p-value comes from this tail.
 ///
 /// ### Params
 ///
@@ -773,16 +731,12 @@ pub fn chisq_sf(x: f64, df: f64) -> Result<f64, EdgeErrors> {
 /// The two halves of the t distribution's mass either side of `|x|`.
 ///
 /// With `h = df / (df + x^2)` and `z = x^2 / (df + x^2)`, the outer tail beyond
-/// `|x|` is `I(h; df/2, 1/2) / 2` and the mass between zero and `|x|` is
-/// `I(z; 1/2, df/2) / 2`. Whichever of the two is the smaller is the one
-/// evaluated, per [`T_INNER_OUTER_SWITCH`], and the larger is recovered by
-/// subtraction, where it can absorb the loss.
+/// `|x|` is `I(h; df/2, 1/2) / 2` and the mass in `(0, |x|)` is
+/// `I(z; 1/2, df/2) / 2`. The smaller one is evaluated, per
+/// [`T_INNER_OUTER_SWITCH`], and the larger recovered by subtraction.
 ///
-/// Both halves of this matter. Forming the inner mass as `0.5 - outer` for a
-/// large `|x|` is the obvious blunder, but the reverse costs just as much: `h`
-/// at `x = 1e-4, df = 100` is `1 - 1e-10`, whose complement carries only six
-/// significant digits, and the tail that comes out of it is wrong in the
-/// eleventh.
+/// Both directions matter: at `x = 1e-4, df = 100`, `h` is `1 - 1e-10`, so
+/// the tail derived from its complement is wrong in the eleventh digit.
 ///
 /// ### Params
 ///
@@ -826,9 +780,8 @@ pub fn t_cdf(x: f64, df: f64) -> Result<f64, EdgeErrors> {
 
 /// Student's t survival function.
 ///
-/// For `x > 0` this is the incomplete beta itself, never `1 - cdf`, which is
-/// what keeps `t_sf(50, 100)` at 7.24e-73 instead of zero. edgeR's moderated t
-/// p-values and the t-to-z conversion in `glmTreat` both live here.
+/// For `x > 0` this is the incomplete beta itself, so `t_sf(50, 100)` is
+/// 7.24e-73. Used for moderated t p-values and the t-to-z conversion in `glmTreat`.
 ///
 /// ### Params
 ///
@@ -849,9 +802,7 @@ pub fn t_sf(x: f64, df: f64) -> Result<f64, EdgeErrors> {
 
 /// Student's t quantile function.
 ///
-/// Inverts the incomplete beta on whichever side of the median is smaller, so
-/// a `p` of 1e-8 is resolved in that tail rather than against a CDF pinned at
-/// one.
+/// Inverts the incomplete beta on the smaller side of the median.
 ///
 /// ### Params
 ///
@@ -884,16 +835,12 @@ pub fn t_ppf(p: f64, df: f64) -> Result<f64, EdgeErrors> {
 
 /// Log of Student's t survival function.
 ///
-/// `ln P(T > x)`, formed from the log incomplete beta rather than as
-/// `t_sf(x).ln()`, so
-/// it keeps going where the probability itself has underflowed to zero. R's
-/// `pt(lower.tail = FALSE, log.p = TRUE)`.
+/// `ln P(T > x)` from the log incomplete beta, so it survives where the
+/// probability underflows. R's `pt(lower.tail = FALSE, log.p = TRUE)`.
 ///
-/// `tmixture.vector` puts the top `proportion / 2` of genes by moderated t
-/// through here, and those are exactly the ones whose tail probability is too
-/// small to represent: an eBayes fit whose prior degrees of freedom came back
-/// infinite gives a `df.total` in the millions, where a t of 40 is already past
-/// 1e-350.
+/// `tmixture.vector` sends the top `proportion / 2` of genes by moderated t
+/// through here. With infinite prior df, `df.total` is in the millions and a t
+/// of 40 is already past 1e-350.
 ///
 /// ### Params
 ///
@@ -909,8 +856,7 @@ pub fn t_sf_log(x: f64, df: f64) -> Result<f64, EdgeErrors> {
         return Ok(if x > 0.0 { f64::NEG_INFINITY } else { 0.0 });
     }
     if x <= 0.0 {
-        // At or below the median the mass is at least a half, so the plain
-        // survival function has all the precision there is to have.
+        // At or below the median the plain survival function is accurate.
         return Ok(t_sf(x, df)?.ln());
     }
     // Both halves formed directly: `1 - df / (df + x^2)` is `x^2 / (df + x^2)`,
@@ -949,9 +895,8 @@ pub fn t_isf_log(log_p: f64, df: f64) -> Result<f64, EdgeErrors> {
         return Ok(f64::INFINITY);
     }
     if log_p > -std::f64::consts::LN_2 {
-        // Above the median, where the tail is the large side and there is
-        // nothing for the log scale to rescue. `1 - p` is representable and
-        // `t_ppf` resolves the other tail properly.
+        // Above the median the log scale rescues nothing; `t_ppf` resolves
+        // the other tail.
         return t_ppf(1.0 - log_p.exp(), df);
     }
     // P(T > t) = I(df / (df + t^2); df/2, 1/2) / 2, so invert on the half.
@@ -968,10 +913,9 @@ pub fn t_isf_log(log_p: f64, df: f64) -> Result<f64, EdgeErrors> {
 
 /// F survival function.
 ///
-/// `I(df2 / (df1 x + df2); df2/2, df1/2)`, formed from the ratio directly
-/// rather than as `1 - df1 x / (df1 x + df2)`. That subtraction is where
-/// `statrs`'s own `FisherSnedecor::sf` loses the tail, and the quasi-likelihood
-/// F test in `glmQLFTest` reads exactly that tail.
+/// `I(df2 / (df1 x + df2); df2/2, df1/2)`, from the ratio directly. The
+/// `1 - df1 x / (df1 x + df2)` form is where `statrs`' `FisherSnedecor::sf` loses
+/// the tail that `glmQLFTest` reads.
 ///
 /// ### Params
 ///
@@ -997,8 +941,7 @@ pub fn f_sf(x: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
 /// F quantile function.
 ///
 /// Inverts the incomplete beta on the smaller tail and recovers `x` from the
-/// side that has not cancelled, so `f_ppf(1 - eps, ..)` does not divide by a
-/// rounded-off `1 - z`.
+/// uncancelled side, so `f_ppf(1 - eps, ..)` never divides by a rounded `1 - z`.
 ///
 /// ### Params
 ///
@@ -1022,8 +965,7 @@ pub fn f_ppf(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
         return Ok(f64::INFINITY);
     }
     // z = df1 x / (df1 x + df2), so x = df2 z / (df1 (1 - z)). Both z and its
-    // complement come back from the inverse at full relative accuracy, so
-    // neither end of the ratio is a cancelled difference.
+    // complement are accurate, so no cancelled difference.
     let (z, one_minus_z) = inv_beta_reg_pair(0.5 * df1, 0.5 * df2, p)?;
     Ok(df2 * z / (df1 * one_minus_z))
 }
@@ -1058,9 +1000,8 @@ pub fn beta_cdf(x: f64, a: f64, b: f64) -> Result<f64, EdgeErrors> {
 
 /// Beta survival function.
 ///
-/// `I(1 - x; b, a)`, the reflected incomplete beta, not `1 - beta_cdf(x)`. The
-/// beta approximation in `exactTestBetaApprox` doubles this for its right-tail
-/// p-value, so the precision carries straight into the reported value.
+/// `I(1 - x; b, a)`, the reflected incomplete beta. `exactTestBetaApprox`
+/// doubles this for its right-tail p-value.
 ///
 /// ### Params
 ///
@@ -1108,9 +1049,8 @@ pub fn beta_ppf(p: f64, a: f64, b: f64) -> Result<f64, EdgeErrors> {
 
 /// Gamma CDF, shape-and-scale parameterisation.
 ///
-/// Matches `scipy.stats.gamma.cdf(x, a=shape, scale=scale)`: the density is
-/// `x^(shape-1) exp(-x/scale) / (Gamma(shape) scale^shape)`, so `scale` is the
-/// reciprocal of the rate. `q2qnbinom` uses it for its gamma approximation.
+/// Matches `scipy.stats.gamma.cdf(x, a=shape, scale=scale)`: `scale` is the
+/// reciprocal of the rate. Used by `q2qnbinom`'s gamma approximation.
 ///
 /// ### Params
 ///
@@ -1136,13 +1076,10 @@ pub fn gamma_cdf(x: f64, shape: f64, scale: f64) -> Result<f64, EdgeErrors> {
 
 /// Gamma quantile function, shape-and-scale parameterisation.
 ///
-/// Hand-rolled. `statrs`'s `Gamma::inverse_cdf` is eight bisection steps plus
-/// four Newton steps from a fixed bracket and lands around 1e-8 relative, which
-/// is not enough for the quantile-to-quantile mapping in `q2qnbinom` where the
-/// output feeds straight back into a pseudo-count. This solves
-/// `gamma_lr(shape, x) = p` by Newton in `ln(x)`, bisecting whenever the Newton
-/// step leaves the bracket, and inverts the upper tail instead for `p > 0.5` so
-/// the residual never cancels.
+/// Hand-rolled: `statrs`' `Gamma::inverse_cdf` is only good to about 1e-8
+/// relative, too coarse for `q2qnbinom`. Solves `gamma_lr(shape, x) = p` by
+/// Newton in `ln(x)`, bisecting when Newton leaves the bracket, and inverts the
+/// upper tail for `p > 0.5` so the residual never cancels.
 ///
 /// ### Params
 ///
@@ -1155,7 +1092,7 @@ pub fn gamma_cdf(x: f64, shape: f64, scale: f64) -> Result<f64, EdgeErrors> {
 /// `x` with `P(X <= x) = p`. `p = 0` gives 0.0 and `p = 1` gives `+inf`.
 /// [`EdgeErrors::InvalidArgument`] for `p` outside `[0, 1]` or a non-positive
 /// `shape` or `scale`, and [`EdgeErrors::NoConvergence`] if the bracket has not
-/// closed within [`GAMMA_PPF_MAX_ITER`].
+/// closed within `GAMMA_PPF_MAX_ITER`.
 pub fn gamma_ppf(p: f64, shape: f64, scale: f64) -> Result<f64, EdgeErrors> {
     check_probability("p", p)?;
     check_positive("shape", shape)?;
@@ -1171,13 +1108,10 @@ pub fn gamma_ppf(p: f64, shape: f64, scale: f64) -> Result<f64, EdgeErrors> {
 
 /// Starting point for the gamma quantile, in `ln(x)` with unit rate.
 ///
-/// Wilson-Hilferty where its cube root is positive, which covers everything
-/// with `shape` above roughly 1. Below that the distribution piles up at zero
-/// and Wilson-Hilferty goes negative, so the small-`x` series
-/// `P(a, x) ~ x^a / (a Gamma(a))` is inverted instead.
-///
-/// The result only has to land in the right decade: the caller brackets it and
-/// bisects, so a poor guess costs iterations, never correctness.
+/// Wilson-Hilferty where its cube root is positive (`shape` above about 1).
+/// Below that it goes negative, so the small-`x` series
+/// `P(a, x) ~ x^a / (a Gamma(a))` is inverted instead. A poor guess costs
+/// iterations, not correctness: the caller brackets and bisects.
 ///
 /// ### Params
 ///
@@ -1205,13 +1139,11 @@ fn gamma_ppf_start(p: f64, shape: f64) -> f64 {
 
 /// Inverts the regularised lower incomplete gamma at unit rate.
 ///
-/// Newton in `t = ln(x)` on a bracketed, monotonically increasing residual. In
-/// log-space the derivative is `x f(x) = exp(shape ln x - x - ln_gamma(shape))`,
-/// which stays representable for the tiny quantiles small shapes produce, where
-/// the density itself would overflow.
+/// Newton in `t = ln(x)` on a bracketed, increasing residual. The derivative
+/// `x f(x) = exp(shape ln x - x - ln_gamma(shape))` stays representable for the
+/// tiny quantiles of small shapes, where the density would overflow.
 ///
-/// For `p > 0.5` the residual is built from `gamma_ur` and the complement
-/// `1 - p`, which is exact by Sterbenz, so no accuracy is lost switching tails.
+/// For `p > 0.5` the residual uses `gamma_ur` and `1 - p` (exact by Sterbenz).
 ///
 /// ### Params
 ///
@@ -1302,24 +1234,20 @@ fn gamma_lr_inv(p: f64, shape: f64) -> Result<f64, EdgeErrors> {
 
 /// Negative binomial log-PMF, "number of successes" parameterisation.
 ///
-/// Matches `scipy.stats.nbinom.logpmf(k, size, prob)` and the `_nb_logpmf`
-/// helper in `edgepython/exact_test.py`: `prob` is the success probability and
-/// `size` the target number of successes, so `k` counts *failures* before the
-/// `size`-th success and the mean is `size (1 - prob) / prob`. Every call site
-/// in edgePython reaches it as `prob = size / (size + mu)`, which is the same
-/// convention read backwards from a mean and a dispersion.
-///
-/// This is the parameterisation to get wrong. The other common one puts `prob`
-/// on the failures and gives a mean of `size prob / (1 - prob)`, which is a
-/// different distribution for the same numbers.
+/// Matches `scipy.stats.nbinom.logpmf(k, size, prob)` and `_nb_logpmf` in
+/// `edgepython/exact_test.py`: `prob` is the success probability, `size` the
+/// target number of successes, `k` counts failures, and the mean is
+/// `size (1 - prob) / prob`. edgePython always calls it with
+/// `prob = size / (size + mu)`. The other common convention puts `prob` on the
+/// failures, a different distribution for the same numbers.
 ///
 /// ```text
 /// ln P(K = k) = lgamma(k + size) - lgamma(k + 1) - lgamma(size)
 ///               + size ln(prob) + k ln(1 - prob)
 /// ```
 ///
-/// The last term is evaluated as `k * ln_1p(-prob)`, which is what `scipy`
-/// does and is more accurate than `ln(1 - prob)` for a small `prob`.
+/// The last term is `k * ln_1p(-prob)`, as in `scipy`, which is more accurate
+/// than `ln(1 - prob)` for small `prob`.
 ///
 /// ### Params
 ///
@@ -1353,9 +1281,8 @@ pub fn nbinom_ln_pmf(k: f64, size: f64, prob: f64) -> Result<f64, EdgeErrors> {
 
 /// Negative binomial CDF, "number of successes" parameterisation.
 ///
-/// The same convention as [`nbinom_ln_pmf`]. `scipy` evaluates this as the
-/// regularised incomplete beta `I(prob; size, floor(k) + 1)` rather than
-/// summing the PMF, and so does this.
+/// Same convention as [`nbinom_ln_pmf`]. Like `scipy`, evaluated as the
+/// incomplete beta `I(prob; size, floor(k) + 1)`, not by summing the PMF.
 ///
 /// ### Params
 ///
@@ -1385,10 +1312,8 @@ pub fn nbinom_cdf(k: f64, size: f64, prob: f64) -> Result<f64, EdgeErrors> {
 
 #[cfg(test)]
 mod tests {
-    // The reference values below are pasted verbatim from R's 17-digit output.
-    // The last digit or two is past what an f64 can hold, and keeping them
-    // exactly as printed is what makes them checkable against the `Rscript`
-    // line quoted above them.
+    // Reference values are pasted verbatim from R's 17-digit output, so they
+    // can be checked against the quoted `Rscript` line.
     #![allow(clippy::excessive_precision)]
 
     use super::*;
@@ -1396,18 +1321,15 @@ mod tests {
 
     /// Target relative accuracy against scipy.
     ///
-    /// A sweep of roughly 1500 points across every function here holds to this
-    /// or better, apart from the mid-tail incomplete beta noted in
-    /// [`BETA_REG_TOL`].
+    /// A sweep of about 1500 points holds to this, apart from the mid-tail
+    /// incomplete beta noted in [`BETA_REG_TOL`].
     const TOL: f64 = 1e-12;
 
     /// Relaxed tolerance where `statrs`'s `beta_reg` is the limiting factor.
     ///
-    /// For arguments past its internal symmetry swap it returns `1 - I(1-x)`,
-    /// and the subtraction costs about a decimal digit when the tail being
-    /// asked for is a tenth or so of the mass. That is the whole of the gap
-    /// between this and [`TOL`], and it only bites in the mid-tail of t and F
-    /// at large `df`, nowhere near where a p-value is read.
+    /// Past its internal symmetry swap it returns `1 - I(1-x)`, costing about a
+    /// digit when the tail is a tenth of the mass. This is the whole gap to
+    /// [`TOL`]; it only bites in the mid-tail of t and F at large `df`.
     const BETA_REG_TOL: f64 = 1e-11;
 
     ////////////
@@ -1611,8 +1533,7 @@ mod tests {
 
     /// `Rscript -e 'pt(x, df, lower.tail=FALSE, log.p=TRUE)'` for each pair.
     ///
-    /// The last two are past what an `f64` probability can hold at all:
-    /// `exp(-803.97)` is about 1e-349 and `exp(-6732)` is not close.
+    /// The last two are below what an `f64` probability can hold.
     const T_SF_LOG: [(f64, f64, f64); 8] = [
         (2.5, 10.0, -4.1526038236684464),
         (8.0, 5.0, -8.3083379118742755),
@@ -1627,9 +1548,8 @@ mod tests {
     #[test]
     fn test_t_sf_log_matches_r() {
         for &(x, df, want) in &T_SF_LOG {
-            // Worst observed is one ULP, on the smallest magnitude of the
-            // eight. The `df = 1e6` case is the one that pins the two accuracy
-            // fixes down: without the paired form it is out by 2.8e-13, and
+            // Worst observed is one ULP. The `df = 1e6` case pins both
+            // accuracy fixes: without the paired form it is out by 2.8e-13,
             // without the Stirling `ln_beta` by 2.6e-13.
             let got = t_sf_log(x, df).unwrap();
             assert_relative_eq!(got, want, max_relative = 1e-15);
@@ -1638,7 +1558,7 @@ mod tests {
 
     #[test]
     fn test_t_sf_log_reaches_past_underflow() {
-        // The plain survival function has nothing left to say here.
+        // The plain survival function has underflowed here.
         assert_eq!(t_sf(120.0, 1e5).unwrap(), 0.0);
         assert!(t_sf_log(120.0, 1e5).unwrap() < -6000.0);
     }
@@ -1690,8 +1610,7 @@ mod tests {
 
     #[test]
     fn test_t_tails_near_the_median() {
-        // The naive h = df / (df + x^2) form loses six digits to cancellation
-        // here, because 1 - h is 1e-10 formed from numbers of order one.
+        // The naive h = df / (df + x^2) form loses six digits here: 1 - h is 1e-10.
         // scipy.stats.t.cdf(0.0001, 100)
         assert_relative_eq!(
             t_cdf(1e-4, 100.0).unwrap(),
@@ -2033,9 +1952,8 @@ mod tests {
 
     #[test]
     fn test_solvers_converge_across_the_grid() {
-        // The two hand-rolled inverses both report NoConvergence rather than
-        // returning a wrong answer, so a sweep that never errs is the check
-        // that the bracketing holds over shapes spanning five decades.
+        // The hand-rolled inverses return NoConvergence rather than a wrong
+        // answer, so a sweep that never errs checks the bracketing over five decades.
         for &shape in &[1e-2_f64, 0.5, 1.0, 13.0, 1e3] {
             for &b in &[1e-2_f64, 0.5, 1.0, 13.0, 1e3] {
                 for &p in &[1e-30_f64, 1e-8, 0.1, 0.5, 0.9, 1.0 - 1e-8] {

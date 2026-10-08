@@ -1,14 +1,14 @@
 //! The fit object the limma pipeline passes along.
 //!
 //! limma's `MArrayLM` is an untyped tagged list whose field set depends on
-//! which functions have run over it: `lmFit` sets one group, `contrasts.fit`
-//! replaces three of them, `eBayes` adds eleven more. The map from field to
-//! dimension lives in `R/subsetting.R:115-121`.
+//! which functions have run: `lmFit` sets one group, `contrasts.fit` replaces
+//! three, `eBayes` adds eleven more. The field-to-dimension map is in
+//! `R/subsetting.R:115-121`.
 //!
-//! Here it is one struct whose later fields are `Option`, populated in that
-//! same order. Each stage consumes the object and returns it, so nothing is
-//! cloned and a fit that has not been through `eBayes` cannot be handed to
-//! something that needs a moderated t: the `Option` is the check.
+//! Here it is one struct whose later fields are `Option`, populated in the same
+//! order. Each stage consumes and returns it, so nothing is cloned, and a fit
+//! that has not been through `eBayes` cannot be passed where a moderated t is
+//! needed: the `Option` is the check.
 
 use crate::limma::lm_fit::LmFitResult;
 use crate::prelude::*;
@@ -165,8 +165,7 @@ impl MArrayLm {
     /// Clears everything `eBayes` and `treat` set.
     ///
     /// `contrasts.fit` drops the test statistics because they belong to the old
-    /// coefficient axis (`R/contrasts.R:21-25`); rotating them would be
-    /// meaningless and leaving them would be worse.
+    /// coefficient axis (`R/contrasts.R:21-25`).
     pub(crate) fn clear_tests(&mut self) {
         self.df_prior = None;
         self.s2_prior = None;

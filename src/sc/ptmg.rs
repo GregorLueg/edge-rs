@@ -1,27 +1,24 @@
 //! The marginal Poisson-gamma mixed model NEBULA starts from.
 //!
-//! `ptmg` is the model with the subject random effect integrated out
-//! analytically: each subject contributes one gamma-distributed frailty shared
-//! by all of its cells, and each cell carries its own gamma overdispersion. The
-//! result is a closed-form marginal likelihood in `(beta, sigma, phi)` that the
-//! R package minimises with L-BFGS-B to get the starting values every later
-//! stage of NEBULA refines.
+//! The subject random effect is integrated out analytically: each subject has
+//! one gamma frailty shared by its cells, and each cell has its own gamma
+//! overdispersion. The closed-form marginal likelihood in `(beta, sigma, phi)`
+//! is minimised, by projected Newton on dense designs and L-BFGS-B where the
+//! zero-count tables apply, to give the starting values every later NEBULA
+//! stage refines. Ports `ptmg_*_eigen` from `nebula`'s C++ plus the R-level
+//! gamma corrections. `ptmg_value_gradient_hessian` supplies the marginal
+//! Hessian edgePython lacks; see `UPSTREAM_DEVIATIONS.md` A20.
 //!
-//! ### Layout and conventions
+//! ### Layout
 //!
-//! Cells are sorted by subject and [`GeneData::fid`] holds the boundaries, so
-//! subject `s` owns cells `fid[s]..fid[s + 1]`. Every inner loop walks that
-//! structure. The design is row-major `n_cells * n_coef`, one contiguous row
-//! per cell, which is the orientation all the per-cell accumulations want. The
-//! parameter vector is `[beta (n_coef), sigma, phi]`.
+//! Cells are sorted by subject and [`GeneData::fid`] holds the boundaries:
+//! subject `s` owns cells `fid[s]..fid[s + 1]`. The design is row-major
+//! `n_cells * n_coef`. The parameter vector is `[beta (n_coef), sigma, phi]`.
 //!
-//! One gene is the unit of work here and everything is sequential; genes are
-//! the parallel axis and belong to the caller. The only exception is
-//! [`cumsum_y`], which sees the whole matrix and fans out over genes itself.
-//!
-//! The public kernels allocate their scratch per call. Stage one's optimiser
-//! evaluates one gene tens to hundreds of times, so it holds a `PtmgScratch`
-//! per gene and goes through `ptmg_value_and_gradient_with` instead.
+//! One gene is the unit of work and kernels are sequential; the caller
+//! parallelises over genes. The exception is [`cumsum_y`], which fans out over
+//! genes itself. Public kernels allocate scratch per call; the optimiser holds
+//! a `PtmgScratch` per gene and uses `ptmg_value_and_gradient_with`.
 //!
 //! ### References
 //!
@@ -31,6 +28,8 @@ use rayon::prelude::*;
 
 use crate::numeric::gamma::{digamma, ln_gamma, trigamma};
 use crate::prelude::*;
+use crate::sc::pml::positive_runs;
+use crate::sc::zeros::ZeroCells;
 
 ///////////////
 // Gene data //
@@ -38,12 +37,9 @@ use crate::prelude::*;
 
 /// Per-gene data laid out the way the kernels want it.
 ///
-/// Counts are held sparsely: only the non-zero entries, with the cell each one
-/// belongs to. That is how NEBULA stores single-cell counts and how
-/// [`positive_indices`] hands them over.
-///
-/// Build with [`GeneData::new`], which is the only thing that checks the
-/// invariants the kernels rely on.
+/// Counts are sparse: non-zero entries plus their cells, as
+/// [`positive_indices`] returns them. Build with [`GeneData::new`], the only
+/// place the kernels' invariants are checked.
 #[derive(Clone, Copy, Debug)]
 pub struct GeneData<'a> {
     /// Design matrix, row-major `n_cells * n_coef`, one row per cell.
@@ -198,27 +194,30 @@ impl<'a> GeneData<'a> {
     }
 }
 
-/// Widest design whose per-subject sums in the gradient pass are held on the
-/// stack.
-///
-/// Heap accumulators cost a store-to-load round trip per cell; on the stack the
-/// compiler keeps them in registers. Measured on one 20000-cell gene at three
-/// coefficients, 258 against 236 us per evaluation. Wider designs take the heap.
+/// Widest design whose per-subject gradient sums live on the stack, where the
+/// compiler keeps them in registers (236 against 258 us per evaluation on a
+/// 20000-cell, three-coefficient gene). Wider designs use the heap.
 const LOCAL_COEF: usize = 8;
 
 /// Per-gene buffers for the kernels, so repeated evaluations of one gene
 /// allocate nothing.
-pub(crate) struct PtmgScratch {
+pub(crate) struct PtmgScratch<'z> {
     /// Count per cell, zero where the gene is not expressed. Constant per gene,
     /// so filled once.
     y_cell: Vec<f64>,
-    /// `exp(eta)` per cell, overwritten by every evaluation.
+    /// `exp(eta)` per cell, overwritten by every evaluation. With tables, only
+    /// the positive and the loose cells are written.
     extb: Vec<f64>,
     /// Sum of `extb` per subject, overwritten by every evaluation.
     cumsumxtb: Vec<f64>,
+    /// The run's zero-count tables, or `None` to sweep every cell.
+    zeros: Option<&'z ZeroCells>,
+    /// Where each subject's run of positive counts starts, length
+    /// `n_subjects + 1`. Empty without tables.
+    run: Vec<usize>,
 }
 
-impl PtmgScratch {
+impl<'z> PtmgScratch<'z> {
     /// Buffers for one gene.
     ///
     /// ### Params
@@ -237,6 +236,27 @@ impl PtmgScratch {
             y_cell,
             extb: vec![0.0; data.n_cells()],
             cumsumxtb: vec![0.0; data.n_subjects()],
+            zeros: None,
+            run: Vec::new(),
+        }
+    }
+
+    /// Buffers for one gene whose value and gradient sum the zero counts from
+    /// the run's tables.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - The gene the scratch will serve, and only that gene
+    /// * `zeros` - Tables built from this gene's design, offsets and subjects
+    ///
+    /// ### Returns
+    ///
+    /// The scratch, with the positive-count runs located.
+    pub(crate) fn tabled(data: &GeneData<'_>, zeros: &'z ZeroCells) -> Self {
+        Self {
+            zeros: Some(zeros),
+            run: positive_runs(data.cells, data.fid),
+            ..Self::new(data)
         }
     }
 }
@@ -247,10 +267,10 @@ impl PtmgScratch {
 
 /// The scalars every kernel derives from `(sigma, phi)`, and their derivatives.
 ///
-/// `sigma` is the log of one plus the subject-level variance, so the gamma
-/// frailty has shape `alpha = 1 / (exp(sigma) - 1)` and rate
-/// `lambda = alpha / sqrt(exp(sigma))`. `phi` is the cell-level gamma shape and
-/// enters the likelihood directly, so it needs no reparametrisation.
+/// `sigma` is the log of one plus the subject-level variance: the gamma frailty
+/// has shape `alpha = 1 / (exp(sigma) - 1)` and rate
+/// `lambda = alpha / sqrt(exp(sigma))`. `phi`, the cell-level gamma shape,
+/// enters directly.
 #[derive(Clone, Copy, Debug)]
 struct Terms {
     /// `sqrt(exp(sigma))`, which is also `alpha / lambda`.
@@ -331,11 +351,10 @@ enum GammaOrder {
 
 /// The gamma-function terms the C++ kernels leave to the R wrappers.
 ///
-/// Two blocks, one per random effect. The subject block is
-/// `sum lgamma(cumsumy + alpha) - lgamma(alpha)` over subjects with a non-zero
-/// total, differentiated through `alpha`. The cell block is
+/// Subject block: `sum lgamma(cumsumy + alpha) - lgamma(alpha)` over subjects
+/// with a non-zero total, differentiated through `alpha`. Cell block:
 /// `sum lgamma(y + phi) - lgamma(phi)` over cells with a non-zero count,
-/// differentiated in `phi` directly.
+/// differentiated in `phi`.
 #[derive(Clone, Copy, Debug, Default)]
 struct GammaTerms {
     /// Subject block, evaluated.
@@ -354,14 +373,10 @@ struct GammaTerms {
 
 /// Evaluates the gamma-function terms and, on request, their derivatives.
 ///
-/// Counts of one and two are handled in closed form, as the reference does:
+/// Counts of one and two use closed forms, as the reference does:
 /// `lgamma(1 + g) - lgamma(g) = log(g)` and
 /// `lgamma(2 + g) - lgamma(g) = log(g) + log(g + 1)`. Only counts of three and
-/// above pay for a `lgamma` call, which is most of the saving on single-cell
-/// data where nearly every non-zero count is a one or a two.
-///
-/// Subjects whose total is zero contribute exactly nothing and are skipped,
-/// which is what the reference's `posind` index does.
+/// above call `lgamma`. Subjects with a zero total are skipped (`posind`).
 ///
 /// ### Params
 ///
@@ -372,12 +387,13 @@ struct GammaTerms {
 ///
 /// ### Returns
 ///
-/// The two blocks and whichever derivatives `order` asked for; the rest stay at
-/// zero.
+/// The two blocks and the derivatives `order` asks for; the rest stay zero.
 fn gamma_terms(data: &GeneData<'_>, alpha: f64, gamma: f64, order: GammaOrder) -> GammaTerms {
     let mut out = GammaTerms::default();
 
-    // -- subject block --
+    // ------------- //
+    // subject block //
+    // ------------- //
     let mut n_positive = 0.0;
     let mut ln_sum = 0.0;
     let mut di_sum = 0.0;
@@ -402,7 +418,9 @@ fn gamma_terms(data: &GeneData<'_>, alpha: f64, gamma: f64, order: GammaOrder) -
         out.subject_trigamma = tri_sum - n_positive * trigamma(alpha);
     }
 
-    // -- cell block --
+    // ---------- //
+    // cell block //
+    // ---------- //
     let mut n_one = 0.0;
     let mut n_two = 0.0;
     let mut n_big = 0.0;
@@ -477,6 +495,7 @@ pub fn ptmg_neg_log_likelihood(data: &GeneData<'_>, params: &[f64]) -> f64 {
         y_cell,
         extb,
         cumsumxtb,
+        ..
     } = &scratch;
 
     for s in 0..n_subjects {
@@ -504,10 +523,9 @@ pub fn ptmg_neg_log_likelihood(data: &GeneData<'_>, params: &[f64]) -> f64 {
 
 /// Gradient of the marginal negative log-likelihood.
 ///
-/// Port of `ptmg_der_eigen` plus the R-level corrections, so this equals
-/// `nebula:::ptmg_der`. It runs the same code as
-/// [`ptmg_value_and_gradient`] and throws the value away; prefer that when both
-/// are wanted, which for an optimiser is always.
+/// Port of `ptmg_der_eigen` plus the R-level corrections, equal to
+/// `nebula:::ptmg_der`. Runs [`ptmg_value_and_gradient`] and drops the value;
+/// prefer that when both are needed.
 ///
 /// ### Params
 ///
@@ -518,13 +536,13 @@ pub fn ptmg_neg_log_likelihood(data: &GeneData<'_>, params: &[f64]) -> f64 {
 ///
 /// The gradient, length `n_coef + 2`.
 pub fn ptmg_gradient(data: &GeneData<'_>, params: &[f64]) -> Vec<f64> {
-    evaluate(data, params, false, &mut PtmgScratch::new(data)).1
+    evaluate(data, params, &mut PtmgScratch::new(data)).1
 }
 
 /// Value and gradient of the marginal negative log-likelihood together.
 ///
 /// Port of `ptmg_ll_der_eigen` plus the R-level corrections, so this equals
-/// `nebula:::ptmg_ll_der`. This is the objective the bounded optimiser drives.
+/// `nebula:::ptmg_ll_der`. This is the optimiser's objective.
 ///
 /// ### Params
 ///
@@ -549,29 +567,28 @@ pub fn ptmg_value_and_gradient(data: &GeneData<'_>, params: &[f64]) -> (f64, Vec
 ///
 /// ### Returns
 ///
-/// The negative log-likelihood and its gradient, bit for bit what
-/// [`ptmg_value_and_gradient`] returns.
+/// The negative log-likelihood and its gradient: bit for bit what
+/// [`ptmg_value_and_gradient`] returns without tables, to rounding with them.
 pub(crate) fn ptmg_value_and_gradient_with(
     data: &GeneData<'_>,
     params: &[f64],
-    scratch: &mut PtmgScratch,
+    scratch: &mut PtmgScratch<'_>,
 ) -> (f64, Vec<f64>) {
-    let (value, gradient, _) = evaluate(data, params, false, scratch);
-    (value, gradient)
+    if let Some(zeros) = scratch.zeros {
+        return evaluate_tabled(data, params, zeros, scratch);
+    }
+    evaluate(data, params, scratch)
 }
 
 /// Value, gradient and Hessian of the marginal negative log-likelihood.
 ///
-/// Port of `ptmg_ll_der_hes_eigen` plus the R-level corrections. This is the
-/// function edgePython does not have, and the reason its standard errors drift
-/// from the R package: the observed information of the marginal likelihood is
-/// what the covariance of `beta` is read off.
+/// Port of `ptmg_ll_der_hes_eigen` plus the R-level corrections. The covariance
+/// of `beta` is read off this observed information; edgePython has no
+/// equivalent (A20).
 ///
-/// The Hessian is in the direct parametrisation `[beta, sigma, phi]`, matching
-/// the gradient. The R package's `ptmg_ll_der_hes2` and `ptmg_ll_der_hes3`
-/// additionally push it through `sigma -> exp(sigma)` for the `trust`
-/// optimiser; that chain rule belongs to whichever driver wants the log scale,
-/// not here.
+/// The Hessian is in the direct parametrisation `[beta, sigma, phi]`. The R
+/// package's `ptmg_ll_der_hes2` and `ptmg_ll_der_hes3` also apply
+/// `sigma -> exp(sigma)` for `trust`; that chain rule is the driver's job.
 ///
 /// ### Params
 ///
@@ -586,7 +603,27 @@ pub fn ptmg_value_gradient_hessian(
     data: &GeneData<'_>,
     params: &[f64],
 ) -> (f64, Vec<f64>, Vec<f64>) {
-    evaluate(data, params, true, &mut PtmgScratch::new(data))
+    evaluate_hessian(data, params, &mut PtmgScratch::new(data))
+}
+
+/// [`ptmg_value_gradient_hessian`] on buffers the caller keeps across
+/// evaluations of one gene.
+///
+/// ### Params
+///
+/// * `data` - The gene, as validated by [`GeneData::new`]
+/// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
+/// * `scratch` - Built by [`PtmgScratch::new`] from this same gene
+///
+/// ### Returns
+///
+/// As [`ptmg_value_gradient_hessian`].
+pub(crate) fn ptmg_value_gradient_hessian_with(
+    data: &GeneData<'_>,
+    params: &[f64],
+    scratch: &mut PtmgScratch<'_>,
+) -> (f64, Vec<f64>, Vec<f64>) {
+    evaluate_hessian(data, params, scratch)
 }
 
 /// Fills the exponentiated linear predictor and its subject sums, and
@@ -601,7 +638,7 @@ pub fn ptmg_value_gradient_hessian(
 /// ### Returns
 ///
 /// `sum_i y_i * eta_i`, the only part of the likelihood linear in `eta`.
-fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch) -> f64 {
+fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch<'_>) -> f64 {
     let nb = data.n_coef;
     let mut total = 0.0;
 
@@ -632,38 +669,199 @@ fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch
     total
 }
 
-/// Value, gradient and optionally Hessian, in one pass over the gene.
+/// Subject-level quantities every kernel derives from the subject sums of
+/// `exp(eta)`.
+struct Subjects {
+    /// `ln(mustar)`, `mustar = cumsumxtb + lambda`.
+    mustar_log: Vec<f64>,
+    /// `ystar / mustar`, `ystar = cumsumy + alpha`.
+    ymustar: Vec<f64>,
+    /// `ystar / mustar^2`.
+    ymumustar: Vec<f64>,
+    /// `1 / mustar`.
+    imustar: Vec<f64>,
+}
+
+impl Subjects {
+    /// Derives the subject scalars and folds their terms into the likelihood:
+    /// `-ystar ln(mustar)` per subject, then `k alpha ln(lambda)` and
+    /// `n gamma ln(gamma)`.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - The gene
+    /// * `terms` - The reparametrised variance components
+    /// * `cumsumxtb` - Sum of `exp(eta)` per subject
+    /// * `total` - The log-likelihood so far, updated
+    ///
+    /// ### Returns
+    ///
+    /// The scalars.
+    #[allow(clippy::needless_range_loop)]
+    fn new(data: &GeneData<'_>, terms: &Terms, cumsumxtb: &[f64], total: &mut f64) -> Self {
+        let k = data.n_subjects();
+        let mut out = Self {
+            mustar_log: vec![0.0; k],
+            ymustar: vec![0.0; k],
+            ymumustar: vec![0.0; k],
+            imustar: vec![0.0; k],
+        };
+        for s in 0..k {
+            let ystar = data.subject_totals[s] + terms.alpha;
+            let mu = cumsumxtb[s] + terms.lambda;
+            let log_mu = mu.ln();
+            out.mustar_log[s] = log_mu;
+            out.ymustar[s] = ystar / mu;
+            out.ymumustar[s] = ystar / mu / mu;
+            out.imustar[s] = 1.0 / mu;
+            *total -= ystar * log_mu;
+        }
+        *total += (k as f64) * terms.alpha * terms.log_lambda;
+        *total += (data.n_cells() as f64) * terms.gamma * terms.log_gamma;
+        out
+    }
+}
+
+/// The gradient in log-likelihood sign, and the intermediates the Hessian
+/// reuses.
+struct GradientParts {
+    /// Gradient of the log-likelihood, length `n_coef + 2`, before the gamma
+    /// corrections.
+    gradient: Vec<f64>,
+    /// `ymumustar * d42c` per subject.
+    ymm_d: Vec<f64>,
+    /// `d42c / mustar` per subject.
+    hbl0: Vec<f64>,
+    /// `sum hbl0`.
+    dbim: f64,
+    /// `sum ymm_d`.
+    sum_ymm_d: f64,
+}
+
+/// The gradient from the per-subject sums, as `ptmg_der_eigen` assembles it.
 ///
-/// The shared body of [`ptmg_value_and_gradient`] and
-/// [`ptmg_value_gradient_hessian`], mirroring how `ptmg_ll_der_eigen` and
-/// `ptmg_ll_der_hes_eigen` share theirs. Everything is accumulated in
-/// log-likelihood sign, exactly as the reference does, and negated once at the
-/// end; the gamma-function corrections are then subtracted from the negated
-/// quantities, which is the order `R/ptmg.R` uses.
+/// ### Params
+///
+/// * `data` - The gene
+/// * `terms` - The reparametrised variance components
+/// * `subjects` - The subject scalars
+/// * `xexb_f` - `sum x e` per subject, row-major `k * n_coef`
+/// * `dbeta_41` - `sum g x e` per subject, row-major `k * n_coef`
+/// * `d42c` - `sum g e - sum e` per subject
+/// * `slpey` - `sum log w` over every cell
+/// * `gstar_sum` - `sum g` over every cell
+///
+/// ### Returns
+///
+/// The gradient and its intermediates.
+#[allow(clippy::too_many_arguments)]
+fn gradient_parts(
+    data: &GeneData<'_>,
+    terms: &Terms,
+    subjects: &Subjects,
+    xexb_f: &[f64],
+    dbeta_41: &[f64],
+    d42c: &[f64],
+    slpey: f64,
+    gstar_sum: f64,
+) -> GradientParts {
+    let nb = data.n_coef;
+    let k = data.n_subjects();
+    let n_cells = data.n_cells() as f64;
+    let Subjects {
+        mustar_log,
+        ymustar,
+        ymumustar,
+        imustar,
+    } = subjects;
+
+    let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
+    let mut gradient = vec![0.0; nb + 2];
+    for j in 0..nb {
+        let mut acc = 0.0;
+        for s in 0..k {
+            acc += xexb_f[s * nb + j] * ymm_d[s] - dbeta_41[s * nb + j] * ymustar[s];
+        }
+        gradient[j] = acc;
+    }
+    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
+        let row = &data.design[c * nb..(c + 1) * nb];
+        for j in 0..nb {
+            gradient[j] += row[j] * y;
+        }
+    }
+
+    let ldm = terms.log_lambda * (k as f64) - mustar_log.iter().sum::<f64>();
+    let adlmy = terms.exps_s * (k as f64) - ymustar.iter().sum::<f64>();
+    let hbl0: Vec<f64> = (0..k).map(|s| d42c[s] * imustar[s]).collect();
+    let dbim: f64 = hbl0.iter().sum();
+    let sum_ymm_d: f64 = ymm_d.iter().sum();
+    gradient[nb] = -terms.alpha_pr * dbim
+        + terms.lambda_pr * sum_ymm_d
+        + terms.alpha_pr * ldm
+        + terms.lambda_pr * adlmy;
+    gradient[nb + 1] = terms.log_gamma * n_cells + n_cells - slpey - gstar_sum;
+
+    GradientParts {
+        gradient,
+        ymm_d,
+        hbl0,
+        dbim,
+        sum_ymm_d,
+    }
+}
+
+/// Negates the log-likelihood and its gradient and subtracts the gamma terms
+/// `R/ptmg.R` adds.
+///
+/// ### Params
+///
+/// * `data` - The gene
+/// * `terms` - The reparametrised variance components
+/// * `total` - The log-likelihood
+/// * `gradient` - Its gradient, from [`gradient_parts`]
+///
+/// ### Returns
+///
+/// The negative log-likelihood and its gradient.
+fn finish_gradient(
+    data: &GeneData<'_>,
+    terms: &Terms,
+    total: f64,
+    mut gradient: Vec<f64>,
+) -> (f64, Vec<f64>) {
+    let nb = data.n_coef;
+    for g in gradient.iter_mut() {
+        *g = -*g;
+    }
+    let extra = gamma_terms(data, terms.alpha, terms.gamma, GammaOrder::Gradient);
+    let value = -total - extra.subject_value - extra.cell_value;
+    gradient[nb] -= terms.alpha_pr * extra.subject_digamma;
+    gradient[nb + 1] -= extra.cell_digamma;
+    (value, gradient)
+}
+
+/// Value and gradient, in one pass over the gene.
+///
+/// Shared body of [`ptmg_value_and_gradient`] and [`ptmg_gradient`].
+/// Accumulates in log-likelihood sign and negates once at the end; the gamma
+/// corrections are then subtracted from the negated quantities, the order
+/// `R/ptmg.R` uses.
 ///
 /// ### Params
 ///
 /// * `data` - The gene, as validated by [`GeneData::new`]
 /// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
-/// * `with_hessian` - Whether to build the Hessian
 /// * `scratch` - Built by [`PtmgScratch::new`] from this same gene
 ///
 /// ### Returns
 ///
-/// The negative log-likelihood, its gradient of length `n_coef + 2`, and its
-/// row-major Hessian, which is empty when `with_hessian` is false.
-fn evaluate(
-    data: &GeneData<'_>,
-    params: &[f64],
-    with_hessian: bool,
-    scratch: &mut PtmgScratch,
-) -> (f64, Vec<f64>, Vec<f64>) {
+/// The negative log-likelihood and its gradient of length `n_coef + 2`.
+fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) -> (f64, Vec<f64>) {
     debug_assert_eq!(params.len(), data.n_params());
 
     let nb = data.n_coef;
-    let n_cells = data.n_cells();
     let k = data.n_subjects();
-    let n_params = nb + 2;
     let fid = data.fid;
     let beta = &params[..nb];
     let terms = Terms::new(params[nb], params[nb + 1]);
@@ -674,48 +872,20 @@ fn evaluate(
         y_cell,
         extb,
         cumsumxtb,
+        ..
     } = &*scratch;
 
-    let mut mustar = vec![0.0; k];
-    let mut mustar_log = vec![0.0; k];
-    let mut ymustar = vec![0.0; k];
-    let mut ymumustar = vec![0.0; k];
-    let mut imustar = vec![0.0; k];
-    for s in 0..k {
-        let csx = cumsumxtb[s];
-        let ystar = data.subject_totals[s] + terms.alpha;
-        let mu = csx + terms.lambda;
-        let log_mu = mu.ln();
-        mustar[s] = mu;
-        mustar_log[s] = log_mu;
-        ymustar[s] = ystar / mu;
-        ymumustar[s] = ystar / mu / mu;
-        imustar[s] = 1.0 / mu;
-        total -= ystar * log_mu;
-    }
-    total += (k as f64) * terms.alpha * terms.log_lambda;
-    total += (n_cells as f64) * gamma * terms.log_gamma;
+    let subjects = Subjects::new(data, &terms, cumsumxtb, &mut total);
+    let ymustar = &subjects.ymustar;
 
-    // One pass per cell for the value and the gradient. The Hessian's per-cell
-    // buffers are only kept when it is wanted. Every sum runs in the same order
-    // as the two passes this was, so the result is unchanged to the bit.
-    let per_cell = |len: usize| {
-        if with_hessian {
-            vec![0.0; len]
-        } else {
-            Vec::new()
-        }
-    };
-    let mut tempa = per_cell(n_cells);
-    let mut gstar = per_cell(n_cells);
-    let mut xexb = per_cell(n_cells * nb);
+    // One pass per cell. Sum order matches the reference.
     let mut xexb_f = vec![0.0; k * nb];
     let mut dbeta_41 = vec![0.0; k * nb];
     let mut d42c = vec![0.0; k];
     // One subject's cells, adding into its rows of `xexb_f` and `dbeta_41`.
-    // The running sums go in and come back by value so they stay in registers;
-    // returns them with the subject's `sum gstar * extb`.
-    let mut cells = |s: usize, sums: [f64; 3], xf: &mut [f64], d41: &mut [f64]| {
+    // Running sums pass by value to stay in registers; returns them with the
+    // subject's `sum gstar * extb`.
+    let cells = |s: usize, sums: [f64; 3], xf: &mut [f64], d41: &mut [f64]| {
         let [mut total, mut slpey, mut gstar_sum] = sums;
         let ym = ymustar[s];
         let mut acc = 0.0;
@@ -738,14 +908,6 @@ fn evaluate(
                 d41[j] += g * v;
             }
             acc += g * e;
-
-            if with_hessian {
-                tempa[i] = inv_w;
-                gstar[i] = g;
-                for j in 0..nb {
-                    xexb[i * nb + j] = row[j] * e;
-                }
-            }
         }
         ([total, slpey, gstar_sum], acc)
     };
@@ -766,56 +928,152 @@ fn evaluate(
     }
     let [total, slpey, gstar_sum] = sums;
 
-    let ymm_d: Vec<f64> = (0..k).map(|s| ymumustar[s] * d42c[s]).collect();
+    let parts = gradient_parts(
+        data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum,
+    );
+    finish_gradient(data, &terms, total, parts.gradient)
+}
 
-    let mut gradient = vec![0.0; n_params];
-    for j in 0..nb {
-        let mut acc = 0.0;
-        for s in 0..k {
-            acc += xexb_f[s * nb + j] * ymm_d[s] - dbeta_41[s * nb + j] * ymustar[s];
+/// Value, gradient and Hessian in one pass over the gene.
+///
+/// Every Hessian entry is a sum over subjects of per-subject sums over cells,
+/// so one pass per subject accumulates them all: the vectors `sum x e`,
+/// `sum g x e`, `sum x e (g/w - 1/w)` and `sum x e g e/w`, three scalars, and
+/// the three symmetric `x x' e` blocks weighted by `1`, `g` and `g e/w`. The
+/// formulas that follow are [`evaluate`]'s, applied to those sums.
+///
+/// ### Params
+///
+/// * `data` - The gene, as validated by [`GeneData::new`]
+/// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
+/// * `scratch` - Built by [`PtmgScratch::new`] from this same gene
+///
+/// ### Returns
+///
+/// The negative log-likelihood, its gradient of length `n_coef + 2`, and its
+/// row-major Hessian.
+fn evaluate_hessian(
+    data: &GeneData<'_>,
+    params: &[f64],
+    scratch: &mut PtmgScratch<'_>,
+) -> (f64, Vec<f64>, Vec<f64>) {
+    debug_assert_eq!(params.len(), data.n_params());
+
+    let nb = data.n_coef;
+    let nn = nb * nb;
+    let n_cells = data.n_cells();
+    let k = data.n_subjects();
+    let n_params = nb + 2;
+    let fid = data.fid;
+    let beta = &params[..nb];
+    let terms = Terms::new(params[nb], params[nb + 1]);
+    let gamma = terms.gamma;
+
+    let mut total = linear_predictor(data, beta, scratch);
+    let PtmgScratch {
+        y_cell,
+        extb,
+        cumsumxtb,
+        ..
+    } = &*scratch;
+
+    let subjects = Subjects::new(data, &terms, cumsumxtb, &mut total);
+    let Subjects {
+        mustar_log,
+        ymustar,
+        ymumustar,
+        imustar,
+    } = &subjects;
+
+    // Per-subject sums, row-major `k * nb` vectors and `k * nb * nb` blocks
+    // (upper triangle filled).
+    let mut xexb_f = vec![0.0; k * nb];
+    let mut dbeta_41 = vec![0.0; k * nb];
+    let mut tmp1_f = vec![0.0; k * nb];
+    let mut tmp2_f = vec![0.0; k * nb];
+    let mut block_plain = vec![0.0; k * nn];
+    let mut block_g = vec![0.0; k * nn];
+    let mut block_gte = vec![0.0; k * nn];
+    let mut hb2_f = vec![0.0; k];
+    let mut b2f = vec![0.0; k];
+    let mut d42c = vec![0.0; k];
+    let mut scalars = HessianScalars {
+        total,
+        slpey: 0.0,
+        gstar_sum: 0.0,
+        sum_tempa: 0.0,
+        sum_gt: 0.0,
+    };
+    for s in 0..k {
+        let v = s * nb..(s + 1) * nb;
+        let m = s * nn..(s + 1) * nn;
+        let block = SubjectBlock {
+            xf: &mut xexb_f[v.clone()],
+            d41: &mut dbeta_41[v.clone()],
+            t1: &mut tmp1_f[v.clone()],
+            t2: &mut tmp2_f[v],
+            plain: &mut block_plain[m.clone()],
+            g: &mut block_g[m.clone()],
+            gte: &mut block_gte[m],
+        };
+        macro_rules! width {
+            ($nb:literal) => {
+                hessian_subject::<$nb>(
+                    data,
+                    fid[s]..fid[s + 1],
+                    extb,
+                    y_cell,
+                    ymustar[s],
+                    gamma,
+                    block,
+                    &mut scalars,
+                )
+            };
         }
-        gradient[j] = acc;
+        let (acc, hb2, b2) = match nb {
+            1 => width!(1),
+            2 => width!(2),
+            3 => width!(3),
+            4 => width!(4),
+            5 => width!(5),
+            6 => width!(6),
+            7 => width!(7),
+            8 => width!(8),
+            _ => width!(0),
+        };
+        hb2_f[s] = hb2;
+        b2f[s] = b2;
+        d42c[s] = acc - cumsumxtb[s];
     }
-    for (&c, &y) in data.cells.iter().zip(data.counts.iter()) {
-        let row = &data.design[c * nb..(c + 1) * nb];
-        for j in 0..nb {
-            gradient[j] += row[j] * y;
-        }
-    }
+    let HessianScalars {
+        total,
+        slpey,
+        gstar_sum,
+        sum_tempa,
+        sum_gt,
+    } = scalars;
 
-    let ldm = terms.log_lambda * (k as f64) - mustar_log.iter().sum::<f64>();
-    let adlmy = terms.exps_s * (k as f64) - ymustar.iter().sum::<f64>();
-    let hbl0: Vec<f64> = (0..k).map(|s| d42c[s] * imustar[s]).collect();
-    let dbim: f64 = hbl0.iter().sum();
-    let sum_ymm_d: f64 = ymm_d.iter().sum();
-
-    gradient[nb] = -terms.alpha_pr * dbim
-        + terms.lambda_pr * sum_ymm_d
-        + terms.alpha_pr * ldm
-        + terms.lambda_pr * adlmy;
-    gradient[nb + 1] = terms.log_gamma * (n_cells as f64) + (n_cells as f64) - slpey - gstar_sum;
-
+    let GradientParts {
+        mut gradient,
+        ymm_d,
+        hbl0,
+        dbim,
+        sum_ymm_d,
+    } = gradient_parts(
+        data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum,
+    );
     let value = -total;
     for g in gradient.iter_mut() {
         *g = -*g;
     }
 
-    if !with_hessian {
-        let extra = gamma_terms(data, terms.alpha, gamma, GammaOrder::Gradient);
-        let value = value - extra.subject_value - extra.cell_value;
-        gradient[nb] -= terms.alpha_pr * extra.subject_digamma;
-        gradient[nb + 1] -= extra.cell_digamma;
-        return (value, gradient, Vec::new());
-    }
-
-    // -- Hessian, still in log-likelihood sign --
+    // Hessian, in log-likelihood sign, as in `evaluate`.
     let mut hessian = vec![0.0; n_params * n_params];
     let lam_ratio = terms.lambda_pr / terms.lambda;
     let mut hes_sigma = (terms.alpha_dpr * terms.log_lambda + 2.0 * terms.alpha_pr * lam_ratio
         - terms.alpha * lam_ratio * lam_ratio
         + terms.alpha / terms.lambda * terms.lambda_dpr)
         * (k as f64);
-
     let sum_hbl0_imu: f64 = (0..k).map(|s| hbl0[s] * imustar[s]).sum();
     let sum_ymmd_imu: f64 = (0..k).map(|s| ymm_d[s] * imustar[s]).sum();
     hes_sigma -= dbim * terms.alpha_dpr
@@ -842,40 +1100,11 @@ fn evaluate(
         hes_sigma_beta[j] = -terms.alpha_pr * d41_imu + terms.lambda_pr * d41_ymm
             - (-terms.alpha_pr * xf_hbl_imu + 2.0 * terms.lambda_pr * xf_hbl_ymm);
     }
-
-    // `alpha_pr / mustar - lambda_pr * ymustar / mustar`, the sensitivity of
-    // the collapsed subject weight to sigma. Appears squared in the sigma
-    // block.
     let apm: Vec<f64> = (0..k)
         .map(|s| terms.alpha_pr * imustar[s] - terms.lambda_pr * ymumustar[s])
         .collect();
 
-    let mut hes_gamma = (n_cells as f64) / gamma - 2.0 * tempa.iter().sum::<f64>();
-    let mut gt = vec![0.0; n_cells];
-    let mut gte = vec![0.0; n_cells];
-    for i in 0..n_cells {
-        gt[i] = gstar[i] * tempa[i];
-        gte[i] = gt[i] * extb[i];
-    }
-    hes_gamma += gt.iter().sum::<f64>();
-
-    let mut tmp1_f = vec![0.0; k * nb];
-    let mut tmp2_f = vec![0.0; k * nb];
-    let mut hb2_f = vec![0.0; k];
-    let mut b2f = vec![0.0; k];
-    for s in 0..k {
-        for i in fid[s]..fid[s + 1] {
-            let f1 = gt[i] - tempa[i];
-            let row = &xexb[i * nb..(i + 1) * nb];
-            for j in 0..nb {
-                tmp1_f[s * nb + j] += row[j] * f1;
-                tmp2_f[s * nb + j] += row[j] * gte[i];
-            }
-            hb2_f[s] += gte[i] - extb[i] * tempa[i];
-            b2f[s] += gte[i] * extb[i];
-        }
-    }
-
+    let hes_gamma = (n_cells as f64) / gamma - 2.0 * sum_tempa + sum_gt;
     let mut hes_gamma_beta = vec![0.0; nb];
     for j in 0..nb {
         let mut a = 0.0;
@@ -887,7 +1116,6 @@ fn evaluate(
         hes_gamma_beta[j] = a - b;
     }
     let hes_sigma_gamma: f64 = (0..k).map(|s| apm[s] * hb2_f[s]).sum();
-
     for j in 0..nb {
         let mut a = 0.0;
         let mut b = 0.0;
@@ -899,28 +1127,18 @@ fn evaluate(
     }
     hes_sigma += (0..k).map(|s| b2f[s] * apm[s] * apm[s]).sum::<f64>();
 
-    // -- beta block --
     let ymu2: Vec<f64> = ymustar.iter().map(|v| v * v).collect();
     let ymuymuimu: Vec<f64> = (0..k).map(|s| ymu2[s] * imustar[s]).collect();
     let b2f_scaled: Vec<f64> = (0..k).map(|s| b2f[s] * ymuymuimu[s] * imustar[s]).collect();
     let ymmd_imu: Vec<f64> = (0..k).map(|s| ymm_d[s] * imustar[s]).collect();
-
     for p in 0..nb {
         for q in p..nb {
             let mut acc = 0.0;
             for s in 0..k {
-                let mut s_gstar = 0.0;
-                let mut s_gte = 0.0;
-                let mut s_plain = 0.0;
-                for i in fid[s]..fid[s + 1] {
-                    let cell = xexb[i * nb + p] * data.design[i * nb + q];
-                    s_gstar += cell * gstar[i];
-                    s_gte += cell * gte[i];
-                    s_plain += cell;
-                }
-                acc -= s_gstar * ymustar[s];
-                acc += s_gte * ymu2[s];
-                acc += ymm_d[s] * s_plain;
+                let at = s * nn + p * nb + q;
+                acc -= block_g[at] * ymustar[s];
+                acc += block_gte[at] * ymu2[s];
+                acc += ymm_d[s] * block_plain[at];
             }
             for s in 0..k {
                 let xf_p = xexb_f[s * nb + p];
@@ -962,17 +1180,321 @@ fn evaluate(
     (value, gradient, hessian)
 }
 
+/// Running scalars of [`evaluate_hessian`]'s sweep over the cells.
+struct HessianScalars {
+    /// The log-likelihood so far.
+    total: f64,
+    /// `sum log w`.
+    slpey: f64,
+    /// `sum g`.
+    gstar_sum: f64,
+    /// `sum 1 / w`.
+    sum_tempa: f64,
+    /// `sum g / w`.
+    sum_gt: f64,
+}
+
+/// One subject's slices of [`evaluate_hessian`]'s per-subject sums.
+struct SubjectBlock<'a> {
+    /// `sum x e`, length `nb`.
+    xf: &'a mut [f64],
+    /// `sum g x e`, length `nb`.
+    d41: &'a mut [f64],
+    /// `sum x e (g / w - 1 / w)`, length `nb`.
+    t1: &'a mut [f64],
+    /// `sum x e g e / w`, length `nb`.
+    t2: &'a mut [f64],
+    /// `sum x x' e`, row-major `nb * nb`, upper triangle.
+    plain: &'a mut [f64],
+    /// `sum x x' e g`, upper triangle.
+    g: &'a mut [f64],
+    /// `sum x x' e g e / w`, upper triangle.
+    gte: &'a mut [f64],
+}
+
+/// Widest design whose per-subject Hessian sums live on the stack.
+const HESSIAN_LOCAL_COEF: usize = 8;
+
+/// One subject's sweep for [`evaluate_hessian`], at a compile-time design
+/// width (`NB == 0` reads it from `data`).
+///
+/// With the width a constant the loops over columns unroll and the sums sit in
+/// stack arrays the compiler keeps in registers; they are written to `block`
+/// once at the end.
+///
+/// ### Params
+///
+/// * `data` - The gene
+/// * `cells` - The subject's cells
+/// * `extb` - `exp(eta)` per cell
+/// * `y_cell` - Count per cell
+/// * `ym` - The subject's `ystar / mustar`
+/// * `gamma` - Cell-level gamma shape
+/// * `block` - The subject's sums, written
+/// * `scalars` - Running scalars, updated
+///
+/// ### Returns
+///
+/// `sum g e`, `sum (g e / w - e / w)` and `sum g e^2 / w` over the subject.
+#[allow(clippy::too_many_arguments)]
+fn hessian_subject<const NB: usize>(
+    data: &GeneData<'_>,
+    cells: std::ops::Range<usize>,
+    extb: &[f64],
+    y_cell: &[f64],
+    ym: f64,
+    gamma: f64,
+    block: SubjectBlock<'_>,
+    scalars: &mut HessianScalars,
+) -> (f64, f64, f64) {
+    let nb = if NB == 0 { data.n_coef } else { NB };
+    const V: usize = HESSIAN_LOCAL_COEF;
+    let mut vecs = [[0.0f64; V]; 4];
+    let mut blocks = [[0.0f64; V * V]; 3];
+    let local = NB != 0;
+    let SubjectBlock {
+        xf,
+        d41,
+        t1,
+        t2,
+        plain,
+        g: bg,
+        gte: bgte,
+    } = block;
+    let mut acc = 0.0;
+    let mut hb2 = 0.0;
+    let mut b2 = 0.0;
+    let HessianScalars {
+        total,
+        slpey,
+        gstar_sum,
+        sum_tempa,
+        sum_gt,
+    } = scalars;
+    {
+        let [lxf, ld41, lt1, lt2] = &mut vecs;
+        let [lbp, lbg, lbgte] = &mut blocks;
+        let SubjectBlock {
+            xf,
+            d41,
+            t1,
+            t2,
+            plain: bp,
+            g: bg,
+            gte: bgte,
+        } = if local {
+            SubjectBlock {
+                xf: &mut lxf[..nb],
+                d41: &mut ld41[..nb],
+                t1: &mut lt1[..nb],
+                t2: &mut lt2[..nb],
+                plain: &mut lbp[..nb * nb],
+                g: &mut lbg[..nb * nb],
+                gte: &mut lbgte[..nb * nb],
+            }
+        } else {
+            SubjectBlock {
+                xf: &mut *xf,
+                d41: &mut *d41,
+                t1: &mut *t1,
+                t2: &mut *t2,
+                plain: &mut *plain,
+                g: &mut *bg,
+                gte: &mut *bgte,
+            }
+        };
+        for i in cells {
+            let e = extb[i];
+            let y = y_cell[i];
+            let we = ym * e;
+            let w = we + gamma;
+            let log_w = w.ln();
+            let inv_w = 1.0 / w;
+            *total += we;
+            *total -= (gamma + y) * log_w;
+            *slpey += log_w;
+            let g = (gamma + y) * inv_w;
+            *gstar_sum += g;
+            let gt = g * inv_w;
+            let gte = gt * e;
+            *sum_tempa += inv_w;
+            *sum_gt += gt;
+            acc += g * e;
+            hb2 += gte - e * inv_w;
+            b2 += gte * e;
+            let f1 = gt - inv_w;
+
+            let row = &data.design[i * nb..(i + 1) * nb];
+            for a in 0..nb {
+                let xe = row[a] * e;
+                xf[a] += xe;
+                d41[a] += g * xe;
+                t1[a] += xe * f1;
+                t2[a] += xe * gte;
+                for b in a..nb {
+                    let c = xe * row[b];
+                    bp[a * nb + b] += c;
+                    bg[a * nb + b] += c * g;
+                    bgte[a * nb + b] += c * gte;
+                }
+            }
+        }
+    }
+    if local {
+        xf.copy_from_slice(&vecs[0][..nb]);
+        d41.copy_from_slice(&vecs[1][..nb]);
+        t1.copy_from_slice(&vecs[2][..nb]);
+        t2.copy_from_slice(&vecs[3][..nb]);
+        plain.copy_from_slice(&blocks[0][..nb * nb]);
+        bg.copy_from_slice(&blocks[1][..nb * nb]);
+        bgte.copy_from_slice(&blocks[2][..nb * nb]);
+    }
+    (acc, hb2, b2)
+}
+
+/// Value and gradient with the zero counts summed from the run's tables.
+///
+/// [`evaluate`] without the Hessian, split as the penalised fit splits it: the
+/// terms of every cell at a count of zero, then what the positive counts
+/// change. At a count of zero a cell's terms depend on `v = ym e / gamma`, so
+/// per group of [`ZeroCells`] they are `L` and `A` at
+/// `s = ln(ym) + x'beta - ln(gamma)`, and `sum ym e` is `ym exp(x'beta) sum O`
+/// exactly. Loose cells are summed one by one.
+///
+/// ### Params
+///
+/// * `data` - The gene, as validated by [`GeneData::new`]
+/// * `params` - `[beta (n_coef), sigma, phi]`, length [`GeneData::n_params`]
+/// * `zeros` - Tables built from this gene's design, offsets and subjects
+/// * `scratch` - Built by [`PtmgScratch::tabled`] from this same gene
+///
+/// ### Returns
+///
+/// The negative log-likelihood and its gradient, length `n_coef + 2`.
+#[allow(clippy::needless_range_loop)]
+fn evaluate_tabled(
+    data: &GeneData<'_>,
+    params: &[f64],
+    zeros: &ZeroCells,
+    scratch: &mut PtmgScratch<'_>,
+) -> (f64, Vec<f64>) {
+    let nb = data.n_coef;
+    let k = data.n_subjects();
+    let beta = &params[..nb];
+    let terms = Terms::new(params[nb], params[nb + 1]);
+    let gamma = terms.gamma;
+    let ln_gamma = terms.log_gamma;
+    let row_of = |r: usize| &data.design[r * nb..(r + 1) * nb];
+    let dot = |row: &[f64]| row.iter().zip(beta).fold(0.0, |acc, (&x, &b)| acc + x * b);
+
+    // Subject sums of `e` and `x e`, and the `exp` of every cell summed one by
+    // one later.
+    let mut total = 0.0;
+    let mut group_xb = vec![0.0; zeros.groups.len()];
+    let mut xexb_f = vec![0.0; k * nb];
+    for s in 0..k {
+        let xf = &mut xexb_f[s * nb..(s + 1) * nb];
+        let mut csx = 0.0;
+        for gi in zeros.subject_groups[s]..zeros.subject_groups[s + 1] {
+            let g = &zeros.groups[gi];
+            let row = row_of(g.row);
+            let xb = dot(row);
+            group_xb[gi] = xb;
+            let e = xb.exp() * g.sum_o;
+            csx += e;
+            for j in 0..nb {
+                xf[j] += row[j] * e;
+            }
+        }
+        for &r in &zeros.loose[zeros.subject_loose[s]..zeros.subject_loose[s + 1]] {
+            let row = row_of(r);
+            let e = (data.log_offset[r] + dot(row)).exp();
+            scratch.extb[r] = e;
+            csx += e;
+            for j in 0..nb {
+                xf[j] += row[j] * e;
+            }
+        }
+        for i in scratch.run[s]..scratch.run[s + 1] {
+            let c = data.cells[i];
+            let eta = data.log_offset[c] + dot(row_of(c));
+            total += eta * data.counts[i];
+            scratch.extb[c] = eta.exp();
+        }
+        scratch.cumsumxtb[s] = csx;
+    }
+
+    let subjects = Subjects::new(data, &terms, &scratch.cumsumxtb, &mut total);
+    let ymustar = &subjects.ymustar;
+
+    let mut slpey = 0.0;
+    let mut gstar_sum = 0.0;
+    let mut dbeta_41 = vec![0.0; k * nb];
+    let mut d42c = vec![0.0; k];
+    for s in 0..k {
+        let ym = ymustar[s];
+        let ln_ym = ym.ln();
+        let d41 = &mut dbeta_41[s * nb..(s + 1) * nb];
+        let mut acc = 0.0;
+        // `sum ym e` over every cell of the subject.
+        total += ym * scratch.cumsumxtb[s];
+        for gi in zeros.subject_groups[s]..zeros.subject_groups[s + 1] {
+            let g = &zeros.groups[gi];
+            let row = row_of(g.row);
+            let [l, a] = g.eval::<0, 2>(ln_ym + group_xb[gi] - ln_gamma);
+            let sum_log_w = g.n * ln_gamma + l;
+            total -= gamma * sum_log_w;
+            slpey += sum_log_w;
+            gstar_sum += g.n - a;
+            // `sum gamma e / w = (gamma / ym) A`.
+            let ge = gamma / ym * a;
+            acc += ge;
+            for j in 0..nb {
+                d41[j] += row[j] * ge;
+            }
+        }
+        let mut cell = |r: usize, y: f64, dense: bool| {
+            let e = scratch.extb[r];
+            let w = ym * e + gamma;
+            let log_w = w.ln();
+            let gw = if dense { gamma / w } else { y / w };
+            if dense {
+                total -= gamma * log_w;
+                slpey += log_w;
+            } else {
+                total -= y * log_w;
+            }
+            gstar_sum += gw;
+            let ge = gw * e;
+            acc += ge;
+            let row = row_of(r);
+            for j in 0..nb {
+                d41[j] += row[j] * ge;
+            }
+        };
+        for &r in &zeros.loose[zeros.subject_loose[s]..zeros.subject_loose[s + 1]] {
+            cell(r, 0.0, true);
+        }
+        for i in scratch.run[s]..scratch.run[s + 1] {
+            cell(data.cells[i], data.counts[i], false);
+        }
+        d42c[s] = acc - scratch.cumsumxtb[s];
+    }
+
+    let parts = gradient_parts(
+        data, &terms, &subjects, &xexb_f, &dbeta_41, &d42c, slpey, gstar_sum,
+    );
+    finish_gradient(data, &terms, total, parts.gradient)
+}
+
 /////////////
 // Helpers //
 /////////////
 
 /// Per-subject count totals for every gene.
 ///
-/// Port of `call_cumsumy`. The reference walks the sparse matrix cell by cell
-/// and dumps an accumulator at each subject boundary, because its counts are
-/// cell-major. Ours are gene-major, so each gene's non-zeros are contiguous and
-/// the subject is looked up per entry instead. Same result, one pass, and genes
-/// fan out over rayon.
+/// Port of `call_cumsumy`. Counts are gene-major here (the reference is
+/// cell-major), so the subject is looked up per non-zero entry.
 ///
 /// ### Params
 ///
@@ -1056,9 +1578,8 @@ pub struct GeneCounts {
 
 /// Extracts one gene's non-zero counts.
 ///
-/// Port of `call_posindy`. The counts of one and two are tallied separately
-/// because the gamma-function part of the likelihood has a closed form for them,
-/// which is where most of the entries in a single-cell matrix land.
+/// Port of `call_posindy`. Counts of one and two are tallied separately for the
+/// closed forms in the gamma terms.
 ///
 /// ### Params
 ///
@@ -1121,10 +1642,9 @@ pub fn positive_indices(
 
 /// Centres and scales a design matrix.
 ///
-/// Port of `center_m`. Each column is centred, then divided by its population
-/// standard deviation. A column with no spread is not scaled: if its first
-/// entry is non-zero it becomes a column of ones, which is how the intercept
-/// survives centring, and otherwise it is left at zero and flagged with a
+/// Port of `center_m`. Each column is centred and divided by its population
+/// standard deviation. A column with no spread is not scaled: it becomes ones if
+/// its first entry is non-zero (the intercept), otherwise it stays zero with a
 /// standard deviation of `-1` so the caller can drop it.
 ///
 /// ### Params
@@ -1204,9 +1724,9 @@ pub struct OffsetSummary {
 
 /// Prepares the offsets and measures their spread.
 ///
-/// Port of `cv_offset`. With no offset every cell gets one, which logs to zero
-/// and has no spread. The coefficient of variation is what decides later
-/// whether NEBULA-LN's approximation is safe for this dataset.
+/// Port of `cv_offset`. With no offset every cell gets one (log zero, no
+/// spread). The coefficient of variation decides whether NEBULA-LN's
+/// approximation is safe.
 ///
 /// ### Params
 ///
@@ -1262,10 +1782,8 @@ pub fn offset_summary(offset: Option<&[f64]>, n_cells: usize) -> Result<OffsetSu
 
 /// Squared coefficient of variation of the fitted cell-level means.
 ///
-/// Port of `get_cv`. Only the cell-level columns of the design contribute,
-/// since subject-level columns are constant within a subject and cannot make
-/// the means vary across cells within one. Note this is the squared CV, unlike
-/// [`offset_summary`]'s `cv`, which is the reference's own asymmetry.
+/// Port of `get_cv`. Only cell-level columns contribute. This is the squared CV,
+/// unlike [`offset_summary`]'s `cv` (the reference's own asymmetry).
 ///
 /// ### Params
 ///
@@ -1340,9 +1858,8 @@ pub fn design_cv(
 
 /// Flags the design columns that vary within a subject.
 ///
-/// Port of `get_cell`. A column constant across every subject's cells is a
-/// subject-level covariate and is absorbed by the random effect; only the
-/// varying ones are cell-level.
+/// Port of `get_cell`. A column constant within every subject is subject-level
+/// and absorbed by the random effect; the rest are cell-level.
 ///
 /// ### Params
 ///
@@ -1404,8 +1921,7 @@ pub fn cell_level_columns(
 // Tests //
 ///////////
 
-// The reference literals are R's `%.17e` output pasted verbatim. Trimming them
-// to the shortest round-tripping form would hide where they came from.
+// Reference literals are R's `%.17e` output, pasted verbatim.
 #[cfg(test)]
 #[allow(clippy::excessive_precision)]
 mod tests {
@@ -1539,28 +2055,22 @@ mod tests {
     // Reference values from nebula 1.5.8, via
     //   Rscript -e 'library(nebula); nebula:::ptmg_ll_der_hes_eigen(X, offset, Y,
     //     fid-1, cumsumy, posind-1, posindy, nb, nind, k, beta, sigma)'
-    // with the gamma-function corrections of R/ptmg.R applied, i.e. the same
-    // arithmetic as nebula:::ptmg_ll_der plus the Hessian lines of
-    // nebula:::ptmg_ll_der_hes2 without its log-scale chain rule. Cross-checked
-    // against nebula:::ptmg_ll and nebula:::ptmg_ll_der.
+    // with the gamma-function corrections of R/ptmg.R applied (the arithmetic of
+    // nebula:::ptmg_ll_der plus the Hessian lines of nebula:::ptmg_ll_der_hes2,
+    // without its log-scale chain rule).
     //
-    // One deliberate departure: the corrections here call base R's lgamma,
-    // digamma and trigamma, where R/ptmg.R calls Rfast's. Rfast::Digamma is
-    // about 5e-11 absolute off base R and Rfast::Trigamma about 1.4e-9, and
-    // `alpha_pr` multiplies those by up to 1e8 at the lower bound on sigma. Our
-    // gamma.rs tracks base R, so comparing against Rfast would be measuring
-    // Rfast's error. Against the package's own Rfast path these references move
-    // the gradient by at most 1e-8 relative.
+    // Deliberate departure: the corrections call base R's lgamma, digamma and
+    // trigamma, where R/ptmg.R calls Rfast's. Rfast::Digamma is ~5e-11 off base
+    // R and Rfast::Trigamma ~1.4e-9, and `alpha_pr` multiplies that by up to 1e8
+    // at the lower bound on sigma. gamma.rs tracks base R. Against the Rfast
+    // path these references move the gradient by at most 1e-8 relative.
     //
-    // Tolerances are 1e-10 on value and gradient and 1e-8 on the Hessian, except
-    // at `sigma = 1e-4`, its lower bound, where they drop to 1e-8 and 1e-6. That
-    // is not slack in the port: there `alpha_pr` is of order 1e8 and `alpha_pr^2`
-    // of order 1e16, and the sigma derivatives are differences of quantities that
-    // large collapsing to order 1e2 and 1e3. Six digits go in the cancellation,
-    // so the last few are set by summation order and by the last bit of
-    // `digamma`, not by the maths. What is actually achieved is 8e-13 on the
-    // value, 1.4e-14 on the gradient and 9e-13 on the Hessian away from that
-    // bound, and 4e-9 and 2e-7 at it.
+    // Tolerances: 1e-10 on value and gradient, 1e-8 on the Hessian; at the
+    // `sigma = 1e-4` lower bound 1e-8 and 1e-6. There `alpha_pr` is ~1e8 and
+    // `alpha_pr^2` ~1e16, and the sigma derivatives cancel down to ~1e2 and 1e3,
+    // so the last digits are set by summation order and the last bit of
+    // `digamma`. Achieved: 8e-13 (value), 1.4e-14 (gradient), 9e-13 (Hessian)
+    // away from the bound; 4e-9 and 2e-7 at it.
 
     #[test]
     fn test_matches_nebula_at_an_interior_point() {
@@ -2002,7 +2512,9 @@ mod tests {
         assert!(matches!(err, EdgeErrors::InvalidArgument(_)));
     }
 
-    // -- helpers --
+    // ------- //
+    // helpers //
+    // ------- //
 
     /// A three-gene, six-cell count matrix in gene-major CSR form.
     ///
@@ -2209,5 +2721,46 @@ mod tests {
             cell_level_columns(&design, 6, 1, &[0, 2, 5]).unwrap_err(),
             EdgeErrors::InvalidArgument(_)
         ));
+    }
+
+    #[test]
+    fn test_tables_match_the_dense_value_and_gradient() {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(5);
+        let fid = vec![0usize, 300, 700, 1000];
+        let mut design = Vec::new();
+        let mut log_offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cells = Vec::new();
+        let mut totals = vec![0.0; 3];
+        for c in 0..1000 {
+            let s = fid.iter().rposition(|&f| f <= c).expect("in range");
+            let kind = f64::from(rng.random_bool(0.3));
+            design.extend([1.0, (s % 2) as f64 - 0.5, kind]);
+            log_offset.push(rng.random_range(-2.0..2.5));
+            if rng.random_bool(0.12) {
+                let y = rng.random_range(1..8) as f64;
+                counts.push(y);
+                cells.push(c);
+                totals[s] += y;
+            }
+        }
+        let gene = GeneData::new(&design, &log_offset, &counts, &cells, &totals, &fid, 3)
+            .expect("valid gene");
+        let zeros = ZeroCells::build(&design, &log_offset, &fid, 3).expect("categorical");
+        for params in [
+            [-2.0, 0.3, 0.2, 0.5, 1.0],
+            [0.5, -0.4, 1.0, 0.05, 0.02],
+            [-4.0, 0.0, -1.0, 2.0, 30.0],
+        ] {
+            let (want_value, want_grad) = ptmg_value_and_gradient(&gene, &params);
+            let mut scratch = PtmgScratch::tabled(&gene, &zeros);
+            let (value, grad) = ptmg_value_and_gradient_with(&gene, &params, &mut scratch);
+            assert_relative_eq!(value, want_value, max_relative = 1e-13);
+            for (g, w) in grad.iter().zip(&want_grad) {
+                assert_relative_eq!(*g, *w, max_relative = 1e-10, epsilon = 1e-9);
+            }
+        }
     }
 }

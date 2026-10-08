@@ -7,10 +7,7 @@
 //! * [`trimmed_mean`] is R's `mean(x, trim = ...)`
 //! * [`moving_average_by_col`] is edgeR's `movingAverageByCol`
 //!
-//! Per the crate numeric policy in `lib.rs` this module is `f64` only. It sits
-//! under the likelihood machinery, not next to the count data, so there is no
-//! memory argument for a generic float and plenty of accuracy argument against
-//! one.
+//! `f64` only.
 
 use crate::prelude::*;
 
@@ -20,35 +17,22 @@ use crate::prelude::*;
 
 /// Benjamini-Hochberg adjusted p-values, exactly as R's `p.adjust`.
 ///
-/// The definition that matters is the monotone one. Sort the p-values in
-/// decreasing order, form `n / i * p` where `i` is the descending rank, take a
-/// running minimum down the sorted sequence, clamp at 1, and scatter back to
-/// the input order. The naive `p * n / rank` without the running minimum agrees
-/// on well-behaved input and disagrees the moment the raw ratios are
-/// non-monotone, which is most real gene lists.
+/// Sorts descending, forms `n / i * p` (`i` the descending rank), takes a
+/// running minimum, clamps at 1 and scatters back to the input order. The
+/// running minimum also makes tied p-values come out equal.
 ///
-/// Ties are handled by the running minimum itself: two equal p-values always
-/// come out equal, whichever order the sort happens to place them in.
-///
-/// Sequential on purpose. The cost is dominated by one sort of at most a few
-/// hundred thousand `f64`, which is single-digit milliseconds, and it runs once
-/// at the very end of an analysis that has already spent seconds to minutes in
-/// the GLM. The running minimum is a prefix scan, so parallelising it means a
-/// two-pass block scan; `par_sort_unstable` would shave a few milliseconds off
-/// a wall clock nobody is looking at. Not worth the extra code path.
+/// Sequential: one sort, run once at the end of an analysis.
 ///
 /// ### Params
 ///
-/// * `p` - Raw p-values, in whatever order the caller holds its genes. A NaN
-///   sorts above `+inf` under [`f64::total_cmp`] and is then skipped by
-///   [`f64::min`], so it comes back as 1.0 and leaves the rest untouched. R's
-///   `p.adjust` instead drops NA and adjusts against the reduced count, so
-///   filter before calling if that distinction matters.
+/// * `p` - Raw p-values. A NaN sorts above `+inf` under [`f64::total_cmp`] and
+///   is skipped by [`f64::min`], so it comes back as 1.0 and leaves the rest
+///   untouched. R's `p.adjust` drops NA and adjusts against the reduced count,
+///   so filter first if that matters.
 ///
 /// ### Returns
 ///
-/// Adjusted p-values in the same order as `p`, each in `[0, 1]`. An empty input
-/// gives an empty output; there is nothing to fail on.
+/// Adjusted p-values in the order of `p`, each in `[0, 1]`. Empty in, empty out.
 ///
 /// ### References
 ///
@@ -82,13 +66,11 @@ pub fn p_adjust_bh(p: &[f64]) -> Vec<f64> {
 
 /// Fractional ranks with ties averaged, as `scipy.stats.rankdata`.
 ///
-/// Ranks are 1-based. A run of tied values all receive the mean of the ranks
-/// that run spans, so three values tied at positions 4, 5, 6 all rank 5.0.
+/// Ranks are 1-based; tied values share the mean of the ranks they span.
 ///
-/// Sorting uses [`f64::total_cmp`], but tie detection uses `==`. That pairing
-/// is what reproduces `scipy`: `-0.0` and `+0.0` tie despite sorting apart, and
-/// two NaNs never tie despite comparing equal under `total_cmp`. NaN sorts last
-/// and so takes the top ranks.
+/// Sorting uses [`f64::total_cmp`], tie detection uses `==`. That pairing
+/// reproduces `scipy`: `-0.0` and `+0.0` tie, two NaNs never tie. NaN sorts
+/// last and takes the top ranks.
 ///
 /// ### Params
 ///
@@ -131,9 +113,8 @@ pub fn rank_average(x: &[f64]) -> Vec<f64> {
 ///
 /// ### Params
 ///
-/// * `x` - Values, in any order. Copied and sorted internally with
-///   [`f64::total_cmp`], so a NaN sorts to the top rather than propagating
-///   through the comparison.
+/// * `x` - Values, in any order. Copied and sorted with [`f64::total_cmp`], so
+///   a NaN sorts to the top.
 ///
 /// ### Returns
 ///
@@ -154,21 +135,17 @@ pub fn median(x: &[f64]) -> f64 {
 
 /// Sample quantile by R's type 7 rule, the default of `quantile()`.
 ///
-/// Type 7 places the `k`-th order statistic at probability `(k - 1) / (n - 1)`
-/// and interpolates linearly between neighbours. With `h = (n - 1) * prob`,
-/// `lo = floor(h)` and `frac = h - lo`, the result is
+/// With `h = (n - 1) * prob`, `lo = floor(h)` and `frac = h - lo`, the result is
 /// `(1 - frac) * x[lo] + frac * x[lo + 1]`.
 ///
-/// The exact arithmetic form matters. `(1 - frac) * a + frac * b` and
-/// `a + frac * (b - a)` differ in the last bits, and this function feeds the
-/// 90th percentile of the quasi-likelihood prior trend, where the result is
-/// then raised to the fourth power. R uses the first form, so this does too.
+/// The arithmetic form matters: `a + frac * (b - a)` differs in the last bits,
+/// and this feeds the 90th percentile of the quasi-likelihood prior trend, which
+/// is then raised to the fourth power. R uses the first form, so this does too.
 ///
 /// ### Params
 ///
-/// * `x` - Sample values, in any order. Copied and sorted internally with
-///   [`f64::total_cmp`], so a NaN sorts to the top and will be returned for
-///   probabilities near 1.
+/// * `x` - Sample values. Copied and sorted with [`f64::total_cmp`], so a NaN
+///   sorts to the top and is returned for probabilities near 1.
 /// * `prob` - Probability in `[0, 1]`.
 ///
 /// ### Returns
@@ -206,14 +183,12 @@ pub fn quantile_type7(x: &[f64], prob: f64) -> Result<f64, EdgeErrors> {
 
 /// Mean after dropping a fraction from each tail, as R's `mean(x, trim = ...)`.
 ///
-/// The trim count is `floor(trim * n)` values from each end of the sorted
-/// sample, which is why `trim = 0.15` on eight observations drops one from each
-/// side rather than 1.2. limma calls this with `trim = 0.15` when it summarises
-/// a genewise quantity into a single robust centre.
+/// Drops `floor(trim * n)` values from each end of the sorted sample, so
+/// `trim = 0.15` on eight observations drops one per side. limma calls this with
+/// `trim = 0.15`.
 ///
-/// Non-finite values are dropped before anything else, matching the reference
-/// port. If nothing finite survives, that is an error rather than a NaN: a NaN
-/// returned here would travel a long way before anyone noticed.
+/// Non-finite values are dropped first, matching the reference port. If nothing
+/// finite survives that is an error, not a NaN.
 ///
 /// ### Params
 ///
@@ -246,8 +221,7 @@ pub fn trimmed_mean(x: &[f64], trim: f64) -> Result<f64, EdgeErrors> {
 
     let n = finite.len();
     let k = (trim * n as f64).floor() as usize;
-    // `trim < 0.5` makes 2k < n for every n, but the guard is free and keeps
-    // the slice below provably non-empty.
+    // `trim < 0.5` already gives 2k < n; the guard keeps the slice non-empty.
     let kept = if 2 * k >= n {
         &finite[..]
     } else {
@@ -263,26 +237,16 @@ pub fn trimmed_mean(x: &[f64], trim: f64) -> Result<f64, EdgeErrors> {
 /// Column-wise moving average, edgeR's `movingAverageByCol`.
 ///
 /// Each column of a row-major `n_rows` by `n_cols` matrix is smoothed with a
-/// running mean of `width` consecutive rows. Computed from a per-column prefix
-/// sum, so the cost is one pass over the matrix regardless of `width`.
+/// running mean of `width` rows, from a per-column prefix sum (one pass,
+/// whatever the `width`). `full_length` sets the end handling and the result shape:
 ///
-/// The `full_length` flag decides what happens at the ends, and it changes the
-/// shape of the result:
+/// * `true` - zero-pad by `ceil(width / 2)` above and `floor(width / 2)` below,
+///   and divide by the number of real observations in each window. `n_rows` rows.
+/// * `false` - keep complete windows only: `n_rows - width + 1` rows, or one row
+///   of column means when `width == n_rows`.
 ///
-/// * `true` - the column is zero-padded by `ceil(width / 2)` above and
-///   `floor(width / 2)` below, and the divisor near each end is reduced to the
-///   number of real observations in the window. The result has `n_rows` rows.
-/// * `false` - only complete windows are kept, and the result has
-///   `n_rows - width + 1` rows. The exception is `width == n_rows`, which
-///   collapses to a single row of column means.
-///
-/// A `width` above `n_rows` is clamped to `n_rows`, as edgeR does (with a
-/// warning it is not worth reproducing). A `width` of 1 returns the input
-/// unchanged.
-///
-/// Sequential: this runs on binned data, tens to hundreds of rows, after the
-/// expensive per-gene work is already done. Parallelising over columns would
-/// mean strided writes from several threads for no measurable gain.
+/// A `width` above `n_rows` is clamped to `n_rows`, as edgeR does. A `width` of
+/// 1 returns the input unchanged. Sequential: it runs on binned data.
 ///
 /// ### Params
 ///
@@ -294,9 +258,9 @@ pub fn trimmed_mean(x: &[f64], trim: f64) -> Result<f64, EdgeErrors> {
 ///
 /// ### Returns
 ///
-/// The smoothed matrix, row-major with `n_cols` columns and a row count as
-/// described above. Errors are [`EdgeErrors::MustBePositive`] for a zero
-/// `width`, [`EdgeErrors::EmptyCounts`] for a zero dimension, and
+/// The smoothed matrix, row-major with `n_cols` columns. Errors are
+/// [`EdgeErrors::MustBePositive`] for a zero `width`,
+/// [`EdgeErrors::EmptyCounts`] for a zero dimension, and
 /// [`EdgeErrors::LengthMismatch`] when `x` disagrees with `n_rows * n_cols`.
 pub fn moving_average_by_col(
     x: &[f64],
@@ -406,7 +370,7 @@ mod tests {
     /// uv run --with scipy python -c "from scipy.stats import rankdata; print(list(rankdata([5.0,1.0,5.0,3.0,1.0,5.0,2.0], method='average')))"
     const RANK_MULTI_TIE: [f64; 7] = [6.0, 1.5, 6.0, 4.0, 1.5, 6.0, 3.0];
 
-    /// Ten values with a deliberately awkward spread, used for the quantiles.
+    /// Ten values with an uneven spread, used for the quantiles.
     const Q_SAMPLE: [f64; 10] = [5.2, 1.1, 9.8, 3.3, 7.7, 2.2, 8.4, 4.6, 6.1, 0.5];
 
     /// Rscript -e 'cat(format(quantile(c(5.2,1.1,9.8,3.3,7.7,2.2,8.4,4.6,6.1,0.5), 0.9, type=7), digits=17))'
@@ -451,7 +415,9 @@ mod tests {
     /// cat(as.vector(t(movingAverageByCol(x, width=8, full.length=FALSE))), sep=",")'
     const MA_W8_NOFULL: [f64; 2] = [3.0, 30.0];
 
-    // -- p_adjust_bh --
+    // ----------- //
+    // p_adjust_bh //
+    // ----------- //
 
     #[test]
     fn test_p_adjust_bh_cumulative_minimum_bites() {
@@ -496,7 +462,9 @@ mod tests {
         assert!(p_adjust_bh(&[]).is_empty());
     }
 
-    // -- rank_average --
+    // ------------ //
+    // rank_average //
+    // ------------ //
 
     #[test]
     fn test_rank_average_ties_take_mean_rank() {
@@ -536,7 +504,9 @@ mod tests {
         assert_eq!(rank_average(&[-0.0, 0.0]), vec![1.5, 1.5]);
     }
 
-    // -- quantile_type7 --
+    // -------------- //
+    // quantile_type7 //
+    // -------------- //
 
     #[test]
     fn test_quantile_type7_endpoints_are_min_and_max() {
@@ -556,8 +526,7 @@ mod tests {
 
     #[test]
     fn test_quantile_type7_ninetieth_percentile() {
-        // This is the one the quasi-likelihood prior leans on; an off-by-one in
-        // the interpolation index moves every QL result.
+        // The QL prior uses this one; an off-by-one in the index moves every QL result.
         let x: Vec<f64> = (1..=10).map(f64::from).collect();
         assert_relative_eq!(
             quantile_type7(&x, 0.9).unwrap(),
@@ -608,7 +577,9 @@ mod tests {
         ));
     }
 
-    // -- trimmed_mean --
+    // ------------ //
+    // trimmed_mean //
+    // ------------ //
 
     #[test]
     fn test_trimmed_mean_fractional_trim_count() {
@@ -679,7 +650,9 @@ mod tests {
         ));
     }
 
-    // -- moving_average_by_col --
+    // --------------------- //
+    // moving_average_by_col //
+    // --------------------- //
 
     #[test]
     fn test_moving_average_odd_width_full_length() {
@@ -745,10 +718,8 @@ mod tests {
 
     #[test]
     fn test_moving_average_sweep_against_edger() {
-        // Every width from 2 to one past 2 * n_rows, both end treatments, on a
-        // 7 by 2 matrix with negative and fractional entries. This is the test
-        // that pins the padding split and the tapered divisors; the single
-        // width cases above only pin the shapes.
+        // Every width from 2 to 9, both end treatments, on a 7 by 2 matrix.
+        // Pins the padding split and the tapered divisors.
         //
         // Rscript -e 'suppressMessages(library(edgeR));
         //   x <- matrix(c(3,-1,4,1,5,9,2, 0.5,2.5,1.5,3.5,0.25,7.25,6.75), nrow=7, ncol=2);

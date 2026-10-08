@@ -1,9 +1,8 @@
-//! Recycled matrices: the `compressedMatrix` of edgeR, done properly.
+//! Recycled matrices: edgeR's `compressedMatrix`.
 //!
-//! Offsets, weights, dispersions and prior counts are all logically
-//! `n_genes` by `n_samples`, and are almost never actually that big. A library
-//! size offset varies by sample only. A tagwise dispersion varies by gene only.
-//! A common dispersion is one number.
+//! Offsets, weights, dispersions and prior counts are logically `n_genes` by
+//! `n_samples` but vary along one axis at most: a library size offset by
+//! sample, a tagwise dispersion by gene, a common dispersion not at all.
 
 use crate::prelude::*;
 
@@ -11,8 +10,7 @@ use crate::prelude::*;
 // Recycled //
 //////////////
 
-/// A logically `n_genes` by `n_samples` matrix stored in whatever form it
-/// actually varies in.
+/// A logically `n_genes` by `n_samples` matrix stored in the form it varies in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recycled<T> {
     /// One value shared by every gene and every sample.
@@ -29,11 +27,8 @@ pub enum Recycled<T> {
 // RecycledRow //
 /////////////////
 
-/// One gene's row of a [`Recycled`], borrowed rather than materialised.
-///
-/// The whole point of the type: a `Scalar` or `ByGene` row is a single value,
-/// and pretending otherwise would allocate `n_samples` floats per gene per
-/// iteration.
+/// One gene's row of a [`Recycled`], borrowed. A `Scalar` or `ByGene` row is a
+/// single value, so no `n_samples` allocation per gene per iteration.
 #[derive(Clone, Copy, Debug)]
 pub enum RecycledRow<'a, T> {
     /// Every sample in this row carries the same value.
@@ -47,8 +42,7 @@ impl<T: Copy> RecycledRow<'_, T> {
     ///
     /// ### Params
     ///
-    /// * `sample` - Sample index. Only bounds-checked in the `Values` case; a
-    ///   `Constant` row is defined for every index.
+    /// * `sample` - Sample index. Bounds-checked for `Values` only.
     ///
     /// ### Returns
     ///
@@ -65,8 +59,7 @@ impl<T: Copy> RecycledRow<'_, T> {
     ///
     /// ### Params
     ///
-    /// * `n_samples` - Number of samples to yield. Ignored for `Values`, which
-    ///   yields its own length.
+    /// * `n_samples` - Number of samples to yield. Ignored for `Values`
     ///
     /// ### Returns
     ///
@@ -174,7 +167,7 @@ impl<T: Copy> Recycled<T> {
 
     /// Borrows one gene's row.
     ///
-    /// This is the accessor the inner loops use. It never allocates.
+    /// The inner-loop accessor; never allocates.
     ///
     /// ### Params
     ///
@@ -199,8 +192,7 @@ impl<T: Copy> Recycled<T> {
 
     /// Single element lookup.
     ///
-    /// Prefer [`Recycled::row`] in a loop over samples; this exists for the
-    /// scattered accesses that do not fit that shape.
+    /// Prefer [`Recycled::row`] in a loop over samples.
     ///
     /// ### Params
     ///
@@ -223,8 +215,7 @@ impl<T: Copy> Recycled<T> {
 
     /// Restricts this matrix to a subset of genes.
     ///
-    /// `Scalar` and `BySample` pass through unchanged, since neither varies by
-    /// gene.
+    /// `Scalar` and `BySample` pass through unchanged.
     ///
     /// ### Params
     ///
@@ -269,9 +260,8 @@ impl<T: Copy> Recycled<T> {
 
     /// Materialises the full row-major matrix.
     ///
-    /// Only for tests and for interop with code that genuinely needs a dense
-    /// buffer. Calling this on the single-cell path defeats the purpose of the
-    /// type.
+    /// For tests and interop needing a dense buffer; avoid on the single-cell
+    /// path.
     ///
     /// ### Params
     ///

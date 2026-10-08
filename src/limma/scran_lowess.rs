@@ -1,10 +1,9 @@
 //! libscran's `WeightedLowess`.
 //!
-//! The smoother behind scrapper's `fitVarianceTrend`. It descends from the
-//! same C code as limma's `weightedLowess` and shares its seed selection, so
-//! [`resolve_delta`] and [`find_seeds`] are reused from [`super::lowess`]. The
-//! rest differs in ways that move the fit, which is why this is a sibling
-//! function rather than a flag on [`super::lowess::weighted_lowess`]:
+//! The smoother behind scrapper's `fitVarianceTrend`. It shares seed selection
+//! with limma's `weightedLowess` (`resolve_delta`, `find_seeds` come from
+//! [`super::lowess`]) but differs enough in the fit to be a sibling function
+//! rather than a flag on [`super::lowess::weighted_lowess`]:
 //!
 //! - the span can be a point count instead of a proportion, and every window
 //!   can be forced to a minimum width in `x`
@@ -29,8 +28,8 @@ use crate::limma::lowess::{LowessFit, PARALLEL_WORK_THRESHOLD, fill, find_seeds,
 
 /// Lower bound on the robustness scale, as a fraction of the range of `y`.
 ///
-/// libscran's `threshold_multiplier`. Stops a residual scale of zero from
-/// dividing by zero when the fit is exact on most points.
+/// libscran's `threshold_multiplier`. Guards against a zero residual scale when
+/// the fit is exact on most points.
 const MIN_THRESHOLD_MULTIPLIER: f64 = 1e-8;
 
 ////////////////
@@ -39,15 +38,15 @@ const MIN_THRESHOLD_MULTIPLIER: f64 = 1e-8;
 
 /// Tuning knobs for [`scran_lowess`].
 ///
-/// The defaults are libscran's: `span = 0.3` as a proportion, no minimum
-/// width, three robustness passes and 200 seed points.
+/// Defaults are libscran's: `span = 0.3` as a proportion, no minimum width,
+/// three robustness passes, 200 seed points.
 #[derive(Clone, Copy, Debug)]
 pub struct ScranLowessParams {
     /// Window size around each seed. A proportion of the total prior weight in
     /// `(0, 1]` when `span_as_proportion`, otherwise the prior weight itself
     /// (a point count with unit weights), which must be positive.
     pub span: f64,
-    /// How `span` is read, see above.
+    /// Whether `span` is a proportion of the total prior weight.
     pub span_as_proportion: bool,
     /// Minimum width in `x` of every window. Zero disables it.
     pub minimum_width: f64,
@@ -78,8 +77,7 @@ impl ScranLowessParams {
     ///
     /// ### Returns
     ///
-    /// The parameter set. Nothing is validated here; [`scran_lowess`] checks
-    /// the values against the data it is given.
+    /// The parameter set. Validation happens in [`scran_lowess`].
     pub fn new(
         span: f64,
         span_as_proportion: bool,
@@ -130,11 +128,10 @@ struct Window {
 
 /// Grows the window around one seed point.
 ///
-/// Port of libscran's `find_limits`. Extends towards whichever neighbour is
-/// closer, both at once on a tie in distance, until `span_weight` is enclosed
-/// or one end of the data is hit; then tops up from the other side alone. The
-/// window is widened over runs of tied `x` at either edge and, if it is still
-/// narrower than `min_width`, out to `seed +- min_width / 2`.
+/// Port of libscran's `find_limits`. Extends towards the closer neighbour (both
+/// on a tie) until `span_weight` is enclosed or one end is hit, then tops up
+/// from the other side. Edges are widened over runs of tied `x`, and out to
+/// `seed +- min_width / 2` if still narrower than `min_width`.
 ///
 /// ### Params
 ///
@@ -225,9 +222,9 @@ fn scran_window(xs: &[f64], ws: &[f64], curpt: usize, span_weight: f64, min_widt
 /// Evaluates the tricube-weighted local line at one seed.
 ///
 /// Port of libscran's `fit_point`. A zero bandwidth gives the weighted mean of
-/// `y`, a zero weighted variance in `x` gives the intercept alone. If the
-/// robustness weights zero out the whole window, they are dropped and the fit
-/// is repeated with the prior weights only.
+/// `y`; a zero weighted variance in `x` gives the intercept alone. If the
+/// robustness weights zero the whole window, the fit is repeated with prior
+/// weights only.
 ///
 /// ### Params
 ///
@@ -371,8 +368,8 @@ fn robust_range(ys: &[f64], rw: &[f64]) -> f64 {
 
 /// Runs the fit-interpolate-reweight loop over sorted data.
 ///
-/// Port of libscran's `fit_trend`. Performs `iterations + 1` fits. The
-/// robustness weights returned are the ones the final fit used.
+/// Port of libscran's `fit_trend`. Performs `iterations + 1` fits and returns
+/// the robustness weights the final fit used.
 ///
 /// ### Params
 ///
@@ -489,12 +486,10 @@ fn scran_iterations(
 
 /// Locally weighted regression of `y` on `x`, libscran flavour.
 ///
-/// Port of libscran's `WeightedLowess::compute`, the smoother scrapper fits its
-/// mean-variance trend with. See the module documentation for how it differs
-/// from [`super::lowess::weighted_lowess`]. Inputs need not be sorted:
-/// `fitted[i]` and `robust_weights[i]` correspond to `x[i]` and `y[i]` in the
-/// caller's original order. Prior weights act as frequency weights, so they
-/// count towards the span as well as the local regressions.
+/// Port of libscran's `WeightedLowess::compute`. See the module header for the
+/// differences from [`super::lowess::weighted_lowess`]. Inputs need not be
+/// sorted; outputs follow the caller's order. Prior weights act as frequency
+/// weights, so they count towards the span as well as the local fits.
 ///
 /// ### Params
 ///
@@ -641,8 +636,7 @@ mod tests {
     const TOL: f64 = 1e-12;
 
     /// The 40-point fixture: `x = ((j * 37) %% 41) / 10`, unsorted and unique,
-    /// `y` a parabola plus deterministic jitter. The generator rebuilds it the
-    /// same way, so no float input crosses as text.
+    /// `y` a parabola plus deterministic jitter.
     fn fixture() -> (Vec<f64>, Vec<f64>) {
         (1..=40u64)
             .map(|j| {
@@ -664,8 +658,7 @@ mod tests {
             .unzip()
     }
 
-    /// 500 points, enough that the default 200 seeds leave most of them to the
-    /// interpolation.
+    /// 500 points, so the default 200 seeds leave most to interpolation.
     fn anchors_fixture() -> (Vec<f64>, Vec<f64>) {
         (1..=500u64)
             .map(|j| {

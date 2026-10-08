@@ -1,43 +1,35 @@
 //! limma's `lmFit`: one weighted least squares fit per gene.
 //!
-//! This is the linear-model half of voom. Genes are fitted independently, so the
-//! shape is a rayon fan-out over genes with a per-thread scratch buffer, the
-//! same pattern as [`crate::glm::levenberg`].
+//! The linear-model half of voom. Genes are fitted independently, as in
+//! [`crate::glm::levenberg`].
 //!
-//! ### One code path, not four
+//! ### One code path
 //!
 //! limma splits `lmFit` across `lm.series` and `gls.series`, each with a fast
-//! all-observed branch and a slow per-gene branch, four bodies in total. They
-//! are all the same computation. Write the working covariance as
-//! `V = D^-1/2 R D^-1/2`, with `D` the weights and `R` the compound-symmetry
-//! correlation induced by `block`; whitening by the Cholesky factor of `V` turns
-//! every case into ordinary least squares. Plain weights are `R = I`, where the
-//! factor is diagonal and whitening is a row scaling by `sqrt(w)`. So there is
-//! one body here, and the special cases are branches inside it rather than
-//! separate routines.
+//! all-observed branch and a slow per-gene branch. They are one computation.
+//! With working covariance `V = D^-1/2 R D^-1/2` (`D` the weights, `R` the
+//! compound-symmetry correlation from `block`), whitening by the Cholesky
+//! factor of `V` turns every case into ordinary least squares. Plain weights
+//! are `R = I`, where whitening is a row scaling by `sqrt(w)`.
 //!
-//! The factorisation is not repeated per gene either. `V = D^-1/2 R D^-1/2`
-//! factors as `L = D^-1/2 L_R`, since scaling a lower triangular matrix by a
-//! positive diagonal leaves it lower triangular with a positive diagonal, and
-//! Cholesky factors are unique. `L_R` therefore depends only on `block` and the
-//! correlation, so it is computed once for the full sample set and reused by
-//! every gene that keeps all its observations. Only genes with dropped
-//! observations refactorise, on their own submatrix.
+//! The factor is computed once, not per gene: `V` factors as `L = D^-1/2 L_R`
+//! (scaling a lower triangular matrix by a positive diagonal keeps it lower
+//! triangular, and Cholesky factors are unique), so `L_R` depends only on
+//! `block` and the correlation. Genes that keep all their observations reuse
+//! it; only genes with dropped observations refactorise, on their own
+//! submatrix.
 //!
 //! ### Missing observations
 //!
-//! A gene whose response is not finite at some samples, or whose weight there is
-//! zero, is refitted on what survives, with its own residual degrees of freedom
-//! and its own rank. That is the whole reason limma has a per-gene loop at all.
+//! A gene with non-finite responses or zero weights is refitted on what
+//! survives, with its own residual df and rank.
 //!
 //! ### Rank deficiency
 //!
 //! The per-gene solve is a Householder QR that accepts design columns left to
-//! right and rejects any whose residual norm has collapsed, which is what
-//! LINPACK's `dqrdc2` does for R's `lm.fit` and hence for limma. Rejected
-//! columns report `NaN` for their coefficient and their unscaled standard
-//! deviation, as R reports `NA`.
-//!
+//! right and rejects any whose residual norm has collapsed (LINPACK `dqrdc2`,
+//! as in R's `lm.fit`). Rejected columns report `NaN` for their coefficient and
+//! unscaled standard deviation, as R reports `NA`.
 //! ### References
 //!
 //! Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004
@@ -53,85 +45,75 @@ use crate::utils::linalg::{
 use crate::utils::recycled::{Recycled, RecycledRow};
 
 /// Relative tolerance for declaring a design column linearly dependent.
-///
-/// R's `lm.fit` factorises with LINPACK's `dqrdc2`, which cycles a column to the
-/// back when the norm of what is left of it, after projecting out the columns
-/// already accepted, falls below `1e-7` times its original norm. limma inherits
-/// that threshold through `lm.fit`, so matching it is what makes the rank
-/// reported here the rank R reports.
+/// R's `lm.fit` (LINPACK `dqrdc2`) cycles a column to the back when its
+/// remaining norm falls below `1e-7` times its original norm. limma inherits the
+/// threshold through `lm.fit`.
 const RANK_TOL: f64 = 1e-7;
 
 /// Weights at or below this drop the observation rather than scaling it.
 ///
 /// limma's `gls.series` sets `M[weights < 1e-15] <- NA`; `lm.series` sets
-/// `weights[weights <= 0] <- NA` and then drops the same observations. One
-/// threshold covers both, and the only inputs the two rules disagree on are
-/// weights inside `(0, 1e-15]`, which carry no information either way.
+/// `weights[weights <= 0] <- NA`. One threshold covers both: they differ only on
+/// weights in `(0, 1e-15]`, which carry no information.
 const MIN_WEIGHT: f64 = 1e-15;
 
-//////////////////
-// LmFitResult  //
-//////////////////
+/////////////////
+// LmFitResult //
+/////////////////
 
 /// Everything `lmFit` produces, per gene.
 #[derive(Clone, Debug)]
 pub struct LmFitResult {
     /// Coefficients, row-major `n_genes * n_coef`.
     ///
-    /// `NaN` for a coefficient that is not estimable, either because the design
-    /// column is aliased or because the gene lost too many observations. R
-    /// reports `NA` in the same places.
+    /// `NaN` for a coefficient that is not estimable (aliased design column, or
+    /// the gene lost too many observations), where R reports `NA`.
     pub coefficients: Vec<f64>,
     /// Unscaled standard deviations, row-major `n_genes * n_coef`.
     ///
-    /// The square root of the diagonal of `(X' V^-1 X)^-1`, not of the full
-    /// coefficient covariance: the residual scale is carried separately in
-    /// [`LmFitResult::sigma`] so that `eBayes` can moderate it.
+    /// The square root of the diagonal of `(X' V^-1 X)^-1`. The residual scale
+    /// is kept in [`LmFitResult::sigma`] so `eBayes` can moderate it.
     pub stdev_unscaled: Vec<f64>,
     /// Residual standard deviation per gene.
     ///
     /// `sqrt(rss / df_residual)` with `rss` the whitened residual sum of
-    /// squares, and zero where `df_residual` is zero. limma reports `NA` in that
-    /// last case; zero is the one deliberate departure in this module, and it
-    /// costs nothing downstream because `squeezeVar` drops zero-df genes before
-    /// it looks at their variances.
+    /// squares. Zero where `df_residual` is zero, where limma reports `NA`;
+    /// this is the one deliberate departure here, harmless because `squeezeVar`
+    /// drops zero-df genes.
     pub sigma: Vec<f64>,
     /// Residual degrees of freedom per gene.
     ///
-    /// Observations kept minus the rank achieved on them, so a gene with a
-    /// dropped sample reports one fewer than its neighbours.
+    /// Observations kept minus the rank achieved on them.
     pub df_residual: Vec<f64>,
     /// Fitted values, row-major `n_genes * n_samples`.
     ///
     /// `X * beta` on the original scale, aliased coefficients contributing
-    /// nothing, evaluated at every sample including the dropped ones. A gene
-    /// with no usable observation at all is `NaN` throughout.
+    /// nothing, at every sample including dropped ones. `NaN` throughout for a
+    /// gene with no usable observation.
     pub fitted: Vec<f64>,
     /// Unscaled covariance of the estimable coefficients, row-major
     /// `rank * rank`.
     ///
-    /// `(X' V^-1 X)^-1` for the design as a whole, in the order the accepted
-    /// columns appear in [`LmFitResult::pivot`]. One matrix for every gene, not
-    /// one per gene: see the note on [`lm_fit`] about what limma does under
+    /// `(X' V^-1 X)^-1` for the design as a whole, in the order of
+    /// [`LmFitResult::pivot`]. One matrix for all genes; see [`lm_fit`].
     /// probe weights.
     pub cov_coefficients: Vec<f64>,
     /// Design column indices, accepted ones first, then the rejected ones.
     ///
     /// Length `n_coef`, zero-based. `pivot[..rank]` names the estimable columns
-    /// in the order [`LmFitResult::cov_coefficients`] uses. R's `qr()$pivot`,
-    /// less the one-based offset.
+    /// in the order [`LmFitResult::cov_coefficients`] uses (R's `qr()$pivot`).
     pub pivot: Vec<usize>,
     /// Rank of the design, shared by every fully observed gene.
     ///
     /// A gene that lost observations can have a lower rank of its own; that
-    /// shows up as extra `NaN` coefficients and a smaller
-    /// [`LmFitResult::df_residual`], not here.
+    /// shows as extra `NaN` coefficients and a smaller
+    /// [`LmFitResult::df_residual`].
     pub rank: usize,
 }
 
-////////////////////////
-// Block correlation  //
-////////////////////////
+///////////////////////
+// Block correlation //
+///////////////////////
 
 /// The compound-symmetry correlation shared by every gene.
 struct BlockCorrelation<'a> {
@@ -177,14 +159,13 @@ fn fill_correlation(
 // Scratch //
 /////////////
 
-/// Per-thread buffers, allocated once per rayon worker rather than per gene.
+/// Per-thread buffers, allocated once per rayon worker.
 struct Scratch {
     /// Sample indices this gene actually contributes, in increasing order.
     obs: Vec<usize>,
     /// Whitened design, column-major: column `j` starts at `j * n_samples`.
     ///
-    /// Column major because the Householder sweep reads one column at a time
-    /// and writes every column to its right.
+    /// Column-major: the Householder sweep reads one column at a time.
     a: Vec<f64>,
     /// Whitened response, overwritten by the Householder-transformed one. The
     /// tail below the rank is the residual, exactly R's `effects`.
@@ -245,11 +226,9 @@ impl Scratch {
 /// Householder QR that accepts design columns left to right and rejects any
 /// whose residual norm has collapsed.
 ///
-/// This is what LINPACK's `dqrdc2` does for R's `lm.fit`, and hence for limma:
-/// a rejected column is set aside rather than cycled to the end, so the
-/// accepted columns keep their original order and `est` is an increasing
-/// subset. Both the per-gene fit and the shared design factorisation go through
-/// here, so the rank they report cannot drift apart.
+/// This is LINPACK's `dqrdc2` as used by R's `lm.fit`: a rejected column is set
+/// aside, not cycled to the end, so `est` is an increasing subset. The per-gene
+/// fit and the shared design factorisation both use it, so their ranks agree.
 ///
 /// ### Params
 ///
@@ -265,9 +244,9 @@ impl Scratch {
 /// * `m` - Number of observations in play
 /// * `stride` - Column stride of `a` and `hh`
 /// * `n_coef` - Number of design columns
-/// * `pivot` - Whether to apply the rank test. A design known to be full rank
-///   on all its samples stays full rank after whitening, so a fully observed
-///   gene can skip it.
+/// * `pivot` - Whether to apply the rank test. A design full rank on all
+///   samples stays full rank after whitening, so a fully observed gene can skip
+///   it.
 ///
 /// ### Returns
 ///
@@ -345,9 +324,9 @@ fn rank_revealing_qr(
     rank
 }
 
-///////////////////
-// Per-gene fit  //
-///////////////////
+//////////////////
+// Per-gene fit //
+//////////////////
 
 /// Outputs of one gene's fit, borrowed from the result buffers.
 struct GeneOut<'a> {
@@ -365,9 +344,8 @@ struct GeneOut<'a> {
 
 /// Fits one gene by whitening, then a rank-revealing Householder QR.
 ///
-/// The whitening turns generalised least squares against `V = D^-1/2 R D^-1/2`
-/// into ordinary least squares, so everything after it is the same code whether
-/// the caller asked for weights, a block correlation, both, or neither.
+/// Whitening turns GLS against `V = D^-1/2 R D^-1/2` into OLS, so the rest is
+/// the same for weights, block correlation, both or neither.
 ///
 /// ### Params
 ///
@@ -407,7 +385,9 @@ fn fit_gene(
         chol,
     } = scratch;
 
-    // -- which observations survive --
+    // -------------------------- //
+    // which observations survive //
+    // -------------------------- //
     obs.clear();
     for (sample, &value) in y_row.iter().enumerate() {
         let usable = value.is_finite()
@@ -433,7 +413,9 @@ fn fit_gene(
         return;
     }
 
-    // -- whiten: scale rows by sqrt(w), then apply the inverse Cholesky factor --
+    // --------------------------------------------------------------------- //
+    // whiten: scale rows by sqrt(w), then apply the inverse Cholesky factor //
+    // --------------------------------------------------------------------- //
     for (i, &sample) in obs.iter().enumerate() {
         let scale = match weights {
             Some(w) => w.get(sample).sqrt(),
@@ -448,8 +430,7 @@ fn fit_gene(
 
     if let Some(g) = gls {
         // A principal submatrix of a positive definite matrix is positive
-        // definite, so the refactorisation a gene with dropped observations
-        // needs cannot fail once the full matrix has been accepted at entry.
+        // definite, so refactorising cannot fail once the full matrix passed.
         let factor: &[f64] = if m < n_samples {
             fill_correlation(chol, n_samples, obs, g.block, g.correlation);
             let factored = cholesky_lower(chol, m, n_samples);
@@ -469,9 +450,8 @@ fn fit_gene(
         forward_substitute(factor, n_samples, m, &mut z[..m]);
     }
 
-    // A full rank design stays full rank after whitening, because whitening is
-    // an invertible linear map on the sample space. Only a gene that lost
-    // observations can lose rank, so only it needs the reference norms.
+    // Whitening is invertible, so a full rank design stays full rank. Only a
+    // gene that lost observations can lose rank and needs the reference norms.
     let pivot = !design_full_rank || m < n_samples;
     if pivot {
         for j in 0..n_coef {
@@ -480,7 +460,9 @@ fn fit_gene(
         }
     }
 
-    // -- rank-revealing Householder QR, columns accepted left to right --
+    // ------------------------------------------------------------- //
+    // rank-revealing Householder QR, columns accepted left to right //
+    // ------------------------------------------------------------- //
     let rank = rank_revealing_qr(
         a,
         Some(z.as_mut_slice()),
@@ -495,7 +477,9 @@ fn fit_gene(
         pivot,
     );
 
-    // -- residual scale --
+    // -------------- //
+    // residual scale //
+    // -------------- //
     let df = m - rank;
     let rss: f64 = z[rank..m].iter().map(|v| v * v).sum();
     *out.df = df as f64;
@@ -505,7 +489,9 @@ fn fit_gene(
         0.0
     };
 
-    // -- coefficients: back substitution against the leading rank block of R --
+    // ------------------------------------------------------------------- //
+    // coefficients: back substitution against the leading rank block of R //
+    // ------------------------------------------------------------------- //
     for i in (0..rank).rev() {
         let mut sum = z[i];
         for t in (i + 1)..rank {
@@ -519,11 +505,12 @@ fn fit_gene(
         out.coef[j] = beta[t];
     }
 
-    // -- unscaled standard deviations: row norms of R^-1 --
+    // ----------------------------------------------- //
+    // unscaled standard deviations: row norms of R^-1 //
+    // ----------------------------------------------- //
     //
-    // diag((R'R)^-1) = diag(R^-1 R^-T), and R^-1 is upper triangular, so entry
-    // i is the sum of squares of row i of R^-1. Forming the inverse of a tiny
-    // triangular matrix is cheaper than a solve per coefficient.
+    // diag((R'R)^-1) = diag(R^-1 R^-T), so entry i is the sum of squares of row
+    // i of R^-1. Inverting a tiny triangular matrix beats a solve per coefficient.
     invert_upper_triangular(r, r_inv, rank, n_coef);
 
     out.stdev.fill(f64::NAN);
@@ -532,7 +519,9 @@ fn fit_gene(
         out.stdev[j] = row.sqrt();
     }
 
-    // -- fitted values on the original scale, at every sample --
+    // ---------------------------------------------------- //
+    // fitted values on the original scale, at every sample //
+    // ---------------------------------------------------- //
     for (sample, slot) in out.fitted.iter_mut().enumerate() {
         let row = &design[sample * n_coef..(sample + 1) * n_coef];
         let mut acc = 0.0;
@@ -543,25 +532,21 @@ fn fit_gene(
     }
 }
 
-////////////////////////////
-// Shared design factor   //
-////////////////////////////
+//////////////////////////
+// Shared design factor //
+//////////////////////////
 
 /// Factors the design once for the whole fit, giving the unscaled covariance.
 ///
 /// **This deliberately ignores per-gene weights.** limma computes
-/// `cov.coefficients` from `qr(design)` on the shared design even when it is
-/// about to fit every gene separately under probe weights
-/// (`R/lmfit.R:180-182`, and `R/lmfit.R:359` for the blocked form, where only
-/// the correlation whitening is applied). It is an approximation, limma knows
-/// it is one, and `contrasts.fit` consumes it regardless: the comment at
-/// `R/contrasts.R:5-6` says so. Reproducing it is the whole point, because the
-/// contrast standard errors downstream have to match.
+/// `cov.coefficients` from `qr(design)` on the shared design even when every
+/// gene is fitted under probe weights (`R/lmfit.R:180-182`, and `R/lmfit.R:359`
+/// for the blocked form, where only the correlation whitening is applied).
+/// `contrasts.fit` consumes it regardless (`R/contrasts.R:5-6`), so reproducing
+/// it keeps the contrast standard errors matching.
 ///
-/// A weight row shared by every gene is a different matter. limma folds those
-/// in, since `lm.wfit` on the shared design is then exact for all genes
-/// (`R/lmfit.R:147`, `R/lmfit.R:316-318`), and it only takes that path when no
-/// response is missing either.
+/// A weight row shared by every gene is folded in, as limma does when no
+/// response is missing either (`R/lmfit.R:147`, `R/lmfit.R:316-318`).
 ///
 /// ### Params
 ///
@@ -571,7 +556,7 @@ fn fit_gene(
 /// * `shared_weights` - One weight per sample when every gene shares the same
 ///   row and no response is missing, otherwise `None`
 /// * `gls` - Optional block correlation, whose Cholesky factor whitens the
-///   design exactly as it whitens each gene
+///   design
 ///
 /// ### Returns
 ///
@@ -638,28 +623,25 @@ fn design_factorisation(
     (cov, pivot, rank)
 }
 
-/////////////
-// lm_fit  //
-/////////////
+////////////
+// lm_fit //
+////////////
 
 /// Fits a linear model to every gene by weighted or generalised least squares.
 ///
-/// Port of limma's `lmFit`, covering the `lm.series` and `gls.series` paths it
-/// dispatches to. Each gene is fitted on its own finite, positively weighted
-/// observations, so genes with missing values get their own residual degrees of
-/// freedom rather than being dropped or imputed.
+/// Port of limma's `lmFit`, covering the `lm.series` and `gls.series` paths.
+/// Each gene is fitted on its own finite, positively weighted observations, so
+/// genes with missing values get their own residual df.
 ///
-/// Supplying `block` and `correlation` gives the mixed-model form: samples
-/// sharing a block label are assumed to have the stated correlation, and the fit
-/// is generalised least squares against that compound-symmetry covariance.
-/// `correlation` on its own, without `block`, is ignored, which is what `lmFit`
-/// does.
+/// `block` plus `correlation` gives the mixed-model form: samples sharing a
+/// label have the stated correlation, and the fit is GLS against that
+/// compound-symmetry covariance. `correlation` without `block` is ignored, as in
+/// `lmFit`.
 ///
 /// ### Params
 ///
-/// * `y` - Response, row-major `n_genes * n_samples`. Log-CPM for voom, so `f64`
-///   throughout rather than generic: there are no counts here to hold in `f32`.
-///   Non-finite entries are treated as missing.
+/// * `y` - Response, row-major `n_genes * n_samples`. `f64` throughout (log-CPM
+///   for voom). Non-finite entries are treated as missing.
 /// * `n_genes` - Number of genes
 /// * `n_samples` - Number of samples
 /// * `design` - Design matrix, row-major `n_samples * n_coef`
@@ -676,11 +658,8 @@ fn design_factorisation(
 /// factorisation `eBayes` and `contrasts.fit` need. [`EdgeErrors`] if the
 /// shapes disagree, the correlation is out of range, or the implied correlation
 /// matrix is not positive definite.
-///
-/// [`LmFitResult::cov_coefficients`] comes from the design as a whole rather
-/// than from each gene's own weighted fit. That is limma's choice, not a
-/// shortcut taken here, and `design_factorisation` in this module documents
-/// why.
+/// [`LmFitResult::cov_coefficients`] comes from the design as a whole, not each
+/// gene's weighted fit. That is limma's choice; see `design_factorisation`.
 ///
 /// ### References
 ///
@@ -720,7 +699,9 @@ pub fn lm_fit(
         w.validate(n_genes, n_samples)?;
     }
 
-    // -- block correlation set-up, done once for all genes --
+    // ------------------------------------------------- //
+    // block correlation set-up, done once for all genes //
+    // ------------------------------------------------- //
     let gls = match block {
         None => None,
         Some(b) => {
@@ -743,8 +724,7 @@ pub fn lm_fit(
                 )));
             }
             if rho == 0.0 {
-                // Uncorrelated blocks give the identity, whose Cholesky factor
-                // is the identity, so skip the whitening entirely.
+                // Uncorrelated blocks give the identity; skip whitening.
                 None
             } else {
                 let obs: Vec<usize> = (0..n_samples).collect();
@@ -765,16 +745,13 @@ pub fn lm_fit(
         }
     };
 
-    // Columns no gene can estimate. Whitening is an invertible map on the
-    // sample space, so a design that is full rank here is full rank for every
-    // gene that keeps all its observations, and those genes skip the rank test.
+    // Columns no gene can estimate. A design full rank here is full rank for
+    // every gene that keeps all its observations, which skip the rank test.
     let design_full_rank = non_estimable(design, n_samples, n_coef)?.is_none();
 
-    // limma folds weights into the shared factorisation only when one row
-    // serves every gene and no response is missing, which is exactly when
-    // `lm.wfit` on the shared design is exact for all of them
-    // (`R/lmfit.R:142`). Probe weights, or any missing value, and it falls back
-    // to the bare design.
+    // limma folds weights into the shared factorisation only when one row serves
+    // every gene and no response is missing, where `lm.wfit` on the shared design
+    // is exact (`R/lmfit.R:142`). Otherwise it uses the bare design.
     let shared_weights: Option<Vec<f64>> = if y.par_iter().all(|v| v.is_finite()) {
         match weights {
             Some(Recycled::Scalar(w)) => Some(vec![*w; n_samples]),
@@ -848,11 +825,9 @@ pub fn lm_fit(
 
 #[cfg(test)]
 mod tests {
-    // Every reference below is pasted verbatim from R's 17-digit output. The
-    // last digit or two is past what an f64 can hold, and one of them is
-    // 1/sqrt(2), which clippy would rather were written as a constant. Keeping
-    // them exactly as printed is what makes them checkable against the
-    // `Rscript` line quoted above them.
+    // References are pasted verbatim from R's 17-digit output, including digits
+    // past f64 precision and a 1/sqrt(2) clippy would like as a constant, so they
+    // stay checkable against the quoted `Rscript` lines.
     #![allow(clippy::excessive_precision, clippy::approx_constant)]
 
     use super::*;
@@ -866,8 +841,7 @@ mod tests {
 
     /// Response fixture, `y[i] = ((i * 7) mod 23) / 64`, row-major 8 by 5.
     ///
-    /// Every value is a dyadic rational, so R and Rust see bit-identical inputs
-    /// and only the outputs need embedding.
+    /// Dyadic rationals, so R and Rust see bit-identical inputs.
     fn fixture_y() -> Vec<f64> {
         (0..N_GENES * N_SAMPLES)
             .map(|i| ((i * 7) % 23) as f64 / 64.0)
@@ -915,10 +889,12 @@ mod tests {
         }
     }
 
-    // -- reference values --------------------------------------------------
-    //
-    // Every literal below comes from limma 3.66 under R 4.5. The fixtures are
-    // built in R by the same closed forms as `fixture_y` and `fixture_weights`:
+    //////////////////////
+    // Reference values //
+    //////////////////////
+
+    // Literals come from limma 3.66 under R 4.5. Fixtures are built in R by the
+    // same closed forms as `fixture_y` and `fixture_weights`:
     //
     //   library(limma)
     //   Y <- matrix(((0:39)*7) %% 23 / 64, 8, 5, byrow=TRUE)
@@ -934,9 +910,8 @@ mod tests {
     //   cat(sprintf("%.17g", f$df.residual), sep=", ")
     //   cat(sprintf("%.17g", as.vector(t(f$coefficients %*% t(X)))), sep=", ")
     //
-    // Where limma reports `sigma = NA` because `df.residual` is zero, the
-    // literal below is `0.0` instead: this crate reports zero there, which is
-    // the one deliberate departure from limma in this module.
+    // Where limma reports `sigma = NA` (zero df.residual), the literal is `0.0`:
+    // this crate's one deliberate departure.
 
     /// `lmFit(Y, X2)`.
     const A_COEF: [f64; 16] = [
@@ -1411,7 +1386,9 @@ mod tests {
         0.081201785694141729,
     ];
 
-    // -- fits --------------------------------------------------------------
+    //////////
+    // Fits //
+    //////////
 
     #[test]
     fn test_unweighted_matches_limma() {
@@ -1461,8 +1438,8 @@ mod tests {
         assert_eq!(fit.rank, 2);
         assert_eq!(fit.pivot, vec![0, 1]);
         assert_close(&fit.cov_coefficients, &A_COV);
-        // The unscaled standard deviations are the square roots of its
-        // diagonal whenever no gene lost an observation.
+        // Unscaled sds are the square roots of its diagonal when no gene lost an
+        // observation.
         for gene in 0..N_GENES {
             assert_relative_eq!(
                 fit.stdev_unscaled[gene * 2],
@@ -1492,9 +1469,8 @@ mod tests {
 
     #[test]
     fn test_cov_coefficients_ignore_per_gene_weights() {
-        // limma takes `cov.coefficients` from the bare design once probe
-        // weights are in play, so this must match the unweighted answer rather
-        // than anything derived from the weights.
+        // limma takes `cov.coefficients` from the bare design once probe weights
+        // are in play, so this must match the unweighted answer.
         let w = Recycled::full(fixture_weights(), N_GENES, N_SAMPLES).unwrap();
         let fit = lm_fit(
             &fixture_y(),
@@ -1614,8 +1590,8 @@ mod tests {
 
     #[test]
     fn test_zero_weight_drops_the_observation() {
-        // limma sets the response to NA wherever the weight vanishes, so a zero
-        // weight must reproduce the missing-value fit exactly.
+        // limma sets the response to NA where the weight vanishes, so this must
+        // reproduce the missing-value fit.
         let mut weights = fixture_weights();
         weights[3 * N_SAMPLES + 2] = 0.0;
         for s in 0..N_SAMPLES {
@@ -1764,8 +1740,8 @@ mod tests {
 
     #[test]
     fn test_rank_deficient_design_aliases_the_last_column() {
-        // R's `lm.fit` accepts columns left to right, so the third column is the
-        // one dropped: `lmFit` prints "Coefficients not estimable: 3".
+        // R's `lm.fit` accepts columns left to right, so the third is dropped
+        // (`lmFit` prints "Coefficients not estimable: 3").
         let fit = lm_fit(
             &fixture_y(),
             N_GENES,
@@ -1787,9 +1763,8 @@ mod tests {
         }
         assert_close(&fit.sigma, &A_SIGMA);
         assert_close(&fit.df_residual, &[3.0; 8]);
-        // limma's `fitted()` would propagate the NA coefficient across the whole
-        // row; here the aliased column contributes nothing, which recovers the
-        // projection the estimable columns actually give.
+        // limma's `fitted()` would propagate the NA coefficient across the row;
+        // here the aliased column contributes nothing.
         assert_close(&fit.fitted, &A_FITTED);
     }
 
@@ -1806,8 +1781,8 @@ mod tests {
 
     #[test]
     fn test_saturated_design_gives_zero_sigma() {
-        // Five coefficients on five samples: nothing left over, so limma would
-        // report NA and this crate reports zero.
+        // Five coefficients on five samples: limma would report NA, this crate
+        // reports zero.
         let mut design = vec![0.0; N_SAMPLES * N_SAMPLES];
         for s in 0..N_SAMPLES {
             design[s * N_SAMPLES + s] = 1.0;
@@ -1820,7 +1795,9 @@ mod tests {
         assert_close(&fit.fitted, &y);
     }
 
-    // -- error branches ----------------------------------------------------
+    ////////////////////
+    // Error branches //
+    ////////////////////
 
     #[test]
     fn test_rejects_empty_input() {

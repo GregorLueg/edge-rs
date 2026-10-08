@@ -2,84 +2,80 @@
 //!
 //! Stage two, the search over the two variance components, is where NEBULA
 //! spends its time: every objective evaluation is a full penalised fit over
-//! every cell, and a gene takes on the order of a hundred of them. This module
-//! runs that search for every gene at once.
+//! every cell, and a gene takes about forty of them. This module runs that
+//! search for every gene at once.
 //!
 //! ### Split
 //!
 //! * **Stage one** (L-BFGS-B on the marginal likelihood) stays on the CPU. It
 //!   has an exact gradient.
-//! * **Stage two** runs as one `StageTwoSearch` per gene, the same state
-//!   machine the CPU path drives. Each round, every live search asks for its
-//!   next points and all of them go out as one device launch of
-//!   [`ResidentBatch::submit`]. The device finds each penalised fit's optimum;
-//!   the host then finishes that fit in `f64` from the device's point and
-//!   assembles the profile objective. Nelder-Mead, the polish least squares and
-//!   the objective never leave the host.
+//! * **Stage two** runs as one `StageTwoSearch` per gene, the state machine the
+//!   CPU path drives. Each round, every live search asks for its next points
+//!   and all of them go out as one [`ResidentBatch::submit`] launch. The device
+//!   finds each penalised fit's optimum; the host finishes that fit in `f64`
+//!   from the device's point and assembles the profile objective. BOBYQA,
+//!   Nelder-Mead, the polish least squares and the objective never leave the
+//!   host.
 //! * **Stage three**, the final fit whose information gives the standard
 //!   errors, stays on the CPU in `f64`.
 //!
 //! ### Why the host finishes every fit
 //!
 //! The search compares profile likelihoods finely: the objective moves about
-//! `6e-6` for a `1e-3` relative move in the subject-level variance. The device's
-//! own value cannot resolve that, and not for want of better summation. With
-//! the sum made exact, the `f32` rounding of one `exp` and one `ln` per cell
-//! still leaves the value off by `1.5e-3` to `2.7e-3` at 20000 cells and
-//! jittering by `2e-5` to `2e-4` between nearby variance components, so the
-//! device resolves the variance to a few tenths of a per cent at best, worse
-//! with more cells. Searching on the device's values, measured on the R
-//! fixtures, drove half the genes' subject-level variance onto its lower bound.
-//! So the host finishes each fit: a full Newton step in `f64` from the device's
-//! optimum (`newton_finish` in [`crate::sc::pml`]), and the value that comes
-//! back is the CPU path's.
+//! `6e-6` for a `1e-3` relative move in the subject-level variance. The
+//! device's value cannot resolve that, even with exact summation: the `f32`
+//! rounding of one `exp` and one `ln` per cell leaves it off by `1.5e-3` to
+//! `2.7e-3` at 20000 cells and jittering by `2e-5` to `2e-4` between nearby
+//! variance components. Searching on it drove half the genes' subject-level
+//! variance onto its lower bound on the R fixtures. So the host takes a full
+//! Newton step in `f64` from the device's optimum (`newton_finish` in
+//! [`crate::sc::pml`]), and the value that comes back is the CPU path's.
 //!
 //! The log-determinant is where this path parts from the CPU's. nebula reads it
 //! off the penultimate iterate, which on the CPU is an `f64` iterate a hair from
-//! the last. Here the penultimate iterate is the device's `f32` point, so the
-//! finish takes it at the stepped point instead, for one more division per
-//! cell. Measured on the R fixtures that moved the worst `sigma^2` disagreement
-//! with nebula on `sc_small` from `3.4e-2` relative to `1.7e-3`, and the median
-//! disagreement with the CPU path on the bench shapes from `2.4e-6` to `4e-7`.
+//! the last; here it would be the device's `f32` point. The finish takes it at
+//! the stepped point instead, for one more division per cell. On the R fixtures
+//! that moved the worst `sigma^2` disagreement with nebula on `sc_small` from
+//! `3.4e-2` relative to `1.7e-3`, and the median disagreement with the CPU path
+//! on the bench shapes from `2.4e-6` to `4e-7`.
 //!
 //! ### Where a fit starts
 //!
 //! nebula starts every inner fit cold, from the gene's mean count and zero
 //! random effects. Here only a gene's first fit does; every later one starts
 //! from the point that first fit converged to. The optimum does not depend on
-//! the start, and the search stays close enough to its own starting variance
-//! that the device's Newton count fell from five or six to two or three.
+//! the start, and the device's Newton count fell from five or six to two or
+//! three.
 //!
-//! The anchor is fixed on purpose. Starting each fit from the *previous* one's
-//! optimum saves a little more per fit and was slower overall: the device's
-//! `f32` location error then depends on the search's history instead of being a
-//! smooth function of the variance components, that reaches the objective at
-//! the simplex's `1e-7` tolerance, and the searches took 24 to 39 per cent more
-//! evaluations. With a fixed anchor they took as many as from cold, 73247
-//! against 73423 on one shape.
+//! The anchor is fixed on purpose. Starting from the *previous* fit's optimum
+//! saves a little more per fit but was slower overall: the device's `f32`
+//! location error then depends on the search's history, not smoothly on the
+//! variance components, and reaches the objective at the simplex's `1e-7`
+//! tolerance. The searches took 24 to 39 per cent more evaluations. With a
+//! fixed anchor they took as many as from cold, 73247 against 73423 on one
+//! shape.
 //!
 //! ### Cost, measured
 //!
 //! Forced HL, 500 genes, 20 subjects, against a 10-thread CPU on an M1 Max.
 //! Seconds; "device" is the time in the device solves, staging and read-back
-//! included.
+//! included. Measured 2026-10-08, after stage two moved to BOBYQA (about forty
+//! fits per gene), stage one to Newton steps and the device sweeps to
+//! compile-time widths.
 //!
 //! | cells | coefficients | density | CPU | GPU | stage one | device | host finish |
 //! |---|---|---|---|---|---|---|---|
-//! | 20000 | 3 | 46% | 29.4 | 7.0 | 2.4 | 1.1 | 3.1 |
-//! | 20000 | 3 | 9% | 30.7 | 4.8 | 1.0 | 1.3 | 2.2 |
-//! | 20000 | 3 | 10%, subjects 100:1 | 29.7 | 5.0 | 1.1 | 1.6 | 2.2 |
-//! | 20000 | 8 | 10% | 48.4 | 14.2 | 1.5 | 9.1 | 3.1 |
-//! | 50000 | 6 | 6%, subjects 30:1 | 117.9 | 23.6 | 3.9 | 12.4 | 6.5 |
-//! | 100000 | 3 | 5% | 171.5 | 22.9 | 6.3 | 5.2 | 10.1 |
+//! | 20000 | 3 | 46% | 5.4 | 2.8 | 0.8 | 0.7 | 1.2 |
+//! | 20000 | 3 | 9% | 3.7 | 1.6 | 0.5 | 0.4 | 0.7 |
+//! | 20000 | 3 | 10%, subjects 100:1 | 3.8 | 1.6 | 0.5 | 0.3 | 0.7 |
+//! | 20000 | 8 | 10% | 8.1 | 2.9 | 1.0 | 0.7 | 0.9 |
+//! | 50000 | 6 | 6%, subjects 30:1 | 16.2 | 5.0 | 2.0 | 0.7 | 1.8 |
+//! | 100000 | 3 | 5% | 18.9 | 6.6 | 2.7 | 0.6 | 2.8 |
 //!
-//! At 4000 genes on the first shape: CPU 231 s, GPU 50.6 s, of which stage one
-//! 19.3 s and the host finish 24.6 s.
-//!
-//! At three coefficients the host is the ceiling: the `f64` finish and stage
-//! one are CPU work, and the device mostly waits for them. At six and eight the
-//! device is, because a launch costs one fit's serial walk over the cells
-//! however many fits ride along, and a wider design makes that walk longer.
+//! The host is the ceiling on every shape: stage one and the `f64` finish are
+//! CPU work, and the cohorts already hide the device behind the finish. A
+//! design with zero-count tables never reaches this module (see
+//! [`nebula_sparse_gpu`]).
 //!
 //! Under NEBULA-LN none of this applies unless stage one sends genes to stage
 //! two. On these shapes it sends none, or one gene in 500, and the GPU path is
@@ -87,18 +83,17 @@
 //!
 //! ### Why lockstep rounds
 //!
-//! Nelder-Mead is sequential within a gene, so the round count is set by the
-//! slowest gene, and on the R fixtures that is about three times the median.
-//! The rounds thin out as searches finish, since only live searches send
-//! requests, so the total device work is the total number of evaluations, not
-//! the slowest gene's count times the gene count. A polish stencil goes out as
-//! all of its points in one round.
+//! The search is sequential within a gene, so the round count is set by the
+//! slowest gene, about three times the median on the R fixtures. Only live
+//! searches send requests, so rounds thin out and the total device work is the
+//! total number of evaluations. A one-component search's polish stencil goes
+//! out as all its points in one round.
 //!
-//! The rounds are not strictly lockstep. The device sits idle while the host
-//! finishes a round in `f64` and the host while the device fits, so where it
-//! pays the searches run as two cohorts that leapfrog: one on the device while
-//! the other is being finished. Where it pays is decided at run time; see
-//! `PROBE_ROUNDS`. The cohorts never change what a search is told, only when.
+//! The rounds are not strictly lockstep. The device idles while the host
+//! finishes a round in `f64`, and the host while the device fits, so where it
+//! pays (decided at run time, see `PROBE_ROUNDS`) the searches run as two
+//! cohorts that leapfrog. The cohorts change when a search is told its values,
+//! never what they are.
 
 use std::time::{Duration, Instant};
 
@@ -114,7 +109,7 @@ use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
 use crate::sc::nebula::{
     GeneOutcome, GenePlan, InnerFit, NebulaFit, NebulaParams, Shared, StageTwoSearch, finish_gene,
-    gene_pml, nebula_sparse_with, plan_gene, variance_bounds, variance_objective,
+    fit_genes, gene_pml, nebula_sparse_with, plan_gene, variance_bounds, variance_objective,
 };
 use crate::sc::pml::{DeviceCurvature, PmlParams, PmlVariance, newton_finish, opt_pml_from};
 use crate::sc::ptmg::{GeneCounts, positive_indices};
@@ -128,9 +123,9 @@ const TIMING_ENV: &str = "EDGE_RS_GPU_TIMING";
 
 /// Launches kept in flight at once, each carrying its own share of the searches.
 ///
-/// Two is what it takes for the device to run one cohort while the host
-/// finishes the other in `f64`. The two costs are of the same order on every
-/// shape measured, so a third cohort would only queue behind the second.
+/// Two lets the device run one cohort while the host finishes the other in
+/// `f64`. The two costs are of the same order on every shape measured, so a
+/// third cohort would only queue behind the second.
 const COHORTS: usize = 2;
 
 /// Rounds, after the first, run as one cohort to decide whether to split.
@@ -138,10 +133,10 @@ const PROBE_ROUNDS: usize = 8;
 
 /// Running searches below which the cohorts merge into one.
 ///
-/// A launch of a few dozen fits costs the device its fixed latency, about 19 ms
-/// at 20000 cells, whatever it carries, and the host finishes it in a
-/// millisecond or two. There is nothing left to overlap then, and two cohorts
-/// would make every straggler wait out the other cohort's launch as well.
+/// A launch of a few dozen fits costs the device its fixed latency (about 19 ms
+/// at 20000 cells) and the host finishes it in a millisecond or two. Nothing is
+/// left to overlap, and two cohorts would make every straggler also wait out the
+/// other cohort's launch.
 const MERGE_BELOW: usize = 64;
 
 /// Bins of the Newton-step histograms; the last one collects everything above.
@@ -238,11 +233,15 @@ impl Timing {
 /// Fits NEBULA's negative binomial gamma mixed model with stage two on the
 /// device.
 ///
-/// Takes and returns exactly what [`crate::sc::nebula::nebula_sparse`] does.
-/// The answers are not bit-identical to the CPU path: the penalised fits in
-/// stage two run in `f32`, so the variance components land within a measured
-/// tolerance of the CPU's rather than on them, and the coefficients and
-/// standard errors follow. See `tests/e2e_nebula_gpu.rs` for the numbers.
+/// Same inputs and outputs as [`crate::sc::nebula::nebula_sparse`]. Results are
+/// not bit-identical to the CPU path: stage two's penalised fits run in `f32`,
+/// so the variance components, and with them the coefficients and standard
+/// errors, land within a measured tolerance. See `tests/e2e_nebula_gpu.rs`.
+///
+/// A design whose zero counts the CPU tabulates (cells sharing design rows
+/// within subjects, `crate::sc::zeros`) runs the CPU path instead, which
+/// is faster there: its results are the CPU's bit for bit, and it accepts
+/// designs wider than the device's eight columns.
 ///
 /// ### Params
 ///
@@ -258,9 +257,8 @@ impl Timing {
 /// ### Returns
 ///
 /// The per-gene fits, or [`EdgeErrors`] as for the CPU path, plus
-/// [`EdgeErrors::InvalidArgument`] if `params.reml` is set, which the device
-/// fit does not implement, and [`EdgeErrors::Gpu`] if the device rejects the
-/// work.
+/// [`EdgeErrors::InvalidArgument`] if `params.reml` is set (not implemented on
+/// the device), and [`EdgeErrors::Gpu`] if the device rejects the work.
 ///
 /// ### References
 ///
@@ -286,7 +284,16 @@ pub fn nebula_sparse_gpu<T: EdgeFloat, R: Runtime>(
         n_coef,
         offset,
         params,
-        |shared, sparse, totals, kept| fit_all(shared, sparse, totals, kept, client),
+        |shared, sparse, totals, kept| {
+            // With zero-count tables the CPU path sums a gene's zero counts per
+            // group, and the device, which sweeps every cell, loses to it: 0.72
+            // against 1.58 s on 500 genes of 20000 cells at 9.5% density.
+            if shared.zeros.is_some() {
+                fit_genes(shared, sparse, totals, kept)
+            } else {
+                fit_all(shared, sparse, totals, kept, client)
+            }
+        },
     )
 }
 
@@ -364,8 +371,8 @@ struct Live<'a> {
     /// Distinct positive counts other than one and two, with multiplicities.
     tail: Vec<(f64, f64)>,
     /// The device's fitted `(beta, log_w)` for the search's first finite
-    /// evaluation, which every later fit starts from. See the module doc for
-    /// why it is never updated.
+    /// evaluation, which every later fit starts from. Never updated; see the
+    /// module doc.
     warm: Option<(Vec<f64>, Vec<f64>)>,
 }
 
@@ -392,9 +399,9 @@ fn search_all<R: Runtime>(
     kept: &[usize],
     client: &ComputeClient<R>,
     mut timing: Option<&mut Timing>,
-) -> Result<(Vec<Option<Option<Vec<f64>>>>, Option<SolveTiming>), EdgeErrors> {
+) -> Result<(Vec<Option<Option<(Vec<f64>, bool)>>>, Option<SolveTiming>), EdgeErrors> {
     let k = shared.n_subjects;
-    let mut refits: Vec<Option<Option<Vec<f64>>>> = vec![None; genes.len()];
+    let mut refits: Vec<Option<Option<(Vec<f64>, bool)>>> = vec![None; genes.len()];
 
     let mut live: Vec<Live<'_>> = Vec::new();
     for (index, (counts, plan)) in genes.iter().enumerate() {
@@ -448,13 +455,13 @@ fn search_all<R: Runtime>(
         max_iter: inner.max_iter as u32,
         max_backtrack: inner.max_backtrack as u32,
         full: true,
-        // The host recomputes both in `f64`; see `finish_at_argmax`.
+        // The host recomputes the information and log-determinant in `f64`.
         information: false,
     };
 
-    // Two cohorts leapfrog: while the host finishes one cohort's fits in `f64`,
-    // the device is already running the other's. Whether that pays is read off
-    // the first rounds, which run as one cohort; see `PROBE_ROUNDS`.
+    // Two cohorts leapfrog: the device runs one while the host finishes the
+    // other. Whether that pays is read off the first rounds, which run as one
+    // cohort; see `PROBE_ROUNDS`.
     let mut split = false;
     let mut probed = 0usize;
     let mut probe_blocked = Duration::ZERO;
@@ -509,8 +516,7 @@ fn search_all<R: Runtime>(
                 })
                 .collect();
             let finished = Instant::now();
-            // The first round is left out: it starts cold and is not what the
-            // rest look like.
+            // The first round is left out: it starts cold.
             if probed <= PROBE_ROUNDS {
                 if probed > 0 {
                     probe_blocked += solved - started;
@@ -546,8 +552,8 @@ fn search_all<R: Runtime>(
                 }
             }
         }
-        // Tried even when nothing of this cohort's came back: once the cohorts
-        // merge, the searches the other one hands over have nowhere else to go.
+        // Tried even when nothing of this cohort's came back: after a merge the
+        // other cohort's searches have nowhere else to go.
         flights[cohort] = launch_cohort(
             shared,
             genes,
@@ -685,15 +691,13 @@ fn launch_cohort<'a, R: Runtime>(
 /// The four scalars the objective reads: the CPU's fit, started from the
 /// device's optimum.
 ///
-/// The device finds the optimum; its own `f32` value is not used. The profile
-/// likelihood is compared across evaluations to well below what `f32` over every
-/// cell can resolve, and the error is not only noise but biased: it grows as the
-/// subject-level variance falls, which on the R fixtures pulled half the genes'
-/// searches onto the lower bound. Evaluating the `f64` value at the device's
-/// point fixed the value, but the log-determinant is not stationary at the
-/// optimum and still carried the device's location error at first order. So
-/// the `f64` fit is finished from the device's point instead: a Newton step
-/// from there, with the log-determinant taken at the stepped point.
+/// The device's own `f32` value is not used: it is biased as well as noisy,
+/// growing as the subject-level variance falls, which pulled half the genes'
+/// searches onto the lower bound on the R fixtures. Evaluating the `f64` value
+/// at the device's point fixes the value, but the log-determinant is not
+/// stationary at the optimum and still carries the location error. So the `f64`
+/// fit takes a Newton step from the device's point, with the log-determinant at
+/// the stepped point.
 ///
 /// ### Params
 ///
@@ -719,8 +723,8 @@ fn finish_at_argmax(
     if !reply.beta.iter().chain(&reply.log_w).all(|v| v.is_finite()) {
         return None;
     }
-    // The fused steps cover an order-one fit that needs no damping, which is
-    // nearly all of them; anything else takes the general loop.
+    // The fused steps cover an order-one fit needing no damping; anything else
+    // takes the general loop.
     if params.ord == 1
         && !params.reml
         && let Some(fit) = newton_finish(
@@ -770,9 +774,8 @@ fn finish_at_argmax(
 /// Distinct positive counts other than one and two, with their multiplicities.
 ///
 /// The profile objective sums `lgamma(y + cell)` over these on every
-/// evaluation. Single-cell counts take few distinct values, so summing over the
-/// distinct ones cuts that from one `lgamma` per positive count to one per
-/// distinct count, which matters once the fits themselves are on the device.
+/// evaluation. Single-cell counts take few distinct values, so this is one
+/// `lgamma` per distinct count rather than per positive count.
 ///
 /// ### Params
 ///
@@ -811,6 +814,10 @@ fn count_histogram(counts: &[f64]) -> Vec<(f64, f64)> {
 fn histogram_tail(histogram: &[(f64, f64)], cell: f64) -> f64 {
     histogram.iter().map(|&(y, m)| m * ln_gamma(y + cell)).sum()
 }
+
+///////////
+// Tests //
+///////////
 
 #[cfg(test)]
 mod tests {

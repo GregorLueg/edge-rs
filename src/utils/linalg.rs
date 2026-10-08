@@ -1,27 +1,25 @@
 //! Small dense factorisations shared by the limma modules.
 //!
-//! Everything here operates on matrices of order `n_coef` or `n_samples`, that
-//! is, tens of values. They are hand-rolled rather than routed through faer
-//! because at this size the call overhead dominates, and because two of them
-//! need to report failure rather than panic. The one exception is the
-//! eigendecomposition, which is faer's.
+//! Matrices are of order `n_coef` or `n_samples` (tens of values), so these are
+//! hand-rolled: faer's call overhead dominates at this size, and failure is
+//! reported rather than panicked. The eigendecomposition is faer's.
 //!
 //! Matrices are row-major with an explicit stride, so a caller can factor a
-//! leading submatrix of a larger buffer without copying it out first.
+//! leading submatrix of a larger buffer in place.
 
 use faer::linalg::solvers::SelfAdjointEigen;
 use faer::{MatRef, Side};
 
 use crate::prelude::*;
 
-///////////////
-// Cholesky  //
-///////////////
+//////////////
+// Cholesky //
+//////////////
 
 /// Lower Cholesky factor of a symmetric positive definite matrix, in place.
 ///
-/// Only the lower triangle of `a` is written; the upper triangle is left as it
-/// was and must not be read afterwards.
+/// Only the lower triangle of `a` is written; do not read the upper one
+/// afterwards.
 ///
 /// ### Params
 ///
@@ -32,8 +30,7 @@ use crate::prelude::*;
 ///
 /// ### Returns
 ///
-/// `false` if a pivot is not strictly positive, meaning the matrix is not
-/// positive definite.
+/// `false` if a pivot is not strictly positive (not positive definite).
 pub(crate) fn cholesky_lower(a: &mut [f64], n: usize, stride: usize) -> bool {
     for i in 0..n {
         for j in 0..=i {
@@ -73,15 +70,14 @@ pub(crate) fn forward_substitute(l: &[f64], stride: usize, n: usize, b: &mut [f6
     }
 }
 
-//////////////////
-// Triangular   //
-//////////////////
+////////////////
+// Triangular //
+////////////////
 
 /// Inverts the leading `n` by `n` block of an upper triangular matrix.
 ///
-/// Back substitution column by column. Entries of `r_inv` outside the leading
-/// block are left untouched, so a scratch buffer can be reused across calls of
-/// differing order without clearing it.
+/// Entries of `r_inv` outside the leading block are left untouched, so a
+/// scratch buffer can be reused across orders.
 ///
 /// ### Params
 ///
@@ -105,8 +101,8 @@ pub(crate) fn invert_upper_triangular(r: &[f64], r_inv: &mut [f64], n: usize, st
 
 /// Forms `R^-1 R^-T` from the inverse of an upper triangular factor.
 ///
-/// That is `(R'R)^-1`, R's `chol2inv`, which for a least squares QR is the
-/// unscaled covariance of the estimable coefficients.
+/// That is `(R'R)^-1`, R's `chol2inv`: the unscaled coefficient covariance for
+/// a least squares QR.
 ///
 /// ### Params
 ///
@@ -141,9 +137,8 @@ pub(crate) fn cross_inverse(r_inv: &[f64], n: usize, stride: usize) -> Vec<f64> 
 
 /// Rescales a covariance matrix to a correlation matrix.
 ///
-/// R's `cov2cor`. A zero or negative diagonal entry would divide by zero;
-/// callers that can produce one are expected to nudge it first, which is what
-/// limma's `classifyTestsF` does for an all-zero contrast.
+/// R's `cov2cor`. The diagonal must be positive; limma's `classifyTestsF` nudges
+/// an all-zero contrast's entry first.
 ///
 /// ### Params
 ///
@@ -164,16 +159,15 @@ pub(crate) fn cov2cor(v: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
-////////////////////
-// Eigenvalues    //
-////////////////////
+/////////////////
+// Eigenvalues //
+/////////////////
 
 /// Eigendecomposition of a symmetric matrix, eigenvalues descending.
 ///
-/// R's `eigen(symmetric = TRUE)` returns eigenvalues in decreasing order and
-/// limma's `classifyTestsF` relies on that, indexing the leading components and
-/// comparing every eigenvalue against the first. faer follows the LAPACK
-/// convention instead, so the pairs are reordered here.
+/// R's `eigen(symmetric = TRUE)` returns decreasing order, which limma's
+/// `classifyTestsF` relies on. faer follows LAPACK (ascending), so the pairs
+/// are reordered here.
 ///
 /// ### Params
 ///

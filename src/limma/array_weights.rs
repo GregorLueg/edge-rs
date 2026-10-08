@@ -1,67 +1,45 @@
 //! limma's `arrayWeights` and `duplicateCorrelation`.
 //!
-//! Two estimators `voomLmFit` reaches for once an experiment stops being a
-//! collection of independent, equally good samples. [`array_weights`] gives one
-//! precision weight per sample, so a bad array is down-weighted everywhere
-//! rather than dropped. [`duplicate_correlation`] gives the consensus
-//! intra-block correlation that turns a repeated-measures design into a
-//! generalised least squares fit.
+//! [`array_weights`] gives one precision weight per sample, so a bad array is
+//! down-weighted everywhere rather than dropped. [`duplicate_correlation`]
+//! gives the consensus intra-block correlation for a repeated-measures design.
 //!
-//! ### The model behind the weights
+//! ### Array weights
 //!
-//! Sample `j` is assumed to have variance `sigma^2 / w_j` with
-//! `log(1 / w_j) = z_j' gamma`, where `z_j` is a row of the variance design
-//! (`contr.sum(n_samples)` by default, so the log weights sum to zero). Both
-//! methods solve the same REML score equations for `gamma`, and differ only in
-//! how they sweep the genes:
+//! Sample `j` has variance `sigma^2 / w_j` with `log(1 / w_j) = z_j' gamma`,
+//! where `z_j` is a row of the variance design (`contr.sum(n_samples)` by
+//! default, so the log weights sum to zero). Both methods solve the same REML
+//! score equations and differ in how they sweep the genes:
 //!
-//! * [`ArrayWeightMethod::GeneByGene`] takes one Fisher scoring step per gene,
-//!   updating the weights as it goes. One pass, no convergence test, and it
-//!   copes with missing values and gene-level weights.
-//! * [`ArrayWeightMethod::Reml`] accumulates the score and information over all
-//!   genes and iterates the whole sweep to convergence. Sharper, but it wants a
-//!   complete matrix.
+//! * [`ArrayWeightMethod::GeneByGene`]: one Fisher scoring step per gene,
+//!   weights updated as it goes. One pass, no convergence test, copes with
+//!   missing values and gene-level weights.
+//! * [`ArrayWeightMethod::Reml`]: score and information accumulated over all
+//!   genes, iterated to convergence. Needs a complete matrix.
 //!
-//! `prior_n` is a ridge on the information: it is the number of notional genes
-//! that saw every weight equal to one, and it stops a small experiment from
-//! chasing noise into extreme weights.
+//! `prior_n` is a ridge on the information: the number of notional genes that
+//! saw every weight equal to one.
 //!
-//! ### The correlation
+//! ### Duplicate correlation
 //!
-//! [`duplicate_correlation`] fits a two-component mixed model per gene through
-//! `statmod::mixedModel2Fit` and takes the trimmed mean of the Fisher
-//! z-transformed correlations. The per-gene fit is not a moment estimator: it
-//! projects the residual space out of the fixed effects, takes an SVD of the
-//! projected block design, and fits a gamma GLM of the squared rotated
-//! residuals against the squared singular values. That gamma GLM is the REML
-//! likelihood for the two variance components, and its Levenberg damping is
-//! reproduced here step for step, because the answer depends on where it stops.
+//! A per-gene two-component mixed model through `statmod::mixedModel2Fit`, then
+//! a trimmed mean of the Fisher z-transformed correlations. The per-gene fit
+//! projects out the fixed effects, takes an SVD of the projected block design,
+//! and fits a gamma GLM of the squared rotated residuals on the squared
+//! singular values. The Levenberg damping of that GLM is reproduced step for
+//! step, since the answer depends on where it stops. edgePython uses a one-way
+//! ANOVA moment estimator instead. See `UPSTREAM_DEVIATIONS.md` A14.
 //!
-//! edgePython replaces all of that with a one-way ANOVA moment estimator. See
-//! the note on [`duplicate_correlation`] and `UPSTREAM_DEVIATIONS.md`.
+//! ### Implementation notes
 //!
-//! ### No scalar optimiser
-//!
-//! Nothing here goes through [`crate::numeric::optimise`], and that is not an
-//! oversight. limma reaches for `optimize` or `uniroot` in the empirical Bayes
-//! fits, but neither of these two routines does: `arrayWeights` is Fisher
-//! scoring on the REML score equations with a closed-form step, and
-//! `duplicateCorrelation` bottoms out in `statmod::glmgam.fit`, a Levenberg-
-//! damped Fisher scoring of its own. Substituting a general optimiser for either
-//! would land somewhere else, because both stop on their own iteration rule
-//! rather than at a minimum an optimiser would find.
-//!
-//! The dense linear algebra is likewise local: a LINPACK `dqrdc2` Householder QR
-//! and a partial-pivot Gaussian elimination, both written out here so the rank
-//! rule and the pivot order are R's rather than faer's. faer is used for exactly
-//! one thing, the SVD inside the mixed model.
-//!
-//! ### Numeric policy
-//!
-//! `f64` only, and deliberately not generic. Everything here is a difference of
-//! sums of squares fed into a log, on matrices whose size is the sample count
-//! rather than the gene count, so there is no memory to save and real precision
-//! to lose.
+//! * No scalar optimiser: `arrayWeights` is Fisher scoring with a closed-form
+//!   step and `glmgam.fit` is its own damped scoring, so
+//!   [`crate::numeric::optimise`] would stop somewhere else.
+//! * The dense linear algebra is local: a LINPACK `dqrdc2` QR and a
+//!   partial-pivot elimination, so the rank rule and pivot order are R's. faer
+//!   is used only for the SVD in the mixed model.
+//! * `f64` only, not generic. The matrices scale with sample count, so there is
+//!   no memory to save.
 //!
 //! ### References
 //!
@@ -84,57 +62,49 @@ const LM_RANK_TOL: f64 = 1e-7;
 
 /// Residual variances below this are treated as structurally zero.
 ///
-/// limma skips such genes rather than dividing by them. A gene whose weighted
-/// residual sum of squares is this small is either constant or perfectly
-/// fitted, and carries no information about the sample variances either way.
+/// limma skips such genes: they are constant or perfectly fitted and carry no
+/// information on the sample variances.
 const MIN_RESIDUAL_VAR: f64 = 1e-15;
 
 /// Residual degrees of freedom a gene needs before it can contribute.
 ///
-/// One residual degree of freedom gives a variance estimate with no leverage on
-/// how that variance splits across samples, so limma requires two.
+/// One residual df gives no leverage on how variance splits across samples.
 const MIN_RESIDUAL_DF: usize = 2;
 
 /// Largest intra-block correlation `duplicateCorrelation` will report.
 ///
-/// The Fisher z-transform is applied after clipping, and `atanh(1)` is infinite,
-/// so the clip is what keeps the trimmed mean finite.
+/// Clipping keeps the Fisher z-transform finite.
 const RHO_MAX: f64 = 0.99;
 
-/// Slack added to the theoretical lower bound on the correlation.
+/// Slack added to the lower bound on the correlation.
 ///
-/// A block of size `m` cannot have an intra-block correlation below
-/// `1 / (1 - m)`, since the block covariance matrix would stop being positive
-/// definite. limma clips to that bound plus this, again to keep `atanh` finite.
+/// A block of size `m` cannot have a correlation below `1 / (1 - m)` without
+/// losing positive definiteness. limma clips to that bound plus this.
 const RHO_MIN_SLACK: f64 = 0.01;
 
 /// Below this, the block factor counts as already spanned by the design.
 ///
-/// limma projects the block indicators onto the residual space of the design and
-/// gives up if nothing survives, because there would be no within-block
-/// replication left to estimate a correlation from.
+/// limma gives up if no block indicator survives projection onto the residual
+/// space, as there is no within-block replication left.
 const BLOCK_ABSORBED_TOL: f64 = 1e-8;
 
 /// Squared singular values above this count as non-zero.
 ///
-/// `mixedModel2Fit` only bothers with the gamma GLM when the projected block
-/// design has at least two of them; with fewer, the linear fit it starts from is
-/// already the answer.
+/// `mixedModel2Fit` runs the gamma GLM only with at least two of them.
 const SINGULAR_VALUE_TOL: f64 = 1e-15;
 
 /// Convergence tolerance of `statmod::glmgam.fit` on the score-step product.
 const GLMGAM_TOL: f64 = 1e-6;
 
-/// Iteration budget `mixedModel2Fit` gives `glmgam.fit`.
+/// Iteration budget `mixedModel2Fit` gives `glmgam.fit` (`maxit = 20`).
 ///
-/// limma calls `mixedModel2Fit(..., maxit = 20)`. `glmgam.fit` tests
-/// `iter > maxit` at the bottom of the loop, so this permits 21 scoring steps.
+/// `glmgam.fit` tests `iter > maxit` at the bottom of the loop, so this permits
+/// 21 scoring steps.
 const GLMGAM_MAX_ITER: usize = 20;
 
 /// Ratio by which the gamma variance is floored inside `glmgam.fit`.
 ///
-/// `v <- pmax(mu^2, max(mu^2) / 1e3)`, which stops a near-zero fitted value from
-/// taking over the weighting.
+/// `v <- pmax(mu^2, max(mu^2) / 1e3)`.
 const GLMGAM_VARIANCE_FLOOR: f64 = 1e3;
 
 /// Damping ratio at which `glmgam.fit` declares the step hopeless and stops.
@@ -149,8 +119,7 @@ const GLMGAM_DEVIANCE_TOL: f64 = 1e-15;
 /// Below this, an observation and its fitted value both count as zero.
 ///
 /// `statmod`'s gamma deviance drops such terms rather than evaluating
-/// `log(0 / 0)`. Numerically the same threshold as [`MIN_RESIDUAL_VAR`], but a
-/// different quantity, so it gets its own name.
+/// `log(0 / 0)`.
 const GLMGAM_ZERO_TOL: f64 = 1e-15;
 
 ////////////////////////
@@ -172,9 +141,8 @@ fn euclidean_norm(x: &[f64]) -> f64 {
 
 /// Solves a small dense system by Gaussian elimination with partial pivoting.
 ///
-/// This is LAPACK's `dgesv` and therefore R's `solve`. The systems here are
-/// `ngam` by `ngam` with `ngam` one less than the sample count, so tens of rows
-/// at most; a factorisation library would cost more in ceremony than it saves.
+/// This is LAPACK's `dgesv` and therefore R's `solve`. The systems are
+/// `ngam` by `ngam`, tens of rows at most.
 ///
 /// ### Params
 ///
@@ -281,17 +249,14 @@ fn contr_sum(n: usize) -> Vec<f64> {
 
 /// A LINPACK `dqrdc2` Householder QR: the factorisation R's `lm.fit` uses.
 ///
-/// This is not faer's QR, and the difference is deliberate. `dqrdc2` does not
-/// pivot for stability; it walks the columns left to right and moves a column
-/// aside only when the part of it orthogonal to what came before has lost a
-/// factor [`LM_RANK_TOL`] of its length. The surviving columns therefore keep
-/// their original order, which is what makes `QR$pivot[1:rank]` in
-/// `arrayWeights` a stable, order-preserving column subset rather than a
-/// magnitude-sorted one.
+/// This is not faer's QR, deliberately. `dqrdc2` walks the columns left to right
+/// and moves a column aside only when the part of it orthogonal to its
+/// predecessors has lost a factor [`LM_RANK_TOL`] of its length. Survivors keep
+/// their original order, which is what makes `QR$pivot[1:rank]` in `arrayWeights`
+/// an order-preserving subset.
 ///
-/// Columns rejected here stay physically in place rather than being cycled to
-/// the end as LINPACK does. Nothing downstream reads them, and leaving them
-/// alone keeps [`LinpackQr::pivot`] ascending.
+/// Rejected columns stay in place instead of being cycled to the end as LINPACK
+/// does; nothing reads them, and it keeps [`LinpackQr::pivot`] ascending.
 struct LinpackQr {
     /// Column-major `n * p` working store. For each accepted step `l` sitting in
     /// original column `j`, row `l` holds `R[l, l]` and rows `l + 1..n` hold the
@@ -495,15 +460,14 @@ impl LinpackQr {
 pub enum ArrayWeightMethod {
     /// One Fisher scoring step per gene, weights updated as the sweep proceeds.
     ///
-    /// limma's `.arrayWeightsGeneByGene`. The only method that accepts missing
-    /// values or gene-level weights without further ado, and the one limma's
+    /// limma's `.arrayWeightsGeneByGene`. Accepts missing values and gene-level
+    /// weights; `method = "auto"` selects it when either is present.
     /// `method = "auto"` selects whenever either is present.
     GeneByGene,
     /// Score and information pooled over all genes, iterated to convergence.
     ///
-    /// limma's `.arrayWeightsREML`, or `.arrayWeightsPrWtsREML` when gene-level
-    /// weights are supplied. `method = "auto"` selects this for a complete,
-    /// unweighted matrix, which is the common case.
+    /// limma's `.arrayWeightsREML`, or `.arrayWeightsPrWtsREML` with gene-level
+    /// weights. `method = "auto"` selects it for a complete, unweighted matrix.
     Reml,
 }
 
@@ -521,18 +485,16 @@ pub struct ArrayWeightParams {
     /// Enters as a ridge `prior_n * Z2' Z2` on the information and, for the REML
     /// sweep, a matching `prior_n * (w - 1)` on the score. limma's default is 10.
     pub prior_n: f64,
-    /// Iteration budget for the REML sweep. Ignored by the gene-by-gene sweep,
-    /// which is a single pass by construction.
+    /// Iteration budget for the REML sweep. Ignored by the gene-by-gene sweep.
     pub max_iter: usize,
     /// Convergence tolerance for the REML sweep, on the score-step product
-    /// scaled by the number of variance coefficients and the effective gene
-    /// count. limma's `arrayWeights` default is `1e-5`.
+    /// scaled by the number of variance coefficients and effective gene count.
+    /// limma's default is `1e-5`.
     pub tol: f64,
     /// Variance design, row-major `n_samples * n_var_coef`.
     ///
-    /// `None` uses `contr.sum(n_samples)`, one free weight per sample under a
-    /// sum-to-zero constraint on the logs. Supplying a coarser basis, such as
-    /// group indicators, pools samples into shared weights.
+    /// `None` uses `contr.sum(n_samples)`: one free weight per sample, logs
+    /// summing to zero. A coarser basis, such as group indicators, pools samples.
     pub var_design: Option<Vec<f64>>,
     /// Number of columns in `var_design`. Ignored when `var_design` is `None`.
     pub n_var_coef: usize,
@@ -541,12 +503,10 @@ pub struct ArrayWeightParams {
 impl Default for ArrayWeightParams {
     /// limma's defaults, with the method fixed at [`ArrayWeightMethod::Reml`].
     ///
-    /// limma's own default is `method = "auto"`, which resolves to `"reml"` for
-    /// a complete matrix with no gene-level weights and `"genebygene"`
-    /// otherwise. There is no `Auto` variant here, so the default matches the
-    /// branch a bare `arrayWeights(y, design)` call takes; pass
-    /// [`ArrayWeightMethod::GeneByGene`] alongside gene-level weights or missing
-    /// values to reproduce the other branch.
+    /// limma's `method = "auto"` resolves to `"reml"` for a complete, unweighted
+    /// matrix and `"genebygene"` otherwise. There is no `Auto` variant, so the
+    /// default matches a bare `arrayWeights(y, design)`; pass
+    /// [`ArrayWeightMethod::GeneByGene`] for weights or missing values.
     fn default() -> Self {
         ArrayWeightParams {
             method: ArrayWeightMethod::Reml,
@@ -644,8 +604,8 @@ fn validate_shapes(
 
 /// Drops the linearly dependent columns of a design.
 ///
-/// limma runs `qr(design)` and keeps `design[, QR$pivot[1:QR$rank]]`, so a rank
-/// deficient design silently loses columns rather than erroring.
+/// limma keeps `design[, QR$pivot[1:QR$rank]]`, so a rank deficient design loses
+/// columns silently.
 ///
 /// ### Params
 ///
@@ -673,10 +633,9 @@ fn reduce_design(design: &[f64], n_samples: usize, n_coef: usize) -> (Vec<f64>, 
 
 /// Builds the variance design `Z2`.
 ///
-/// With no user basis this is `contr.sum(n_samples)`. With one, limma centres
-/// every column and then drops the linearly dependent ones, which is how a
-/// user-supplied intercept column disappears: centring turns it into zeros, and
-/// a zero column always fails the [`LM_RANK_TOL`] test.
+/// With no user basis this is `contr.sum(n_samples)`. Otherwise limma centres
+/// every column and drops the linearly dependent ones, so a user-supplied
+/// intercept becomes a zero column and fails the [`LM_RANK_TOL`] test.
 ///
 /// ### Params
 ///
@@ -826,12 +785,11 @@ fn weighted_fit(x: &[f64], y: &[f64], w: &[f64], n: usize, p: usize) -> Weighted
     }
 }
 
-/// Accumulates the score contribution `info[-1, -1] - info[-1, 1] info[1, -1] / info[1, 1]`.
+/// Accumulates `info[-1, -1] - info[-1, 1] info[1, -1] / info[1, 1]` into `info2`.
 ///
-/// `Z = [1 | Z2]`, so the leading row and column of `info` are the intercept's,
-/// and sweeping them out is what leaves an information matrix for `gamma` alone.
-/// Forming `info` as an explicit `(1 + ngam)^2` matrix and then slicing it would
-/// be clearer but allocates once per gene, so the pieces are kept separate.
+/// `Z = [1 | Z2]`, so the leading row and column of `info` are the intercept's;
+/// sweeping them out leaves the information for `gamma`. The pieces are kept
+/// separate to avoid allocating a `(1 + ngam)^2` matrix per gene.
 ///
 /// ### Params
 ///
@@ -844,13 +802,8 @@ fn weighted_fit(x: &[f64], y: &[f64], w: &[f64], n: usize, p: usize) -> Weighted
 /// ### Returns
 ///
 /// `true` when the contribution was added, `false` when `corner` was
-/// non-positive or not a number.
-///
-/// limma has no such guard: it divides by `info[1, 1]` unconditionally. The
-/// guard is defensive rather than a deviation, since `corner` is `nobs - rank`
-/// in the gene-by-gene sweep and at least two by the admission rules, and the
-/// REML sweep's `n - 2 rank + sum(Q2' 1)^2` is positive for any design that got
-/// this far. Nothing in the test suite reaches it; a `false` here would mean the
+/// non-positive or NaN. limma has no such guard; it never triggers for admitted
+/// genes and only avoids `NaN` weights.
 /// alternative was `NaN` weights.
 fn sweep_intercept(
     info2: &mut [f64],
@@ -876,20 +829,15 @@ fn sweep_intercept(
 
 /// Per-sample quality weights, limma's `arrayWeights`.
 ///
-/// Estimates one precision weight per sample under the model that sample `j`
-/// has residual variance `sigma_g^2 / w_j`, shared across genes. A weight below
-/// one marks an array that is noisier than the rest; the weights are normalised
-/// so that their logs sum to zero over whatever variance design is in force.
+/// Sample `j` has residual variance `sigma_g^2 / w_j`, shared across genes. A
+/// weight below one marks a noisier array; the logs of the weights sum to zero
+/// over the variance design. The estimator is REML on the variance components,
+/// solved per gene or pooled (see [`ArrayWeightMethod`]). Both return all-ones
+/// weights when there is nothing to estimate from: fewer than two genes, or
+/// fewer than two residual degrees of freedom.
 ///
-/// The estimator is REML on the variance components, solved either one gene at a
-/// time or by pooling every gene and iterating. See [`ArrayWeightMethod`]. Both
-/// return early with all-ones weights when there is nothing to estimate from:
-/// fewer than two genes, or fewer than two residual degrees of freedom in the
-/// design.
-///
-/// Zero weights are handled as limma does, by turning the corresponding
-/// expression values into missing ones and the weights into ones, which forces
-/// the gene-by-gene sweep to skip those observations entirely.
+/// Zero weights become missing expression values and unit weights, as in limma,
+/// so the gene-by-gene sweep skips those observations.
 ///
 /// ### Params
 ///
@@ -908,26 +856,11 @@ fn sweep_intercept(
 /// One weight per sample, or [`EdgeErrors`] on a shape mismatch, an invalid
 /// weight, an out-of-domain parameter, or a singular information matrix.
 ///
-/// ### Where edgePython disagrees with limma
+/// ### edgePython
 ///
-/// `edgepython/voom_lmfit.py:834` diverges in five places, all followed here to
-/// limma rather than to the Python:
-///
-/// * It has no equivalent of `.arrayWeightsPrWtsREML`. With `method = "reml"`
-///   and gene-level weights, its REML branch takes no `weights` argument at all,
-///   so the weights are silently dropped. Masked by its `auto` rule, which sends
-///   weighted input to the gene-by-gene sweep, but not by an explicit `"reml"`.
-/// * It reduces both the design and the variance design with a fully pivoted QR
-///   (`scipy.linalg.qr(pivoting = True)`), which reorders columns by magnitude.
-///   R's `qr` moves only negligible columns, and only to the end, so a rank
-///   deficient design keeps a different subset in a different order.
-/// * The gene-by-gene sweep solves the information system with
-///   `pinv(info2, rcond = 1e-12)` where limma uses `solve`. A pseudo-inverse
-///   returns a minimum-norm answer where limma would stop.
-/// * It clamps the working weights up to machine epsilon and the leverages into
-///   `[0, 1]`. limma does neither.
-/// * Its gene-by-gene missing-value branch admits a gene on `sum(good) > p`
-///   alone, where limma additionally requires two residual degrees of freedom.
+/// `edgepython/voom_lmfit.py:834` differs from limma in five places (no
+/// `.arrayWeightsPrWtsREML`, fully pivoted QR, `pinv` for `solve`, clamping,
+/// looser gene admission). This follows limma. See `UPSTREAM_DEVIATIONS.md` A14.
 ///
 /// ### References
 ///
@@ -971,8 +904,8 @@ pub fn array_weights(
         return Ok(ones);
     }
 
-    // Zero weights become missing observations, exactly as limma does, so the
-    // expression matrix has to be materialised before the sweep starts.
+    // Zero weights become missing observations (as in limma), so the expression
+    // matrix is materialised before the sweep.
     let mut expression = y.to_vec();
     let mut weight_matrix: Option<Vec<f64>> = None;
     if let Some(w) = weights {
@@ -1075,7 +1008,7 @@ pub fn array_weights(
 }
 
 /// The prior ridge `prior_n * Z2' Z2`, the starting information for all three
-/// array weight estimators.
+/// estimators.
 ///
 /// ### Params
 ///
@@ -1102,10 +1035,9 @@ fn prior_ridge(z2: &[f64], n_samples: usize, ngam: usize, prior_n: f64) -> Vec<f
 
 /// limma's `.arrayWeightsGeneByGene`.
 ///
-/// One Fisher scoring step per gene, with the weights refreshed after every
-/// step, so the sweep is inherently sequential: gene `i + 1` is fitted under the
-/// weights gene `i` produced. That rules out a parallel gene axis, which is why
-/// this is the one estimator in the module that runs on a single thread.
+/// One Fisher scoring step per gene with weights refreshed after each step. Gene
+/// `i + 1` is fitted under the weights gene `i` produced, so this is the one
+/// estimator in the module that runs on a single thread.
 ///
 /// ### Params
 ///
@@ -1235,9 +1167,9 @@ fn array_weights_gene_by_gene(
 /// Builds limma's `Q2` and the leverages from a fitted QR.
 ///
 /// `Q2` holds every product `Q[, i] * Q[, j]` for `i <= j` over the leading `p`
-/// columns of `Q`, with the off-diagonal blocks scaled by `sqrt(2)`. That gives
-/// `Q2' Q2` the second moments of the residual projection, which is the second
-/// derivative term in the REML information for the log weights.
+/// columns of `Q`, off-diagonal blocks scaled by `sqrt(2)`, so `Q2' Q2` gives the
+/// second moments of the residual projection (the second-derivative term of the
+/// REML information).
 ///
 /// ### Params
 ///
@@ -1356,10 +1288,9 @@ fn weights_from_gamma(z2: &[f64], gam: &[f64], n_samples: usize, ngam: usize) ->
 
 /// limma's `.arrayWeightsREML`, the unweighted pooled sweep.
 ///
-/// Every gene shares the same weighted design, so the QR is factorised once per
-/// iteration and reused across genes; only the projection of each gene's
-/// response changes. Genes are chunked and reduced in a fixed order so the
-/// answer does not depend on how rayon happened to split the work.
+/// All genes share one weighted design, so the QR is factorised once per
+/// iteration. Genes are chunked and reduced in a fixed order so the result does
+/// not depend on rayon's split.
 ///
 /// ### Params
 ///
@@ -1469,13 +1400,10 @@ fn array_weights_reml(
 
 /// One pooled pass over the genes at fixed sample weights.
 ///
-/// Returns the two quantities the REML update needs: the mean over genes of
-/// `w_j r_gj^2 / s2_g` at each sample, and the per-gene residual variances.
-///
-/// The QR of the weighted design is shared, so this is `O(n_genes * n_samples * p)`
-/// with no factorisation per gene. Genes are split into fixed chunks whose
-/// partial sums are added back in index order, which keeps the result
-/// bit-reproducible across runs.
+/// Computes the mean over genes of `w_j r_gj^2 / s2_g` at each sample and the
+/// per-gene residual variances. The QR of the weighted design is shared, so
+/// there is no factorisation per gene. Genes are split into fixed chunks whose
+/// partial sums are added in index order, so results are bit-reproducible.
 ///
 /// ### Params
 ///
@@ -1489,8 +1417,7 @@ fn array_weights_reml(
 /// ### Returns
 ///
 /// The per-sample mean of `w_j r^2 / s2`, the per-gene `s2`, and the shared
-/// factorisation of the weighted design, which the caller needs for the REML
-/// information and would otherwise have to redo.
+/// factorisation of the weighted design (reused for the REML information).
 fn reml_gene_pass(
     y: &[f64],
     n_genes: usize,
@@ -1542,13 +1469,12 @@ fn reml_gene_pass(
 
 /// limma's `.arrayWeightsPrWtsREML`, the pooled sweep with gene-level weights.
 ///
-/// Every gene now has its own weighted design, so the QR cannot be shared and
-/// each iteration refactorises once per gene. The score and information are
-/// accumulated by chunk and summed back in index order for reproducibility.
+/// Each gene has its own weighted design, so the QR is refactorised per gene per
+/// iteration. Score and information are accumulated by chunk and summed in index
+/// order for reproducibility.
 ///
-/// Unlike [`array_weights_reml`], this one does not test the convergence
-/// criterion for improvement, only for finiteness and for falling below `tol`.
-/// That is limma's behaviour, not an oversight here.
+/// Unlike [`array_weights_reml`], convergence is tested only for finiteness and
+/// falling below `tol`, not for improvement. That is limma's behaviour.
 ///
 /// ### Params
 ///
@@ -1616,9 +1542,8 @@ fn array_weights_prior_reml(
                         reml_information(&q2, p2, &hat, z2, ngam, n_samples);
                     let added = sweep_intercept(&mut info2, corner, &edge, &block, ngam);
 
-                    // Skip the score contribution too when the information one
-                    // was skipped, so info2 and z never fall out of step - the
-                    // same rule array_weights_gene_by_gene applies.
+                    // Skip the score too when the information was skipped, so
+                    // info2 and z stay in step (as in array_weights_gene_by_gene).
                     if added && s2 > MIN_RESIDUAL_VAR {
                         let residual = qr_residuals(&qr, row, design, &coef, n_samples);
                         for i in 0..n_samples {
@@ -1672,9 +1597,9 @@ fn array_weights_prior_reml(
     Ok(w)
 }
 
-//////////////////////////
+///////////////////////////
 // Duplicate correlation //
-//////////////////////////
+///////////////////////////
 
 /// Consensus intra-block correlation, limma's `duplicateCorrelation`.
 ///
@@ -1682,32 +1607,20 @@ fn array_weights_prior_reml(
 /// effect, and reports `tanh` of the trimmed mean of the Fisher z-transformed
 /// per-gene correlations `sigma_block^2 / (sigma_block^2 + sigma_e^2)`.
 ///
-/// Two situations short-circuit to a correlation of exactly zero, as in limma:
-/// every block has a single member, so there is no within-block replication; or
-/// the block factor already lies in the column space of the design, so it has
-/// been absorbed into the fixed effects.
+/// Fits `y_g = X beta_g + Z u_g + e_g` per gene with `u_g` a random block
+/// effect, and reports `tanh` of the trimmed mean of the Fisher z-transformed
+/// per-gene correlations `sigma_block^2 / (sigma_block^2 + sigma_e^2)`.
 ///
-/// A gene contributes only when it has more than `n_coef + 2` observations, more
-/// than one block, and fewer blocks than `n_obs - 1`. Genes failing any of those
-/// are dropped from the trimmed mean rather than counted as zero.
+/// Returns exactly zero, as limma does, when every block has a single member or
+/// the block factor already lies in the column space of the design.
 ///
-/// ### edgePython disagrees with limma here
+/// A gene contributes only with more than `n_coef + 2` observations, more than
+/// one block and fewer blocks than `n_obs - 1`; others are dropped from the
+/// trimmed mean, not counted as zero.
 ///
-/// `edgepython/voom_lmfit.py:898` replaces the per-gene mixed model with a
-/// one-way ANOVA moment estimator, `(MS_between - MS_within) / (MS_between +
-/// (n0 - 1) MS_within)`. That is the classical intraclass correlation, not the
-/// REML estimate limma computes, and the two agree only for balanced blocks with
-/// no fixed effects beyond an intercept. Alongside that it:
-///
-/// * clips the per-gene correlations to `[-0.99, 0.99]` rather than to limma's
-///   block-size-dependent lower bound `1 / (1 - max_block_size) + 0.01`;
-/// * drops limma's `nblocks < n_obs - 1` and `n_obs > n_coef + 2` admission
-///   rules on its vectorised path, so genes limma refuses still contribute;
-/// * has no check for a block factor already spanned by the design, and none for
-///   blocks that are all of size one, both of which limma answers with an exact
-///   zero.
-///
-/// This implementation follows limma throughout.
+/// edgePython replaces the per-gene mixed model with a one-way ANOVA moment
+/// estimator and drops several of limma's admission rules. This follows limma.
+/// See `UPSTREAM_DEVIATIONS.md` A14.
 ///
 /// ### Params
 ///
@@ -1863,21 +1776,16 @@ pub fn duplicate_correlation(
 
 /// `statmod::mixedModel2Fit(..., only.varcomp = TRUE)`.
 ///
-/// Projects the response and the block design onto the residual space of the
-/// fixed effects, rotates by the SVD of the projected block design, and fits a
-/// gamma GLM of the squared rotated residuals against the squared singular
-/// values. The two coefficients of that GLM are the residual and block variance
-/// components.
+/// Projects the response and block design onto the residual space of the fixed
+/// effects, rotates by the SVD of the projected block design, and fits a gamma
+/// GLM of the squared rotated residuals on the squared singular values. Its two
+/// coefficients are the residual and block variance components.
 ///
-/// `w` scales the response and the fixed effects but deliberately not the block
-/// design, which is what `statmod` does.
-///
-/// The left singular vectors beyond the rank of the projected block design are
-/// an arbitrary orthonormal completion, and faer's differs from LAPACK's. It
-/// does not matter: all of those rotated residuals share a squared singular
-/// value of zero, and both the linear start and the gamma GLM's score equations
-/// see rows with equal covariates only through their sum, which the completion
-/// preserves.
+/// `w` scales the response and fixed effects but not the block design, as in
+/// `statmod`. Left singular vectors beyond the rank are an arbitrary orthonormal
+/// completion (faer's differs from LAPACK's), which does not matter: those rows
+/// share a squared singular value of zero and enter the fit only through their
+/// sum.
 ///
 /// ### Params
 ///
@@ -1978,10 +1886,10 @@ fn mixed_model_varcomp(
 
 /// `statmod::glmgam.fit` with a supplied starting value.
 ///
-/// A gamma GLM with an identity link, fitted by Levenberg-damped Fisher scoring
-/// on the deviance. The damping schedule is the whole point of reproducing this
-/// verbatim: the objective is nearly flat near the optimum, so where the
-/// iteration stops decides the answer well before the arithmetic does.
+/// A gamma GLM with identity link, fitted by Levenberg-damped Fisher scoring on
+/// the deviance. The damping schedule is reproduced verbatim because the
+/// objective is nearly flat at the optimum, so where the iteration stops decides
+/// the answer.
 ///
 /// ### Params
 ///
@@ -2131,10 +2039,8 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// Every reference value in this module comes from limma 3.66 on R 4.5,
-    /// with `statmod` 1.5 underneath `duplicateCorrelation`. The inputs are
-    /// embedded alongside the outputs so nothing depends on reproducing an RNG
-    /// stream:
+    /// Reference values come from limma 3.66 on R 4.5 with `statmod` 1.5. Inputs
+    /// are embedded alongside the outputs so nothing depends on an RNG stream:
     ///
     /// ```r
     /// set.seed(1); y <- matrix(rnorm(200), 20, 10)
@@ -2145,16 +2051,12 @@ mod tests {
     ///
     /// ### Agreement achieved
     ///
-    /// [`array_weights`] reproduces limma to better than `1e-16` relative on
-    /// every fixture here, both methods, weighted and not, which is the printing
-    /// precision of the references and therefore as close as they can pin it.
-    /// The assertions sit at `1e-14` for headroom on other platforms.
+    /// [`array_weights`] matches limma to better than `1e-16` relative on every
+    /// fixture (both methods, weighted and not); assertions sit at `1e-14`.
     ///
-    /// [`duplicate_correlation`] reaches `5e-15` at worst, and the binding
-    /// constraint is `glmgam.fit`'s own `tol = 1e-6` on the score-step product
-    /// rather than the arithmetic: both implementations stop at the same iterate
-    /// of a nearly flat objective, and the residual difference is the rounding
-    /// accumulated in the SVD ahead of it. The assertions sit at `1e-13`.
+    /// [`duplicate_correlation`] reaches `5e-15` at worst, bound by
+    /// `glmgam.fit`'s own `tol = 1e-6` and SVD rounding rather than the
+    /// arithmetic; assertions sit at `1e-13`.
     const Y: [f64; 200] = [
         -0.6264538107423324,
         0.9189773716082182,
@@ -2609,9 +2511,9 @@ mod tests {
         }
     }
 
-    ///////////////////////////
+    //////////////////////////////
     // arrayWeights, no weights //
-    ///////////////////////////
+    //////////////////////////////
 
     /// `Rscript -e 'suppressMessages(library(limma)); set.seed(1); y <- matrix(rnorm(200), 20, 10); X <- cbind(1, rep(0:1, each=5)); cat(arrayWeights(y, X), "\n")'`
     ///
@@ -2661,7 +2563,7 @@ mod tests {
     }
 
     /// `arrayWeights(y, X, method = "genebygene", prior.n = 5)`. Halving the
-    /// prior widens the spread of the weights, which is the point of the knob.
+    /// prior widens the spread of the weights.
     #[test]
     fn test_array_weights_prior_n_loosens_the_shrinkage() {
         let design = two_group_design();
@@ -2722,10 +2624,9 @@ mod tests {
         assert_weights(&gbg, &want_gbg, 1e-14);
     }
 
-    /// `arrayWeights(y, X3, method = "reml")` and `"genebygene"` on a design
-    /// with an intercept, a group indicator and a continuous covariate. Three
-    /// coefficients means `Q2` has six columns rather than three, which is the
-    /// part of the REML information a two-column design never exercises.
+    /// `arrayWeights(y, X3, method = "reml")` and `"genebygene"` on an intercept,
+    /// group indicator and continuous covariate. Three coefficients give `Q2`
+    /// six columns, which a two-column design never exercises.
     #[test]
     fn test_array_weights_three_coefficient_design() {
         let reml = array_weights(&Y, N_GENES, N_SAMPLES, &X3, 3, None, None).unwrap();
@@ -2793,9 +2694,9 @@ mod tests {
         assert_weights(&got, &want, 1e-14);
     }
 
-    //////////////////////////////
+    ////////////////////////////////
     // arrayWeights, with weights //
-    //////////////////////////////
+    ////////////////////////////////
 
     /// `arrayWeights(y, X, weights = W, method = "genebygene")`. This is also
     /// what `method = "auto"` picks once weights are present, and the branch
@@ -2970,10 +2871,9 @@ mod tests {
         assert_weights(&got, &want, 1e-14);
     }
 
-    /// A non-finite value also pushes the REML sweep to drop that gene, as
-    /// limma does before calling `.arrayWeightsREML`. Dropping gene 1 leaves 19
-    /// genes, so the answer moves; the assertion is that it stays finite,
-    /// normalised and different from the complete-matrix fit.
+    /// A non-finite value makes the REML sweep drop that gene, as limma does
+    /// before `.arrayWeightsREML`. Asserts the result is finite, normalised and
+    /// differs from the complete-matrix fit.
     #[test]
     fn test_array_weights_reml_drops_incomplete_genes() {
         let design = two_group_design();
@@ -2989,9 +2889,9 @@ mod tests {
         );
     }
 
-    ///////////////////////////
+    //////////////////////////////
     // arrayWeights, var.design //
-    ///////////////////////////
+    //////////////////////////////
 
     /// A two-level variance design pools the samples into two weights:
     ///
@@ -3083,9 +2983,9 @@ mod tests {
         assert_weights(&got, &want, 1e-14);
     }
 
-    /////////////////////////////
+    ///////////////////////////////
     // arrayWeights, early exits //
-    /////////////////////////////
+    ///////////////////////////////
 
     #[test]
     fn test_array_weights_returns_ones_for_a_single_gene() {
@@ -3104,9 +3004,9 @@ mod tests {
         assert_eq!(got, vec![1.0; 3]);
     }
 
-    ///////////////////////////
-    // arrayWeights, errors   //
-    ///////////////////////////
+    //////////////////////////
+    // arrayWeights, errors //
+    //////////////////////////
 
     #[test]
     fn test_array_weights_rejects_empty_input() {
@@ -3238,9 +3138,9 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    ////////////////////////////
-    // duplicateCorrelation    //
-    ////////////////////////////
+    //////////////////////////
+    // duplicateCorrelation //
+    //////////////////////////
 
     /// `Rscript -e 'suppressMessages(library(limma)); set.seed(1); y <- matrix(rnorm(200), 20, 10); X <- cbind(1, rep(0:1, each=5)); b <- rep(1:5, 2); cat(duplicateCorrelation(y, X, block=b)$consensus.correlation, "\n")'`
     #[test]
@@ -3278,9 +3178,8 @@ mod tests {
     }
 
     /// `duplicateCorrelation(y, X, block = b, weights = W)`, balanced and
-    /// unbalanced. `mixedModel2Fit` scales the response and the fixed effects by
-    /// `sqrt(w)` but leaves the block design alone, which is the detail this
-    /// pins.
+    /// unbalanced. `mixedModel2Fit` scales the response and fixed effects by
+    /// `sqrt(w)` but not the block design.
     #[test]
     fn test_duplicate_correlation_with_weights() {
         let design = two_group_design();
@@ -3334,10 +3233,9 @@ mod tests {
         assert_relative_eq!(got, 0.031669365881093696, max_relative = 1e-14);
     }
 
-    /// Every per-gene correlation, on the Fisher scale, against
-    /// `duplicateCorrelation(y, X, block = b)$atanh.correlations`. The consensus
-    /// is a trimmed mean, so it can hide a gene that is wrong in the tail;
-    /// this cannot.
+    /// Per-gene correlations on the Fisher scale against
+    /// `duplicateCorrelation(y, X, block = b)$atanh.correlations`. Catches a wrong
+    /// gene the trimmed mean would hide.
     #[test]
     fn test_duplicate_correlation_per_gene_values() {
         let design = two_group_design();
@@ -3450,8 +3348,7 @@ mod tests {
         assert!(matches!(err, EdgeErrors::EmptyCounts { .. }));
     }
 
-    /// Every gene fails the admission rules, so there is nothing to average and
-    /// a number would be a lie.
+    /// Every gene fails the admission rules, so there is nothing to average.
     #[test]
     fn test_duplicate_correlation_errors_when_no_gene_qualifies() {
         // Four samples against a two-column design: `n_obs > n_coef + 2` fails.
@@ -3473,9 +3370,9 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /////////////////////////
-    // Internal machinery   //
-    /////////////////////////
+    ////////////////////////
+    // Internal machinery //
+    ////////////////////////
 
     /// The QR has to reproduce R's, so its leverages must match
     /// `hat(qr(X))` and its rank must match `qr(X)$rank`.
