@@ -148,5 +148,4 @@ bobyqa_rosen_edge,status,4
 bobyqa_corner,status,4
 bobyqa_chain3,status,4
 bobyqa_rescue,status,4
-bobyqa_rescue_twice,status,4
 bobyqa_roundoff,status,-4

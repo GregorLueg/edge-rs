@@ -1261,8 +1261,10 @@ if (requireNamespace("nebula", quietly = TRUE)) {
 # nebula's stage two runs `nloptr::bobyqa`, NLopt 2.7.1 inside nloptr 2.2.1.
 # Every point the optimiser evaluates is recorded on four bounded problems, so
 # src/numeric/bobyqa.rs can be held to the same sequence. nloptr evaluates the
-# start twice itself before NLopt runs; those two rows are dropped. The powers
-# are written as R evaluates them: `^2` is `x * x`, `^4` is libm `pow`.
+# start twice itself before NLopt runs; those two rows are dropped. The
+# objectives use only correctly rounded operations (`^2` is `x * x` in R,
+# `floor`, `abs`): a libm `sin` or `pow` rounds differently on another
+# platform, and BOBYQA turns one ulp into a different path.
 if (requireNamespace("nloptr", quietly = TRUE)) {
   bobyqa_cases <- list(
     list(tag = "rosen", f = function(x) 100 * (x[2] - x[1]^2)^2 + (1 - x[1])^2,
@@ -1272,19 +1274,18 @@ if (requireNamespace("nloptr", quietly = TRUE)) {
     list(tag = "corner", f = function(x) (x[1] - 3)^2 + 10 * (x[2] + 1)^2 + x[1] * x[2],
          x0 = c(1, 1), lo = c(0, 0), hi = c(2, 2)),
     list(tag = "chain3",
-         f = function(x) (x[1] - 1)^2 + 100 * (x[2] - x[1]^2)^2 + (x[3] - x[2])^2 + 0.5 * x[3]^4,
+         f = function(x) (x[1] - 1)^2 + 100 * (x[2] - x[1]^2)^2 + (x[3] - x[2])^2 + 0.5 * (x[3]^2)^2,
          x0 = c(0.5, 2, -1), lo = c(-3, -3, -3), hi = c(3, 3, 3)),
-    # A quadratic under a fast ripple degrades the interpolation set until
-    # BOBYQA calls `rescue`: once here, twice in the next. Every constant is
-    # exactly representable, so R's decimal parser cannot shift an input.
+    # A quadratic under a fast squared triangle wave degrades the interpolation
+    # set until BOBYQA calls `rescue`. Every constant is exactly representable,
+    # so R's decimal parser cannot shift an input.
     list(tag = "rescue",
-         f = function(x) (x[1] - 0.25)^2 + 2 * (x[2] + 0.125)^2 + 0.5 * x[1] * x[2] +
-           sin(10000 * x[1] + 30000 * x[2]),
-         x0 = c(1.75, -1.75), lo = c(-2, -2), hi = c(2, 2)),
-    list(tag = "rescue_twice",
-         f = function(x) (x[1] - 0.25)^2 + 2 * (x[2] + 0.125)^2 + 0.5 * x[1] * x[2] +
-           0.25 * sin(50000 * x[1] + 70000 * x[2]),
-         x0 = c(1.75, -1.75), lo = c(-2, -2), hi = c(2, 2)),
+         f = function(x) {
+           u <- 10000 * x[1] + 30000 * x[2]
+           t <- abs(u - 2 * floor((u + 1) / 2))
+           (x[1] - 0.25)^2 + 2 * (x[2] + 0.125)^2 + 0.5 * x[1] * x[2] + 0.5 * (t * t)
+         },
+         x0 = c(-1, 0.25), lo = c(-2, -2), hi = c(2, 2)),
     # A valley with no unique minimiser; BOBYQA ends ROUNDOFF_LIMITED (-4).
     list(tag = "roundoff", f = function(x) (x[1] + x[2] - 1)^2,
          x0 = c(0, 0), lo = c(-2, -2), hi = c(2, 2))

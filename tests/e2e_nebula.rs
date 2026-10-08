@@ -203,8 +203,11 @@ const CPU_TOLS: NebulaTols = NebulaTols {
 ///   stops at `phi = 322`. Needs `5.6e-4` on the coefficients and on
 ///   `sigma^2`, and `2.1e-3` absolute on the cell overdispersion. The gates are
 ///   per dataset, so the other five pure genes are held to them too.
-/// * `sc_high`: means of `1e3` to `1e4`. Needs `6.1e-5` on the coefficients,
-///   `2.1e-4` on `sigma^2` and `3.5e-3` on the covariance.
+/// * `sc_high`: means of `1e3` to `1e4`, the set most sensitive to how the
+///   platform's `exp` and `log` round: the profile likelihood's `1e-6` jitter
+///   carries an ulp into the optimum. Needs, macOS then Linux: `6.1e-5` and
+///   `1.24e-4` on the coefficients, `2.1e-4` and `8.5e-4` on `sigma^2`,
+///   `3.5e-3` and `1.1e-2` on the covariance.
 ///
 /// The `sc_blocks` and `sc_cat_ln` gene is not settled as a port fault or an R
 /// one.
@@ -232,9 +235,9 @@ fn tols(tag: &str, base: NebulaTols) -> NebulaTols {
             ..base
         },
         "sc_high" => NebulaTols {
-            coef: Tol::new(base.coef.max_relative.max(1e-4), base.coef.epsilon),
-            subject: Tol::new(base.subject.max_relative.max(3e-4), base.subject.epsilon),
-            cov: Tol::new(base.cov.max_relative.max(5e-3), base.cov.epsilon),
+            coef: Tol::new(base.coef.max_relative.max(3e-4), base.coef.epsilon),
+            subject: Tol::new(base.subject.max_relative.max(2e-3), base.subject.epsilon),
+            cov: Tol::new(base.cov.max_relative.max(2.5e-2), base.cov.epsilon),
             ..base
         },
         _ => base,

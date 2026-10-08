@@ -12,7 +12,7 @@
   * Stage two searches the two variance components with BOBYQA, ported from
     NLopt 2.7.1 as `nloptr::bobyqa` runs it, so it makes about forty fits
     per gene where the simplex and polish made 120. It retraces nloptr point
-    for point on seven bounded problems.
+    for point on six bounded problems.
   * Stage one takes projected Newton steps on a fused Hessian on dense designs,
     falling back to L-BFGS-B.
   * The penalised fit sweeps every cell once per Newton step instead of a dozen

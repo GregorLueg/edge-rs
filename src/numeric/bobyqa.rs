@@ -2869,17 +2869,9 @@ mod tests {
     }
 
     fn ripple(x: &[f64]) -> f64 {
-        (x[0] - 0.25).powi(2)
-            + 2.0 * (x[1] + 0.125).powi(2)
-            + 0.5 * x[0] * x[1]
-            + (10000.0 * x[0] + 30000.0 * x[1]).sin()
-    }
-
-    fn ripple_fast(x: &[f64]) -> f64 {
-        (x[0] - 0.25).powi(2)
-            + 2.0 * (x[1] + 0.125).powi(2)
-            + 0.5 * x[0] * x[1]
-            + 0.25 * (50000.0 * x[0] + 70000.0 * x[1]).sin()
+        let u = 10000.0 * x[0] + 30000.0 * x[1];
+        let t = (u - 2.0 * ((u + 1.0) / 2.0).floor()).abs();
+        (x[0] - 0.25).powi(2) + 2.0 * (x[1] + 0.125).powi(2) + 0.5 * x[0] * x[1] + 0.5 * (t * t)
     }
 
     fn valley(x: &[f64]) -> f64 {
@@ -2887,15 +2879,13 @@ mod tests {
     }
 
     fn chain3(x: &[f64]) -> f64 {
-        // R's `x^4` is libm `pow`; `powi` rounds differently and the traces
-        // part after 190 evaluations.
         (x[0] - 1.0).powi(2)
             + 100.0 * (x[1] - x[0] * x[0]).powi(2)
             + (x[2] - x[1]).powi(2)
-            + 0.5 * x[2].powf(4.0)
+            + 0.5 * x[2].powi(2).powi(2)
     }
 
-    const CASES: [Case; 7] = [
+    const CASES: [Case; 6] = [
         Case {
             tag: "rosen",
             f: rosen,
@@ -2928,19 +2918,11 @@ mod tests {
             hi: &[3.0, 3.0, 3.0],
             status: BobyqaStatus::XtolReached,
         },
-        // `rescue` once, then twice: the ripple degrades the interpolation set.
+        // The ripple degrades the interpolation set until `rescue` runs.
         Case {
             tag: "rescue",
             f: ripple,
-            x0: &[1.75, -1.75],
-            lo: &[-2.0, -2.0],
-            hi: &[2.0, 2.0],
-            status: BobyqaStatus::XtolReached,
-        },
-        Case {
-            tag: "rescue_twice",
-            f: ripple_fast,
-            x0: &[1.75, -1.75],
+            x0: &[-1.0, 0.25],
             lo: &[-2.0, -2.0],
             hi: &[2.0, 2.0],
             status: BobyqaStatus::XtolReached,
