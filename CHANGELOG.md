@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.2.1
+
+### Features
+
+* NEBULA is several times faster. Against R nebula 1.5.8 on 100 genes of 20000
+  cells, one thread against one core: NEBULA-LN 0.78 s against 1.94 s and
+  NEBULA-HL 5.4 s against 6.7 s with a continuous cell-level covariate, and
+  0.74 s against 1.92 s and 1.8 s against 6.9 s with a categorical one. On ten
+  threads the four take 0.11 to 0.71 s.
+  * Stage two searches the two variance components with BOBYQA, ported from
+    NLopt 2.7.1 as `nloptr::bobyqa` runs it, so it makes about forty fits
+    per gene where the simplex and polish made 120. It retraces nloptr point
+    for point on seven bounded problems.
+  * Stage one takes projected Newton steps on a fused Hessian on dense designs,
+    falling back to L-BFGS-B.
+  * The penalised fit sweeps every cell once per Newton step instead of a dozen
+    times.
+  * Designs whose cell-level columns are categorical sum each gene's zero
+    counts from per-run tables, one lookup per subject and cell type, so a gene
+    costs its positive counts rather than every cell.
+* `nebula_sparse_gpu` runs 1.9x to 3.3x faster than the ten-thread CPU path
+  (500 genes, 20000 to 100000 cells), up to 2.8x faster on the device at eight
+  coefficients. A design with zero-count tables runs the CPU path from it,
+  which is faster there and accepts designs wider than eight columns.
+
+### Bug fixes
+
+* The one-component NEBULA-LN refit no longer stops on a variance bound its
+  simplex collapsed onto; it restarts once from between the bound and the
+  start. This settles the `sc_high` gene the tests recorded as an open gap.
+
+### Notes
+
+* Results move against v0.2.0 within nebula's own reproducibility: stage two
+  now takes R's optimiser path, and the `1e-6` jitter of the profile likelihood
+  sends nearby runs to slightly different points. The R fixtures gate every
+  change; three new categorical fixtures cover the zero-count tables.
+
 ## v0.2.0
 
 ### Breaking changes
