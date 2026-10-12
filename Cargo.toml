@@ -55,3 +55,7 @@ harness = false
 name = "nebula_gpu_bench"
 harness = false
 required-features = ["gpu"]
+
+[[bench]]
+name = "bulk_bench"
+harness = false
