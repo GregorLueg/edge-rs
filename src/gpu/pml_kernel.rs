@@ -306,7 +306,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
         cells,
         subject_ptr,
         subject_total,
-        subject_scratch,
+        &*subject_scratch,
         &beta,
         SLOT_LOG_W,
         alpha,
@@ -332,9 +332,11 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
     let mut settled = false;
     // Whether the stopping test has passed once already.
     let mut confirmed = false;
-    let mut running = true;
+    // Negated flags: on cubecl 0.11 a `while` whose whole condition is a bare
+    // mutable bool never re-reads it, so the loop runs forever on the GPU.
+    let mut done = false;
 
-    while running {
+    while !done {
         j = 0u32;
         while j < nb {
             damp_beta[j as usize] = one;
@@ -536,7 +538,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
 
         if settled {
             // The assembly above ran at the returned point; nothing further to do.
-            running = false;
+            done = true;
         } else {
             step += 1u32;
 
@@ -608,7 +610,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 cells,
                 subject_ptr,
                 subject_total,
-                subject_scratch,
+                &*subject_scratch,
                 &new_beta,
                 SLOT_NEW_LOG_W,
                 alpha,
@@ -634,8 +636,8 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             let noise = F::abs(ll_prev) * noise_scale;
             backtracks = 0u32;
             let mut min_step = cutoff;
-            let mut searching = likdif < zero - noise || ll > huge || ll < zero - huge;
-            while searching {
+            let mut accepted = !(likdif < zero - noise || ll > huge || ll < zero - huge);
+            while !accepted {
                 backtracks += 1u32;
                 min_step /= two;
 
@@ -662,13 +664,13 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                     if worst > F::new(GRADIENT_TOLERANCE) {
                         backtracks += 1u32;
                     }
-                    searching = false;
+                    accepted = true;
                 } else {
                     j = 0u32;
                     while j < nb {
                         let d = step_beta[j as usize];
                         if d < cutoff && d > zero - cutoff {
-                            damp_beta[j as usize] = damp_beta[j as usize] / two;
+                            damp_beta[j as usize] /= two;
                             new_beta[j as usize] = beta[j as usize] + d * damp_beta[j as usize];
                         } else if d > zero {
                             new_beta[j as usize] = beta[j as usize] + min_step;
@@ -703,7 +705,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                         cells,
                         subject_ptr,
                         subject_total,
-                        subject_scratch,
+                        &*subject_scratch,
                         &new_beta,
                         SLOT_NEW_LOG_W,
                         alpha,
@@ -719,7 +721,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                         nb_cap,
                     );
                     likdif = ll - ll_prev;
-                    searching = likdif < zero - noise || ll > huge || ll < zero - huge;
+                    accepted = !(likdif < zero - noise || ll > huge || ll < zero - huge);
                 }
             }
 
@@ -749,7 +751,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
                 confirmed = true;
             }
             if settled && final_assembly == 0u32 {
-                running = false;
+                done = true;
             }
         }
     }
@@ -1111,7 +1113,7 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
         if d != zero {
             i = step + 1u32;
             while i < n {
-                a[(i * n + step) as usize] = a[(i * n + step) as usize] / d;
+                a[(i * n + step) as usize] /= d;
                 i += 1u32;
             }
         }
@@ -1141,7 +1143,7 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
     while row < n {
         let d = a[(row * n + row) as usize];
         if F::abs(d) > tiny {
-            b[row as usize] = b[row as usize] / d;
+            b[row as usize] /= d;
         } else {
             b[row as usize] = zero;
         }
@@ -1197,8 +1199,8 @@ fn ldlt_solve<F: Float>(a: &mut Array<F>, b: &mut Array<F>, n: u32, #[comptime] 
 /// * [`EdgeErrors::InvalidArgument`] if `nb` exceeds [`MAX_BETA_CAP`].
 /// * [`EdgeErrors::Gpu`] if the grid busts the device's cube-count limit.
 #[allow(clippy::too_many_arguments)]
-pub fn launch_opt_pml<R, F>(
-    tensors: &PmlGpuTensors<R, F>,
+pub fn launch_opt_pml<F>(
+    tensors: &PmlGpuTensors<F>,
     n_genes: usize,
     n_req: usize,
     k: usize,
@@ -1206,10 +1208,9 @@ pub fn launch_opt_pml<R, F>(
     max_iter: u32,
     max_backtrack: u32,
     final_assembly: bool,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<(), EdgeErrors>
 where
-    R: Runtime,
     F: Float + cubecl::CubeElement,
 {
     if nb == 0 || nb > MAX_BETA_CAP {
@@ -1241,7 +1242,7 @@ where
         ($cap:expr) => {
             unsafe {
                 debug_assert_eq!(nb, $cap as usize);
-                opt_pml_gpu::launch_unchecked::<F, R>(
+                opt_pml_gpu::launch_unchecked::<F>(
                     client,
                     count,
                     CubeDim::new_1d(cube_width),
@@ -1294,42 +1295,42 @@ where
 /// totals) are uploaded once and indexed through a request's gene. Request
 /// buffers are rewritten per launch and are request-minor: entry `i` of request
 /// `q` lives at `i * n_req + q`.
-pub struct PmlGpuTensors<R: Runtime, F: cubecl::CubeElement + Numeric> {
+pub struct PmlGpuTensors<F: cubecl::CubeElement + Numeric> {
     /// Shared design, row-major `n_cells * nb`.
-    pub design: GpuTensor<R, F>,
+    pub design: GpuTensor<F>,
     /// Shared log offset per cell.
-    pub log_offset: GpuTensor<R, F>,
+    pub log_offset: GpuTensor<F>,
     /// Shared subject boundaries, length `k + 1`.
-    pub subject_start: GpuTensor<R, u32>,
+    pub subject_start: GpuTensor<u32>,
     /// Concatenated positive counts for every resident gene.
-    pub counts: GpuTensor<R, F>,
+    pub counts: GpuTensor<F>,
     /// Cell index of each entry of `counts`.
-    pub cells: GpuTensor<R, u32>,
+    pub cells: GpuTensor<u32>,
     /// Start of each subject's run within each gene's block in `counts`,
     /// `[gene * (k + 1) + s]`.
-    pub subject_ptr: GpuTensor<R, u32>,
+    pub subject_ptr: GpuTensor<u32>,
     /// Count total per subject, `[s * n_genes + gene]`.
-    pub subject_total: GpuTensor<R, F>,
+    pub subject_total: GpuTensor<F>,
     /// Unweighted mean design row per subject, `[s * nb + j]`.
-    pub subject_mean: GpuTensor<R, F>,
+    pub subject_mean: GpuTensor<F>,
     /// The gene each request is for.
-    pub request_gene: GpuTensor<R, u32>,
+    pub request_gene: GpuTensor<u32>,
     /// `alpha`, `lambda` and `gamma` per request, `[i * n_req + q]`.
-    pub request_params: GpuTensor<R, F>,
+    pub request_params: GpuTensor<F>,
     /// Starting fixed effects, `[j * n_req + q]`.
-    pub beta_init: GpuTensor<R, F>,
+    pub beta_init: GpuTensor<F>,
     /// Starting random effects on the log scale, `[s * n_req + q]`.
-    pub log_w_init: GpuTensor<R, F>,
+    pub log_w_init: GpuTensor<F>,
     /// nebula's absolute stopping tolerance, then the relative resolution
     /// floor. Two elements.
-    pub tolerance: GpuTensor<R, F>,
+    pub tolerance: GpuTensor<F>,
     /// Per-subject working store, `[(slot * k + s) * n_req + q]`.
-    pub subject_scratch: GpuTensor<R, F>,
+    pub subject_scratch: GpuTensor<F>,
     /// Cross block of the information, `[(s * nb + j) * n_req + q]`.
-    pub vwb_scratch: GpuTensor<R, F>,
+    pub vwb_scratch: GpuTensor<F>,
     /// Everything a request brings back, `[row * n_req + q]`: [`OUT_HEADER`]
     /// rows, then `nb` fixed effects, the `nb * nb` Schur complement, the `k`
     /// random effects, the `k` random-effect curvatures and the `k * nb` cross
     /// block.
-    pub out: GpuTensor<R, F>,
+    pub out: GpuTensor<F>,
 }

@@ -616,9 +616,9 @@ pub fn scalars() -> Scalars {
 
 /// The default wgpu client.
 #[cfg(feature = "gpu-tests")]
-pub fn gpu_client() -> cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime> {
-    use cubecl::Runtime;
+pub fn gpu_client() -> cubecl::prelude::Client {
+    use cubecl_utils_rs::prelude::Runtime;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
-    WgpuRuntime::client(&WgpuDevice::default())
+    <WgpuRuntime>::client(&WgpuDevice::default())
 }
