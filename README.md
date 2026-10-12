@@ -123,7 +123,7 @@ components, where every evaluation is a penalised fit over every cell. The
 Same inputs, same `NebulaFit` out as `nebula_sparse`.
 
 ```toml
-edge-rs = { version = "0.1", features = ["gpu"] }
+edge-rs = { version = "0.3", features = ["gpu"] }
 cubecl = { version = "0.11", features = ["wgpu"] }
 cubecl-utils-rs = "0.2"
 ```
