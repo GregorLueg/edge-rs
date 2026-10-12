@@ -263,14 +263,14 @@ impl Timing {
 /// ### References
 ///
 /// He et al., Communications Biology 4, 629, 2021
-pub fn nebula_sparse_gpu<T: EdgeFloat, R: Runtime>(
+pub fn nebula_sparse_gpu<T: EdgeFloat>(
     counts: &CompressedSparse<f64>,
     subject_id: &[usize],
     design: &[T],
     n_coef: usize,
     offset: Option<&[T]>,
     params: Option<NebulaParams>,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<NebulaFit, EdgeErrors> {
     if params.is_some_and(|p| p.reml) {
         return Err(EdgeErrors::InvalidArgument(
@@ -311,12 +311,12 @@ pub fn nebula_sparse_gpu<T: EdgeFloat, R: Runtime>(
 /// ### Returns
 ///
 /// One outcome per kept gene, in order.
-fn fit_all<R: Runtime>(
+fn fit_all(
     shared: &Shared<'_>,
     sparse: &CompressedSparse<f64>,
     totals: &[f64],
     kept: &[usize],
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<Vec<GeneOutcome>, EdgeErrors> {
     let k = shared.n_subjects;
     let mut timing = std::env::var_os(TIMING_ENV).map(|_| Timing::default());
@@ -392,12 +392,12 @@ struct Live<'a> {
 /// One entry per kept gene: `None` where no refit was called for, else the
 /// search's result. Then the phases inside the device solves, when timed.
 #[allow(clippy::type_complexity)]
-fn search_all<R: Runtime>(
+fn search_all(
     shared: &Shared<'_>,
     genes: &[(GeneCounts, GenePlan)],
     totals: &[f64],
     kept: &[usize],
-    client: &ComputeClient<R>,
+    client: &Client,
     mut timing: Option<&mut Timing>,
 ) -> Result<(Vec<Option<Option<(Vec<f64>, bool)>>>, Option<SolveTiming>), EdgeErrors> {
     let k = shared.n_subjects;
@@ -611,16 +611,16 @@ struct Flight<'a> {
 ///
 /// The flight, or `None` when no search of the cohort is asking.
 #[allow(clippy::too_many_arguments)]
-fn launch_cohort<'a, R: Runtime>(
+fn launch_cohort<'a>(
     shared: &Shared<'_>,
     genes: &[(GeneCounts, GenePlan)],
     live: &[Live<'_>],
     in_flight: &mut [bool],
     cohort: usize,
     split: bool,
-    resident: &mut ResidentBatch<R>,
+    resident: &mut ResidentBatch,
     solve_params: &GpuSolveParams,
-    client: &'a ComputeClient<R>,
+    client: &'a Client,
     timing: Option<&mut Timing>,
 ) -> Result<Option<Flight<'a>>, EdgeErrors> {
     let started = Instant::now();

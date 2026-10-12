@@ -639,12 +639,12 @@ fn drift(got: &NebulaFit, want: &NebulaFit) -> String {
 /// * `cpu_hl` - The CPU NEBULA-HL fit, when that cell ran
 #[cfg(feature = "gpu")]
 fn gpu_cells(problem: &Problem, cpu_ln: Option<&NebulaFit>, cpu_hl: Option<&NebulaFit>) {
-    use cubecl::Runtime;
+    use cubecl_utils_rs::prelude::Runtime;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use edge_rs::gpu::stage_two::nebula_sparse_gpu;
 
     let device = WgpuDevice::default();
-    let client = WgpuRuntime::client(&device);
+    let client = <WgpuRuntime>::client(&device);
 
     for (name, method, cpu) in [
         ("gpu_ln", NebulaMethod::Ln, cpu_ln),

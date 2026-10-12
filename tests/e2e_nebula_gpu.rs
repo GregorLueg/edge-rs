@@ -26,7 +26,7 @@
 
 mod common;
 
-use cubecl::Runtime;
+use cubecl_utils_rs::prelude::Runtime;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -310,7 +310,7 @@ fn cpu_reference(batch: &Batch) -> Vec<PmlResult> {
 fn compare(
     batch: &Batch,
     cpu: &[PmlResult],
-    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    client: &cubecl::prelude::Client,
     noise_scale: f64,
     eps: f64,
 ) -> (f64, f64, f64, usize) {
@@ -331,7 +331,7 @@ fn compare(
         })
         .collect();
 
-    let gpu = opt_pml_batch::<WgpuRuntime>(
+    let gpu = opt_pml_batch(
         &batch.design,
         &batch.log_offset,
         &batch.subject_start,
@@ -382,7 +382,7 @@ fn compare(
 fn diagnose(
     batch: &Batch,
     cpu: &[PmlResult],
-    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    client: &cubecl::prelude::Client,
     noise_scale: f64,
     eps: f64,
 ) {
@@ -402,7 +402,7 @@ fn diagnose(
             gamma: 1.0 / TRUE_PHI_INV,
         })
         .collect();
-    let gpu = opt_pml_batch::<WgpuRuntime>(
+    let gpu = opt_pml_batch(
         &batch.design,
         &batch.log_offset,
         &batch.subject_start,
@@ -509,7 +509,7 @@ fn gpu_first_newton_step_matches_cpu() {
         })
         .collect();
     let client = common::gpu_client();
-    let gpu = opt_pml_batch::<WgpuRuntime>(
+    let gpu = opt_pml_batch(
         &batch.design,
         &batch.log_offset,
         &batch.subject_start,
@@ -651,7 +651,7 @@ fn gpu_opt_pml_holds_across_the_variance_range() {
                 gamma: 1.0 / TRUE_PHI_INV,
             })
             .collect();
-        let gpu = opt_pml_batch::<WgpuRuntime>(
+        let gpu = opt_pml_batch(
             &batch.design,
             &batch.log_offset,
             &batch.subject_start,
@@ -820,7 +820,7 @@ fn assert_same_bits(a: &NebulaFit, b: &NebulaFit) {
 /// * `label` - What the batch is, for the report
 fn assert_batch_matches_cpu(
     batch: &Batch,
-    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    client: &cubecl::prelude::Client,
     label: &str,
 ) {
     let cpu = cpu_reference(batch);
@@ -854,7 +854,7 @@ fn assert_batch_matches_cpu(
 #[test]
 fn gpu_rejects_what_it_cannot_fit() {
     let f = fixture("sc_k2", true);
-    let client = WgpuRuntime::client(&WgpuDevice::default());
+    let client = <WgpuRuntime>::client(&WgpuDevice::default());
     let hl = NebulaParams {
         method: NebulaMethod::Hl,
         ..NebulaParams::default()

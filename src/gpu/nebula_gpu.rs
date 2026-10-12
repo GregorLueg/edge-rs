@@ -191,27 +191,27 @@ pub struct PendingSolve<'a> {
 /// The counts and cell indices are the largest upload (hundreds of megabytes),
 /// and stage two fits every gene about forty times with only the variance
 /// components changed.
-pub struct ResidentBatch<R: Runtime> {
+pub struct ResidentBatch {
     /// Shared design, row-major `n_cells * nb`.
-    design: GpuTensor<R, f32>,
+    design: GpuTensor<f32>,
     /// Shared log offset per cell.
-    log_offset: GpuTensor<R, f32>,
+    log_offset: GpuTensor<f32>,
     /// Shared subject boundaries.
-    subject_start: GpuTensor<R, u32>,
+    subject_start: GpuTensor<u32>,
     /// Concatenated positive counts.
-    counts: GpuTensor<R, f32>,
+    counts: GpuTensor<f32>,
     /// Cell index of each count.
-    cells: GpuTensor<R, u32>,
+    cells: GpuTensor<u32>,
     /// Start of each subject's run in each gene's counts, `[gene * (k + 1) + s]`.
-    subject_ptr: GpuTensor<R, u32>,
+    subject_ptr: GpuTensor<u32>,
     /// Count total per subject, gene-minor.
-    subject_total: GpuTensor<R, f32>,
+    subject_total: GpuTensor<f32>,
     /// Unweighted mean design row per subject, `[s * nb + j]`.
-    subject_mean: GpuTensor<R, f32>,
+    subject_mean: GpuTensor<f32>,
     /// Per-subject scratch, sized for `capacity` requests.
-    subject_scratch: GpuTensor<R, f32>,
+    subject_scratch: GpuTensor<f32>,
     /// Cross-block scratch, sized for `capacity` requests.
-    vwb_scratch: GpuTensor<R, f32>,
+    vwb_scratch: GpuTensor<f32>,
     /// Requests the scratch is currently sized for.
     capacity: usize,
     /// Genes resident.
@@ -224,7 +224,7 @@ pub struct ResidentBatch<R: Runtime> {
     timing: Option<SolveTiming>,
 }
 
-impl<R: Runtime> ResidentBatch<R> {
+impl ResidentBatch {
     /// Uploads everything that does not change between launches.
     ///
     /// ### Params
@@ -245,7 +245,7 @@ impl<R: Runtime> ResidentBatch<R> {
         log_offset: &[f64],
         subject_start: &[usize],
         genes: &[GpuGene<'_>],
-        client: &ComputeClient<R>,
+        client: &Client,
     ) -> Result<Self, EdgeErrors> {
         let n_genes = genes.len();
         if n_genes == 0 {
@@ -440,7 +440,7 @@ impl<R: Runtime> ResidentBatch<R> {
         &mut self,
         requests: &[PmlRequest],
         params: &GpuSolveParams,
-        client: &ComputeClient<R>,
+        client: &Client,
     ) -> Result<Vec<PmlReply>, EdgeErrors> {
         let pending = self.submit(requests, params, client)?;
         self.collect(pending)
@@ -465,7 +465,7 @@ impl<R: Runtime> ResidentBatch<R> {
         &mut self,
         requests: &[PmlRequest],
         params: &GpuSolveParams,
-        client: &'a ComputeClient<R>,
+        client: &'a Client,
     ) -> Result<PendingSolve<'a>, EdgeErrors> {
         let n_req = requests.len();
         if n_req == 0 {
@@ -536,7 +536,7 @@ impl<R: Runtime> ResidentBatch<R> {
         }
 
         let header = OUT_HEADER as usize;
-        let tensors = PmlGpuTensors::<R, f32> {
+        let tensors = PmlGpuTensors::<f32> {
             design: self.design.clone(),
             log_offset: self.log_offset.clone(),
             subject_start: self.subject_start.clone(),
@@ -565,7 +565,7 @@ impl<R: Runtime> ResidentBatch<R> {
             .map_err(err)?,
         };
 
-        launch_opt_pml::<R, f32>(
+        launch_opt_pml::<f32>(
             &tensors,
             n_genes,
             n_req,
@@ -673,7 +673,7 @@ impl<R: Runtime> ResidentBatch<R> {
 /// The fits, or [`EdgeErrors`] if the inputs disagree in shape or a device
 /// limit rejects the work.
 #[allow(clippy::too_many_arguments)]
-pub fn opt_pml_batch<R: Runtime>(
+pub fn opt_pml_batch(
     design: &[f64],
     log_offset: &[f64],
     subject_start: &[usize],
@@ -682,7 +682,7 @@ pub fn opt_pml_batch<R: Runtime>(
     noise_scale: f64,
     max_iter: u32,
     max_backtrack: u32,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<GpuPmlBatch, EdgeErrors> {
     let mut resident = ResidentBatch::upload(design, log_offset, subject_start, genes, client)?;
     solve_per_gene(
@@ -712,11 +712,11 @@ pub fn opt_pml_batch<R: Runtime>(
 /// ### Returns
 ///
 /// The fits, gene-major.
-pub fn solve_per_gene<R: Runtime>(
-    resident: &mut ResidentBatch<R>,
+pub fn solve_per_gene(
+    resident: &mut ResidentBatch,
     genes: &[GpuGene<'_>],
     params: &GpuSolveParams,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<GpuPmlBatch, EdgeErrors> {
     let nb = resident.n_coef();
     let requests: Vec<PmlRequest> = genes

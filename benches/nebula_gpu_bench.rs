@@ -20,7 +20,7 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
-use cubecl::Runtime;
+use cubecl_utils_rs::prelude::Runtime;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -252,7 +252,7 @@ fn run_cpu(batch: &Batch, n_genes: usize) -> f64 {
 fn run_gpu(
     batch: &Batch,
     n_genes: usize,
-    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    client: &cubecl::prelude::Client,
 ) -> f64 {
     run_gpu_capped(batch, n_genes, client, PmlParams::default().max_iter as u32)
 }
@@ -276,7 +276,7 @@ fn run_gpu(
 fn run_gpu_capped(
     batch: &Batch,
     n_genes: usize,
-    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    client: &cubecl::prelude::Client,
     max_iter: u32,
 ) -> f64 {
     let params = PmlParams {
@@ -294,7 +294,7 @@ fn run_gpu_capped(
             gamma: 1.0 / TRUE_PHI_INV,
         })
         .collect();
-    let fit = opt_pml_batch::<WgpuRuntime>(
+    let fit = opt_pml_batch(
         &batch.design,
         &batch.log_offset,
         &batch.subject_start,
@@ -335,7 +335,7 @@ fn gpu_genes<'a>(batch: &'a Batch, n_genes: usize, beta_init: &'a [f64]) -> Vec<
 
 fn main() {
     let device = WgpuDevice::default();
-    let client = WgpuRuntime::client(&device);
+    let client = <WgpuRuntime>::client(&device);
 
     let shapes: Vec<(usize, usize)> =
         match (env_usize("NEBULA_GPU_GENES"), env_usize("NEBULA_GPU_CELLS")) {

@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.0
+
+### Breaking changes
+
+* The `gpu` feature moves to cubecl 0.11 and cubecl-utils-rs 0.2. Callers need
+  the same versions.
+* The GPU API drops its runtime generic, following cubecl. `nebula_sparse_gpu`,
+  `opt_pml_batch`, `solve_per_gene`, `ResidentBatch` and `launch_opt_pml` take
+  a `&Client` instead of a `&ComputeClient<R>`, and `PmlGpuTensors` holds
+  `GpuTensor<F>`. Build the client with
+  `<WgpuRuntime>::client(&WgpuDevice::default())`, with `Runtime` from
+  `cubecl_utils_rs::prelude`.
+* faer 0.24.
+
+### Notes
+
+* On cubecl 0.11 the GPU path is up to 13% faster at 20000 cells and 13%
+  slower on repeated solves at 80000 cells (M1 Max, 3 coefficients). GPU
+  against CPU accuracy is unchanged.
+* `benches/bulk_bench.rs` times the bulk limma and edgeR entry points.
+
 ## v0.2.1
 
 ### Features

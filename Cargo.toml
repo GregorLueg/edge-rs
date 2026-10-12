@@ -1,6 +1,6 @@
 [package]
 name = "edge-rs"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -22,10 +22,10 @@ gpu = ["cubecl", "cubecl-utils-rs"]
 gpu-tests = ["gpu"]
 
 [dependencies]
-cubecl = { version = "0.10.0", features = ["wgpu"], optional = true }
-cubecl-utils-rs = { version = "0.1.0", optional = true }
-faer = "0.23.2"
-faer-traits = "0.23.2"
+cubecl = { version = "0.11.0", features = ["wgpu"], optional = true }
+cubecl-utils-rs = { version = "0.2.0", optional = true }
+faer = "0.24.4"
+faer-traits = "0.24.0"
 num-traits = "0.2.19"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
@@ -55,3 +55,7 @@ harness = false
 name = "nebula_gpu_bench"
 harness = false
 required-features = ["gpu"]
+
+[[bench]]
+name = "bulk_bench"
+harness = false
