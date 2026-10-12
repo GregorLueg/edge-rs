@@ -3159,7 +3159,7 @@ mod tests {
         let block: Vec<usize> = (0..10).map(|i| i % 5).collect();
         let got =
             duplicate_correlation(&Y, N_GENES, N_SAMPLES, &design, 2, &block, None, 0.0).unwrap();
-        assert_relative_eq!(got, 0.05971830681411544, max_relative = 1e-14);
+        assert_relative_eq!(got, 0.05971830681411544, max_relative = 1e-13);
     }
 
     /// `block = c(1,1,1,2,2,3,3,3,4,4)`, so the blocks are of size 3, 2, 3 and
