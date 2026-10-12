@@ -124,15 +124,16 @@ Same inputs, same `NebulaFit` out as `nebula_sparse`.
 
 ```toml
 edge-rs = { version = "0.1", features = ["gpu"] }
-cubecl = { version = "0.10", features = ["wgpu"] }
+cubecl = { version = "0.11", features = ["wgpu"] }
+cubecl-utils-rs = "0.2"
 ```
 
 ```rust
-use cubecl::Runtime;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use cubecl_utils_rs::prelude::Runtime;
 use edge_rs::gpu::stage_two::nebula_sparse_gpu;
 
-let client = WgpuRuntime::client(&WgpuDevice::default());
+let client = <WgpuRuntime>::client(&WgpuDevice::default());
 let fit = nebula_sparse_gpu(
     &counts, &subject_id, &design, n_coef, Some(&offset), None, &client,
 )?;
