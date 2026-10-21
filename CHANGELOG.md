@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.1
+
+### Notes
+
+* faer is built without its default features, which drops the `npy` chain
+  (npyz, py_literal, pest_derive, stacker). The stacker build script failed on
+  Windows ARM64. Downstream crates must also declare faer with
+  `default-features = false`, as cargo unifies features.
+
 ## v0.3.0
 
 ### Breaking changes
