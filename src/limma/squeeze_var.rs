@@ -2848,9 +2848,12 @@ mod tests {
         for (k, &i) in [6_usize, 22, 30].iter().enumerate() {
             assert_relative_eq!(shrunk[i], B_ROBUST_SHRUNK_OUTLIERS[k], max_relative = 1e-12);
         }
+        // Measured 3.3e-14 on macOS, 1.1e-12 on Windows. df2 amplifies the
+        // ~1e-14 noise in the beta quantiles by about 100x, so platform libm
+        // rounding moves it more than the quantiles' own error against R.
         for (i, &v) in shrunk.iter().enumerate() {
             if ![6, 22, 30].contains(&i) {
-                assert_relative_eq!(v, B_ROBUST_DF2, max_relative = 1e-12);
+                assert_relative_eq!(v, B_ROBUST_DF2, max_relative = 5e-12);
             }
         }
     }
