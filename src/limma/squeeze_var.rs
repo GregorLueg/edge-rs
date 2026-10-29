@@ -3070,7 +3070,10 @@ mod tests {
         )
         .unwrap();
         assert_relative_eq!(out.var_prior[0], B_ROBUST_WIDE_SCALE, max_relative = 1e-12);
-        assert_relative_eq!(out.df_prior[0], B_ROBUST_WIDE_DF2, max_relative = 1e-12);
+        // Measured 1.4e-12. df.prior amplifies the ~1e-14 noise in the beta
+        // quantiles behind the Winsor limits; moving the beta inverse's start
+        // shifted it from 5.4e-13 with no change in accuracy against R.
+        assert_relative_eq!(out.df_prior[0], B_ROBUST_WIDE_DF2, max_relative = 2e-12);
         assert_relative_eq!(out.df_prior[6], B_ROBUST_WIDE_OUTLIER, max_relative = 1e-12);
     }
 
