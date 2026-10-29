@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.2
+
+### Fixes
+
+* `ebayes` could hang on large fits with homogeneous noise. The culprit was
+  statrs' `inv_beta_reg`, used as the start for the t quantile in `tmixture`:
+  its loops are unbounded and spin forever on tiny tail probabilities. It's
+  gone; the inverse now starts from the small-`x` asymptote and works in
+  `ln x`. That also fixes `t_isf_log` returning `inf` on one df at
+  `log_p = -700` and losing digits on huge df (7e-5 off at df 1e9). Against R's
+  `qt` it's now within 1e-8 for df up to 1e9 and `log_p` down to -700.
+
+### Features
+
+* `lm_fit` fits all genes with two GEMMs when nothing is missing, weights are
+  absent or shared across genes, and there's no block correlation. This is
+  limma's own `lm.series` shortcut. 10k samples by 19k genes, 60 coefficients:
+  52 s down to 0.33 s, against 16 s for R's `lmFit`. Results match the per-gene
+  path to 2e-14.
+
 ## v0.3.1
 
 ### Notes

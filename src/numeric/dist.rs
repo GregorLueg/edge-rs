@@ -10,7 +10,7 @@
 //! upper tail directly: the upper incomplete gamma for normal and chi-squared,
 //! the incomplete beta with swapped arguments for t, F and beta.
 
-use statrs::function::beta::{beta_reg, inv_beta_reg, ln_beta};
+use statrs::function::beta::{beta_reg, ln_beta};
 use statrs::function::erf::erfc_inv;
 use statrs::function::gamma::ln_gamma;
 
@@ -265,12 +265,6 @@ const BETA_CF_MAX_ITER: usize = 300;
 /// Relative tolerance at which the continued fraction stops.
 const BETA_CF_EPS: f64 = 3e-16;
 
-/// Log of the smallest positive probability an `f64` can hold.
-///
-/// Below this, `exp(ln_p)` is zero and AS 109 cannot seed the search; the
-/// small-`x` asymptote does instead.
-const MIN_REPRESENTABLE_LN: f64 = -745.0;
-
 /// Shape above which the beta log-normaliser goes through Stirling.
 ///
 /// `ln_beta` forms `lnGamma(a) + lnGamma(b) - lnGamma(a + b)`, where the first
@@ -389,26 +383,11 @@ fn beta_cf(a: f64, b: f64, x: f64) -> f64 {
     h
 }
 
-/// Log of the regularised incomplete beta.
+/// Log of the regularised incomplete beta, given both `x` and `1 - x`.
 ///
 /// `ln I(x; a, b)` without forming `I`, so a tail of 1e-4000 is about `-9210`,
 /// not `-inf`. R's `pbeta(log.p = TRUE)`. Needed by the unequal-df conversion in
 /// `tmixture.vector` for a moderated t of 40 against a near-infinite `df.total`.
-///
-/// ### Params
-///
-/// * `x` - Argument in `[0, 1]`
-/// * `a` - First shape, strictly positive
-/// * `b` - Second shape, strictly positive
-///
-/// ### Returns
-///
-/// `ln I(x; a, b)`. `x = 0` gives `-inf` and `x = 1` gives `0`.
-fn ln_beta_reg(x: f64, a: f64, b: f64) -> f64 {
-    ln_beta_reg_pair(x, 1.0 - x, a, b)
-}
-
-/// Log of the regularised incomplete beta, given both `x` and `1 - x`.
 ///
 /// The prefactor is `a ln x + b ln(1 - x)`; when one of `x`, `1 - x` is near one,
 /// its log is taken from the other. `a` is half the degrees of freedom, which
@@ -447,7 +426,45 @@ fn ln_beta_reg_pair(x: f64, one_minus_x: f64, a: f64, b: f64) -> f64 {
     } else {
         one_minus_x.ln()
     };
+    ln_beta_reg_logs(x, one_minus_x, ln_x, ln_1mx, a, b)
+}
 
+/// Log of the regularised incomplete beta at `x = e^t`.
+///
+/// For the inverse, which searches in `t`. Both `ln x = t` and
+/// `ln(1 - x) = ln(-expm1(t))` stay exact where `x` underflows (a t quantile of
+/// 1e303 on one df puts `x` near `e^-1400`) or rounds to one (a df of 1e9 puts
+/// `1 - x` near 1e-9).
+///
+/// ### Params
+///
+/// * `t` - Log of the argument, strictly negative
+/// * `a` - First shape, strictly positive
+/// * `b` - Second shape, strictly positive
+///
+/// ### Returns
+///
+/// `ln I(e^t; a, b)`.
+fn ln_beta_reg_at_ln(t: f64, a: f64, b: f64) -> f64 {
+    let one_minus_x = -t.exp_m1();
+    ln_beta_reg_logs(t.exp(), one_minus_x, t, one_minus_x.ln(), a, b)
+}
+
+/// Shared body of [`ln_beta_reg_pair`] and [`ln_beta_reg_at_ln`].
+///
+/// ### Params
+///
+/// * `x` - Argument in `[0, 1)`, possibly underflowed to zero
+/// * `one_minus_x` - Its complement, strictly positive
+/// * `ln_x` - `ln x`, finite
+/// * `ln_1mx` - `ln(1 - x)`
+/// * `a` - First shape, strictly positive
+/// * `b` - Second shape, strictly positive
+///
+/// ### Returns
+///
+/// `ln I(x; a, b)`.
+fn ln_beta_reg_logs(x: f64, one_minus_x: f64, ln_x: f64, ln_1mx: f64, a: f64, b: f64) -> f64 {
     // The continued fraction converges quickly only below this switchover;
     // past it, evaluate the complement and take `ln(1 - .)`.
     if x < (a + 1.0) / (a + b + 2.0) {
@@ -466,11 +483,14 @@ fn ln_beta_reg_pair(x: f64, one_minus_x: f64, a: f64, b: f64) -> f64 {
 
 /// Inverts the regularised incomplete beta on its lower half.
 ///
-/// `statrs`' `inv_beta_reg` (AS 109) has a `1e-30` floor and drifts by orders of
-/// magnitude below about `p = 1e-12` for small shapes. It is used as a start,
-/// then polished by Newton on `ln I(x; a, b) = ln p` in `t = ln x`. For small
-/// `x`, `I ~ x^a / (a B(a, b))`, so the residual is near-linear in `t` and two
-/// or three steps land it. A bracket doubled outwards guards a bad start.
+/// Newton on `ln I(x; a, b) = ln p` in `t = ln x`, started from the small-`x`
+/// asymptote `I ~ x^a / (a B(a, b))`, where the residual is near-linear in `t`.
+/// A bracket doubled outwards guards a bad start, and any step leaving it falls
+/// back to bisection.
+///
+/// `statrs`' `inv_beta_reg` (AS 109) is not used, not even as a start: its
+/// refinement loops are unbounded and spin indefinitely at `p = e^-300` on
+/// `a = 5000`, and it panics near `p = e^-700`.
 ///
 /// Only the lower half is solved. Callers wanting a quantile above the median
 /// flip the shapes and probability and take the complement.
@@ -483,23 +503,22 @@ fn ln_beta_reg_pair(x: f64, one_minus_x: f64, a: f64, b: f64) -> f64 {
 ///
 /// ### Returns
 ///
-/// `x` with `I(x; a, b) = p`, or [`EdgeErrors::NoConvergence`].
-///
-/// ### References
-///
-/// Cran, Martin & Robson, Algorithm AS 109, Applied Statistics, 1977
-fn inv_beta_reg_lower(a: f64, b: f64, p: f64) -> Result<f64, EdgeErrors> {
+/// `(x, 1 - x)` with `I(x; a, b) = p`, or [`EdgeErrors::NoConvergence`].
+fn inv_beta_reg_lower(a: f64, b: f64, p: f64) -> Result<(f64, f64), EdgeErrors> {
     debug_assert!(p <= 0.5, "inv_beta_reg_lower solves the lower half only");
     if p <= 0.0 {
-        return Ok(0.0);
+        return Ok((0.0, 1.0));
     }
-    inv_ln_beta_reg_lower(a, b, p.ln())
+    let t = inv_ln_beta_reg_lower(a, b, p.ln())?;
+    Ok((t.exp(), -t.exp_m1()))
 }
 
-/// Inverts the regularised incomplete beta from a log probability.
+/// Inverts the regularised incomplete beta from a log probability, in logs.
 ///
 /// The body of [`inv_beta_reg_lower`]. Taking the target in logs reaches
-/// probabilities below `ln p = -745`, which are not representable otherwise.
+/// probabilities below `ln p = -745`. Returning `ln x` keeps both `x`, which can
+/// underflow, and `1 - x`, which cancels when `x` is near one as it is for a t
+/// quantile on huge df, recoverable to full relative accuracy.
 ///
 /// ### Params
 ///
@@ -509,27 +528,19 @@ fn inv_beta_reg_lower(a: f64, b: f64, p: f64) -> Result<f64, EdgeErrors> {
 ///
 /// ### Returns
 ///
-/// `x` with `ln I(x; a, b) = ln_p`, or [`EdgeErrors::NoConvergence`].
+/// `ln x` with `ln I(x; a, b) = ln_p`: strictly negative, `-inf` for
+/// `ln_p = -inf`. [`EdgeErrors::NoConvergence`] if the budget runs out.
 fn inv_ln_beta_reg_lower(a: f64, b: f64, ln_p: f64) -> Result<f64, EdgeErrors> {
     if ln_p == f64::NEG_INFINITY {
-        return Ok(0.0);
+        return Ok(f64::NEG_INFINITY);
     }
-    let ln_b = ln_beta(a, b);
+    let ln_b = ln_beta_stable(a, b);
 
     // g(t) = ln I(e^t; a, b) - ln p, increasing in t.
-    let g = |t: f64| ln_beta_reg(t.exp().min(1.0), a, b) - ln_p;
+    let g = |t: f64| ln_beta_reg_at_ln(t, a, b) - ln_p;
 
-    let start = if ln_p > MIN_REPRESENTABLE_LN {
-        inv_beta_reg(a, b, ln_p.exp())
-    } else {
-        0.0
-    };
-    let mut t = if start > 0.0 && start < 1.0 {
-        start.ln()
-    } else {
-        // Small-x asymptote I ~ x^a / (a B(a, b)), inverted.
-        (ln_p + a.ln() + ln_b) / a
-    };
+    // Small-x asymptote I ~ x^a / (a B(a, b)), inverted.
+    let mut t = (ln_p + a.ln() + ln_b) / a;
 
     // x = 1 always satisfies I = 1 >= p, so t = 0 is a standing upper bracket.
     let mut lo = f64::NEG_INFINITY;
@@ -540,8 +551,22 @@ fn inv_ln_beta_reg_lower(a: f64, b: f64, ln_p: f64) -> Result<f64, EdgeErrors> {
     let mut step = 1.0;
     if g(t) < 0.0 {
         lo = t;
+        // Additive steps far out, then geometric towards zero: a tiny second
+        // shape puts the root within e^-100 or closer of x = 1, decades below
+        // anything additive steps or halving would reach in budget.
+        let mut shrink = 0.5;
         for _ in 0..INV_BETA_MAX_ITER {
-            let probe = (t + step).min(0.0);
+            let probe = if lo + step < 0.5 * lo {
+                lo + step
+            } else {
+                let p = lo * shrink;
+                shrink *= shrink;
+                p
+            };
+            // t = 0 is already the upper bracket.
+            if probe == 0.0 {
+                break;
+            }
             if g(probe) >= 0.0 {
                 hi = probe;
                 break;
@@ -562,39 +587,45 @@ fn inv_ln_beta_reg_lower(a: f64, b: f64, ln_p: f64) -> Result<f64, EdgeErrors> {
         }
     }
 
+    // Bisection, geometric while the bracket spans more than a factor of four
+    // so a root near zero is reached in log time.
+    let mid = |lo: f64, hi: f64| {
+        if !lo.is_finite() {
+            hi - 1.0
+        } else if hi < 0.0 && lo / hi > 4.0 {
+            -(lo * hi).sqrt()
+        } else {
+            0.5 * (lo + hi)
+        }
+    };
+
     for _ in 0..INV_BETA_MAX_ITER {
         if !(t > lo && t < hi) {
-            t = if lo.is_finite() {
-                0.5 * (lo + hi)
-            } else {
-                hi - 1.0
-            };
+            t = mid(lo, hi);
         }
-        let x = t.exp();
-        let ln_i = ln_beta_reg(x, a, b);
+        let ln_i = ln_beta_reg_at_ln(t, a, b);
         let residual = ln_i - ln_p;
         if residual < 0.0 {
             lo = t;
         } else {
             hi = t;
         }
-        let tol = INV_BETA_REL_TOL * (1.0 + t.abs());
+        // Relative to |t|: near x = 1, `1 - x ~ -t` is what callers divide by.
+        let tol = INV_BETA_REL_TOL * t.abs();
         if lo.is_finite() && hi - lo <= tol {
-            return Ok(t.exp());
+            return Ok(t);
         }
         // d(ln I)/dt = x^a (1 - x)^(b - 1) / (B(a, b) I), formed in logs.
-        let d = (a * t + (b - 1.0) * (-x).ln_1p() - ln_b - ln_i).exp();
+        let d = (a * t + (b - 1.0) * (-t.exp_m1()).ln() - ln_b - ln_i).exp();
         let t_next = if d > 0.0 && d.is_finite() {
             t - residual / d
-        } else if lo.is_finite() {
-            0.5 * (lo + hi)
         } else {
-            hi - 1.0
+            mid(lo, hi)
         };
         let delta = (t_next - t).abs();
         t = t_next;
         if delta <= tol {
-            return Ok(t.clamp(lo, hi).exp());
+            return Ok(t.clamp(lo, hi));
         }
     }
 
@@ -622,11 +653,10 @@ fn inv_ln_beta_reg_lower(a: f64, b: f64, ln_p: f64) -> Result<f64, EdgeErrors> {
 fn inv_beta_reg_pair(a: f64, b: f64, p: f64) -> Result<(f64, f64), EdgeErrors> {
     // 1 - p is exact for p >= 0.5 by Sterbenz, so the flip is free.
     if p <= 0.5 {
-        let x = inv_beta_reg_lower(a, b, p)?;
-        Ok((x, 1.0 - x))
+        inv_beta_reg_lower(a, b, p)
     } else {
-        let y = inv_beta_reg_lower(b, a, 1.0 - p)?;
-        Ok((1.0 - y, y))
+        let (y, one_minus_y) = inv_beta_reg_lower(b, a, 1.0 - p)?;
+        Ok((one_minus_y, y))
     }
 }
 
@@ -900,11 +930,10 @@ pub fn t_isf_log(log_p: f64, df: f64) -> Result<f64, EdgeErrors> {
         return t_ppf(1.0 - log_p.exp(), df);
     }
     // P(T > t) = I(df / (df + t^2); df/2, 1/2) / 2, so invert on the half.
-    let z = inv_ln_beta_reg_lower(0.5 * df, 0.5, log_p + std::f64::consts::LN_2)?;
-    if z <= 0.0 {
-        return Ok(f64::INFINITY);
-    }
-    Ok((df * (1.0 - z) / z).sqrt())
+    // In logs: z = e^t underflows on one df far out, and 1 - z cancels for
+    // huge df.
+    let t = inv_ln_beta_reg_lower(0.5 * df, 0.5, log_p + std::f64::consts::LN_2)?;
+    Ok((0.5 * (df.ln() + (-t.exp_m1()).ln() - t)).exp())
 }
 
 ///////
@@ -1577,6 +1606,40 @@ mod tests {
         assert_eq!(t_isf_log(f64::NEG_INFINITY, 5.0).unwrap(), f64::INFINITY);
         assert!(t_isf_log(0.5, 5.0).is_err());
         assert!(t_isf_log(-1.0, 0.0).is_err());
+    }
+
+    /// `Rscript -e 'qt(log_p, df, lower.tail = FALSE, log.p = TRUE)'` as
+    /// `(df, log_p, q)`, R 4.5 / nmath. Rows are df in {1, 3, 10, 1e3, 1e4, 1e5,
+    /// 4e5, 1e6, 1e7, 1.9e8, 1e9} by log_p in {-0.7, -1, -5, -20, -100, -300,
+    /// -700}. 1.9e8 is the pooled `df.total` cap of a 10k sample, 19k gene fit.
+    #[rustfmt::skip]
+    const QT_LOG_GRID: [(f64, f64, f64); 77] = [
+        (1.0, -0.7, 0.010727996056060032), (1.0, -1.0, 0.44067109149597056), (1.0, -5.0, 47.234319609736062), (1.0, -20.0, 154432878.13122693), (1.0, -100.0, 8.5565426146019082e+42), (1.0, -300.0, 6.1829352478963506e+129), (1.0, -700.0, 3.2284008990665143e+303),
+        (3.0, -0.7, 0.0092905389147059717), (3.0, -1.0, 0.37029899283826995), (3.0, -5.0, 5.2475138376631794), (3.0, -20.0, 811.78808368028865), (3.0, -100.0, 309477904024416.44), (3.0, -300.0, 2.7771229477676254e+43), (3.0, -700.0, 2.2362792333273065e+101),
+        (10.0, -0.7, 0.008775818159585138), (10.0, -1.0, 0.34703299170371826), (10.0, -5.0, 2.9942293392092791), (10.0, -20.0, 18.706235887243576), (10.0, -100.0, 56487.437947175575), (10.0, -300.0, 27405738909205.633), (10.0, -700.0, 6.4509071659330355e+30),
+        (1e3, -0.7, 0.0085616188761565917), (1e3, -1.0, 0.33756895837492173), (1e3, -5.0, 2.4753353727812137), (1e3, -20.0, 5.9318851848927343), (1e3, -100.0, 14.589866910195592), (1e3, -300.0, 28.420117490087314), (1e3, -700.0, 54.963935967094699),
+        (1e4, -0.7, 0.0085596925877981043), (1e4, -1.0, 0.33748436168020041), (1e4, -5.0, 2.4713776448556568), (1e4, -20.0, 5.8844407247954154), (1e4, -100.0, 13.956071278727959), (1e4, -300.0, 24.691443000854449), (1e4, -700.0, 38.631342851237399),
+        (1e5, -0.7, 0.0085594999827712914), (1e5, -1.0, 0.3374759035403414), (1e5, -5.0, 2.4709825313699096), (1e5, -20.0, 5.8797321331878409), (1e5, -100.0, 13.895210853298972), (1e5, -300.0, 24.36253385697686), (1e5, -700.0, 37.425236780450611),
+        (4e5, -0.7, 0.0085594839325480367), (4e5, -1.0, 0.33747519870791493), (4e5, -5.0, 2.4709496106501212), (4e5, -20.0, 5.8793400431624043), (4e5, -100.0, 13.890159224879307), (4e5, -300.0, 24.335454270416953), (4e5, -700.0, 37.327548110119771),
+        (1e6, -0.7, 0.0085594807225069999), (1e6, -1.0, 0.33747505774166164), (1e6, -5.0, 2.4709430266059176), (1e6, -20.0, 5.879261630556309), (1e6, -100.0, 13.889149268709051), (1e6, -300.0, 24.330044382743896), (1e6, -700.0, 37.308061369533142),
+        (1e7, -0.7, 0.0085594787964829531), (1e7, -1.0, 0.33747497316194669), (1e7, -5.0, 2.4709390761953562), (1e7, -20.0, 5.8792145838564425), (1e7, -100.0, 13.888543354111878), (1e7, -300.0, 24.326799414030287), (1e7, -700.0, 37.296377467260015),
+        (1.9e8, -0.7, 0.0085594785937436069), (1.9e8, -1.0, 0.33747496425882045), (1.9e8, -5.0, 2.4709386603633621), (1.9e8, -20.0, 5.8792096316099309), (1.9e8, -100.0, 13.888479576206455), (1.9e8, -300.0, 24.326457880420246), (1.9e8, -700.0, 37.295147937854146),
+        (1e9, -0.7, 0.0085594785846203371), (1e9, -1.0, 0.33747496385817977), (1e9, -5.0, 2.4709386416509251), (1e9, -20.0, 5.8792094087590065), (1e9, -100.0, 13.888476706212259), (1e9, -300.0, 24.326442511596071), (1e9, -700.0, 37.295092610620635),
+    ];
+
+    #[test]
+    fn test_t_isf_log_matches_r_up_to_huge_df() {
+        // Measured worst 7.6e-9 at df 3, log_p -700, where R's own qt only
+        // round-trips through pt to 2.3e-8. Next worst 4.9e-9 at df 1e9,
+        // log_p -5, from `t_sf_log` itself near the continued fraction's
+        // switchover; everything at df <= 1e6 is within 3e-12. Before the
+        // fix, df 1e4 at log_p -300 never returned (statrs' AS 109 start),
+        // df 1 at log_p -700 gave inf, and df 1e9 near the median was out by
+        // 7e-5 from cancellation in 1 - x.
+        for &(df, log_p, want) in &QT_LOG_GRID {
+            let got = t_isf_log(log_p, df).unwrap();
+            assert_relative_eq!(got, want, max_relative = 1e-8);
+        }
     }
 
     #[test]
