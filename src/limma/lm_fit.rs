@@ -19,6 +19,13 @@
 //! it; only genes with dropped observations refactorise, on their own
 //! submatrix.
 //!
+//! ### Shared fast path
+//!
+//! When nothing is dropped anywhere and there is no block correlation, every
+//! gene has the same design and its QR is the shared one, so all genes are
+//! fitted by two GEMMs (`lm.series`' all-observed branch). The per-gene path
+//! above stays for everything else.
+//!
 //! ### Missing observations
 //!
 //! A gene with non-finite responses or zero weights is refitted on what
@@ -35,6 +42,8 @@
 //! Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004
 //! Law, Chen, Shi and Smyth, Genome Biology 15, R29, 2014
 
+use faer::linalg::matmul::matmul;
+use faer::{Accum, MatMut, MatRef, Par};
 use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
@@ -536,6 +545,22 @@ fn fit_gene(
 // Shared design factor //
 //////////////////////////
 
+/// The design factorised once for the whole fit.
+struct DesignFactor {
+    /// Unscaled covariance of the estimable columns, row-major `rank * rank`.
+    cov: Vec<f64>,
+    /// Design column indices, accepted first, then rejected.
+    pivot: Vec<usize>,
+    /// Rank of the (weighted, whitened) design.
+    rank: usize,
+    /// Least-squares solve matrix, row-major `n_samples * n_coef`:
+    /// `beta = y' P` for any fully observed gene. `W^1/2 Q R^-T` scattered to
+    /// the accepted columns; rejected columns are zero.
+    solve: Vec<f64>,
+    /// Unscaled standard deviation per design column, `NaN` for rejected ones.
+    stdev: Vec<f64>,
+}
+
 /// Factors the design once for the whole fit, giving the unscaled covariance.
 ///
 /// **This deliberately ignores per-gene weights.** limma computes
@@ -560,15 +585,16 @@ fn fit_gene(
 ///
 /// ### Returns
 ///
-/// The unscaled covariance of the estimable columns (row-major `rank * rank`),
-/// the pivot with accepted columns first, and the rank.
+/// The unscaled covariance, pivot and rank, plus the solve matrix and
+/// standard deviations the shared fast path in [`lm_fit`] uses. The latter two
+/// are only meaningful without `gls`, the only case that path is taken.
 fn design_factorisation(
     design: &[f64],
     n_samples: usize,
     n_coef: usize,
     shared_weights: Option<&[f64]>,
     gls: Option<&BlockCorrelation<'_>>,
-) -> (Vec<f64>, Vec<usize>, usize) {
+) -> DesignFactor {
     let mut a = vec![0.0; n_samples * n_coef];
     for sample in 0..n_samples {
         let scale = match shared_weights {
@@ -620,7 +646,154 @@ fn design_factorisation(
     let mut pivot = est.clone();
     pivot.extend((0..n_coef).filter(|j| !est.contains(j)));
 
-    (cov, pivot, rank)
+    // Thin Q, column-major `n_samples * rank`: the reflectors applied in
+    // reverse to the leading identity columns. Reflector i touches rows i..,
+    // so columns before it are still unit vectors and are skipped.
+    let mut q = vec![0.0; n_samples * rank];
+    for j in 0..rank {
+        q[j * n_samples + j] = 1.0;
+    }
+    for i in (0..rank).rev() {
+        let u = &hh[i * n_samples + i..(i + 1) * n_samples];
+        for j in i..rank {
+            let col = &mut q[j * n_samples + i..(j + 1) * n_samples];
+            let dot: f64 = u.iter().zip(col.iter()).map(|(a, b)| a * b).sum();
+            let factor = dot * tau[i];
+            for (c, &uv) in col.iter_mut().zip(u) {
+                *c -= factor * uv;
+            }
+        }
+    }
+
+    // beta_t = sum_l R^-1[t, l] (Q' W^1/2 y)_l, so P[s, est[t]] is
+    // sqrt(w_s) sum_{l >= t} R^-1[t, l] Q[s, l].
+    let mut solve = vec![0.0; n_samples * n_coef];
+    for s in 0..n_samples {
+        let scale = shared_weights.map_or(1.0, |w| w[s].sqrt());
+        for (t, &j) in est.iter().enumerate() {
+            let acc: f64 = (t..rank)
+                .map(|l| r_inv[t * n_coef + l] * q[l * n_samples + s])
+                .sum();
+            solve[s * n_coef + j] = scale * acc;
+        }
+    }
+
+    // Row norms of R^-1, as `fit_gene` forms them.
+    let mut stdev = vec![f64::NAN; n_coef];
+    for (t, &j) in est.iter().enumerate() {
+        let row: f64 = (t..rank).map(|s| r_inv[t * n_coef + s].powi(2)).sum();
+        stdev[j] = row.sqrt();
+    }
+
+    DesignFactor {
+        cov,
+        pivot,
+        rank,
+        solve,
+        stdev,
+    }
+}
+
+//////////////////////
+// Shared fast path //
+//////////////////////
+
+/// Fits every gene at once against the shared design factorisation.
+///
+/// limma's `lm.series` all-observed branch (`lm.fit(design, t(M))`). Valid
+/// when every response is finite, every gene shares one weight row with no
+/// dropped observation, and there is no block correlation: then every gene
+/// has the same whitened design, so the per-gene QR is the same QR. Two GEMMs
+/// replace it, both through faer at the top level:
+///
+/// * `coefficients = Y P` (`n_genes * n_samples` by `n_samples * n_coef`);
+/// * `fitted = coefficients X'`, needed by voom regardless.
+///
+/// The residual sum of squares comes from `y - fitted` in one fused pass over
+/// genes, not from `||y||^2 - ||Q'y||^2`, which cancels for well-fitted genes
+/// at high expression.
+///
+/// ### Params
+///
+/// * `y` - Response, row-major `n_genes * n_samples`, all finite
+/// * `n_genes` - Number of genes
+/// * `n_samples` - Number of samples
+/// * `design` - Row-major design, `n_samples * n_coef`
+/// * `n_coef` - Number of coefficients
+/// * `factor` - Shared factorisation of the (weighted) design
+/// * `shared_weights` - The one weight row, or `None` for unit weights
+/// * `out` - Result buffers to fill, sized for all genes
+#[allow(clippy::too_many_arguments)]
+fn fit_shared(
+    y: &[f64],
+    n_genes: usize,
+    n_samples: usize,
+    design: &[f64],
+    n_coef: usize,
+    factor: &DesignFactor,
+    shared_weights: Option<&[f64]>,
+    out: &mut LmFitResult,
+) {
+    let y_mat = MatRef::from_row_major_slice(y, n_genes, n_samples);
+    let x_mat = MatRef::from_row_major_slice(design, n_samples, n_coef);
+    let p_mat = MatRef::from_row_major_slice(&factor.solve, n_samples, n_coef);
+
+    // Rejected columns of P are zero, so their coefficients come out zero and
+    // drop out of the fitted values. They become NaN below.
+    matmul(
+        MatMut::from_row_major_slice_mut(&mut out.coefficients, n_genes, n_coef),
+        Accum::Replace,
+        y_mat,
+        p_mat,
+        1.0,
+        Par::rayon(0),
+    );
+    matmul(
+        MatMut::from_row_major_slice_mut(&mut out.fitted, n_genes, n_samples),
+        Accum::Replace,
+        MatRef::from_row_major_slice(&out.coefficients, n_genes, n_coef),
+        x_mat.transpose(),
+        1.0,
+        Par::rayon(0),
+    );
+
+    let df = n_samples - factor.rank;
+    out.df_residual.fill(df as f64);
+    out.sigma
+        .par_iter_mut()
+        .zip(y.par_chunks(n_samples))
+        .zip(out.fitted.par_chunks(n_samples))
+        .for_each(|((sig, y_row), fit_row)| {
+            let rss: f64 = match shared_weights {
+                Some(w) => y_row
+                    .iter()
+                    .zip(fit_row)
+                    .zip(w)
+                    .map(|((a, b), wj)| wj * (a - b).powi(2))
+                    .sum(),
+                None => y_row
+                    .iter()
+                    .zip(fit_row)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum(),
+            };
+            *sig = if df > 0 {
+                (rss / df as f64).sqrt()
+            } else {
+                0.0
+            };
+        });
+
+    let rejected: Vec<usize> = factor.pivot[factor.rank..].to_vec();
+    out.coefficients
+        .par_chunks_mut(n_coef)
+        .zip(out.stdev_unscaled.par_chunks_mut(n_coef))
+        .for_each(|(coef, stdev)| {
+            for &j in &rejected {
+                coef[j] = f64::NAN;
+            }
+            stdev.copy_from_slice(&factor.stdev);
+        });
 }
 
 ////////////
@@ -637,6 +810,11 @@ fn design_factorisation(
 /// label have the stated correlation, and the fit is GLS against that
 /// compound-symmetry covariance. `correlation` without `block` is ignored, as in
 /// `lmFit`.
+///
+/// When every response is finite, the weights are absent or one row shared by
+/// all genes (all positive), and there is no block correlation, every gene has
+/// the same design and the fit is two GEMMs against one factorisation. This is
+/// limma's own all-observed branch. Anything else goes gene by gene.
 ///
 /// ### Params
 ///
@@ -674,6 +852,43 @@ pub fn lm_fit(
     weights: Option<&Recycled<f64>>,
     block: Option<&[usize]>,
     correlation: Option<f64>,
+) -> Result<LmFitResult, EdgeErrors> {
+    lm_fit_impl(
+        y,
+        n_genes,
+        n_samples,
+        design,
+        n_coef,
+        weights,
+        block,
+        correlation,
+        true,
+    )
+}
+
+/// Body of [`lm_fit`], with the shared fast path optional.
+///
+/// ### Params
+///
+/// * `y`, `n_genes`, `n_samples`, `design`, `n_coef`, `weights`, `block`,
+///   `correlation` - As for [`lm_fit`]
+/// * `allow_shared` - Whether the shared fast path may be taken. `false` forces
+///   the per-gene path, so tests can compare the two.
+///
+/// ### Returns
+///
+/// As for [`lm_fit`].
+#[allow(clippy::too_many_arguments)]
+fn lm_fit_impl(
+    y: &[f64],
+    n_genes: usize,
+    n_samples: usize,
+    design: &[f64],
+    n_coef: usize,
+    weights: Option<&Recycled<f64>>,
+    block: Option<&[usize]>,
+    correlation: Option<f64>,
+    allow_shared: bool,
 ) -> Result<LmFitResult, EdgeErrors> {
     if n_genes == 0 || n_samples == 0 {
         return Err(EdgeErrors::EmptyCounts { n_genes, n_samples });
@@ -761,7 +976,7 @@ pub fn lm_fit(
     } else {
         None
     };
-    let (cov_coefficients, pivot, rank) = design_factorisation(
+    let factor = design_factorisation(
         design,
         n_samples,
         n_coef,
@@ -769,19 +984,50 @@ pub fn lm_fit(
         gls.as_ref(),
     );
 
-    let mut coefficients = vec![0.0; n_genes * n_coef];
-    let mut stdev_unscaled = vec![0.0; n_genes * n_coef];
-    let mut sigma = vec![0.0; n_genes];
-    let mut df_residual = vec![0.0; n_genes];
-    let mut fitted = vec![0.0; n_genes * n_samples];
+    let mut out = LmFitResult {
+        coefficients: vec![0.0; n_genes * n_coef],
+        stdev_unscaled: vec![0.0; n_genes * n_coef],
+        sigma: vec![0.0; n_genes],
+        df_residual: vec![0.0; n_genes],
+        fitted: vec![0.0; n_genes * n_samples],
+        cov_coefficients: Vec::new(),
+        pivot: Vec::new(),
+        rank: factor.rank,
+    };
+
+    // No observation dropped anywhere, so every gene sees the same whitened
+    // design: all responses finite (`shared_weights` is only set then), and
+    // either no weights or a shared row that drops nothing.
+    let all_observed = y.par_iter().all(|v| v.is_finite())
+        && match weights {
+            None => true,
+            Some(_) => shared_weights
+                .as_deref()
+                .is_some_and(|w| w.iter().all(|&v| v.is_finite() && v > MIN_WEIGHT)),
+        };
+    if allow_shared && gls.is_none() && all_observed {
+        fit_shared(
+            y,
+            n_genes,
+            n_samples,
+            design,
+            n_coef,
+            &factor,
+            shared_weights.as_deref(),
+            &mut out,
+        );
+        out.cov_coefficients = factor.cov;
+        out.pivot = factor.pivot;
+        return Ok(out);
+    }
 
     let blocked = gls.is_some();
-    coefficients
+    out.coefficients
         .par_chunks_mut(n_coef)
-        .zip(stdev_unscaled.par_chunks_mut(n_coef))
-        .zip(fitted.par_chunks_mut(n_samples))
-        .zip(sigma.par_iter_mut())
-        .zip(df_residual.par_iter_mut())
+        .zip(out.stdev_unscaled.par_chunks_mut(n_coef))
+        .zip(out.fitted.par_chunks_mut(n_samples))
+        .zip(out.sigma.par_iter_mut())
+        .zip(out.df_residual.par_iter_mut())
         .enumerate()
         .for_each_init(
             || Scratch::new(n_samples, n_coef, blocked),
@@ -807,16 +1053,9 @@ pub fn lm_fit(
             },
         );
 
-    Ok(LmFitResult {
-        coefficients,
-        stdev_unscaled,
-        sigma,
-        df_residual,
-        fitted,
-        cov_coefficients,
-        pivot,
-        rank,
-    })
+    out.cov_coefficients = factor.cov;
+    out.pivot = factor.pivot;
+    Ok(out)
 }
 
 ///////////
@@ -1956,5 +2195,114 @@ mod tests {
             ),
             Err(EdgeErrors::CholeskyFailed(_))
         ));
+    }
+
+    /// Fits once through the shared path and once forced per gene, and
+    /// compares every output.
+    ///
+    /// ### Params
+    ///
+    /// * `design` - Row-major design, `n_samples * n_coef`
+    /// * `n_samples` - Number of samples
+    /// * `n_coef` - Number of coefficients
+    /// * `weights` - Optional weights
+    fn assert_shared_matches_per_gene(
+        design: &[f64],
+        n_samples: usize,
+        n_coef: usize,
+        weights: Option<&Recycled<f64>>,
+    ) {
+        use rand::prelude::*;
+        use rand_distr::Normal;
+
+        let n_genes = 200;
+        let mut rng = StdRng::seed_from_u64(7);
+        let noise = Normal::new(0.0, 0.7).unwrap();
+        // A spread of means, so some genes fit tightly at high expression.
+        let y: Vec<f64> = (0..n_genes * n_samples)
+            .map(|i| (i / n_samples) as f64 * 0.1 + rng.sample(noise))
+            .collect();
+
+        let fit = |allow_shared| {
+            lm_fit_impl(
+                &y,
+                n_genes,
+                n_samples,
+                design,
+                n_coef,
+                weights,
+                None,
+                None,
+                allow_shared,
+            )
+            .unwrap()
+        };
+        let (fast, slow) = (fit(true), fit(false));
+
+        // Absolute or relative. Measured worst absolute difference over the
+        // three cases is 2.1e-14 (coefficients, fitted); relative goes to
+        // 2.3e-11 only for coefficients near zero.
+        let tol = 5e-14;
+        for (name, a, b) in [
+            ("coefficients", &fast.coefficients, &slow.coefficients),
+            ("stdev_unscaled", &fast.stdev_unscaled, &slow.stdev_unscaled),
+            ("sigma", &fast.sigma, &slow.sigma),
+            ("df_residual", &fast.df_residual, &slow.df_residual),
+            ("fitted", &fast.fitted, &slow.fitted),
+        ] {
+            assert_eq!(a.len(), b.len(), "{name}");
+            for (x, z) in a.iter().zip(b) {
+                if z.is_nan() {
+                    assert!(x.is_nan(), "{name}: {x} vs NaN");
+                } else {
+                    assert_relative_eq!(*x, *z, max_relative = tol, epsilon = tol);
+                }
+            }
+        }
+        assert_eq!(fast.rank, slow.rank);
+        assert_eq!(fast.pivot, slow.pivot);
+        assert_eq!(fast.cov_coefficients, slow.cov_coefficients);
+    }
+
+    /// Intercept, a three-level factor and a continuous covariate over 30
+    /// samples.
+    fn design_factor_covariate() -> Vec<f64> {
+        (0..30)
+            .flat_map(|s| {
+                let level = s % 3;
+                [
+                    1.0,
+                    (level == 1) as u8 as f64,
+                    (level == 2) as u8 as f64,
+                    (s as f64 * 0.37).sin(),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_shared_path_matches_per_gene_path_unweighted() {
+        assert_shared_matches_per_gene(&design_factor_covariate(), 30, 4, None);
+    }
+
+    #[test]
+    fn test_shared_path_matches_per_gene_path_with_sample_weights() {
+        let w: Vec<f64> = (0..30).map(|s| 0.5 + (s % 7) as f64 / 4.0).collect();
+        assert_shared_matches_per_gene(
+            &design_factor_covariate(),
+            30,
+            4,
+            Some(&Recycled::BySample(w)),
+        );
+    }
+
+    #[test]
+    fn test_shared_path_matches_per_gene_path_rank_deficient() {
+        // Column 4 is the sum of the two factor columns, so it is aliased.
+        let design: Vec<f64> = design_factor_covariate()
+            .chunks_exact(4)
+            .flat_map(|r| [r[0], r[1], r[2], r[3], r[1] + r[2]])
+            .collect();
+        assert_shared_matches_per_gene(&design, 30, 5, None);
     }
 }
