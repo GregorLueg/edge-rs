@@ -6,7 +6,7 @@ Where `edge-rs` deliberately does not reproduce its upstreams, and why.
   [`edgePython`](https://github.com/pachterlab/edgePython), but where it
   disagrees with edgeR, limma or `nebula`, upstream wins. Those are what users
   compare against and what the fixtures gate on.
-- **Section B: edgeR or limma are wrong.** Rarer. Each fault is reproduced in
+- **Section B: edgeR, limma or nebula are wrong.** Rarer. Each fault is reproduced in
   the installed package. Copying a bug faithfully is not parity worth having.
 
 Every entry was checked against the installed package (edgeR 4.8.2, limma
@@ -47,6 +47,7 @@ against a newer checkout.
 | [B2](#b2-fitfdistrobustly-stops-its-root-solve-early) | `fitFDistRobustly` stops `uniroot` early | low | `limma/squeeze_var.rs` |
 | [B3](#b3-exacttestbysmallp-returns-one-p-value-for-every-gene) | `exactTestBySmallP` uses `min` for `pmin` | severe | `exact/mod.rs` |
 | [B4](#b4-binomtest-mishandles-exact-ties) | `binomTest` mishandles exact ties | medium | `exact/mod.rs` |
+| [B5](#b5-nebula-ln-stage-one-stops-on-a-spurious-sigma-bound) | NEBULA-LN stage one stops on a spurious `sigma` bound | high | `sc/nebula.rs` |
 
 ---
 
@@ -530,7 +531,7 @@ calibrated against that, so both ports keep it.
 
 ---
 
-# Section B: edgeR or limma are wrong
+# Section B: edgeR, limma or nebula are wrong
 
 ### B1. `aveLogCPM` corrupts the first gene under a matrix offset
 
@@ -646,3 +647,34 @@ Not reproduced either: above a total of 10000, `binomTest` switches to a
 chi-square shortcut whose 2 by 2 table uses column totals of whichever genes were
 passed in, so one gene's p-value depends on its neighbours. `edge-rs` enumerates
 exactly at every size.
+
+### B5. NEBULA-LN stage one stops on a spurious `sigma` bound
+
+- **Upstream:** nebula 1.5.9, `R/nebula.R`, the stage-one `lbfgs` on `ptmg_ll_der`
+- **Ported to:** `src/sc/nebula.rs`, `minimise_marginal`
+- **Severity:** up to one gene in a hundred in simulation keeps `sigma^2 = 1e-4` where the interior
+  optimum is far better; the subject effect is dropped and the SE shrinks up to
+  3.6x on simulated data
+- **Test:** `test_stage_one_restarts_off_a_spurious_sigma_bound`
+
+The marginal likelihood can rise off the lower bound on `sigma` before falling
+into an interior minimum. Any step from `sigma = 1` that jumps the interior basin
+lands on the bound, where the outward gradient holds it. `kappa_obs` is above 800
+on these genes, so the sigma-only HL refit never fires. nebula's own objective
+shows it. Simulated, 130 subjects of 280 cells:
+
+```
+# nebula's lbfgs, nebula's setup, by start value of sigma
+gene 148  start 1     -> sigma 1e-4     nll -135420.547
+gene 148  start 1e-3  -> sigma 3.158e-3 nll -135454.927
+gene 246  start 1     -> sigma 1e-4     nll  -29132.124
+gene 246  ptmg_ll at the edge-rs point (sigma 4.663e-3):  -29164.884
+```
+
+Simulated `sigma^2` was 3.1e-3 and 6.0e-3. The same trap catches the port's own
+projected Newton more often than nebula's L-BFGS, since its first step is longer.
+
+`edge-rs` restarts stage one, up to three times, from the geometric mean of the
+bound and the previous start, and keeps the lowest objective. That fixes every gene
+where nebula finds the interior and the port did not, and also moves genes off the
+bound where nebula stays on it. The second kind disagree with R by design.
