@@ -48,8 +48,10 @@
 //! bound the start was inside is restarted once from between the two, and the
 //! better minimiser kept.
 //!
-//! Stage one has an exact gradient and no jitter, so it is one call to
-//! [`minimise`] and lands on the reference optimum.
+//! Stage one has an exact gradient and no jitter, so it needs no polish. It does
+//! need restarting: its objective can have a spurious minimum on the lower bound
+//! of `sigma` that nebula's own L-BFGS falls into too, so it is restarted off
+//! that bound and the lowest objective kept. See `UPSTREAM_DEVIATIONS.md` B5.
 //!
 //! Only `model = "NBGMM"` is implemented. `PMM` needs Poisson-gamma kernels this
 //! crate lacks; `NBLMM` needs the log-normal outer objective, which has no
@@ -163,6 +165,22 @@ const STAGE_ONE_MAX_HALVINGS: usize = 40;
 /// free block of the Hessian is not positive definite; it grows tenfold until
 /// the Cholesky factor exists.
 const STAGE_ONE_SHIFT: f64 = 1e-8;
+
+/// Restarts of stage one off a bound its start was inside.
+///
+/// Each restart sits at the geometric mean of the bound and the previous start,
+/// so the ladder walks towards the bound in log steps: from `sigma = 1` to a
+/// `1e-4` bound it tries `1e-2`, `1e-3` and `3e-4`. One rung is not enough for a
+/// small interior optimum, whose basin a step from `1e-2` can still jump.
+const STAGE_ONE_RESTARTS: usize = 3;
+
+/// Least improvement in the stage-one objective for a restart to replace the
+/// incumbent, nebula's absolute `eps`.
+///
+/// A restart that only re-finds the same bound point lands a rounding-level
+/// distance away. Swapping it in would move `phi`, and every later stage, by
+/// noise; a genuine interior minimum clears this by orders of magnitude.
+const STAGE_ONE_RESTART_GAIN: f64 = 1e-6;
 
 /// Iteration budget for the stage-one quasi-Newton.
 const STAGE_ONE_MAX_ITER: usize = 300;
@@ -327,9 +345,13 @@ pub struct NebulaFit {
     /// has no fitted subject-level variance: the model has collapsed to a plain
     /// negative binomial GLM and the reported `sigma^2` is the constraint.
     ///
-    /// This is a legitimate KKT point of the box constraint, not a convergence
-    /// failure, so [`NebulaFit::convergence`] usually reports success. Lowering
-    /// `min.0` moves the answer down with it.
+    /// This is a KKT point of the box constraint, not a convergence failure,
+    /// so [`NebulaFit::convergence`] usually reports success. Lowering `min.0`
+    /// moves the answer down with it. Stage one is restarted off the bound and
+    /// keeps an interior minimum where it finds a better one, but with the
+    /// subject effect gone the SE is that of a plain NB GLM and can be far too
+    /// small if subjects do vary. Treat a flagged gene's SE and p-value with
+    /// suspicion.
     ///
     /// The R package has no such flag: its `check_conv` tests only the upper
     /// bound, so these genes report success.
@@ -1052,12 +1074,18 @@ fn fit_gene(
 /// nebula's stage one, an L-BFGS on an exact gradient. Here a dense design
 /// takes a projected Newton step on the exact Hessian instead, which costs
 /// about one gradient evaluation and converges in ten or so where the
-/// quasi-Newton takes 35 to 120 evaluations; both land on the same optimum, to
-/// the quasi-Newton's own tolerance. A design with zero-count tables keeps the
-/// quasi-Newton: its gradient walks only the positive counts, the Hessian every
-/// cell. A Newton search that has not converged falls back to the
+/// quasi-Newton takes 35 to 120 evaluations. A design with zero-count tables
+/// keeps the quasi-Newton: its gradient walks only the positive counts, the
+/// Hessian every cell. A Newton search that has not converged falls back to the
 /// quasi-Newton. `sigma` runs to its lower bound on most genes; see the
 /// `max_feasible_step` note in `numeric::lbfgsb`.
+///
+/// The lower bound on `sigma` can be a spurious KKT point: the objective rises
+/// off it before falling into an interior minimum that is far better. A long
+/// first step from `sigma = 1` jumps the interior basin and lands on the bound,
+/// where the outward gradient holds it. So a search that ends on a bound the
+/// start was inside runs again from [`bound_restart`], up to
+/// [`STAGE_ONE_RESTARTS`] times, and the lowest minimum is kept.
 ///
 /// No quadratic polish, unlike [`refine_variance`]: the objective is smooth, and
 /// the stencil costs `3^(n_coef + 2)` evaluations. The remainder is inside
@@ -1084,21 +1112,69 @@ fn minimise_marginal(
     upper: &[f64],
 ) -> (Vec<f64>, bool) {
     let n = start.len();
-    let mut best: Vec<f64> = (0..n).map(|j| start[j].clamp(lower[j], upper[j])).collect();
+    let x0: Vec<f64> = (0..n).map(|j| start[j].clamp(lower[j], upper[j])).collect();
+    let dense = zeros.is_none();
     let mut scratch = match zeros {
         Some(z) => PtmgScratch::tabled(gene, z),
         None => PtmgScratch::new(gene),
     };
-    let best_f = ptmg_value_and_gradient_with(gene, &best, &mut scratch).0;
-    if !best_f.is_finite() {
-        return (best, true);
+    let f0 = ptmg_value_and_gradient_with(gene, &x0, &mut scratch).0;
+    if !f0.is_finite() {
+        return (x0, true);
     }
 
-    if zeros.is_none()
-        && let Some((x, f)) = newton_marginal(gene, &mut scratch, &best, lower, upper)
-        && f < best_f
+    let (mut best, mut best_f) = descend_marginal(gene, &mut scratch, dense, &x0, f0, lower, upper);
+    let (mut last, mut anchor) = (best.clone(), x0);
+    for _ in 0..STAGE_ONE_RESTARTS {
+        let Some(x1) = bound_restart(&last, &anchor, lower, upper) else {
+            break;
+        };
+        let f1 = ptmg_value_and_gradient_with(gene, &x1, &mut scratch).0;
+        if !f1.is_finite() {
+            break;
+        }
+        let (x, f) = descend_marginal(gene, &mut scratch, dense, &x1, f1, lower, upper);
+        if f < best_f - STAGE_ONE_RESTART_GAIN {
+            (best, best_f) = (x.clone(), f);
+        }
+        (last, anchor) = (x, x1);
+    }
+
+    (best, false)
+}
+
+/// One descent on the marginal likelihood from a feasible point.
+///
+/// Projected Newton on a dense design, with the quasi-Newton as its fallback
+/// and as the only option on a tabled one. See [`minimise_marginal`].
+///
+/// ### Params
+///
+/// * `gene` - The gene
+/// * `scratch` - Its buffers, dense or tabled
+/// * `dense` - Whether `scratch` is dense, so the exact Hessian is available
+/// * `x0` - Starting point, inside the box
+/// * `f0` - The objective at `x0`, finite
+/// * `lower` - Lower bounds
+/// * `upper` - Upper bounds
+///
+/// ### Returns
+///
+/// The best point found and its objective; `(x0, f0)` if nothing improved on it.
+fn descend_marginal(
+    gene: &GeneData<'_>,
+    scratch: &mut PtmgScratch<'_>,
+    dense: bool,
+    x0: &[f64],
+    f0: f64,
+    lower: &[f64],
+    upper: &[f64],
+) -> (Vec<f64>, f64) {
+    if dense
+        && let Some((x, f)) = newton_marginal(gene, scratch, x0, lower, upper)
+        && f < f0
     {
-        return (x, false);
+        return (x, f);
     }
 
     let params = LbfgsbParams {
@@ -1109,22 +1185,52 @@ fn minimise_marginal(
         ..LbfgsbParams::default()
     };
 
-    if let Ok(step) = minimise(
+    match minimise(
         |x, g| {
-            let (value, gradient) = ptmg_value_and_gradient_with(gene, x, &mut scratch);
+            let (value, gradient) = ptmg_value_and_gradient_with(gene, x, scratch);
             g.copy_from_slice(&gradient);
             value
         },
-        &best,
+        x0,
         lower,
         upper,
         Some(params),
-    ) && step.f < best_f
-    {
-        best = step.x;
+    ) {
+        Ok(step) if step.f < f0 => (step.x, step.f),
+        _ => (x0.to_vec(), f0),
     }
+}
 
-    (best, false)
+/// Where to restart a search that ended on a bound its start was inside.
+///
+/// Stage one and the stage-two simplex can both be thrown onto a bound by an
+/// overshooting step and then held there.
+///
+/// ### Params
+///
+/// * `best` - The search's minimiser, inside the box
+/// * `start` - Its starting point, clamped into the box
+/// * `lower` - Lower bounds
+/// * `upper` - Upper bounds
+///
+/// ### Returns
+///
+/// `best` with every coordinate on a bound the start was strictly inside moved
+/// to the geometric mean of that bound and the start, or `None` when no
+/// coordinate is on such a bound. A coordinate whose bound and start differ in
+/// sign has no geometric mean and is left alone; only fixed effects can.
+fn bound_restart(best: &[f64], start: &[f64], lower: &[f64], upper: &[f64]) -> Option<Vec<f64>> {
+    let mut x0 = best.to_vec();
+    let mut moved = false;
+    for j in 0..best.len() {
+        for bound in [lower[j], upper[j]] {
+            if best[j] == bound && start[j] != bound && bound * start[j] > 0.0 {
+                x0[j] = (bound * start[j]).sqrt();
+                moved = true;
+            }
+        }
+    }
+    moved.then_some(x0)
 }
 
 /// Projected Newton on the marginal likelihood, inside the box.
@@ -1704,7 +1810,7 @@ impl StageTwoSearch {
     /// Asks for the simplex's next point, clamped, or moves on when it is done.
     ///
     /// A simplex that ends on a bound the start was inside is restarted once
-    /// from [`Self::restart_point`], and the better of the two minimisers kept.
+    /// from [`bound_restart`], and the better of the two minimisers kept.
     /// Clamping collapses a simplex whose step overshoots a bound onto that
     /// bound, and it cannot leave again: on `sc_cat_hl` gene 3 the first run
     /// pinned the subject variance at `1e-4` with an objective `0.071` above
@@ -1718,7 +1824,8 @@ impl StageTwoSearch {
         let result = simplex.result();
         let mut best = self.clamped(&result.x);
         if !self.restarted
-            && let Some(x0) = self.restart_point(&best)
+            && let Some(x0) =
+                bound_restart(&best, &self.clamped(&self.start), &self.lower, &self.upper)
         {
             self.restarted = true;
             self.pinned = Some((best, result.f));
@@ -1735,32 +1842,6 @@ impl StageTwoSearch {
         self.simplex = None;
         self.stage = SearchStage::Check;
         self.asked = vec![best];
-    }
-
-    /// Where to restart a simplex that ended on a bound.
-    ///
-    /// ### Params
-    ///
-    /// * `best` - The first simplex's clamped minimiser
-    ///
-    /// ### Returns
-    ///
-    /// `best` with every coordinate on a bound the start was strictly inside
-    /// moved to the geometric mean of that bound and the start, or `None` when
-    /// no coordinate is on such a bound.
-    fn restart_point(&self, best: &[f64]) -> Option<Vec<f64>> {
-        let start = self.clamped(&self.start);
-        let mut x0 = best.to_vec();
-        let mut moved = false;
-        for j in 0..best.len() {
-            for bound in [self.lower[j], self.upper[j]] {
-                if best[j] == bound && start[j] != bound {
-                    x0[j] = (bound * start[j]).sqrt();
-                    moved = true;
-                }
-            }
-        }
-        moved.then_some(x0)
     }
 
     /// Builds the next polish stencil, or finishes the pass after the last.
@@ -3590,10 +3671,92 @@ mod tests {
 
     #[test]
     fn test_restart_point_is_the_geometric_mean_of_bound_and_start() {
-        let search = StageTwoSearch::new(&[0.25], &[1e-4], &[10.0], 1);
-        let x0 = search.restart_point(&[1e-4]).expect("on its bound");
-        assert_relative_eq!(x0[0], (1e-4f64 * 0.25).sqrt(), max_relative = 1e-15);
-        assert!(search.restart_point(&[0.1]).is_none());
+        let (lower, upper) = ([-100.0, 1e-4], [100.0, 10.0]);
+        let x0 = bound_restart(&[0.3, 1e-4], &[0.0, 0.25], &lower, &upper).expect("on its bound");
+        assert_relative_eq!(x0[1], (1e-4f64 * 0.25).sqrt(), max_relative = 1e-15);
+        assert_eq!(x0[0], 0.3);
+        assert!(bound_restart(&[0.3, 0.1], &[0.0, 0.25], &lower, &upper).is_none());
+        // A fixed effect on its bound has no geometric mean with a zero start.
+        assert!(bound_restart(&[-100.0, 0.1], &[0.0, 0.25], &lower, &upper).is_none());
+    }
+
+    /// A gene in the regime where `sigma`'s lower bound is a spurious minimum:
+    /// 40 subjects of 60 cells, high counts and a small subject variance.
+    /// Design `[1, subject covariate, cell covariate]`, gamma-Poisson counts.
+    ///
+    /// ### Params
+    ///
+    /// * `seed` - Seed of the generator
+    ///
+    /// ### Returns
+    ///
+    /// The gene, laid out as [`NewtonGene`].
+    fn trap_gene(seed: u64) -> NewtonGene {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        use rand_distr::{Gamma, Normal, Poisson};
+        let (n_subjects, per) = (40, 60);
+        let (mu0, size, sigma2) = (20.0f64, 25.0, 0.015f64);
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let normal = Normal::new(0.0, 1.0).expect("valid normal");
+        let fid: Vec<usize> = (0..=n_subjects).map(|s| s * per).collect();
+        let mut design = Vec::new();
+        let mut log_offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cells = Vec::new();
+        let mut totals = vec![0.0; n_subjects];
+        for (s, total) in totals.iter_mut().enumerate() {
+            let x_subject: f64 = normal.sample(&mut rng);
+            let u = -sigma2 / 2.0 + sigma2.sqrt() * normal.sample(&mut rng);
+            for i in 0..per {
+                let x_cell: f64 = normal.sample(&mut rng);
+                let lo = 0.4 * normal.sample(&mut rng);
+                design.extend([1.0, x_subject, x_cell]);
+                log_offset.push(lo);
+                let mu = (mu0.ln() + 0.05 * x_subject + 0.05 * x_cell + u + lo).exp();
+                let lambda = Gamma::new(size, mu / size)
+                    .expect("valid gamma")
+                    .sample(&mut rng);
+                let y = Poisson::new(lambda)
+                    .expect("valid Poisson")
+                    .sample(&mut rng);
+                if y > 0.0 {
+                    counts.push(y);
+                    cells.push(s * per + i);
+                    *total += y;
+                }
+            }
+        }
+        (design, log_offset, counts, cells, totals, fid)
+    }
+
+    #[test]
+    fn test_stage_one_restarts_off_a_spurious_sigma_bound() {
+        let (design, log_offset, counts, cells, totals, fid) = trap_gene(3);
+        let gene = GeneData::new(&design, &log_offset, &counts, &cells, &totals, &fid, 3)
+            .expect("valid gene");
+        let mean = counts.iter().sum::<f64>() / fid[fid.len() - 1] as f64;
+        let start = [mean.ln(), 0.0, 0.0, 1.0, 1.0];
+        let lower = [-BETA_BOUND, -BETA_BOUND, -BETA_BOUND, 1e-4, 1e-4];
+        let upper = [BETA_BOUND, BETA_BOUND, BETA_BOUND, 10.0, 1000.0];
+        let mut scratch = PtmgScratch::new(&gene);
+        let f0 = ptmg_value_and_gradient_with(&gene, &start, &mut scratch).0;
+
+        // One descent from `sigma = 1` is thrown onto the bound and held there;
+        // without that the rest of the test proves nothing.
+        let (pinned, f_pinned) =
+            descend_marginal(&gene, &mut scratch, true, &start, f0, &lower, &upper);
+        assert_eq!(pinned[3], lower[3]);
+
+        let (x, failed) = minimise_marginal(&gene, None, &start, &lower, &upper);
+        let f = ptmg_value_and_gradient_with(&gene, &x, &mut scratch).0;
+        assert!(!failed);
+        assert!(x[3] > 10.0 * lower[3], "sigma {} still on its bound", x[3]);
+        assert!(
+            f < f_pinned - 1.0,
+            "restart gained {} over the bound",
+            f_pinned - f
+        );
     }
 
     /// Design, log offsets, counts, cells, subject totals and boundaries.

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.3
+
+### Fixes
+
+* NEBULA-LN stage one now restarts when it ends on the lower bound of the
+  subject variance and keeps the better fit. Affected genes get an interior
+  `sigma^2` and larger, correct SEs; all other genes are unchanged at the same
+  seed.
+
 ## v0.3.2
 
 ### Fixes
