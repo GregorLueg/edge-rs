@@ -8,6 +8,9 @@ description = "Negative binomial differential expression for bulk and single-cel
 repository = "https://github.com/GregorLueg/edge-rs"
 keywords = ["bioinformatics", "rna-seq", "statistics", "single-cell", "glm"]
 categories = ["science", "mathematics"]
+# The Python bindings build against this crate by path and are never published
+# with it.
+exclude = ["python/"]
 
 [lib]
 name = "edge_rs"
