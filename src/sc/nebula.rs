@@ -140,14 +140,14 @@ const POLISH_FLOOR: [f64; 2] = [1e-5, 1e-4];
 /// step means the model is wrong and the incumbent is kept.
 const POLISH_MAX_STEP: f64 = 2.0;
 
-/// Relative objective tolerance for the stage-one quasi-Newton.
+/// Absolute objective tolerance for stage one, nebula's `eps`, which it hands
+/// nlopt's L-BFGS as `ftol_abs`.
 ///
-/// nebula stops nlopt's L-BFGS on an absolute change of `eps = 1e-6`, about
-/// `1e-10` relative on the log-likelihoods seen here. [`minimise`] tests a
-/// relative change, so passing `eps` through would stop four orders too early,
-/// and NEBULA-LN carries the cell-level overdispersion out of this stage
-/// untouched. A fixed tight value converges past nebula in every case.
-const STAGE_ONE_FTOL: f64 = 1e-13;
+/// The Newton search tests it as is. [`minimise`] tests a change relative to
+/// the objective, so the quasi-Newton is given this over the starting
+/// objective's magnitude; passing `eps` straight through would stop orders of
+/// magnitude early on log-likelihoods in the thousands.
+const STAGE_ONE_FTOL_ABS: f64 = 1e-6;
 
 /// Projected gradient tolerance for the stage-one quasi-Newton.
 const STAGE_ONE_PGTOL: f64 = 1e-7;
@@ -1180,7 +1180,7 @@ fn descend_marginal(
     }
 
     let params = LbfgsbParams {
-        ftol: STAGE_ONE_FTOL,
+        ftol: STAGE_ONE_FTOL_ABS / f0.abs().max(1.0),
         pgtol: STAGE_ONE_PGTOL,
         max_iter: STAGE_ONE_MAX_ITER,
         max_line_search: STAGE_ONE_MAX_LINE_SEARCH,
@@ -1242,7 +1242,7 @@ fn bound_restart(best: &[f64], start: &[f64], lower: &[f64], upper: &[f64]) -> O
 /// Levenberg-style until it factors, then an Armijo backtracking along the
 /// projected path. Stops when the projected gradient is under
 /// [`STAGE_ONE_PGTOL`] or a step improves the objective by less than
-/// [`STAGE_ONE_FTOL`] relative, the quasi-Newton's own tests.
+/// [`STAGE_ONE_FTOL_ABS`], nebula's stopping rule.
 ///
 /// ### Params
 ///
@@ -1340,7 +1340,7 @@ fn newton_marginal(
             alpha *= 0.5;
         }
         let (xt, ft, derivatives) = accepted?;
-        if (f - ft) <= STAGE_ONE_FTOL * f.abs() {
+        if (f - ft) <= STAGE_ONE_FTOL_ABS {
             return Some((xt, ft));
         }
         let (ft, gt, ht) = match derivatives {
@@ -3838,7 +3838,9 @@ mod tests {
             &lower,
             &upper,
             Some(LbfgsbParams {
-                ftol: STAGE_ONE_FTOL,
+                // Converged well past stage one's own stop, so it is the optimum
+                // Newton is held to.
+                ftol: 1e-14,
                 pgtol: STAGE_ONE_PGTOL,
                 max_iter: STAGE_ONE_MAX_ITER,
                 max_line_search: STAGE_ONE_MAX_LINE_SEARCH,
@@ -3854,7 +3856,7 @@ mod tests {
         // From its own optimum it gains no more than its stopping tolerance.
         let (x2, f2) =
             newton_marginal(&gene, &mut scratch, &x, &lower, &upper).expect("already converged");
-        assert!(f2 <= f && f - f2 <= STAGE_ONE_FTOL * f.abs());
+        assert!(f2 <= f && f - f2 <= STAGE_ONE_FTOL_ABS);
         for (a, b) in x2.iter().zip(&x) {
             assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
         }

@@ -63,8 +63,8 @@ use edge_rs::sc::test::{ScTested, glm_sc_test, packed_len};
 // Tolerances //
 ////////////////
 
-/// Coefficients on the pure paths. Needs `7.4e-6`, against `1.0e-6` in the
-/// in-crate eight-gene golden.
+/// Coefficients on the pure paths. Needs `1.1e-5` (`sc_intercept`), against
+/// `1.0e-6` in the in-crate eight-gene golden.
 const TOL_COEF: Tol = Tol::new(3e-5, 1e-9);
 
 /// Standard errors. Needs `2.3e-5`.
@@ -75,7 +75,7 @@ const TOL_SE: Tol = Tol::rel(1e-4);
 const TOL_COV: Tol = Tol::new(1e-3, 1e-12);
 
 /// Subject-level overdispersion. The profile likelihood is flatter in this
-/// direction than in the cell-level one. Needs `5.9e-5` relative
+/// direction than in the cell-level one. Needs `6.7e-5` relative
 /// (`sc_cat_sparse`), except near the lower bound: BOBYQA stops at a radius of
 /// `1e-6` times its first step, so a small `sigma^2` is resolved to a few `1e-7`
 /// absolute, by nebula as by this crate (`sc_intercept` gene 18: `2.2e-4`
@@ -207,14 +207,15 @@ const CPU_TOLS: NebulaTols = NebulaTols {
 ///   cell overdispersion, and a p-value `1.2e-2` off at `p = 6e-238`, which the
 ///   `1e-12` floor absorbs.
 /// * `sc_cat_ln`: the same planted near-Poisson gene, `gene_id` 29, where R
-///   stops at `phi = 322`. Needs `5.6e-4` on the coefficients and on
-///   `sigma^2`, and `2.1e-3` absolute on the cell overdispersion. The gates are
-///   per dataset, so the other five pure genes are held to them too.
+///   stops at `phi = 322`. Needs `5.8e-4` on the coefficients, `6.1e-4` on
+///   `sigma^2`, `2.1e-3` absolute on the cell overdispersion, and `9.7e-3` on
+///   its p-value against the unloosened `1e-2`. The gates are per dataset, so
+///   the other five pure genes are held to them too.
 /// * `sc_high`: means of `1e3` to `1e4`, the set most sensitive to how the
 ///   platform's `exp` and `log` round: the profile likelihood's `1e-6` jitter
-///   carries an ulp into the optimum. Needs, macOS then Linux: `6.1e-5` and
-///   `1.24e-4` on the coefficients, `2.1e-4` and `8.5e-4` on `sigma^2`,
-///   `3.5e-3` and `1.1e-2` on the covariance.
+///   carries an ulp into the optimum. Needs on macOS `1.5e-4` on the
+///   coefficients, `4.8e-4` on `sigma^2` and `8.9e-3` on the covariance; Linux
+///   has needed two to four times the macOS figures on this set.
 ///
 /// The `sc_blocks` and `sc_cat_ln` gene is not settled as a port fault or an R
 /// one.
