@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.0
+
+### Features
+
+* NEBULA is much faster on wide designs (many covariates or factor levels).
+  Results agree with the previous release to rounding at the same seed.
+
+### Changes
+
+* NEBULA stage one now stops on nebula's own absolute tolerance (`1e-6`)
+  rather than a far tighter relative one. Results move slightly at the same
+  seed, within the parity tolerances against R.
+
 ## v0.3.3
 
 ### Fixes
