@@ -39,6 +39,7 @@
 
 use crate::errors::EdgeErrors;
 use crate::sc::zeros::ZeroCells;
+use crate::utils::linalg::weighted_gram;
 
 //////////////////////
 // Tuning and codes //
@@ -1480,6 +1481,16 @@ fn sweep_width<const NB: usize>(
         &mut local[..2 * nb + nb * nb]
     };
 
+    // Wide and dense, the curvature block is `gamma X' diag(p) X` over every
+    // fold, so the per-row weights are summed and the block is one Gram at the
+    // end instead of a triangle update per cell.
+    let gram = NB == 0 && zeros.is_none();
+    let mut row_weight = if gram {
+        vec![0.0; data.n_cells()]
+    } else {
+        Vec::new()
+    };
+
     out.db.fill(0.0);
     out.vb.fill(0.0);
     let ln_gamma = gamma.ln();
@@ -1499,9 +1510,18 @@ fn sweep_width<const NB: usize>(
 
         // `d` adds to the gradient, `p` to the curvature, the latter before the
         // factor of `gamma` the curvature blocks take at the end.
-        let mut fold = |row: &[f64], d: f64, p: f64| {
+        let mut fold = |r: usize, d: f64, p: f64| {
+            let row = &data.design[r * nb..(r + 1) * nb];
             resid += d;
             weight += p;
+            if gram {
+                row_weight[r] += p;
+                for a in 0..nb {
+                    score[a] += row[a] * d;
+                    first[a] += p * row[a];
+                }
+                return;
+            }
             for a in 0..nb {
                 score[a] += row[a] * d;
                 let pa = p * row[a];
@@ -1525,13 +1545,12 @@ fn sweep_width<const NB: usize>(
                     stored[r] = (eta + log_w_s).exp();
                 }
                 for r in cells {
-                    let row = &data.design[r * nb..(r + 1) * nb];
                     let extb = stored[r];
                     let t = extb + gamma;
                     sum_log += t.ln();
                     let inv = 1.0 / t;
                     let u = extb * inv;
-                    fold(row, -gamma * u, gamma * u * inv);
+                    fold(r, -gamma * u, gamma * u * inv);
                 }
             }
             Some(z) => {
@@ -1545,7 +1564,7 @@ fn sweep_width<const NB: usize>(
                     }
                     let [l, a, b] = g.eval::<0, 3>(log_tau);
                     sum_log += g.n * ln_gamma + l;
-                    fold(row, -gamma * a, b);
+                    fold(g.row, -gamma * a, b);
                 }
                 for &r in &z.loose[z.subject_loose[s]..z.subject_loose[s + 1]] {
                     let row = &data.design[r * nb..(r + 1) * nb];
@@ -1559,7 +1578,7 @@ fn sweep_width<const NB: usize>(
                     sum_log += t.ln();
                     let inv = 1.0 / t;
                     let u = extb * inv;
-                    fold(row, -gamma * u, gamma * u * inv);
+                    fold(r, -gamma * u, gamma * u * inv);
                 }
             }
         }
@@ -1583,7 +1602,7 @@ fn sweep_width<const NB: usize>(
             weighted_log += y * t.ln();
             let inv = 1.0 / t;
             let u = extb * inv;
-            fold(row, y * (1.0 - u), y * u * inv);
+            fold(c, y * (1.0 - u), y * u * inv);
         }
 
         log_likelihood += linear + log_w_s * data.subject_total[s] - gamma * sum_log - weighted_log;
@@ -1593,9 +1612,17 @@ fn sweep_width<const NB: usize>(
         for a in 0..nb {
             out.db[a] += score[a];
             out.vwb[s * nb + a] = gamma * first[a];
-            for b in a..nb {
-                out.vb[a * nb + b] += gamma * second[a * nb + b];
+            if !gram {
+                for b in a..nb {
+                    out.vb[a * nb + b] += gamma * second[a * nb + b];
+                }
             }
+        }
+    }
+    if gram {
+        let xwx = weighted_gram(data.design, nb, &row_weight);
+        for (v, x) in out.vb.iter_mut().zip(xwx) {
+            *v = gamma * x;
         }
     }
     for a in 0..nb {

@@ -73,8 +73,9 @@ use crate::sc::pml::{
     CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml_tabled,
 };
 use crate::sc::ptmg::{
-    GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
-    positive_indices, ptmg_value_and_gradient_with, ptmg_value_gradient_hessian_with,
+    GeneData, HESSIAN_LOCAL_COEF, PtmgScratch, cell_level_columns, centre_design, cumsum_y,
+    design_cv, offset_summary, positive_indices, ptmg_value_and_gradient_with,
+    ptmg_value_gradient_hessian_with,
 };
 use crate::sc::test::packed_len;
 use crate::sc::zeros::ZeroCells;
@@ -1072,9 +1073,10 @@ fn fit_gene(
 /// Minimises the marginal negative log-likelihood over `[beta, sigma, phi]`.
 ///
 /// nebula's stage one, an L-BFGS on an exact gradient. Here a dense design
-/// takes a projected Newton step on the exact Hessian instead, which costs
-/// about one gradient evaluation and converges in ten or so where the
-/// quasi-Newton takes 35 to 120 evaluations. A design with zero-count tables
+/// takes a projected Newton step on the exact Hessian instead. On a narrow
+/// design that costs about one gradient evaluation and converges in ten or so
+/// where the quasi-Newton takes 35 to 120 evaluations; on a wide one the
+/// Hessian is a GEMM and Newton stays level with the quasi-Newton. A design with zero-count tables
 /// keeps the quasi-Newton: its gradient walks only the positive counts, the
 /// Hessian every cell. A Newton search that has not converged falls back to the
 /// quasi-Newton. `sigma` runs to its lower bound on most genes; see the
@@ -1269,6 +1271,10 @@ fn newton_marginal(
     if !finite(f, &g, &h) {
         return None;
     }
+    // Up to `HESSIAN_LOCAL_COEF` a Hessian costs about one gradient, so trial
+    // points take it in case they are accepted. Wider, it costs
+    // `O(n_cells * n_coef^2)` and trials need only the value.
+    let speculative = gene.n_coef <= HESSIAN_LOCAL_COEF;
     for _ in 0..STAGE_ONE_NEWTON_MAX_ITER {
         let projected = (0..n)
             .map(|i| ((x[i] - g[i]).clamp(lower[i], upper[i]) - x[i]).abs())
@@ -1318,19 +1324,36 @@ fn newton_marginal(
                 .map(|i| (x[i] + alpha * d[i]).clamp(lower[i], upper[i]))
                 .collect();
             let decrease: f64 = (0..n).map(|i| g[i] * (xt[i] - x[i])).sum();
-            let (ft, gt, ht) = ptmg_value_gradient_hessian_with(gene, &xt, scratch);
-            if finite(ft, &gt, &ht) && ft <= f + STAGE_ONE_ARMIJO * decrease {
-                accepted = Some((xt, ft, gt, ht));
+            let trial = if speculative {
+                let (ft, gt, ht) = ptmg_value_gradient_hessian_with(gene, &xt, scratch);
+                finite(ft, &gt, &ht).then_some((ft, Some((gt, ht))))
+            } else {
+                let ft = ptmg_value_and_gradient_with(gene, &xt, scratch).0;
+                ft.is_finite().then_some((ft, None))
+            };
+            if let Some((ft, derivatives)) = trial
+                && ft <= f + STAGE_ONE_ARMIJO * decrease
+            {
+                accepted = Some((xt, ft, derivatives));
                 break;
             }
             alpha *= 0.5;
         }
-        let (xt, ft, gt, ht) = accepted?;
-        let done = (f - ft) <= STAGE_ONE_FTOL * f.abs();
-        (x, f, g, h) = (xt, ft, gt, ht);
-        if done {
-            return Some((x, f));
+        let (xt, ft, derivatives) = accepted?;
+        if (f - ft) <= STAGE_ONE_FTOL * f.abs() {
+            return Some((xt, ft));
         }
+        let (ft, gt, ht) = match derivatives {
+            Some((gt, ht)) => (ft, gt, ht),
+            None => {
+                let (ft, gt, ht) = ptmg_value_gradient_hessian_with(gene, &xt, scratch);
+                if !finite(ft, &gt, &ht) {
+                    return None;
+                }
+                (ft, gt, ht)
+            }
+        };
+        (x, f, g, h) = (xt, ft, gt, ht);
     }
     None
 }

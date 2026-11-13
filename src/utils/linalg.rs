@@ -1,4 +1,5 @@
-//! Small dense factorisations shared by the limma modules.
+//! Small dense factorisations shared by the limma modules, and the weighted
+//! Gram the NEBULA kernels use on wide designs.
 //!
 //! Matrices are of order `n_coef` or `n_samples` (tens of values), so these are
 //! hand-rolled: faer's call overhead dominates at this size, and failure is
@@ -7,8 +8,9 @@
 //! Matrices are row-major with an explicit stride, so a caller can factor a
 //! leading submatrix of a larger buffer in place.
 
+use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
-use faer::{MatRef, Side};
+use faer::{Accum, MatMut, MatRef, Par, Side};
 
 use crate::prelude::*;
 
@@ -212,6 +214,57 @@ pub(crate) fn self_adjoint_eigen_desc(
     }
 
     Ok((values, vectors))
+}
+
+///////////////////
+// Weighted Gram //
+///////////////////
+
+/// Rows scaled per [`weighted_gram`] block. Keeps the scaled copy small enough
+/// to stay in L2 next to the rows it was read from.
+const GRAM_CHUNK: usize = 512;
+
+/// `X' diag(w) X` for a tall row-major `X`.
+///
+/// Sequential faer GEMMs over row blocks of [`GRAM_CHUNK`], so the caller can
+/// run it inside a parallel loop. Weights may be negative.
+///
+/// ### Params
+///
+/// * `x` - Row-major `n_rows * n_cols`
+/// * `n_cols` - Number of columns
+/// * `weight` - One weight per row, its length fixes `n_rows`
+///
+/// ### Returns
+///
+/// The symmetric `n_cols * n_cols` matrix, row-major and full.
+pub(crate) fn weighted_gram(x: &[f64], n_cols: usize, weight: &[f64]) -> Vec<f64> {
+    let n_rows = weight.len();
+    debug_assert_eq!(x.len(), n_rows * n_cols);
+    let mut gram = vec![0.0; n_cols * n_cols];
+    let mut scaled = vec![0.0; GRAM_CHUNK.min(n_rows) * n_cols];
+    for start in (0..n_rows).step_by(GRAM_CHUNK) {
+        let rows = GRAM_CHUNK.min(n_rows - start);
+        let block = &x[start * n_cols..(start + rows) * n_cols];
+        for ((dst, src), &w) in scaled
+            .chunks_exact_mut(n_cols)
+            .zip(block.chunks_exact(n_cols))
+            .zip(&weight[start..start + rows])
+        {
+            for (d, &v) in dst.iter_mut().zip(src) {
+                *d = v * w;
+            }
+        }
+        matmul(
+            MatMut::from_row_major_slice_mut(&mut gram, n_cols, n_cols),
+            Accum::Add,
+            MatRef::from_row_major_slice(block, rows, n_cols).transpose(),
+            MatRef::from_row_major_slice(&scaled[..rows * n_cols], rows, n_cols),
+            1.0,
+            Par::Seq,
+        );
+    }
+    gram
 }
 
 ///////////

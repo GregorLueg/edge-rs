@@ -24,12 +24,15 @@
 //!
 //! He et al., Communications Biology 4, 629, 2021
 
+use faer::linalg::matmul::matmul;
+use faer::{Accum, MatMut, MatRef, Par};
 use rayon::prelude::*;
 
 use crate::numeric::gamma::{digamma, ln_gamma, trigamma};
 use crate::prelude::*;
 use crate::sc::pml::positive_runs;
 use crate::sc::zeros::ZeroCells;
+use crate::utils::linalg::weighted_gram;
 
 ///////////////
 // Gene data //
@@ -629,6 +632,10 @@ pub(crate) fn ptmg_value_gradient_hessian_with(
 /// Fills the exponentiated linear predictor and its subject sums, and
 /// accumulates `sum y * eta`.
 ///
+/// `X beta` is one matrix-vector product into `extb`, then a pass adds the
+/// offset and exponentiates in place. A per-row dot product is a single
+/// dependency chain over `n_coef`, which is latency bound on wide designs.
+///
 /// ### Params
 ///
 /// * `data` - The gene
@@ -640,21 +647,27 @@ pub(crate) fn ptmg_value_gradient_hessian_with(
 /// `sum_i y_i * eta_i`, the only part of the likelihood linear in `eta`.
 fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch<'_>) -> f64 {
     let nb = data.n_coef;
+    let n_cells = data.n_cells();
     let mut total = 0.0;
+
+    matmul(
+        MatMut::from_column_major_slice_mut(&mut scratch.extb, n_cells, 1),
+        Accum::Replace,
+        MatRef::from_row_major_slice(data.design, n_cells, nb),
+        MatRef::from_column_major_slice(beta, nb, 1),
+        1.0,
+        Par::Seq,
+    );
 
     for (s, csx_s) in scratch.cumsumxtb.iter_mut().enumerate() {
         let span = data.fid[s]..data.fid[s + 1];
         let mut csx = 0.0;
-        for (((row, &offset), &y), extb_i) in data.design[span.start * nb..span.end * nb]
-            .chunks_exact(nb)
-            .zip(&data.log_offset[span.clone()])
+        for ((&offset, &y), extb_i) in data.log_offset[span.clone()]
+            .iter()
             .zip(&scratch.y_cell[span.clone()])
             .zip(&mut scratch.extb[span])
         {
-            let mut eta = offset;
-            for (&x, &b) in row.iter().zip(beta.iter()) {
-                eta += x * b;
-            }
+            let eta = offset + *extb_i;
             // Guarded so a huge eta paired with a zero count cannot make `0 * inf`.
             if y != 0.0 {
                 total += eta * y;
@@ -942,6 +955,12 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
 /// the three symmetric `x x' e` blocks weighted by `1`, `g` and `g e/w`. The
 /// formulas that follow are [`evaluate`]'s, applied to those sums.
 ///
+/// Wider than [`HESSIAN_LOCAL_COEF`], the three blocks only ever enter the
+/// Hessian in one subject-weighted combination, so they are folded into a
+/// single `X' diag(w) X` once the subject weights are known. That is a second
+/// pass over the cells, but a GEMM instead of three scalar triangle updates per
+/// cell, and no `k * n_coef^2` storage.
+///
 /// ### Params
 ///
 /// * `data` - The gene, as validated by [`GeneData::new`]
@@ -986,14 +1005,18 @@ fn evaluate_hessian(
     } = &subjects;
 
     // Per-subject sums, row-major `k * nb` vectors and `k * nb * nb` blocks
-    // (upper triangle filled).
+    // (upper triangle filled). A wide design keeps `g e` and `g e^2 / w` per
+    // cell for the Gram instead of the blocks.
+    let wide = nb > HESSIAN_LOCAL_COEF;
+    let n_block = if wide { 0 } else { k * nn };
     let mut xexb_f = vec![0.0; k * nb];
     let mut dbeta_41 = vec![0.0; k * nb];
     let mut tmp1_f = vec![0.0; k * nb];
     let mut tmp2_f = vec![0.0; k * nb];
-    let mut block_plain = vec![0.0; k * nn];
-    let mut block_g = vec![0.0; k * nn];
-    let mut block_gte = vec![0.0; k * nn];
+    let mut block_plain = vec![0.0; n_block];
+    let mut block_g = vec![0.0; n_block];
+    let mut block_gte = vec![0.0; n_block];
+    let mut cell_terms = vec![0.0; if wide { 2 * n_cells } else { 0 }];
     let mut hb2_f = vec![0.0; k];
     let mut b2f = vec![0.0; k];
     let mut d42c = vec![0.0; k];
@@ -1006,7 +1029,11 @@ fn evaluate_hessian(
     };
     for s in 0..k {
         let v = s * nb..(s + 1) * nb;
-        let m = s * nn..(s + 1) * nn;
+        let (m, c) = if wide {
+            (0..0, 2 * fid[s]..2 * fid[s + 1])
+        } else {
+            (s * nn..(s + 1) * nn, 0..0)
+        };
         let block = SubjectBlock {
             xf: &mut xexb_f[v.clone()],
             d41: &mut dbeta_41[v.clone()],
@@ -1015,6 +1042,7 @@ fn evaluate_hessian(
             plain: &mut block_plain[m.clone()],
             g: &mut block_g[m.clone()],
             gte: &mut block_gte[m],
+            cell: &mut cell_terms[c],
         };
         macro_rules! width {
             ($nb:literal) => {
@@ -1131,14 +1159,31 @@ fn evaluate_hessian(
     let ymuymuimu: Vec<f64> = (0..k).map(|s| ymu2[s] * imustar[s]).collect();
     let b2f_scaled: Vec<f64> = (0..k).map(|s| b2f[s] * ymuymuimu[s] * imustar[s]).collect();
     let ymmd_imu: Vec<f64> = (0..k).map(|s| ymm_d[s] * imustar[s]).collect();
+    // The three blocks enter only as `sum x x' e (ymm_d - ym g + ym^2 g e / w)`.
+    let gram = wide.then(|| {
+        let mut weight = vec![0.0; n_cells];
+        for s in 0..k {
+            let ym = ymustar[s];
+            for i in fid[s]..fid[s + 1] {
+                weight[i] =
+                    extb[i] * ymm_d[s] - ym * cell_terms[2 * i] + ym * ym * cell_terms[2 * i + 1];
+            }
+        }
+        weighted_gram(data.design, nb, &weight)
+    });
     for p in 0..nb {
         for q in p..nb {
             let mut acc = 0.0;
-            for s in 0..k {
-                let at = s * nn + p * nb + q;
-                acc -= block_g[at] * ymustar[s];
-                acc += block_gte[at] * ymu2[s];
-                acc += ymm_d[s] * block_plain[at];
+            match &gram {
+                Some(gram) => acc += gram[p * nb + q],
+                None => {
+                    for s in 0..k {
+                        let at = s * nn + p * nb + q;
+                        acc -= block_g[at] * ymustar[s];
+                        acc += block_gte[at] * ymu2[s];
+                        acc += ymm_d[s] * block_plain[at];
+                    }
+                }
             }
             for s in 0..k {
                 let xf_p = xexb_f[s * nb + p];
@@ -1210,10 +1255,13 @@ struct SubjectBlock<'a> {
     g: &'a mut [f64],
     /// `sum x x' e g e / w`, upper triangle.
     gte: &'a mut [f64],
+    /// `g e` and `g e^2 / w` per cell, interleaved. Wide designs only, which
+    /// leave the three blocks empty.
+    cell: &'a mut [f64],
 }
 
 /// Widest design whose per-subject Hessian sums live on the stack.
-const HESSIAN_LOCAL_COEF: usize = 8;
+pub(crate) const HESSIAN_LOCAL_COEF: usize = 8;
 
 /// One subject's sweep for [`evaluate_hessian`], at a compile-time design
 /// width (`NB == 0` reads it from `data`).
@@ -1260,7 +1308,9 @@ fn hessian_subject<const NB: usize>(
         plain,
         g: bg,
         gte: bgte,
+        cell,
     } = block;
+    let first = cells.start;
     let mut acc = 0.0;
     let mut hb2 = 0.0;
     let mut b2 = 0.0;
@@ -1282,6 +1332,7 @@ fn hessian_subject<const NB: usize>(
             plain: bp,
             g: bg,
             gte: bgte,
+            cell,
         } = if local {
             SubjectBlock {
                 xf: &mut lxf[..nb],
@@ -1291,6 +1342,7 @@ fn hessian_subject<const NB: usize>(
                 plain: &mut lbp[..nb * nb],
                 g: &mut lbg[..nb * nb],
                 gte: &mut lbgte[..nb * nb],
+                cell: &mut [],
             }
         } else {
             SubjectBlock {
@@ -1301,6 +1353,7 @@ fn hessian_subject<const NB: usize>(
                 plain: &mut *plain,
                 g: &mut *bg,
                 gte: &mut *bgte,
+                cell: &mut *cell,
             }
         };
         for i in cells {
@@ -1325,6 +1378,18 @@ fn hessian_subject<const NB: usize>(
             let f1 = gt - inv_w;
 
             let row = &data.design[i * nb..(i + 1) * nb];
+            if !local {
+                cell[2 * (i - first)] = g * e;
+                cell[2 * (i - first) + 1] = gte * e;
+                for a in 0..nb {
+                    let xe = row[a] * e;
+                    xf[a] += xe;
+                    d41[a] += g * xe;
+                    t1[a] += xe * f1;
+                    t2[a] += xe * gte;
+                }
+                continue;
+            }
             for a in 0..nb {
                 let xe = row[a] * e;
                 xf[a] += xe;
