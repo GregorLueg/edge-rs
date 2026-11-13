@@ -35,6 +35,34 @@ RUSTFLAGS="-C target-cpu=x86-64-v4" cargo build --release
 A bare `+avx512f` is not enough, since `wide` only ships its real 512-bit types
 under the full feature set.
 
+## Python
+
+The bulk edgeR quasi-likelihood and limma-voom stacks also ship as a Python
+package, built from `python/` with PyO3. NumPy in, polars out, every function
+named after the R function it reproduces.
+
+```sh
+uv pip install edge-rs
+```
+
+```python
+import edge_rs
+
+# counts: (n_genes, n_samples), as in edgeR
+res = edge_rs.run_edger_ql(counts, design, feature_ids=genes, coef="treated")
+res = edge_rs.run_limma_voom(counts, design, feature_ids=genes, coef="treated")
+```
+
+The step functions are there too (`filter_by_expr`, `calc_norm_factors`,
+`glm_ql_fit`, `voom_lm_fit`, `ebayes`, `top_table` and friends). Pseudobulked
+single cell data from [bixverse](https://gregorlueg.github.io/bixverse-rs/)
+goes straight in as `pb.counts.T`. NEBULA, the exact test and the plain NB GLM
+are not exposed yet.
+
+Docs, API reference and vignettes: <https://gregorlueg.github.io/edge-rs/>.
+The Python package is versioned on its own; see
+[python/CHANGELOG.md](python/CHANGELOG.md).
+
 ## Quick start
 
 ### The GLM chain

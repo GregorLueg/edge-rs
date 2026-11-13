@@ -13,6 +13,13 @@
   rather than a far tighter relative one. Results move slightly at the same
   seed, within the parity tolerances against R.
 
+### Notes
+
+* Python bindings for the bulk edgeR QL and limma-voom stacks live in
+  `python/` and ship to PyPI as `edge-rs`, with their own
+  [changelog](python/CHANGELOG.md). The crate excludes `python/` from its
+  package, so nothing changes for Rust users.
+
 ## v0.3.3
 
 ### Fixes
