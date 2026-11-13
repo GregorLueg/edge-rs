@@ -2516,7 +2516,9 @@ mod tests {
     fn test_opt_pml_collinear_design_reports_minus_twentyfive() {
         // The covariate is duplicated, so the information matrix is singular.
         let design: Vec<f64> = DESIGN
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|r| [r[0], r[1], r[1]])
             .collect();
         let data = PmlData {

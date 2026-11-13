@@ -1762,7 +1762,7 @@ mod tests {
         assert_close(&fit.coefficients, &B_COEF);
         assert_close(&fit.sigma, &B_SIGMA);
         // Per-sample weights are shared by every gene, so is the design metric.
-        for row in fit.stdev_unscaled.chunks_exact(2) {
+        for row in fit.stdev_unscaled.as_chunks::<2>().0.iter() {
             assert_close(row, &B_SDU);
         }
     }
@@ -1870,7 +1870,7 @@ mod tests {
         assert_close(&fit.coefficients, &F_COEF);
         assert_close(&fit.sigma, &F_SIGMA);
         assert_close(&fit.df_residual, &[3.0; 8]);
-        for row in fit.stdev_unscaled.chunks_exact(2) {
+        for row in fit.stdev_unscaled.as_chunks::<2>().0.iter() {
             assert_close(row, &F_SDU);
         }
     }
@@ -1911,7 +1911,7 @@ mod tests {
         .unwrap();
         assert_close(&fit.coefficients, &K_COEF);
         assert_close(&fit.sigma, &K_SIGMA);
-        for row in fit.stdev_unscaled.chunks_exact(2) {
+        for row in fit.stdev_unscaled.as_chunks::<2>().0.iter() {
             assert_close(row, &K_SDU);
         }
     }
@@ -2300,7 +2300,9 @@ mod tests {
     fn test_shared_path_matches_per_gene_path_rank_deficient() {
         // Column 4 is the sum of the two factor columns, so it is aliased.
         let design: Vec<f64> = design_factor_covariate()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|r| [r[0], r[1], r[2], r[3], r[1] + r[2]])
             .collect();
         assert_shared_matches_per_gene(&design, 30, 5, None);

@@ -528,7 +528,7 @@ pub fn natural_spline_basis(x: &[f64], df: usize) -> Result<(Vec<f64>, usize), E
     let n_internal = df - MIN_BASIS_DF;
     if n_internal == 0 || lower == upper {
         let mut basis = vec![0.0; n * MIN_BASIS_DF];
-        for (row, &xi) in basis.chunks_exact_mut(MIN_BASIS_DF).zip(x) {
+        for (row, &xi) in basis.as_chunks_mut::<MIN_BASIS_DF>().0.iter_mut().zip(x) {
             row[0] = 1.0;
             row[1] = xi;
         }

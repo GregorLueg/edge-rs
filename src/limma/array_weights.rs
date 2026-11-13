@@ -1086,9 +1086,8 @@ fn array_weights_gene_by_gene(
 
         let mut d = vec![0.0; n_samples];
         let mut h1 = vec![0.0; n_samples];
-        let s2;
 
-        if row.iter().all(|v| v.is_finite()) {
+        let s2 = if row.iter().all(|v| v.is_finite()) {
             // No residual degrees of freedom check on this branch: limma has
             // none either, and the caller has already guaranteed at least two.
             let fit = weighted_fit(design, row, &w, n_samples, p);
@@ -1096,7 +1095,7 @@ fn array_weights_gene_by_gene(
                 d[j] = w[j] * fit.residuals[j] * fit.residuals[j];
                 h1[j] = 1.0 - fit.hat[j];
             }
-            s2 = fit.s2;
+            fit.s2
         } else {
             let observed: Vec<usize> = (0..n_samples).filter(|&j| row[j].is_finite()).collect();
             let n_obs = observed.len();
@@ -1119,8 +1118,8 @@ fn array_weights_gene_by_gene(
                 d[j] = sub_w[k] * fit.residuals[k] * fit.residuals[k];
                 h1[j] = 1.0 - fit.hat[k];
             }
-            s2 = fit.s2;
-        }
+            fit.s2
+        };
 
         if !s2.is_finite() || s2 < MIN_RESIDUAL_VAR {
             continue;

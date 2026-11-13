@@ -506,7 +506,9 @@ mod tests {
         ];
         let y: Vec<f64> = (0..48).map(|i| ((i * 17) % 41) as f64 / 8.0).collect();
         let amean: Vec<f64> = y
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|r| r.iter().sum::<f64>() / 6.0)
             .collect();
         let fit = lm_fit(&y, 8, 6, &design, 2, None, None, None).unwrap();

@@ -1502,9 +1502,9 @@ mod tests {
         let (x, y, w) = fixture();
         let both = locfit_by_col(&y, 24, 2, Some(&x), Some(&w), 0.5, 1).unwrap();
         for col in 0..2 {
-            let single: Vec<f64> = y.chunks_exact(2).map(|r| r[col]).collect();
+            let single: Vec<f64> = y.as_chunks::<2>().0.iter().map(|r| r[col]).collect();
             let alone = locfit_by_col(&single, 24, 1, Some(&x), Some(&w), 0.5, 1).unwrap();
-            let sliced: Vec<f64> = both.chunks_exact(2).map(|r| r[col]).collect();
+            let sliced: Vec<f64> = both.as_chunks::<2>().0.iter().map(|r| r[col]).collect();
             assert_eq!(alone, sliced, "column {col} was not independent");
         }
     }
@@ -1515,7 +1515,7 @@ mod tests {
         let (x, y) = ties_fixture();
         let fit = locfit_by_col(&y, 24, 2, Some(&x), None, 0.5, 0).unwrap();
         assert_close(&fit, &LOCFIT_TIES_DEG0);
-        for group in fit.chunks_exact(6) {
+        for group in fit.as_chunks::<6>().0.iter() {
             assert_eq!(group[0], group[2]);
             assert_eq!(group[0], group[4]);
         }
@@ -1639,7 +1639,7 @@ mod tests {
         let fit = loess_by_col(&y, 24, 2, Some(&x), 0.5).unwrap();
         assert_close(&fit.fitted, &LOESS_TIES_FITTED);
         assert_close(&fit.leverages, &LOESS_TIES_LEV);
-        for group in fit.fitted.chunks_exact(6) {
+        for group in fit.fitted.as_chunks::<6>().0.iter() {
             assert_eq!(group[0], group[2]);
             assert_eq!(group[0], group[4]);
         }
@@ -1675,9 +1675,15 @@ mod tests {
         let (x, y, _) = fixture();
         let both = loess_by_col(&y, 24, 2, Some(&x), 0.5).unwrap();
         for col in 0..2 {
-            let single: Vec<f64> = y.chunks_exact(2).map(|r| r[col]).collect();
+            let single: Vec<f64> = y.as_chunks::<2>().0.iter().map(|r| r[col]).collect();
             let alone = loess_by_col(&single, 24, 1, Some(&x), 0.5).unwrap();
-            let sliced: Vec<f64> = both.fitted.chunks_exact(2).map(|r| r[col]).collect();
+            let sliced: Vec<f64> = both
+                .fitted
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|r| r[col])
+                .collect();
             assert_eq!(alone.fitted, sliced, "column {col} was not independent");
             assert_eq!(alone.leverages, both.leverages);
         }
