@@ -1,0 +1,89 @@
+site_name: edge-rs
+site_description: edgeR and limma-voom differential expression for Python, with the numerics in Rust.
+site_url: https://gregorlueg.github.io/edge-rs/
+repo_url: https://github.com/GregorLueg/edge-rs
+repo_name: GregorLueg/edge-rs
+edit_uri: edit/main/python/docs/
+copyright: MIT licensed
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+
+nav:
+  - Home: index.md
+  - Vignettes:
+      - Bulk differential expression: vignettes/bulk_dge.ipynb
+      - Pseudobulk with bixverse: vignettes/pseudobulk.ipynb
+  - API reference:
+      - Pipelines: api/pipelines.md
+      - Filtering and normalisation: api/core.md
+      - edgeR quasi-likelihood: api/edger.md
+      - limma: api/limma.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+
+plugins:
+  - search
+  # The `.ipynb` carry their outputs (`dev/vignettes.py execute`); the `.py`
+  # sources stay out of the site.
+  - mkdocs-jupyter:
+      execute: false
+      include: ["vignettes/*.ipynb"]
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: ["."]
+          options:
+            docstring_style: google
+            docstring_section_style: table
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            members_order: source
+            show_root_heading: false
+            show_root_toc_entry: false
+            show_root_full_path: false
+            show_source: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            heading_level: 2
+            filters: ["!^_"]
+
+watch:
+  - edge_rs
+
+exclude_docs: |
+  vignettes/*.py

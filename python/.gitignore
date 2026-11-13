@@ -2,3 +2,5 @@ target/
 .venv/
 __pycache__/
 *.so
+site/
+.cache/
