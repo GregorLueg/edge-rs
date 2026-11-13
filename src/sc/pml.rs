@@ -2887,6 +2887,85 @@ mod tests {
         (design, offset, counts, cell_index, subject_total, starts)
     }
 
+    /// [`categorical_gene`] with a nine-level cell type in place of the
+    /// indicator, ten columns in all: past [`MAX_UNROLLED_WIDTH`], so the dense
+    /// sweep sums its curvature as a Gram while the tabled one keeps the
+    /// triangle update.
+    fn wide_categorical_gene() -> (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<f64>,
+        Vec<usize>,
+    ) {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(17);
+        let starts = vec![0usize, 400, 800, 1200];
+        let mut design = Vec::new();
+        let mut offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cell_index = Vec::new();
+        let mut subject_total = vec![0.0; 3];
+        for c in 0..1200 {
+            let s = c / 400;
+            let kind = rng.random_range(0..9usize);
+            design.extend([1.0, (s % 2) as f64]);
+            design.extend((1..9).map(|l| f64::from(kind == l)));
+            offset.push(rng.random_range(-2.3..2.3));
+            if rng.random_bool(0.1 + 0.02 * kind as f64) {
+                let y = rng.random_range(1..6) as f64;
+                counts.push(y);
+                cell_index.push(c);
+                subject_total[s] += y;
+            }
+        }
+        (design, offset, counts, cell_index, subject_total, starts)
+    }
+
+    #[test]
+    fn test_opt_pml_wide_gram_matches_the_tabled_sweep() {
+        let (design, offset, counts, cell_index, subject_total, starts) = wide_categorical_gene();
+        let n_coef = 10;
+        assert!(n_coef > MAX_UNROLLED_WIDTH);
+        let data = PmlData {
+            design: &design,
+            offset: &offset,
+            counts: &counts,
+            cell_index: &cell_index,
+            subject_start: &starts,
+            subject_total: &subject_total,
+        };
+        let zeros = ZeroCells::build(&design, &offset, &starts, n_coef).expect("categorical");
+        let mut start = vec![0.05; n_coef];
+        start[0] = -1.5;
+        for (subject, cell) in [(0.3, 0.05), (0.8, 2.0), (0.05, 40.0)] {
+            let variance = PmlVariance { subject, cell };
+            let params = PmlParams {
+                reml: true,
+                ord: 3,
+                ..Default::default()
+            };
+            let dense = opt_pml(&data, &start, &variance, Some(params)).expect("dense");
+            let tabled = opt_pml_tabled(&data, Some(&zeros), &start, &variance, Some(params))
+                .expect("tabled");
+            assert_eq!(dense.iterations, tabled.iterations);
+            for (a, b) in dense.beta.iter().zip(&tabled.beta) {
+                assert_relative_eq!(*a, *b, max_relative = 1e-10, epsilon = 1e-12);
+            }
+            for (a, b) in dense.information.iter().zip(&tabled.information) {
+                assert_relative_eq!(*a, *b, max_relative = 1e-10, epsilon = 1e-12);
+            }
+            assert_relative_eq!(
+                dense.log_likelihood,
+                tabled.log_likelihood,
+                max_relative = 1e-13
+            );
+            assert_relative_eq!(dense.log_det, tabled.log_det, max_relative = 1e-12);
+        }
+    }
+
     #[test]
     fn test_opt_pml_tables_match_the_dense_sweep() {
         let (design, offset, counts, cell_index, subject_total, starts) = categorical_gene();

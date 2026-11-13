@@ -2505,6 +2505,90 @@ mod tests {
         }
     }
 
+    /// Fixture W: 240 cells over four subjects and ten design columns, past
+    /// [`HESSIAN_LOCAL_COEF`], so the Hessian takes the weighted Gram.
+    ///
+    /// ### Returns
+    ///
+    /// Design, log offsets, non-zero counts, their cells, subject totals, `fid`.
+    #[allow(clippy::type_complexity)]
+    fn fixture_wide() -> (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<f64>,
+        Vec<usize>,
+    ) {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(29);
+        let fid = vec![0usize, 50, 110, 160, 240];
+        let mut design = Vec::new();
+        let mut log_offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cells = Vec::new();
+        let mut subject_totals = vec![0.0; 4];
+        for c in 0..240 {
+            let s = fid.iter().rposition(|&b| b <= c).unwrap();
+            design.push(1.0);
+            design.push((s % 2) as f64);
+            design.extend((0..8).map(|_| rng.random_range(-1.0..1.0)));
+            log_offset.push(rng.random_range(-0.5..0.5));
+            if rng.random_bool(0.4) {
+                let y = rng.random_range(1..8) as f64;
+                counts.push(y);
+                cells.push(c);
+                subject_totals[s] += y;
+            }
+        }
+        (design, log_offset, counts, cells, subject_totals, fid)
+    }
+
+    /// The wide Hessian against a central difference of the gradient, which
+    /// never builds a Hessian.
+    #[test]
+    fn test_wide_hessian_agrees_with_finite_differences() {
+        let (design, log_offset, counts, cells, subject_totals, fid) = fixture_wide();
+        let n_coef = 10;
+        assert!(n_coef > HESSIAN_LOCAL_COEF);
+        let data = GeneData::new(
+            &design,
+            &log_offset,
+            &counts,
+            &cells,
+            &subject_totals,
+            &fid,
+            n_coef,
+        )
+        .unwrap();
+        let mut params = vec![0.0; n_coef + 2];
+        params[0] = 0.5;
+        for (j, p) in params[1..n_coef].iter_mut().enumerate() {
+            *p = 0.1 * (j as f64 - 4.0);
+        }
+        params[n_coef] = 0.4;
+        params[n_coef + 1] = 2.0;
+        let (_, gradient, hessian) = ptmg_value_gradient_hessian(&data, &params);
+        let n = params.len();
+        assert_eq!(gradient, ptmg_gradient(&data, &params));
+
+        for j in 0..n {
+            let step = 1e-6 * params[j].abs().max(1.0);
+            let mut up = params.clone();
+            let mut down = params.clone();
+            up[j] += step;
+            down[j] -= step;
+            let g_up = ptmg_gradient(&data, &up);
+            let g_down = ptmg_gradient(&data, &down);
+            for i in 0..n {
+                let fd = (g_up[i] - g_down[i]) / (2.0 * step);
+                assert_relative_eq!(hessian[i * n + j], fd, max_relative = 1e-5, epsilon = 1e-6);
+                assert_relative_eq!(hessian[i * n + j], hessian[j * n + i], max_relative = 1e-13);
+            }
+        }
+    }
+
     #[test]
     fn test_rejects_a_design_of_the_wrong_length() {
         let (_, log_offset, counts, cells, subject_totals, fid) = fixture_a();

@@ -276,6 +276,53 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
+    /// `X' diag(w) X` summed row by row, the definition.
+    fn explicit_gram(x: &[f64], n_cols: usize, weight: &[f64]) -> Vec<f64> {
+        let mut gram = vec![0.0; n_cols * n_cols];
+        for (row, &w) in x.chunks_exact(n_cols).zip(weight) {
+            for a in 0..n_cols {
+                for b in 0..n_cols {
+                    gram[a * n_cols + b] += w * row[a] * row[b];
+                }
+            }
+        }
+        gram
+    }
+
+    /// A deterministic tall matrix and weights of both signs.
+    fn gram_inputs(n_rows: usize, n_cols: usize) -> (Vec<f64>, Vec<f64>) {
+        let x = (0..n_rows * n_cols)
+            .map(|i| ((i * 37 % 101) as f64 - 50.0) / 25.0)
+            .collect();
+        let weight = (0..n_rows)
+            .map(|i| ((i * 13 % 29) as f64 - 9.0) / 7.0)
+            .collect();
+        (x, weight)
+    }
+
+    #[test]
+    fn test_weighted_gram_matches_the_explicit_sum_across_chunks() {
+        // Two full blocks and a ragged one.
+        let n_cols = 7;
+        let (x, weight) = gram_inputs(2 * GRAM_CHUNK + 37, n_cols);
+        let got = weighted_gram(&x, n_cols, &weight);
+        let want = explicit_gram(&x, n_cols, &weight);
+        for (g, w) in got.iter().zip(&want) {
+            assert_relative_eq!(*g, *w, max_relative = 1e-12, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_weighted_gram_with_fewer_rows_than_a_chunk() {
+        let n_cols = 4;
+        let (x, weight) = gram_inputs(5, n_cols);
+        let got = weighted_gram(&x, n_cols, &weight);
+        let want = explicit_gram(&x, n_cols, &weight);
+        for (g, w) in got.iter().zip(&want) {
+            assert_relative_eq!(*g, *w, max_relative = 1e-13, epsilon = 1e-12);
+        }
+    }
+
     #[test]
     fn test_cholesky_lower_reproduces_the_matrix() {
         // [[4, 2], [2, 5]] = L L' with L = [[2, 0], [1, 2]].

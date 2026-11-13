@@ -23,6 +23,13 @@
 //! * `sc_wide`: eight columns (the kernel's cap), 40 subjects of 12 cells.
 //! * `sc_high`: means of `1e3` to `1e4` on offsets around `5e3`.
 //!
+//! One more is wider than the GPU kernel takes, so only the CPU path sees it:
+//!
+//! * `sc_xwide`: thirteen columns, ten of them continuous cell-level ones, 30
+//!   subjects of 40 cells, LN. Past the eight columns the CPU kernels keep on
+//!   the stack, so stage one's Hessian and the penalised fits' curvature are
+//!   weighted Grams.
+//!
 //! Three more have a categorical cell type in place of the continuous
 //! cell-level column, so the CPU kernels sum the zero counts from tables:
 //!
@@ -271,10 +278,12 @@ struct Dataset {
 const NAMES_SC: &[&str] = &["int", "grp", "cov2"];
 
 /// Coefficient suffixes of the edge datasets (numbered by R).
-const NAMES_EDGE: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
+const NAMES_EDGE: [&str; 13] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
+];
 
 /// Every single-cell dataset. `sc` is first; single-set tests read it by index.
-const DATASETS: [Dataset; 10] = [
+const DATASETS: [Dataset; 11] = [
     Dataset {
         tag: "sc",
         method: NebulaMethod::Ln,
@@ -320,7 +329,7 @@ const DATASETS: [Dataset; 10] = [
         method: NebulaMethod::Hl,
         expect_ln: false,
         has_offset: true,
-        names: &NAMES_EDGE,
+        names: NAMES_EDGE.split_at(8).0,
         design_file: true,
     },
     Dataset {
@@ -329,6 +338,14 @@ const DATASETS: [Dataset; 10] = [
         expect_ln: true,
         has_offset: true,
         names: NAMES_EDGE.split_at(3).0,
+        design_file: true,
+    },
+    Dataset {
+        tag: "sc_xwide",
+        method: NebulaMethod::Ln,
+        expect_ln: true,
+        has_offset: true,
+        names: &NAMES_EDGE,
         design_file: true,
     },
     Dataset {
@@ -1015,6 +1032,9 @@ fn test_gpu_nebula_matches_the_r_package() {
 
     for d in &DATASETS {
         let l = load(d);
+        if l.n_coef > edge_rs::gpu::pml_kernel::MAX_BETA_CAP {
+            continue;
+        }
         let mut data = Vec::new();
         let mut indices = Vec::new();
         let mut indptr = vec![0u32];
