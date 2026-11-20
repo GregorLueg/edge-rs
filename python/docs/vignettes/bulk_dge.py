@@ -153,6 +153,30 @@ samples.select("sample", "group", "lib_size", "norm_factors")
 # `method` takes `"TMM"`, `"TMMwsp"`, `"RLE"`, `"upperquartile"` and `"none"`,
 # as in edgeR.
 #
+# ### With a `DgeList`
+#
+# If carrying `lib_size` around by hand sounds like a bug waiting to happen,
+# `make_dgelist()` bundles counts, library sizes, normalisation factors and
+# annotation into a frozen record, edgeR's `DGEList` minus the S4. Subsetting
+# genes keeps the library sizes of the full matrix, and every function that
+# takes counts takes a `DgeList` instead and reads both from it.
+
+# %%
+dge = edge_rs.make_dgelist(
+    counts, genes=pl.DataFrame({"gene_id": gene_ids}), samples=samples
+)
+dge = edge_rs.calc_norm_factors(
+    dge[edge_rs.filter_by_expr(dge, group=samples["group"])]
+)
+
+print(dge.shape, np.array_equal(dge.norm_factors, norm_factors))
+
+# %% [markdown]
+# Same genes, same factors. `glm_ql_fit(dge, design)` and
+# `voom_lm_fit(dge, design)` work the same way; pass
+# `feature_ids=dge.genes["gene_id"]` to `top_tags()` or `top_table()`. The rest
+# of this vignette sticks with plain arrays, to show what goes where.
+#
 # ## A first look
 #
 # Before testing anything, check what separates the samples. Log-CPM via

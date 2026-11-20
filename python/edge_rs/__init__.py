@@ -9,13 +9,18 @@ One call:
     >>> res = edge_rs.run_edger_ql(counts, design, feature_ids=genes, coef="treated")
     >>> res = edge_rs.run_limma_voom(counts, design, feature_ids=genes, coef="treated")
 
-Step by step, as in edgeR and limma:
+Step by step, as in edgeR and limma. A `DgeList` keeps the library sizes of
+the unfiltered matrix through the gene filter:
 
-    >>> keep = edge_rs.filter_by_expr(counts, design=design)
-    >>> lib = counts.sum(axis=0)
-    >>> nf = edge_rs.calc_norm_factors(counts[keep], lib_size=lib)
-    >>> fit = edge_rs.glm_ql_fit(counts[keep], design, lib_size=lib, norm_factors=nf)
-    >>> edge_rs.top_tags(edge_rs.glm_ql_ftest(fit, coef="treated"))
+    >>> dge = edge_rs.make_dgelist(counts, genes=pl.DataFrame({"gene_id": genes}))
+    >>> dge = dge[edge_rs.filter_by_expr(dge, design=design)]
+    >>> dge = edge_rs.calc_norm_factors(dge)
+    >>> fit = edge_rs.glm_ql_fit(dge, design)
+    >>> res = edge_rs.glm_ql_ftest(fit, coef="treated")
+    >>> edge_rs.top_tags(res, feature_ids=dge.genes["gene_id"])
+
+Every function that takes counts also takes plain arrays with `lib_size` and
+`norm_factors`.
 """
 
 from importlib.metadata import version
@@ -27,6 +32,7 @@ from edge_rs._core import (
     filter_by_expr,
     remove_batch_effect,
 )
+from edge_rs._dgelist import DgeList, make_dgelist
 from edge_rs._edge_rs import EdgeRsError, LinearFit, QLFit
 from edge_rs._edger import QLTest, glm_ql_fit, glm_ql_ftest, top_tags
 from edge_rs._limma import (
@@ -44,6 +50,7 @@ from edge_rs._pipelines import run_edger_ql, run_limma_voom
 __version__ = version("edge-rs")
 
 __all__ = [
+    "DgeList",
     "EdgeRsError",
     "LinearFit",
     "QLFit",
@@ -59,6 +66,7 @@ __all__ = [
     "glm_ql_ftest",
     "lm_fit",
     "make_contrasts",
+    "make_dgelist",
     "remove_batch_effect",
     "run_edger_ql",
     "run_limma_voom",

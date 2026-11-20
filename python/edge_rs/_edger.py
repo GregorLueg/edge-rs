@@ -14,6 +14,7 @@ import polars as pl
 from beartype import beartype
 
 from edge_rs import _edge_rs
+from edge_rs._dgelist import DgeList, unpack
 from edge_rs._edge_rs import QLFit
 from edge_rs._validate import (
     CONF,
@@ -56,7 +57,7 @@ class QLTest:
 
 @beartype(conf=CONF)
 def glm_ql_fit(
-    counts: np.ndarray,
+    counts: np.ndarray | DgeList,
     design: Design,
     *,
     lib_size: Vector | None = None,
@@ -72,7 +73,8 @@ def glm_ql_fit(
     pre-4.0 pipeline, which runs `estimateDisp` first and uses its trend.
 
     Args:
-        counts: `(n_genes, n_samples)` raw counts, already filtered.
+        counts: `(n_genes, n_samples)` raw counts, already filtered, or a
+            `DgeList`.
         design: `(n_samples, n_coef)` design with an intercept. A polars frame's
             column names can later be used as `coef`.
         lib_size: Library size per sample. Defaults to the column sums. After a
@@ -92,6 +94,7 @@ def glm_ql_fit(
     References:
         Chen, Lun and Smyth, F1000Research, 2016.
     """
+    counts, lib_size, norm_factors = unpack(counts, lib_size, norm_factors)
     y = as_counts(counts)
     mm, names = as_design(design, y.shape[1])
     lib = effective_lib_size(y, lib_size, norm_factors)

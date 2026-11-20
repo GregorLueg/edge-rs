@@ -15,6 +15,7 @@ import polars as pl
 from beartype import beartype
 
 from edge_rs import _edge_rs
+from edge_rs._dgelist import DgeList, unpack
 from edge_rs._edge_rs import LinearFit
 from edge_rs._validate import (
     CONF,
@@ -57,7 +58,7 @@ class Voom:
 
 @beartype(conf=CONF)
 def voom(
-    counts: np.ndarray,
+    counts: np.ndarray | DgeList,
     design: Design,
     *,
     lib_size: Vector | None = None,
@@ -73,7 +74,8 @@ def voom(
     is limma's classic two-step one.
 
     Args:
-        counts: `(n_genes, n_samples)` raw counts, already filtered.
+        counts: `(n_genes, n_samples)` raw counts, already filtered, or a
+            `DgeList`.
         design: `(n_samples, n_coef)` design.
         lib_size: Library size per sample. Defaults to the column sums.
         norm_factors: Normalisation factors, multiplied into `lib_size`.
@@ -87,6 +89,7 @@ def voom(
     References:
         Law, Chen, Shi and Smyth, Genome Biology, 2014.
     """
+    counts, lib_size, norm_factors = unpack(counts, lib_size, norm_factors)
     y = as_counts(counts)
     mm, _ = as_design(design, y.shape[1])
     lib = effective_lib_size(y, lib_size, norm_factors)
@@ -96,7 +99,7 @@ def voom(
 
 @beartype(conf=CONF)
 def voom_lm_fit(
-    counts: np.ndarray,
+    counts: np.ndarray | DgeList,
     design: Design,
     *,
     lib_size: Vector | None = None,
@@ -111,7 +114,8 @@ def voom_lm_fit(
     zeros would otherwise inflate.
 
     Args:
-        counts: `(n_genes, n_samples)` raw counts, already filtered.
+        counts: `(n_genes, n_samples)` raw counts, already filtered, or a
+            `DgeList`.
         design: `(n_samples, n_coef)` design with an intercept.
         lib_size: Library size per sample. Defaults to the column sums. After a
             gene filter, pass the unfiltered column sums.
@@ -126,6 +130,7 @@ def voom_lm_fit(
     References:
         Law, Chen, Shi and Smyth, Genome Biology, 2014.
     """
+    counts, lib_size, norm_factors = unpack(counts, lib_size, norm_factors)
     y = as_counts(counts)
     mm, names = as_design(design, y.shape[1])
     lib = effective_lib_size(y, lib_size, norm_factors)

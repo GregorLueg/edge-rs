@@ -6,11 +6,14 @@ matrix's column sums to keep edgeR's `keep.lib.sizes = TRUE` behaviour.
 """
 
 from collections.abc import Sequence
+from dataclasses import replace
+from typing import overload
 
 import numpy as np
 from beartype import beartype
 
 from edge_rs import _edge_rs
+from edge_rs._dgelist import DgeList, unpack
 from edge_rs._validate import (
     CONF,
     Design,
@@ -28,7 +31,7 @@ Vector = np.ndarray | Sequence[float]
 
 @beartype(conf=CONF)
 def filter_by_expr(
-    counts: np.ndarray,
+    counts: np.ndarray | DgeList,
     *,
     group: Labels | None = None,
     design: Design | None = None,
@@ -42,7 +45,7 @@ def filter_by_expr(
     """Keep genes with enough counts to be worth testing, edgeR's `filterByExpr`.
 
     Args:
-        counts: `(n_genes, n_samples)` raw counts.
+        counts: `(n_genes, n_samples)` raw counts, or a `DgeList`.
         group: One group label per sample. Takes precedence over `design`.
         design: `(n_samples, n_coef)` design. Without `group` or `design` all
             samples are one group.
@@ -66,6 +69,7 @@ def filter_by_expr(
         >>> keep = edge_rs.filter_by_expr(counts, design=design)
         >>> counts = counts[keep]
     """
+    counts, lib_size, norm_factors = unpack(counts, lib_size, norm_factors)
     y = as_counts(counts)
     n = y.shape[1]
     return _edge_rs.filter_by_expr(
@@ -80,32 +84,61 @@ def filter_by_expr(
     )
 
 
-@beartype(conf=CONF)
+@overload
 def calc_norm_factors(
     counts: np.ndarray,
+    *,
+    method: str = ...,
+    lib_size: Vector | None = ...,
+    ref_column: int | None = ...,
+) -> np.ndarray: ...
+
+
+@overload
+def calc_norm_factors(
+    counts: DgeList,
+    *,
+    method: str = ...,
+    lib_size: None = ...,
+    ref_column: int | None = ...,
+) -> DgeList: ...
+
+
+@beartype(conf=CONF)
+def calc_norm_factors(
+    counts: np.ndarray | DgeList,
     *,
     method: str = "TMM",
     lib_size: Vector | None = None,
     ref_column: int | None = None,
-) -> np.ndarray:
+) -> np.ndarray | DgeList:
     """Library size normalisation factors, edgeR's `calcNormFactors`.
 
     Args:
-        counts: `(n_genes, n_samples)` raw counts.
+        counts: `(n_genes, n_samples)` raw counts, or a `DgeList`.
         method: `"TMM"`, `"TMMwsp"`, `"RLE"`, `"upperquartile"` or `"none"`.
         lib_size: Library size per sample. Defaults to the column sums. Pass
             the unfiltered column sums after a gene filter, as edgeR does.
         ref_column: 0-based reference sample for TMM. `None` picks edgeR's.
 
     Returns:
-        One factor per sample, with a geometric mean of one.
+        One factor per sample, with a geometric mean of one. Given a
+        `DgeList`, a copy with these as its `norm_factors`.
 
     Raises:
-        ValueError: On an unknown method or mismatched shapes.
+        ValueError: On an unknown method, mismatched shapes, or `lib_size`
+            alongside a `DgeList`.
 
     References:
         Robinson and Oshlack, Genome Biology, 2010.
     """
+    if isinstance(counts, DgeList):
+        if lib_size is not None:
+            raise ValueError("A `DgeList` carries its own `lib_size`.")
+        nf = _edge_rs.calc_norm_factors(
+            counts.counts, counts.lib_size, method, ref_column
+        )
+        return replace(counts, norm_factors=nf)
     y = as_counts(counts)
     lib = None if lib_size is None else as_vector(lib_size, y.shape[1], "lib_size")
     return _edge_rs.calc_norm_factors(y, lib, method, ref_column)
@@ -113,7 +146,7 @@ def calc_norm_factors(
 
 @beartype(conf=CONF)
 def cpm(
-    counts: np.ndarray,
+    counts: np.ndarray | DgeList,
     *,
     lib_size: Vector | None = None,
     norm_factors: Vector | None = None,
@@ -123,7 +156,7 @@ def cpm(
     """Counts per million, edgeR's `cpm`.
 
     Args:
-        counts: `(n_genes, n_samples)` raw counts.
+        counts: `(n_genes, n_samples)` raw counts, or a `DgeList`.
         lib_size: Library size per sample. Defaults to the column sums.
         norm_factors: Normalisation factors, multiplied into `lib_size`.
         log: Return log2-CPM.
@@ -132,6 +165,7 @@ def cpm(
     Returns:
         `(n_genes, n_samples)` CPM or log2-CPM.
     """
+    counts, lib_size, norm_factors = unpack(counts, lib_size, norm_factors)
     y = as_counts(counts)
     lib = effective_lib_size(y, lib_size, norm_factors)
     return _edge_rs.cpm(y, lib, log, prior_count)
@@ -139,7 +173,7 @@ def cpm(
 
 @beartype(conf=CONF)
 def ave_log_cpm(
-    counts: np.ndarray,
+    counts: np.ndarray | DgeList,
     *,
     lib_size: Vector | None = None,
     norm_factors: Vector | None = None,
@@ -152,7 +186,7 @@ def ave_log_cpm(
     per gene.
 
     Args:
-        counts: `(n_genes, n_samples)` raw counts.
+        counts: `(n_genes, n_samples)` raw counts, or a `DgeList`.
         lib_size: Library size per sample. Defaults to the column sums.
         norm_factors: Normalisation factors, multiplied into `lib_size`.
         prior_count: Count added before the log, scaled by library size.
@@ -161,6 +195,7 @@ def ave_log_cpm(
     Returns:
         One value per gene.
     """
+    counts, lib_size, norm_factors = unpack(counts, lib_size, norm_factors)
     y = as_counts(counts)
     lib = effective_lib_size(y, lib_size, norm_factors)
     return _edge_rs.ave_log_cpm(y, lib, prior_count, dispersion)

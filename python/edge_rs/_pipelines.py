@@ -15,6 +15,7 @@ import polars as pl
 from beartype import beartype
 
 from edge_rs._core import calc_norm_factors, filter_by_expr
+from edge_rs._dgelist import DgeList, make_dgelist
 from edge_rs._edger import glm_ql_fit, glm_ql_ftest, top_tags
 from edge_rs._limma import contrasts_fit, ebayes, top_table, voom_lm_fit
 from edge_rs._validate import (
@@ -23,7 +24,6 @@ from edge_rs._validate import (
     Contrast,
     Design,
     Labels,
-    as_counts,
     as_design,
     coef_positions,
 )
@@ -38,27 +38,28 @@ def _filter_and_normalise(
     feature_ids: Labels | None,
     norm_method: str,
     filter: bool,
-) -> tuple[np.ndarray, np.ndarray, pl.Series]:
-    """Filtered counts, their effective library sizes and their ids.
+) -> tuple[DgeList, pl.Series]:
+    """The filtered, normalised `DgeList` and the ids of its genes.
 
     Raises:
         ValueError: If no gene survives the filter.
     """
-    y = as_counts(counts)
-    as_design(design, y.shape[1])
-    lib = y.sum(axis=0)
-    keep = filter_by_expr(y, design=design) if filter else np.ones(y.shape[0], bool)
-    if not keep.any():
-        raise ValueError("No gene passed `filter_by_expr`.")
-    kept = np.flatnonzero(keep)
+    n_genes = counts.shape[0]
     ids = (
-        pl.Series("feature_id", kept, dtype=pl.UInt32)
+        pl.Series("feature_id", np.arange(n_genes), dtype=pl.UInt32)
         if feature_ids is None
-        else pl.Series(feature_ids).gather(kept)
+        else pl.Series("feature_id", feature_ids)
     )
-    y = y[keep]
-    nf = calc_norm_factors(y, method=norm_method, lib_size=lib)
-    return y, lib * nf, ids
+    dge = make_dgelist(counts, genes=ids.to_frame())
+    as_design(design, dge.shape[1])
+    if filter:
+        keep = filter_by_expr(dge, design=design)
+        if not keep.any():
+            raise ValueError("No gene passed `filter_by_expr`.")
+        dge = dge[keep]
+    dge = calc_norm_factors(dge, method=norm_method)
+    assert dge.genes is not None
+    return dge, dge.genes["feature_id"]
 
 
 @beartype(conf=CONF)
@@ -99,10 +100,8 @@ def run_edger_ql(
     References:
         Chen, Lun and Smyth, F1000Research, 2016.
     """
-    y, lib, ids = _filter_and_normalise(
-        counts, design, feature_ids, norm_method, filter
-    )
-    fit = glm_ql_fit(y, design, lib_size=lib, robust=robust, legacy=legacy)
+    dge, ids = _filter_and_normalise(counts, design, feature_ids, norm_method, filter)
+    fit = glm_ql_fit(dge, design, robust=robust, legacy=legacy)
     res = glm_ql_ftest(fit, coef=coef, contrast=contrast)
     return top_tags(res, feature_ids=ids, sort_by="none")
 
@@ -157,10 +156,8 @@ def run_limma_voom(
     """
     if coef is not None and contrast is not None:
         raise ValueError("Supply either `coef` or `contrast`, not both.")
-    y, lib, ids = _filter_and_normalise(
-        counts, design, feature_ids, norm_method, filter
-    )
-    fit = voom_lm_fit(y, design, lib_size=lib, span=span, adaptive_span=adaptive_span)
+    dge, ids = _filter_and_normalise(counts, design, feature_ids, norm_method, filter)
+    fit = voom_lm_fit(dge, design, span=span, adaptive_span=adaptive_span)
     if contrast is not None:
         fit = contrasts_fit(fit, contrast)
         if fit.n_coef != 1:
