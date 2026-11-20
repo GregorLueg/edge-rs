@@ -8,8 +8,10 @@ copyright: MIT licensed
 
 theme:
   name: material
+  font: false
   features:
-    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.top
     - navigation.tracking
     - content.code.copy
@@ -18,18 +20,21 @@ theme:
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: teal
-      accent: teal
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-night
         name: Dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: teal
-      accent: teal
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-sunny
         name: Light mode
+
+extra_css:
+  - stylesheets/pkgdown.css
 
 nav:
   - Home: index.md
@@ -69,6 +74,7 @@ plugins:
           options:
             docstring_style: google
             docstring_section_style: table
+            merge_init_into_class: true
             separate_signature: true
             show_signature_annotations: true
             signature_crossrefs: true
