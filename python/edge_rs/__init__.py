@@ -9,18 +9,17 @@ One call:
     >>> res = edge_rs.run_edger_ql(counts, design, feature_ids=genes, coef="treated")
     >>> res = edge_rs.run_limma_voom(counts, design, feature_ids=genes, coef="treated")
 
-Step by step, as in edgeR and limma. A `DgeList` keeps the library sizes of
-the unfiltered matrix through the gene filter:
+Step by step, as in edgeR and limma:
 
-    >>> dge = edge_rs.make_dgelist(counts, genes=pl.DataFrame({"gene_id": genes}))
-    >>> dge = dge[edge_rs.filter_by_expr(dge, design=design)]
-    >>> dge = edge_rs.calc_norm_factors(dge)
-    >>> fit = edge_rs.glm_ql_fit(dge, design)
-    >>> res = edge_rs.glm_ql_ftest(fit, coef="treated")
-    >>> edge_rs.top_tags(res, feature_ids=dge.genes["gene_id"])
+    >>> keep = edge_rs.filter_by_expr(counts, design=design)
+    >>> lib = counts.sum(axis=0)
+    >>> nf = edge_rs.calc_norm_factors(counts[keep], lib_size=lib)
+    >>> fit = edge_rs.glm_ql_fit(counts[keep], design, lib_size=lib, norm_factors=nf)
+    >>> edge_rs.top_tags(edge_rs.glm_ql_ftest(fit, coef="treated"))
 
-Every function that takes counts also takes plain arrays with `lib_size` and
-`norm_factors`.
+Every function that takes counts also takes a `DgeList` from `make_dgelist`,
+which carries `lib_size` and `norm_factors` and keeps the library sizes of the
+full matrix through a gene subset.
 """
 
 from importlib.metadata import version

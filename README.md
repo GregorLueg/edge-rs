@@ -54,7 +54,8 @@ res = edge_rs.run_limma_voom(counts, design, feature_ids=genes, coef="treated")
 ```
 
 The step functions are there too (`filter_by_expr`, `calc_norm_factors`,
-`glm_ql_fit`, `voom_lm_fit`, `ebayes`, `top_table` and friends). Pseudobulked
+`glm_ql_fit`, `voom_lm_fit`, `ebayes`, `top_table` and friends), plus an
+optional `DgeList` that keeps library sizes through a gene filter. Pseudobulked
 single cell data from [bixverse](https://gregorlueg.github.io/bixverse-rs/)
 goes straight in as `pb.counts.T`. NEBULA, the exact test and the plain NB GLM
 are not exposed yet.

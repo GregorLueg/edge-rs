@@ -43,6 +43,18 @@ vfit = edge_rs.voom_lm_fit(counts[keep], design, lib_size=lib_size, norm_factors
 edge_rs.top_table(edge_rs.ebayes(vfit), coef="treated")
 ```
 
+If you would rather not carry `lib_size` around, `make_dgelist` bundles counts,
+library sizes, normalisation factors and annotation. Subsetting it keeps the
+library sizes of the full matrix, as edgeR's `keep.lib.sizes = TRUE` does, and
+every function above takes it in place of the counts:
+
+```python
+dge = edge_rs.make_dgelist(counts, genes=pl.DataFrame({"gene_id": genes}))
+dge = edge_rs.calc_norm_factors(dge[edge_rs.filter_by_expr(dge, design=design)])
+fit = edge_rs.glm_ql_fit(dge, design)
+edge_rs.top_tags(edge_rs.glm_ql_ftest(fit, coef="treated"), feature_ids=dge.genes["gene_id"])
+```
+
 Counts are genes x samples. Single cell tools are the other way round, so
 pseudobulk from [bixverse](https://gregorlueg.github.io/bixverse-rs/) goes in as
 `pb.counts.T`. A design is a NumPy matrix or a polars frame; with a frame, the
@@ -53,6 +65,7 @@ column names become coefficient names and `coef="treated"` works. Everything is
 
 | Python | R |
 | --- | --- |
+| `make_dgelist`, `DgeList` | `edgeR::DGEList` |
 | `filter_by_expr` | `edgeR::filterByExpr` |
 | `calc_norm_factors` | `edgeR::calcNormFactors` |
 | `cpm`, `ave_log_cpm` | `edgeR::cpm`, `edgeR::aveLogCPM` |
