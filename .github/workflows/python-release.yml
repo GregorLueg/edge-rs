@@ -48,6 +48,8 @@ jobs:
       repository-url: ${{ (github.event_name == 'workflow_dispatch' && inputs.index == 'testpypi') && 'https://test.pypi.org/legacy/' || '' }}
       # The sdist would carry a `path` dependency on the parent crate.
       sdist: false
+      # No Windows wheel: Windows users go through WSL2.
+      linux-arm64: true
 
   # The upload has to live here: PyPI's trusted publishing matches the OIDC
   # token's `job_workflow_ref`, which for a reusable workflow points at the other
