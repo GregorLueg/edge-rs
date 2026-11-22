@@ -54,6 +54,10 @@ const F75_DEGENERATE: f64 = 1e-20;
 /// `upperquartile` method.
 const REF_COLUMN_QUANTILE: f64 = 0.75;
 
+/// Genes per parallel block of the RLE geometric means. Large enough to
+/// amortise the fork, small enough that a block of every column stays in L2.
+const RLE_GENE_BLOCK: usize = 4096;
+
 /// The strings edgeR accepts, for the error message.
 const NORM_METHOD_NAMES: &str = "TMM, TMMwsp, RLE, upperquartile, none";
 
@@ -378,10 +382,12 @@ fn resolve_ref_column(
         return Ok(arg_max_sqrt_colsum(x, n_kept, n_samples));
     }
 
-    let mut f75 = vec![0.0_f64; n_samples];
-    for (j, f) in f75.iter_mut().enumerate() {
-        *f = quantile_type7(&x[j * n_kept..(j + 1) * n_kept], REF_COLUMN_QUANTILE)? / lib_size[j];
-    }
+    let f75: Vec<f64> = (0..n_samples)
+        .into_par_iter()
+        .map(|j| {
+            Ok(quantile_type7(&x[j * n_kept..(j + 1) * n_kept], REF_COLUMN_QUANTILE)? / lib_size[j])
+        })
+        .collect::<Result<_, EdgeErrors>>()?;
 
     let median = quantile_type7(&f75, 0.5)?;
     if median < F75_DEGENERATE {
@@ -464,18 +470,19 @@ fn calc_factor_quantile(
     lib_size: &[f64],
     p: f64,
 ) -> Result<Vec<f64>, EdgeErrors> {
-    let mut f = vec![0.0_f64; n_samples];
-    for (j, out) in f.iter_mut().enumerate() {
-        let q = quantile_type7(&x[j * n_kept..(j + 1) * n_kept], p)?;
-        if q <= 0.0 {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "the {p} quantile of sample {j} is zero; upper-quartile \
-                 normalisation is undefined for counts this sparse"
-            )));
-        }
-        *out = q / lib_size[j];
-    }
-    Ok(f)
+    (0..n_samples)
+        .into_par_iter()
+        .map(|j| {
+            let q = quantile_type7(&x[j * n_kept..(j + 1) * n_kept], p)?;
+            if q <= 0.0 {
+                return Err(EdgeErrors::InvalidArgument(format!(
+                    "the {p} quantile of sample {j} is zero; upper-quartile \
+                     normalisation is undefined for counts this sparse"
+                )));
+            }
+            Ok(q / lib_size[j])
+        })
+        .collect()
 }
 
 /// RLE factors: the median ratio to the gene-wise geometric mean.
@@ -507,12 +514,21 @@ fn calc_factor_rle(
     n_samples: usize,
     lib_size: &[f64],
 ) -> Result<Vec<f64>, EdgeErrors> {
+    // Gene blocks in parallel; within a block samples stay outermost, so each
+    // gene's sum keeps its sample order.
     let mut log_gm = vec![0.0_f64; n_kept];
-    for j in 0..n_samples {
-        for (acc, v) in log_gm.iter_mut().zip(&x[j * n_kept..(j + 1) * n_kept]) {
-            *acc += v.ln();
-        }
-    }
+    log_gm
+        .par_chunks_mut(RLE_GENE_BLOCK)
+        .enumerate()
+        .for_each(|(b, block)| {
+            let start = b * RLE_GENE_BLOCK;
+            for j in 0..n_samples {
+                let col = &x[j * n_kept + start..j * n_kept + start + block.len()];
+                for (acc, v) in block.iter_mut().zip(col) {
+                    *acc += v.ln();
+                }
+            }
+        });
     let positive: Vec<usize> = log_gm
         .iter()
         .enumerate()
@@ -528,16 +544,19 @@ fn calc_factor_rle(
         .map(|&g| (log_gm[g] / n_samples as f64).exp())
         .collect();
 
-    let mut f = vec![0.0_f64; n_samples];
-    let mut ratios = vec![0.0_f64; positive.len()];
-    for (j, out) in f.iter_mut().enumerate() {
-        let col = &x[j * n_kept..(j + 1) * n_kept];
-        for (r, (&g, &m)) in ratios.iter_mut().zip(positive.iter().zip(gm.iter())) {
-            *r = col[g] / m;
-        }
-        *out = quantile_type7(&ratios, 0.5)? / lib_size[j];
-    }
-    Ok(f)
+    (0..n_samples)
+        .into_par_iter()
+        .map_init(
+            || vec![0.0_f64; positive.len()],
+            |ratios, j| {
+                let col = &x[j * n_kept..(j + 1) * n_kept];
+                for (r, (&g, &m)) in ratios.iter_mut().zip(positive.iter().zip(gm.iter())) {
+                    *r = col[g] / m;
+                }
+                Ok(quantile_type7(ratios, 0.5)? / lib_size[j])
+            },
+        )
+        .collect()
 }
 
 ///////////////////////

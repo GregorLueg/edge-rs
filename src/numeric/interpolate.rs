@@ -637,7 +637,7 @@ pub fn interp_linear_extrap(x: &[f64], xp: &[f64], fp: &[f64]) -> Result<Vec<f64
 ///
 /// The interpolated value.
 #[inline]
-fn interp_one(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
+pub(crate) fn interp_one(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
     let last = xp.len() - 1;
     if x <= xp[0] {
         return fp[0];

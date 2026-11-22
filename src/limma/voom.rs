@@ -39,7 +39,7 @@ use crate::errors::EdgeErrors;
 use crate::glm::fit::glm_fit;
 use crate::limma::lm_fit::{LmFitResult, lm_fit};
 use crate::limma::lowess::{LowessParams, lowess, weighted_lowess};
-use crate::numeric::interpolate::interp_linear_extrap;
+use crate::numeric::interpolate::interp_one;
 use crate::utils::design::{
     LIMMA_LOWESS_DEFAULTS, choose_lowess_span, gather_rows, hat_diagonal, matrix_rank,
 };
@@ -400,7 +400,7 @@ pub fn voom_lmfit<T: EdgeFloat>(
             });
     }
 
-    let full = Recycled::full(w.clone(), n_genes, n_samples)?;
+    let full = Recycled::full(w, n_genes, n_samples)?;
     let mut final_fit = lm_fit(
         &prep.e,
         n_genes,
@@ -411,6 +411,9 @@ pub fn voom_lmfit<T: EdgeFloat>(
         None,
         None,
     )?;
+    let Recycled::Full(w) = full else {
+        unreachable!("Recycled::full builds the Full variant")
+    };
     for (k, &g) in zeros.rows.iter().enumerate() {
         let mask = &zeros.observed[k * n_samples..(k + 1) * n_samples];
         let (sigma, df) = masked_fit(
@@ -585,7 +588,10 @@ fn prepare<T: EdgeFloat>(
     }
     let rank = matrix_rank(design, n_samples, n_coef)?;
     if rank != n_coef {
-        return Err(EdgeErrors::DesignNotFullRank { n_cols: n_coef, rank });
+        return Err(EdgeErrors::DesignNotFullRank {
+            n_cols: n_coef,
+            rank,
+        });
     }
     // Explicit rather than a negated comparison, so a NaN prior count is
     // rejected instead of slipping through.
@@ -904,12 +910,11 @@ fn voom_weights(
             // two libm entry points disagree in the last bit.
             *v = (INV_PER_MILLION * (2.0_f64.powf(*f) * l)).log2();
         }
-        // Cannot fail: `collapse` guarantees at least two strictly increasing
-        // knots, which is all `interp_linear_extrap` validates.
-        let t = interp_linear_extrap(row, &trend.x, &trend.y)
-            .expect("trend knots were validated when the trend was built");
-        for (v, ti) in row.iter_mut().zip(t.iter()) {
-            let square = ti * ti;
+        // `collapse` guarantees at least two strictly increasing knots, so the
+        // per-gene call skips the O(n_knots) validation.
+        for v in row.iter_mut() {
+            let t = interp_one(*v, &trend.x, &trend.y);
+            let square = t * t;
             *v = 1.0 / (square * square);
         }
     };
