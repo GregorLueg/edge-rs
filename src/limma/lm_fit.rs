@@ -37,6 +37,7 @@
 //! right and rejects any whose residual norm has collapsed (LINPACK `dqrdc2`,
 //! as in R's `lm.fit`). Rejected columns report `NaN` for their coefficient and
 //! unscaled standard deviation, as R reports `NA`.
+//!
 //! ### References
 //!
 //! Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004

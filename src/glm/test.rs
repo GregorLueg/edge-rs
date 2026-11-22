@@ -412,14 +412,6 @@ fn integrate_pnorm(a: f64, b: f64) -> f64 {
 }
 
 /// Standard normal density.
-///
-/// ### Params
-///
-/// * `x` - Quantile
-///
-/// ### Returns
-///
-/// `exp(-x^2 / 2) / sqrt(2 pi)`.
 #[inline]
 fn norm_pdf(x: f64) -> f64 {
     INV_SQRT_2PI * (-0.5 * x * x).exp()
@@ -632,15 +624,6 @@ fn shift_offset(
 }
 
 /// Reads a per-gene quantity that may have been supplied as a single value.
-///
-/// ### Params
-///
-/// * `values` - Either one value or one per gene
-/// * `gene` - Gene index
-///
-/// ### Returns
-///
-/// The value for that gene.
 #[inline]
 fn recycle(values: &[f64], gene: usize) -> f64 {
     if values.len() == 1 {

@@ -811,18 +811,6 @@ struct RobustFit {
 }
 
 /// [`fit_f_dist_robustly`] with the lowess span exposed.
-///
-/// ### Params
-///
-/// * `x` - Genewise variances
-/// * `df1` - Residual degrees of freedom, length one or one per gene
-/// * `covariate` - Covariate, one per gene, or `None`
-/// * `winsor_tail_p` - Lower and upper Winsorising proportions
-/// * `span` - Lowess span, or `None` for [`ROBUST_LOWESS_SPAN`]
-///
-/// ### Returns
-///
-/// The prior scale and the per-gene prior degrees of freedom.
 fn robust_fit(
     x: &[f64],
     df1: &[f64],
@@ -1558,14 +1546,6 @@ fn zero_out_weights(prior_weights: &mut Option<Vec<f64>>, mask: &[bool]) {
 }
 
 /// Index of the smallest element, the first one when they tie.
-///
-/// ### Params
-///
-/// * `v` - Values, non-empty
-///
-/// ### Returns
-///
-/// The index, as R's `which.min` picks it. Zero for an empty slice.
 fn which_min(v: &[f64]) -> usize {
     let mut best = 0;
     for i in 1..v.len() {
@@ -1713,28 +1693,12 @@ fn gauss_legendre_unit(n: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 /// The link `d -> d / (1 + d)` that maps `[0, inf]` onto `[0, 1]`.
-///
-/// ### Params
-///
-/// * `d` - Degrees of freedom, non-negative
-///
-/// ### Returns
-///
-/// `d / (1 + d)`, and 1 for an infinite argument.
 #[inline]
 fn link_fun(d: f64) -> f64 {
     if d.is_infinite() { 1.0 } else { d / (1.0 + d) }
 }
 
 /// Inverse of [`link_fun`].
-///
-/// ### Params
-///
-/// * `p` - Value in `[0, 1]`
-///
-/// ### Returns
-///
-/// `p / (1 - p)`, and `inf` at 1.
 #[inline]
 fn link_inv(p: f64) -> f64 {
     p / (1.0 - p)
@@ -2057,14 +2021,6 @@ fn check_fit_lengths(name: &'static str, x: &[f64], df1: &[f64]) -> Result<usize
 }
 
 /// Checks that both Winsorising proportions lie in `[0, 0.5)`.
-///
-/// ### Params
-///
-/// * `winsor_tail_p` - Lower and upper proportions
-///
-/// ### Returns
-///
-/// Nothing, or [`EdgeErrors::InvalidArgument`].
 fn check_winsor_tail_p(winsor_tail_p: (f64, f64)) -> Result<(), EdgeErrors> {
     for p in [winsor_tail_p.0, winsor_tail_p.1] {
         if !(0.0..0.5).contains(&p) {
@@ -2077,16 +2033,6 @@ fn check_winsor_tail_p(winsor_tail_p: (f64, f64)) -> Result<(), EdgeErrors> {
 }
 
 /// Which genes carry usable information, by limma's `fitFDist` rule.
-///
-/// ### Params
-///
-/// * `x` - Variances
-/// * `df1` - Residual degrees of freedom, length one or one per gene
-/// * `df_tol` - Smallest degrees of freedom to accept
-///
-/// ### Returns
-///
-/// One flag per gene.
 fn informative_mask(x: &[f64], df1: &[f64], df_tol: f64) -> Vec<bool> {
     (0..x.len())
         .map(|i| {
@@ -2161,30 +2107,12 @@ fn finitise_covariate(covariate: &[f64]) -> Result<Vec<f64>, EdgeErrors> {
 }
 
 /// Reads a length-one or full-length vector at a gene index.
-///
-/// ### Params
-///
-/// * `v` - Vector of length one or at least `i + 1`
-/// * `i` - Gene index
-///
-/// ### Returns
-///
-/// The recycled value.
 #[inline]
 fn at(v: &[f64], i: usize) -> f64 {
     if v.len() == 1 { v[0] } else { v[i] }
 }
 
 /// Expands a length-one vector to `n`, leaving longer ones alone.
-///
-/// ### Params
-///
-/// * `v` - Vector of length one or `n`
-/// * `n` - Target length
-///
-/// ### Returns
-///
-/// A vector of length `n`.
 fn recycle(v: &[f64], n: usize) -> Vec<f64> {
     if v.len() == 1 {
         vec![v[0]; n]
@@ -2194,15 +2122,6 @@ fn recycle(v: &[f64], n: usize) -> Vec<f64> {
 }
 
 /// Keeps the flagged entries.
-///
-/// ### Params
-///
-/// * `v` - Values
-/// * `ok` - Flags, same length
-///
-/// ### Returns
-///
-/// The flagged values in order.
 fn subset(v: &[f64], ok: &[bool]) -> Vec<f64> {
     v.iter()
         .zip(ok)
@@ -2233,14 +2152,6 @@ fn subset_recycled(v: &[f64], ok: &[bool]) -> Vec<f64> {
 }
 
 /// Arithmetic mean.
-///
-/// ### Params
-///
-/// * `x` - Values, non-empty
-///
-/// ### Returns
-///
-/// The mean.
 fn mean(x: &[f64]) -> f64 {
     x.iter().sum::<f64>() / x.len() as f64
 }
@@ -2262,14 +2173,6 @@ fn mean_trigamma(df: &[f64]) -> f64 {
 }
 
 /// Indices that sort `x` ascending, ties keeping their input order.
-///
-/// ### Params
-///
-/// * `x` - Values
-///
-/// ### Returns
-///
-/// The permutation, as R's `order` produces it.
 fn stable_order(x: &[f64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..x.len()).collect();
     order.sort_by(|&a, &b| x[a].total_cmp(&x[b]));
@@ -2277,11 +2180,6 @@ fn stable_order(x: &[f64]) -> Vec<usize> {
 }
 
 /// Running maximum applied along a permutation.
-///
-/// ### Params
-///
-/// * `v` - Values, modified in place
-/// * `order` - Permutation to walk
 fn cummax_in_order(v: &mut [f64], order: &[usize]) {
     let mut running = f64::NEG_INFINITY;
     for &i in order {
@@ -2353,15 +2251,6 @@ fn collapse_ties(x: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>) {
 
 /// Maps a fallible scalar function over a slice, in parallel above
 /// [`PARALLEL_THRESHOLD`].
-///
-/// ### Params
-///
-/// * `x` - Inputs
-/// * `f` - Function to apply
-///
-/// ### Returns
-///
-/// The mapped values, or the first error encountered.
 fn map_maybe_par<F>(x: &[f64], f: F) -> Result<Vec<f64>, EdgeErrors>
 where
     F: Fn(f64) -> Result<f64, EdgeErrors> + Sync + Send,

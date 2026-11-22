@@ -580,10 +580,6 @@ impl NelderMeadStepper {
 
     /// Moves the vertex at sorted position `pos` halfway to the best one and
     /// asks for its value.
-    ///
-    /// ### Params
-    ///
-    /// * `pos` - Position in the sorted order, from `1` to `n`
     fn shrink_vertex(&mut self, pos: usize) {
         let i = self.order[pos];
         let best = self.best;

@@ -40,15 +40,6 @@ const MIN_INTERP_POINTS: usize = 2;
 ////////////////
 
 /// Checks that a knot vector can carry a spline.
-///
-/// ### Params
-///
-/// * `x` - Knot abscissae
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] if there are fewer than
-/// [`MIN_SPLINE_KNOTS`] knots or they are not strictly increasing.
 fn validate_knots(x: &[f64]) -> Result<(), EdgeErrors> {
     if x.len() < MIN_SPLINE_KNOTS {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -563,15 +554,6 @@ pub fn natural_spline_basis(x: &[f64], df: usize) -> Result<(Vec<f64>, usize), E
 }
 
 /// The cube of the positive part of `x - knot`.
-///
-/// ### Params
-///
-/// * `x` - Covariate value
-/// * `knot` - Knot position
-///
-/// ### Returns
-///
-/// `max(x - knot, 0)^3`.
 #[inline]
 fn truncated_cube(x: f64, knot: f64) -> f64 {
     let t = (x - knot).max(0.0);

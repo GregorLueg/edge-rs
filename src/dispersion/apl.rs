@@ -54,15 +54,6 @@ struct GeneScratch {
 
 impl GeneScratch {
     /// Allocates scratch for one worker.
-    ///
-    /// ### Params
-    ///
-    /// * `n_samples` - Number of samples
-    /// * `n_coef` - Number of coefficients
-    ///
-    /// ### Returns
-    ///
-    /// Buffers sized for a single gene across the whole grid.
     fn new(n_samples: usize, n_coef: usize) -> Self {
         Self {
             y: vec![0.0; n_samples],

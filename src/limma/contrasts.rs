@@ -418,15 +418,6 @@ enum Operand {
 
 impl<'a> Parser<'a> {
     /// Starts a parse.
-    ///
-    /// ### Params
-    ///
-    /// * `expr` - The expression text
-    /// * `levels` - Level names, in design order
-    ///
-    /// ### Returns
-    ///
-    /// A parser positioned at the start of `expr`.
     fn new(expr: &'a str, levels: &'a [&'a str]) -> Self {
         Self {
             src: expr.as_bytes(),
@@ -437,14 +428,6 @@ impl<'a> Parser<'a> {
     }
 
     /// Builds a syntax error naming the expression and position.
-    ///
-    /// ### Params
-    ///
-    /// * `what` - What went wrong
-    ///
-    /// ### Returns
-    ///
-    /// The error.
     fn error(&self, what: &str) -> EdgeErrors {
         EdgeErrors::InvalidArgument(format!(
             "contrast '{}': {what} at position {}",
@@ -460,20 +443,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Returns the next non-space byte without consuming it.
-    ///
-    /// ### Returns
-    ///
-    /// The byte, or `None` at the end of the input.
     fn peek(&mut self) -> Option<u8> {
         self.skip_space();
         self.src.get(self.pos).copied()
     }
 
     /// Checks that the whole expression was consumed.
-    ///
-    /// ### Returns
-    ///
-    /// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the leftover.
     fn finish(&mut self) -> Result<(), EdgeErrors> {
         match self.peek() {
             None => Ok(()),

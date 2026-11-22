@@ -665,15 +665,6 @@ fn prepare<T: EdgeFloat>(
 }
 
 /// Checks that a library size vector is the right length and strictly positive.
-///
-/// ### Params
-///
-/// * `lib_size` - Library size per sample
-/// * `n_samples` - Number of samples expected
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors`] on a length or positivity failure.
 fn check_lib_size(lib_size: &[f64], n_samples: usize) -> Result<(), EdgeErrors> {
     if lib_size.len() != n_samples {
         return Err(EdgeErrors::LengthMismatch {
@@ -966,16 +957,6 @@ fn finish(
 }
 
 /// The result upstream returns when the design has no replication to speak of.
-///
-/// ### Params
-///
-/// * `e` - log2-CPM matrix
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// The expression matrix with every weight set to one and no trend.
 fn no_trend_result(e: Vec<f64>, n_genes: usize, n_samples: usize) -> VoomResult {
     let amean = e.chunks_exact(n_samples).map(row_mean).collect();
     VoomResult {

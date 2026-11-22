@@ -1,25 +1,19 @@
 //! SIMD kernels behind the `EdgeSimd` trait.
 //!
-//! The optimiser core (`glm::levenberg`) calls `f64::dot_simd(..)` and
-//! `f64::exp_in_place_simd(..)` directly, since likelihoods and optimisers work
-//! in f64 regardless of the crate's `T: EdgeFloat` data layer. The vector width
-//! lives here and nowhere else; no intrinsics or `wide` types appear outside
-//! this file.
+//! The optimiser core calls `f64::dot_simd(..)` and `f64::exp_in_place_simd(..)`
+//! directly, since likelihoods work in f64 regardless of `T: EdgeFloat`. The
+//! vector width lives here and nowhere else.
 //!
 //! Each operation exists at four widths: scalar, 128-bit, 256-bit and 512-bit.
 //! [`detect_simd_level`] caches what the machine supports and the trait impls
-//! dispatch on it. A tier vectorises what it can at its own width, then hands
-//! the remainder down to the tier below. That ladder matters here because the
-//! hot caller is `linear_predictor`, which dots design rows of two to ten
-//! elements: a single-width kernel would drop those straight to scalar.
+//! dispatch on it. A tier vectorises what it can, then hands the remainder down
+//! to the tier below: the hot caller, `linear_predictor`, dots design rows of
+//! two to ten elements, which a single-width kernel would drop straight to
+//! scalar.
 //!
-//! The reductions run one accumulator, not several. Multiple accumulators break
-//! the `fadd` dependency chain and pay from a few hundred elements up, but the
-//! block loop that drives them needs `lanes * accumulators` elements before it
-//! can fire at all, which at two to ten coefficients it never does. Dropping the
-//! four-accumulator version moved `glm_fit` by under three per cent either way
-//! at two and four coefficients and made it five per cent faster at eight, so it
-//! was buying code and nothing else.
+//! The reductions run one accumulator on purpose. Several accumulators need
+//! `lanes * accumulators` elements before the block loop fires, which rows of
+//! two to ten coefficients never reach.
 
 use std::sync::OnceLock;
 
@@ -134,15 +128,6 @@ pub trait EdgeSimd: Sized + Copy {
 //-----------//
 
 /// Dot product of two `f64` slices, scalar.
-///
-/// ### Params
-///
-/// * `a` - Left operand
-/// * `b` - Right operand
-///
-/// ### Returns
-///
-/// The sum of elementwise products, truncated to the shorter operand.
 #[inline]
 fn dot_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
@@ -229,15 +214,6 @@ fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
 
 /// Fallback when the crate is not built with AVX-512, so `f64x8` would be two
 /// 256-bit halves and buy nothing over the 256-bit tier.
-///
-/// ### Params
-///
-/// * `a` - Left operand
-/// * `b` - Right operand
-///
-/// ### Returns
-///
-/// The sum of elementwise products, truncated to the shorter operand.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 #[inline]
 fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
@@ -249,15 +225,6 @@ fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
 //-----------//
 
 /// Dot product of two `f32` slices, scalar.
-///
-/// ### Params
-///
-/// * `a` - Left operand
-/// * `b` - Right operand
-///
-/// ### Returns
-///
-/// The sum of elementwise products, truncated to the shorter operand.
 #[inline]
 fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
@@ -343,15 +310,6 @@ fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Fallback when the crate is not built with AVX-512.
-///
-/// ### Params
-///
-/// * `a` - Left operand
-/// * `b` - Right operand
-///
-/// ### Returns
-///
-/// The sum of elementwise products, truncated to the shorter operand.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 #[inline]
 fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
@@ -367,10 +325,6 @@ fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
 //-----------//
 
 /// In-place exponential over an `f64` slice, scalar.
-///
-/// ### Params
-///
-/// * `x` - Values to exponentiate
 #[inline]
 fn exp_f64_scalar(x: &mut [f64]) {
     for v in x.iter_mut() {
@@ -446,10 +400,6 @@ fn exp_f64_avx512(x: &mut [f64]) {
 }
 
 /// Fallback when the crate is not built with AVX-512.
-///
-/// ### Params
-///
-/// * `x` - Values to exponentiate
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 #[inline]
 fn exp_f64_avx512(x: &mut [f64]) {
@@ -461,10 +411,6 @@ fn exp_f64_avx512(x: &mut [f64]) {
 //-----------//
 
 /// In-place exponential over an `f32` slice, scalar.
-///
-/// ### Params
-///
-/// * `x` - Values to exponentiate
 #[inline]
 fn exp_f32_scalar(x: &mut [f32]) {
     for v in x.iter_mut() {
@@ -537,10 +483,6 @@ fn exp_f32_avx512(x: &mut [f32]) {
 }
 
 /// Fallback when the crate is not built with AVX-512.
-///
-/// ### Params
-///
-/// * `x` - Values to exponentiate
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 #[inline]
 fn exp_f32_avx512(x: &mut [f32]) {

@@ -107,14 +107,6 @@ impl TryFrom<&str> for NormMethod {
     type Error = EdgeErrors;
 
     /// Fallible form of [`parse_norm_method`].
-    ///
-    /// ### Params
-    ///
-    /// * `s` - Method name
-    ///
-    /// ### Returns
-    ///
-    /// The variant, or [`EdgeErrors::UnknownMethod`] naming the accepted set.
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         parse_norm_method(s).ok_or_else(|| EdgeErrors::UnknownMethod {
             kind: "normalisation",
@@ -490,8 +482,8 @@ fn calc_factor_quantile(
 /// `.calcFactorRLE(x) / lib.size`. Genes with a zero geometric mean (any sample
 /// without a count) contribute nothing, as `[gm > 0]` does in the R.
 ///
-/// Geometric means are accumulated samples-outside, genes-inside, so reads and
-/// accumulator writes are sequential.
+/// Geometric means run over gene blocks in parallel, samples outermost within
+/// a block, so reads and accumulator writes are sequential.
 ///
 /// ### Params
 ///

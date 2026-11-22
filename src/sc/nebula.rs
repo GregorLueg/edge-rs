@@ -7,56 +7,32 @@
 //!
 //! ### The three stages of one gene
 //!
-//! 1. Bounded L-BFGS-B on the marginal likelihood
-//!    ([`ptmg_value_and_gradient`](crate::sc::ptmg::ptmg_value_and_gradient))
-//!    over `[beta, sigma, phi]`. Only the variance components survive; the
-//!    fixed effects restart from `log(mean count) - mean log offset`.
+//! 1. The marginal likelihood over `[beta, sigma, phi]`: projected Newton on a
+//!    dense design, bounded L-BFGS-B where the zero-count tables apply. Only the
+//!    variance components survive; the fixed effects restart from
+//!    `log(mean count) - mean log offset`.
 //! 2. A bounded search over the two variance components, with the fixed effects
 //!    profiled out by [`opt_pml`](crate::sc::pml::opt_pml) at every evaluation.
 //!    NEBULA-HL always runs it; NEBULA-LN runs it, a one-dimensional
-//!    restriction of it, or neither, depending on how well the large-sample
-//!    approximation is expected to hold.
+//!    restriction of it, or neither.
 //! 3. A final [`opt_pml`](crate::sc::pml::opt_pml) at the chosen variances; its
 //!    observed information inverts to the covariance of `beta`.
 //!
 //! ### Deviations from the R package
 //!
-//! nebula drives stage one with `nloptr`'s `NLOPT_LD_LBFGS` (`ftol_abs =
-//! 1e-6`), which is not in this crate. Stage two over both variance components
-//! is `nloptr::bobyqa` here as there: [`crate::numeric::bobyqa`] is NLopt
-//! 2.7.1's BOBYQA, set-up included, and retraces it point for point. The
-//! two evaluations nloptr itself makes at the start before NLopt runs are
-//! skipped. The objective is not bit-identical to nebula's (the inner fit sums
-//! in a different order), and it jitters at the `1e-6` level because
-//! [`opt_pml`](crate::sc::pml::opt_pml) stops on an absolute improvement of
-//! `eps = 1e-6`, so the two searches part company once a step lands on a
-//! different side of a jitter. They then stop within BOBYQA's own resolution
-//! of each other.
+//! - Stage two over both components is NLopt 2.7.1's BOBYQA
+//!   ([`crate::numeric::bobyqa`]), as `nloptr::bobyqa` is. The objective jitters
+//!   at the `1e-6` level ([`opt_pml`](crate::sc::pml::opt_pml) stops on an
+//!   absolute `eps`), so the two searches can part company but stop within
+//!   BOBYQA's resolution of each other.
+//! - A non-finite objective fails the gene instead of poisoning NLopt's model.
+//! - The one-component LN refit (nebula's `nlminb`) is a bounded Nelder-Mead
+//!   plus a quadratic least-squares polish, which averages the jitter out. A
+//!   simplex collapsed on a bound is restarted once.
+//! - Stage one restarts off a spurious minimum on the lower bound of `sigma`.
+//! - Only `model = "NBGMM"` is implemented.
 //!
-//! A non-finite objective ends the BOBYQA pass. nebula stops there only on its
-//! `second < -1` error (raised at a higher Laplace order, which this port
-//! retries at order one, as nebula does) and otherwise hands the value to
-//! NLopt, whose quadratic model it then poisons. At order one the only source
-//! is a non-finite penalised likelihood, so this port reports the gene as
-//! failed instead of continuing on a broken model.
-//!
-//! The one-component restriction NEBULA-LN refits (nebula's `nlminb`) runs a
-//! bounded Nelder-Mead followed by a local quadratic least-squares polish. A
-//! stencil wide compared with the noise averages the jitter out, which a
-//! simplex chasing individual values cannot. Clamping a simplex into the box
-//! can collapse it onto a bound it cannot leave, so a simplex that ends on a
-//! bound the start was inside is restarted once from between the two, and the
-//! better minimiser kept.
-//!
-//! Stage one has an exact gradient and no jitter, so it needs no polish. It does
-//! need restarting: its objective can have a spurious minimum on the lower bound
-//! of `sigma` that nebula's own L-BFGS falls into too, so it is restarted off
-//! that bound and the lowest objective kept. See `UPSTREAM_DEVIATIONS.md` B5.
-//!
-//! Only `model = "NBGMM"` is implemented. `PMM` needs Poisson-gamma kernels this
-//! crate lacks; `NBLMM` needs the log-normal outer objective, which has no
-//! golden to validate against. For the Hessian and `_opt_pml_nb` differences
-//! from edgePython, see `UPSTREAM_DEVIATIONS.md` A20 and A21.
+//! Details in `UPSTREAM_DEVIATIONS.md` A20, A21 and B5.
 //!
 //! ### References
 //!
@@ -110,9 +86,9 @@ const HIGH_ORDER: u32 = 3;
 /// Relative slack allowed when deciding a fitted value sits on its lower bound.
 ///
 /// The optimiser can stop a few parts in `1e6` above the constraint, inside its
-/// own tolerance. Strict equality missed two of 118 genes R reports as pinned on
-/// the small fixture. The smallest genuinely fitted subject variance on any
-/// fixture is four times the bound; this admits values within one part in `1e4`.
+/// own tolerance, so strict equality misses genes R reports as pinned. Genuinely
+/// fitted subject variances sit far above the bound; this admits values within
+/// one part in `1e4`.
 const BOUND_SLACK: f64 = 1.0 + 1e-4;
 
 /// Value of `kappa_obs` below which NEBULA-LN always refits the subject-level
@@ -1064,9 +1040,9 @@ fn fit_gene(
 ///
 /// nebula's stage one, an L-BFGS on an exact gradient. Here a dense design
 /// takes a projected Newton step on the exact Hessian instead. On a narrow
-/// design that costs about one gradient evaluation and converges in ten or so
-/// where the quasi-Newton takes 35 to 120 evaluations; on a wide one the
-/// Hessian is a GEMM and Newton stays level with the quasi-Newton. A design with zero-count tables
+/// design that costs about one gradient evaluation and converges in far fewer
+/// steps than the quasi-Newton; on a wide one the Hessian is a GEMM and Newton
+/// stays level with the quasi-Newton. A design with zero-count tables
 /// keeps the quasi-Newton: its gradient walks only the positive counts, the
 /// Hessian every cell. A Newton search that has not converged falls back to the
 /// quasi-Newton. `sigma` runs to its lower bound on most genes; see the
@@ -1757,14 +1733,6 @@ impl StageTwoSearch {
     }
 
     /// Clamps a point into the box.
-    ///
-    /// ### Params
-    ///
-    /// * `x` - The point
-    ///
-    /// ### Returns
-    ///
-    /// The clamped copy.
     fn clamped(&self, x: &[f64]) -> Vec<f64> {
         (0..x.len())
             .map(|j| x[j].clamp(self.lower[j], self.upper[j]))
@@ -1808,10 +1776,6 @@ impl StageTwoSearch {
     }
 
     /// Ends a pass, retrying at the leading order where nebula would.
-    ///
-    /// ### Params
-    ///
-    /// * `found` - What the pass produced
     fn end_pass(&mut self, found: Option<Vec<f64>>) {
         if (found.is_some() && !self.invalid) || self.order == 1 {
             self.found = found;
@@ -2117,16 +2081,6 @@ fn cholesky_factor(a: &[f64], n: usize) -> Option<Vec<f64>> {
 }
 
 /// Solves `L L' x = b` against a factor from [`cholesky_factor`], in place.
-///
-/// ### Params
-///
-/// * `l` - Lower factor, row-major `n * n`
-/// * `n` - Side length
-/// * `x` - Right-hand side, overwritten by the solution
-///
-/// ### Returns
-///
-/// `false` if the solution is not finite.
 fn solve_factored(l: &[f64], n: usize, x: &mut [f64]) -> bool {
     forward_substitute(l, n, n, x);
     back_substitute_transpose(l, n, n, x);
@@ -2134,16 +2088,6 @@ fn solve_factored(l: &[f64], n: usize, x: &mut [f64]) -> bool {
 }
 
 /// Solves `A x = b` for symmetric positive definite `A`.
-///
-/// ### Params
-///
-/// * `a` - Row-major `n * n` matrix
-/// * `n` - Side length
-/// * `b` - Right-hand side, length `n`
-///
-/// ### Returns
-///
-/// The solution, or `None` if `a` is not positive definite.
 fn cholesky_solve(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
     let l = cholesky_factor(a, n)?;
     let mut x = b.to_vec();
@@ -2210,16 +2154,6 @@ fn subject_boundaries(subject_id: &[usize]) -> Result<Vec<usize>, EdgeErrors> {
 }
 
 /// Converts a generic slice to `f64`, rejecting anything that will not fit.
-///
-/// ### Params
-///
-/// * `name` - Name used in the error message
-/// * `values` - The slice to convert
-///
-/// ### Returns
-///
-/// The converted values, or [`EdgeErrors::InvalidArgument`] on a value that does
-/// not convert.
 fn to_f64<T: EdgeFloat>(name: &str, values: &[T]) -> Result<Vec<f64>, EdgeErrors> {
     values
         .iter()

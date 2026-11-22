@@ -34,17 +34,6 @@ pub const LIMMA_LOWESS_DEFAULTS: (usize, f64, f64) = (50, 0.3, 1.0 / 3.0);
 /////////////
 
 /// Wraps a row-major slice as a faer matrix, checking the shape first.
-///
-/// ### Params
-///
-/// * `design` - Row-major values
-/// * `n_rows` - Number of rows
-/// * `n_cols` - Number of columns
-///
-/// ### Returns
-///
-/// The borrowed matrix, or [`EdgeErrors::LengthMismatch`] if the slice does not
-/// match the stated shape.
 fn as_matrix(design: &[f64], n_rows: usize, n_cols: usize) -> Result<MatRef<'_, f64>, EdgeErrors> {
     validate_shape(design.len(), n_rows, n_cols)?;
     Ok(MatRef::from_row_major_slice(design, n_rows, n_cols))

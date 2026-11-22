@@ -235,15 +235,6 @@ struct Panel {
 }
 
 /// Picks the panel covering `mu` and maps `mu` onto `[-1, 1]`.
-///
-/// ### Params
-///
-/// * `panels` - Panels in ascending order of `upper`, the last unbounded
-/// * `mu` - Mean to locate
-///
-/// ### Returns
-///
-/// The mapped abscissa and the coefficient offset of the panel holding `mu`.
 #[inline]
 fn locate(panels: &[Panel], mu: f64) -> (f64, usize) {
     let panel = panels
@@ -414,28 +405,12 @@ pub fn cheb_eval_2d(coefficients: &[f64], x: f64, y: f64, nx: usize, ny: usize) 
 ///////////////////
 
 /// Large-`mu` expansion of the Poisson deviance scale.
-///
-/// ### Params
-///
-/// * `mu` - Mean, expected to be at least [`POIS_ASYMPTOTIC_MU`]
-///
-/// ### Returns
-///
-/// `1 - 1/(6 mu) - 1/(2 mu^2)`, the tail edgeR uses in place of a fit.
 #[inline]
 fn pois_alpha_tail(mu: f64) -> f64 {
     1.0 - 1.0 / (6.0 * mu) - 1.0 / (2.0 * mu * mu)
 }
 
 /// Large-`mu` expansion of the Poisson deviance degrees of freedom.
-///
-/// ### Params
-///
-/// * `mu` - Mean, expected to be at least [`POIS_ASYMPTOTIC_MU`]
-///
-/// ### Returns
-///
-/// `1 - 1/(2.5 mu^2)`.
 #[inline]
 fn pois_kappa_tail(mu: f64) -> f64 {
     1.0 - 1.0 / (2.5 * mu * mu)
@@ -685,14 +660,6 @@ fn nb_kappa_case2(mu: f64, phi: f64) -> f64 {
 }
 
 /// Maps `mu` onto `[-1, 1]` for the case 2 reciprocal-`mu` panels.
-///
-/// ### Params
-///
-/// * `mu` - Fitted mean, expected in `[50, 5000)`
-///
-/// ### Returns
-///
-/// The mapped abscissa and the panel's coefficient offset.
 #[inline]
 fn locate_reciprocal(mu: f64) -> (f64, usize) {
     if mu < NB2_MID_KNOTS[0] {

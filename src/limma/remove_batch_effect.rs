@@ -60,18 +60,6 @@ fn sum_contrast_columns(labels: &[usize]) -> Result<(Vec<f64>, usize), EdgeError
 }
 
 /// Appends row-major columns onto a row-major matrix, `cbind` for this layout.
-///
-/// ### Params
-///
-/// * `left` - Row-major `n_rows * n_left`
-/// * `n_left` - Columns in `left`
-/// * `right` - Row-major `n_rows * n_right`
-/// * `n_right` - Columns in `right`
-/// * `n_rows` - Number of rows
-///
-/// ### Returns
-///
-/// Row-major `n_rows * (n_left + n_right)`.
 fn cbind(left: &[f64], n_left: usize, right: &[f64], n_right: usize, n_rows: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(n_rows * (n_left + n_right));
     for i in 0..n_rows {
@@ -82,16 +70,6 @@ fn cbind(left: &[f64], n_left: usize, right: &[f64], n_right: usize, n_rows: usi
 }
 
 /// Checks a per-sample vector against the sample count.
-///
-/// ### Params
-///
-/// * `name` - Argument name for the error
-/// * `len` - Supplied length
-/// * `n_samples` - Required length
-///
-/// ### Returns
-///
-/// `Ok(())` or [`EdgeErrors::LengthMismatch`].
 fn check_len(name: &'static str, len: usize, n_samples: usize) -> Result<(), EdgeErrors> {
     if len != n_samples {
         return Err(EdgeErrors::LengthMismatch {

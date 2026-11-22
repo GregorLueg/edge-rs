@@ -395,15 +395,6 @@ impl Penalty {
     }
 
     /// The prior's contribution to the random-effect gradient.
-    ///
-    /// ### Params
-    ///
-    /// * `log_w_s` - Random effect for this subject
-    /// * `w_s` - `exp(log_w_s)`
-    ///
-    /// ### Returns
-    ///
-    /// The term added to `cumsumy - sum(gstar_extb_phi)` for this subject.
     fn gradient(&self, log_w_s: f64, w_s: f64) -> f64 {
         match *self {
             Penalty::Gamma { alpha, lambda } => alpha - lambda * w_s,
@@ -412,14 +403,6 @@ impl Penalty {
     }
 
     /// The prior's contribution to the random-effect curvature.
-    ///
-    /// ### Params
-    ///
-    /// * `w_s` - `exp(log_w_s)`
-    ///
-    /// ### Returns
-    ///
-    /// The term added to the data curvature for this subject.
     fn curvature(&self, w_s: f64) -> f64 {
         match *self {
             Penalty::Gamma { lambda, .. } => lambda * w_s,
@@ -446,15 +429,6 @@ pub(crate) fn gamma_prior(exps: f64) -> (f64, f64) {
 }
 
 /// The gamma penalty for a subject-level variance, checked.
-///
-/// ### Params
-///
-/// * `subject` - [`PmlVariance::subject`]
-///
-/// ### Returns
-///
-/// [`Penalty::Gamma`], or [`EdgeErrors::InvalidArgument`] unless
-/// `e^subject` is finite and above one.
 fn gamma_penalty(subject: f64) -> Result<Penalty, EdgeErrors> {
     let exps = subject.exp();
     if !(exps.is_finite() && exps > 1.0) {
@@ -692,22 +666,13 @@ const EXP_SERIES_MAX: f64 = 1e-3;
 /// rounding at a converged point rather than a step that went wrong.
 ///
 /// From the device's `f32` optimum the `f64` step gains less than the rounding
-/// of a sum over all cells, so `likdif` is a few ulp negative on about 15 per
-/// cent of fits (S1: 10804 of 73650, between `1e-16` and `1e-15` relative).
+/// of a sum over all cells, so `likdif` is often a few ulp negative.
 /// [`opt_pml_from`] would backtrack to the same point. A real overshoot loses
 /// orders of magnitude more.
 #[cfg(feature = "gpu")]
 const LIKDIF_ROUNDING: f64 = 1e-12;
 
 /// `exp(z)` to fifth order, for `|z|` within [`EXP_SERIES_MAX`].
-///
-/// ### Params
-///
-/// * `z` - The exponent
-///
-/// ### Returns
-///
-/// `exp(z)`, to well under an ulp.
 #[cfg(feature = "gpu")]
 #[inline(always)]
 fn exp_series(z: f64) -> f64 {
@@ -750,10 +715,6 @@ impl LogSum {
     }
 
     /// Adds `ln(t)`.
-    ///
-    /// ### Params
-    ///
-    /// * `t` - The term, strictly positive
     #[inline(always)]
     fn push(&mut self, t: f64) {
         self.product *= t;
@@ -766,10 +727,6 @@ impl LogSum {
     }
 
     /// The sum, with the group in flight folded in.
-    ///
-    /// ### Returns
-    ///
-    /// `sum ln(t)` over everything pushed.
     fn finish(self) -> f64 {
         self.sum + self.product.ln()
     }
@@ -894,9 +851,8 @@ pub(crate) fn newton_finish(
 /// accumulators with a store-to-load round trip per cell.
 ///
 /// The first sweep takes a subject's `exp` in its own loop, so the accumulating
-/// loop has no call in it and the positive cells read the stored value. Together
-/// with the registers: 15.6 to 12.1 ns per cell per step on a 20000-cell gene;
-/// the split alone is slower.
+/// loop has no call in it and the positive cells read the stored value. The
+/// split only pays together with the registers.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn newton_finish_width<const NB: usize>(

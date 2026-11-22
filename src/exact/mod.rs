@@ -340,14 +340,6 @@ fn ln_reg_gamma_upper_inv(ln_q: f64, a: f64) -> Result<f64, EdgeErrors> {
 ////////////////
 
 /// Rejects a dispersion outside `[0, inf)`.
-///
-/// ### Params
-///
-/// * `dispersion` - Value supplied by the caller
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidDispersion`].
 fn check_dispersion(dispersion: f64) -> Result<(), EdgeErrors> {
     if !dispersion.is_finite() || dispersion < 0.0 {
         return Err(EdgeErrors::InvalidDispersion(dispersion));
@@ -356,15 +348,6 @@ fn check_dispersion(dispersion: f64) -> Result<(), EdgeErrors> {
 }
 
 /// Rejects a slice holding a negative or non-finite value.
-///
-/// ### Params
-///
-/// * `name` - Argument name, used verbatim in the error message
-/// * `values` - Values to check
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the offending value.
 fn check_non_negative(name: &str, values: &[f64]) -> Result<(), EdgeErrors> {
     if let Some(bad) = values.iter().find(|v| !v.is_finite() || **v < 0.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -727,17 +710,6 @@ fn log_sum_exp(values: &[f64]) -> f64 {
 }
 
 /// Binomial log-PMF, for the Poisson limit of the exact test.
-///
-/// ### Params
-///
-/// * `k` - Number of successes, in `0..=n`
-/// * `n` - Number of trials
-/// * `ln_p` - Log of the success probability
-/// * `ln_q` - Log of one minus the success probability
-///
-/// ### Returns
-///
-/// `ln P(K = k)`.
 #[inline]
 fn binom_ln_pmf(k: f64, n: f64, ln_p: f64, ln_q: f64) -> f64 {
     ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0) + k * ln_p + (n - k) * ln_q
@@ -1186,18 +1158,6 @@ fn augmented_abundance(
 }
 
 /// Joins two per-group matrices, first group's columns first.
-///
-/// ### Params
-///
-/// * `y1` - First group's counts, row-major `n_genes * n1`
-/// * `y2` - Second group's counts, row-major `n_genes * n2`
-/// * `n_genes` - Number of genes
-/// * `n1` - Number of samples in the first group
-/// * `n2` - Number of samples in the second group
-///
-/// ### Returns
-///
-/// A row-major `n_genes * (n1 + n2)` matrix.
 fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> Vec<f64> {
     let mut out = vec![0.0_f64; n_genes * (n1 + n2)];
     out.par_chunks_mut(n1 + n2)

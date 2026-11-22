@@ -125,14 +125,6 @@ const GLMGAM_ZERO_TOL: f64 = 1e-15;
 ////////////////////////
 
 /// Euclidean norm of a slice.
-///
-/// ### Params
-///
-/// * `x` - Values
-///
-/// ### Returns
-///
-/// `sqrt(sum(x^2))`.
 fn euclidean_norm(x: &[f64]) -> f64 {
     x.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -201,16 +193,6 @@ fn solve_linear(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, EdgeErrors> 
 }
 
 /// Transposes a row-major matrix into column-major order.
-///
-/// ### Params
-///
-/// * `x` - Row-major `n_rows * n_cols` values
-/// * `n_rows` - Number of rows
-/// * `n_cols` - Number of columns
-///
-/// ### Returns
-///
-/// The same matrix, column-major.
 fn to_column_major(x: &[f64], n_rows: usize, n_cols: usize) -> Vec<f64> {
     let mut out = vec![0.0; n_rows * n_cols];
     for i in 0..n_rows {
@@ -222,16 +204,6 @@ fn to_column_major(x: &[f64], n_rows: usize, n_cols: usize) -> Vec<f64> {
 }
 
 /// R's `contr.sum(n)`.
-///
-/// ### Params
-///
-/// * `n` - Number of levels
-///
-/// ### Returns
-///
-/// Column-major `n * (n - 1)`: an identity block over the first `n - 1` rows
-/// and a row of `-1` underneath. Constraining the log weights against this
-/// basis is what makes them sum to zero.
 fn contr_sum(n: usize) -> Vec<f64> {
     let mut out = vec![0.0; n * (n - 1)];
     for k in 0..(n - 1) {
@@ -340,19 +312,11 @@ impl LinpackQr {
     }
 
     /// Numerical rank, in R's sense.
-    ///
-    /// ### Returns
-    ///
-    /// The number of columns that survived the [`RANK_TOL`] test.
     fn rank(&self) -> usize {
         self.pivot.len()
     }
 
     /// Applies `Q'` in place, giving R's `effects`.
-    ///
-    /// ### Params
-    ///
-    /// * `y` - Vector of length `n`, overwritten with `Q' y`
     fn qty(&self, y: &mut [f64]) {
         for l in 0..self.rank() {
             self.reflect(l, y);
@@ -394,14 +358,6 @@ impl LinpackQr {
     }
 
     /// The leading columns of `Q`, R's `qr.qy(qr, diag(1, n, k))`.
-    ///
-    /// ### Params
-    ///
-    /// * `k` - Number of columns wanted
-    ///
-    /// ### Returns
-    ///
-    /// Column-major `n * k`.
     fn leading_q(&self, k: usize) -> Vec<f64> {
         let mut out = vec![0.0; self.n * k];
         for c in 0..k {
@@ -413,10 +369,6 @@ impl LinpackQr {
     }
 
     /// Leverages of the rows, R's `hat(qr)`.
-    ///
-    /// ### Returns
-    ///
-    /// The hat matrix diagonal, one value per row.
     fn hat(&self) -> Vec<f64> {
         let rank = self.rank();
         let q = self.leading_q(rank);
@@ -686,17 +638,6 @@ fn prepare_var_design(
 }
 
 /// Scales each design column by the per-observation square-root weight.
-///
-/// ### Params
-///
-/// * `design` - Column-major `n * p` design
-/// * `root_w` - Square-root weights, length `n`
-/// * `n` - Number of observations
-/// * `p` - Number of columns
-///
-/// ### Returns
-///
-/// The weighted design, column-major `n * p`.
 fn weight_columns(design: &[f64], root_w: &[f64], n: usize, p: usize) -> Vec<f64> {
     let mut xw = vec![0.0; n * p];
     for j in 0..p {
@@ -708,18 +649,6 @@ fn weight_columns(design: &[f64], root_w: &[f64], n: usize, p: usize) -> Vec<f64
 }
 
 /// Reconstructs unweighted residuals `y - X b` from a pivoted QR's solve.
-///
-/// ### Params
-///
-/// * `qr` - The pivoted QR the coefficients were solved from
-/// * `y` - Response of length `n`
-/// * `design` - Column-major `n * p` design, unweighted
-/// * `coef` - Coefficients in pivot order, as returned by [`LinpackQr::solve_r`]
-/// * `n` - Number of observations
-///
-/// ### Returns
-///
-/// The residuals, length `n`.
 fn qr_residuals(qr: &LinpackQr, y: &[f64], design: &[f64], coef: &[f64], n: usize) -> Vec<f64> {
     let mut residuals = y.to_vec();
     for (m, &j) in qr.pivot.iter().enumerate() {
@@ -1263,17 +1192,6 @@ fn reml_information(
 }
 
 /// Turns the current `gamma` into weights, `exp(-Z2 gamma)`.
-///
-/// ### Params
-///
-/// * `z2` - Column-major `n_samples * ngam` variance design
-/// * `gam` - Current variance coefficients
-/// * `n_samples` - Number of samples
-/// * `ngam` - Number of variance coefficients
-///
-/// ### Returns
-///
-/// One weight per sample.
 fn weights_from_gamma(z2: &[f64], gam: &[f64], n_samples: usize, ngam: usize) -> Vec<f64> {
     (0..n_samples)
         .map(|j| {

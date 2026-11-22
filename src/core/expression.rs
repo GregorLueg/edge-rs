@@ -78,14 +78,6 @@ pub(crate) fn check_counts<T: EdgeFloat>(
 }
 
 /// Rejects a prior count that cannot be scaled.
-///
-/// ### Params
-///
-/// * `prior_count` - Prior count before library-size scaling
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] if it is negative or non-finite.
 fn check_prior_count(prior_count: f64) -> Result<(), EdgeErrors> {
     if !prior_count.is_finite() || prior_count < 0.0 {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -136,17 +128,6 @@ pub(crate) fn check_positive_finite(values: &[f64], name: &str) -> Result<(), Ed
 }
 
 /// Rejects gene lengths that cannot be divided by.
-///
-/// ### Params
-///
-/// * `lengths` - One length per gene
-/// * `n_genes` - Number of genes
-/// * `name` - Argument name, for the error message
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::LengthMismatch`] on the wrong length and
-/// [`EdgeErrors::InvalidArgument`] on a non-positive entry.
 fn check_gene_length(
     lengths: &[f64],
     n_genes: usize,

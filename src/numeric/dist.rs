@@ -71,15 +71,6 @@ const GAMMA_PPF_REL_TOL: f64 = 1e-15;
 ////////////////
 
 /// Checks that a degrees-of-freedom-like parameter is finite and positive.
-///
-/// ### Params
-///
-/// * `name` - Parameter name, used verbatim in the error message
-/// * `value` - Value supplied by the caller
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the parameter and value.
 fn check_positive(name: &str, value: f64) -> Result<(), EdgeErrors> {
     if !(value.is_finite() && value > 0.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -90,15 +81,6 @@ fn check_positive(name: &str, value: f64) -> Result<(), EdgeErrors> {
 }
 
 /// Checks that a probability lies in the closed unit interval.
-///
-/// ### Params
-///
-/// * `name` - Parameter name, used verbatim in the error message
-/// * `value` - Value supplied by the caller
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the parameter and value.
 fn check_probability(name: &str, value: f64) -> Result<(), EdgeErrors> {
     if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -216,15 +198,6 @@ fn gamma_series(a: f64, x: f64) -> f64 {
 }
 
 /// Continued fraction representation of `Q(a, x)`, for `x >= a + 1`.
-///
-/// ### Params
-///
-/// * `a` - Shape, strictly positive
-/// * `x` - Argument, at least `a + 1`
-///
-/// ### Returns
-///
-/// `Q(a, x)`.
 fn gamma_cont_frac(a: f64, x: f64) -> f64 {
     gamma_cont_frac_raw(a, x) * inc_gamma_prefactor(a, x)
 }

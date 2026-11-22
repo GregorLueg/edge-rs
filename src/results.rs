@@ -59,16 +59,6 @@ pub struct TopTags {
 ////////////////
 
 /// Checks that a companion column is one value per gene.
-///
-/// ### Params
-///
-/// * `name` - Argument name, used verbatim in the error message
-/// * `values` - Column to check
-/// * `n_genes` - Number of genes the table holds
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::LengthMismatch`].
 fn check_length(name: &'static str, values: &[f64], n_genes: usize) -> Result<(), EdgeErrors> {
     if values.len() != n_genes {
         return Err(EdgeErrors::LengthMismatch {
@@ -81,16 +71,6 @@ fn check_length(name: &'static str, values: &[f64], n_genes: usize) -> Result<()
 }
 
 /// Checks that a cutoff is a usable probability.
-///
-/// ### Params
-///
-/// * `name` - Argument name, used verbatim in the error message
-/// * `value` - Cutoff supplied by the caller
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`]. NaN is rejected, since it would
-/// silently return nothing.
 fn check_cutoff(name: &str, value: f64) -> Result<(), EdgeErrors> {
     if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
         return Err(EdgeErrors::InvalidArgument(format!(
