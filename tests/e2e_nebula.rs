@@ -71,7 +71,7 @@ const TOL_COEF: Tol = Tol::new(3e-5, 1e-9);
 const TOL_SE: Tol = Tol::rel(1e-4);
 
 /// Covariance entries, which are standard errors squared and so carry twice the
-/// relative error. Needs `2.3e-4`.
+/// relative error. Needs `6.2e-4` (`sc_small`).
 const TOL_COV: Tol = Tol::new(1e-3, 1e-12);
 
 /// Subject-level overdispersion. The profile likelihood is flatter in this

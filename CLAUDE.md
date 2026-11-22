@@ -33,8 +33,8 @@ The runtime probe in `detect_simd_level` handles dispatch below that.
 ## Parity testing
 
 The E2E suites in `tests/e2e_*.rs` gate against committed CSV fixtures under
-`tests/data/e2e`, written by `tests/r/generate_fixtures.R` against edgeR 4.8.2,
-limma 3.66.0, statmod 1.5.2 and nebula 1.5.8. CI never runs the R. Regenerate by
+`tests/data/e2e`, written by `tests/r/generate_fixtures.R` against edgeR 4.10.7,
+limma 3.68.5, statmod 1.5.2 and nebula 1.5.9. CI never runs the R. Regenerate by
 hand from the repository root after an upstream bump and inspect the diff:
 
 ```sh

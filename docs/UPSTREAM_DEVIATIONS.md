@@ -12,8 +12,8 @@ Where `edge-rs` deliberately does not reproduce its upstreams, and why.
 Every entry was checked against the installed package, not inferred from
 reading, and names a test that fails if the behaviour drifts back. Section A
 was last checked against edgeR 4.10.7, limma 3.68.5 and nebula 1.5.9, Section B
-against the versions each entry names. The committed fixtures still come from
-edgeR 4.8.2 and limma 3.66.0.
+against the versions each entry names. The committed fixtures come from the
+same edgeR, limma and nebula versions as Section A.
 
 edgePython citations are against **version 0.5.1, commit `4be67c8`**
 (2026-10-24). A line number without a commit rots. Entries edgePython has since

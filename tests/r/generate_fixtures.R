@@ -2,8 +2,8 @@
 #
 # Reference fixtures for the end-to-end parity tests in tests/e2e_*.rs.
 #
-# Generated against R 4.5.1 with edgeR 4.8.2, limma 3.66.0, statmod 1.5.2 and
-# nebula 1.5.8. CI never runs this: the outputs are committed and the Rust side
+# Generated against R 4.6.1 with edgeR 4.10.7, limma 3.68.5, statmod 1.5.2 and
+# nebula 1.5.9. CI never runs this: the outputs are committed and the Rust side
 # reads them. Run it by hand after an upstream bump and inspect the diff.
 #
 #   Rscript tests/r/generate_fixtures.R
@@ -425,10 +425,12 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
     cbind(
       default = aveLogCPM(cf, lib.size = eff_lib),
       disp02 = aveLogCPM(cf, lib.size = eff_lib, dispersion = 0.2),
-      with_offset = aveLogCPM(cf, offset = off)
+      with_offset = aveLogCPM(cf, offset = off),
+      # The same model as a matrix. edgeR 4.8.2 corrupted gene 1 here; 4.10.7 does not.
+      with_matrix_offset = aveLogCPM(cf, offset = matrix(off, nrow(cf), ncol(cf), byrow = TRUE))
     ),
     paste0(tag, "_avelogcpm.csv"),
-    c("default", "disp02", "with_offset")
+    c("default", "disp02", "with_offset", "with_matrix_offset")
   )
 
   # -- dispersions.
