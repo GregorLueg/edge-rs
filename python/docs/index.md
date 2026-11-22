@@ -46,7 +46,9 @@ every function above takes it in place of the counts:
 dge = edge_rs.make_dgelist(counts, genes=pl.DataFrame({"gene_id": genes}))
 dge = edge_rs.calc_norm_factors(dge[edge_rs.filter_by_expr(dge, design=design)])
 fit = edge_rs.glm_ql_fit(dge, design)
-edge_rs.top_tags(edge_rs.glm_ql_ftest(fit, coef="treated"), feature_ids=dge.genes["gene_id"])
+edge_rs.top_tags(
+    edge_rs.glm_ql_ftest(fit, coef="treated"), feature_ids=dge.genes["gene_id"]
+)
 ```
 
 ## Conventions
