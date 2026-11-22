@@ -209,8 +209,7 @@ fn residual_deviance<T: EdgeFloat>(
 ///
 /// Ports edgeR's `addPriorCount`. The prior is scaled by each library's size
 /// relative to the average, so every sample is perturbed by the same relative
-/// amount. edgePython drops that scaling for matrix offsets; this follows
-/// edgeR. See `UPSTREAM_DEVIATIONS.md` A5.
+/// amount.
 ///
 /// ### Params
 ///

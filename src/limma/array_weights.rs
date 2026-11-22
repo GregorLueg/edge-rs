@@ -27,8 +27,7 @@
 //! projects out the fixed effects, takes an SVD of the projected block design,
 //! and fits a gamma GLM of the squared rotated residuals on the squared
 //! singular values. The Levenberg damping of that GLM is reproduced step for
-//! step, since the answer depends on where it stops. edgePython uses a one-way
-//! ANOVA moment estimator instead. See `UPSTREAM_DEVIATIONS.md` A14.
+//! step, since the answer depends on where it stops.
 //!
 //! ### Implementation notes
 //!
@@ -789,12 +788,6 @@ fn sweep_intercept(
 /// One weight per sample, or [`EdgeErrors`] on a shape mismatch, an invalid
 /// weight, an out-of-domain parameter, or a singular information matrix.
 ///
-/// ### edgePython
-///
-/// `edgepython/voom_lmfit.py:834` differs from limma in five places (no
-/// `.arrayWeightsPrWtsREML`, fully pivoted QR, `pinv` for `solve`, clamping,
-/// looser gene admission). This follows limma. See `UPSTREAM_DEVIATIONS.md` A14.
-///
 /// ### References
 ///
 /// Ritchie, Diyagama, Neilson, van Laar, Dobrovic, Holloway and Smyth, BMC
@@ -1539,10 +1532,6 @@ fn array_weights_prior_reml(
 /// A gene contributes only with more than `n_coef + 2` observations, more than
 /// one block and fewer blocks than `n_obs - 1`; others are dropped from the
 /// trimmed mean, not counted as zero.
-///
-/// edgePython replaces the per-gene mixed model with a one-way ANOVA moment
-/// estimator and drops several of limma's admission rules. This follows limma.
-/// See `UPSTREAM_DEVIATIONS.md` A14.
 ///
 /// ### Params
 ///

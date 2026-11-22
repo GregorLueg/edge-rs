@@ -10,8 +10,9 @@
 //! [`ave_log_cpm`] is called by `estimateDisp` on every analysis. It adds a
 //! library-size-scaled prior count and fits an intercept-only NB GLM with
 //! [`mglm_one_group`] instead of averaging log-CPMs, which keeps it stable for
-//! genes that are zero in most samples. edgeR has a matrix-offset bug here that
-//! this port does not reproduce. See `UPSTREAM_DEVIATIONS.md` B1.
+//! genes that are zero in most samples. edgeR 4.8.2 corrupts the first gene
+//! under a matrix offset (fixed by 4.10.7); this port treats both offset forms
+//! as the same model.
 
 use std::f64::consts::LN_2;
 
@@ -1094,7 +1095,7 @@ mod tests {
     /// edgeR 4.8.2 does not: `aveLogCPM(y, offset = matrix(log(ls), nrow(y),
     /// ncol(y), byrow = TRUE), dispersion = 0.1)` returns 24.62 for the first
     /// gene against 4.675 from `offset = log(ls)`. The reference here is the
-    /// vector-offset call. See `UPSTREAM_DEVIATIONS.md` B1.
+    /// vector-offset call. Fixed in edgeR 4.10.7.
     #[test]
     fn test_ave_log_cpm_with_a_constant_full_offset_matches_the_per_sample_form() {
         let dispersion = Recycled::scalar(0.1);

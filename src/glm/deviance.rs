@@ -1,8 +1,7 @@
 //! Negative binomial deviance.
 //!
 //! The crate's single implementation, used by the Levenberg fit, the residual
-//! deviance and the quasi-likelihood weights. Ports edgeR's `compute_nbdev.c`,
-//! not edgePython's naive version. See `UPSTREAM_DEVIATIONS.md` A3.
+//! deviance and the quasi-likelihood weights. Ports edgeR's `compute_nbdev.c`.
 //!
 //! Two details give the accuracy. `y` and `mu` are both nudged by
 //! [`MILDLY_LOW_VALUE`], which keeps zero counts finite without a special
@@ -107,7 +106,7 @@ mod tests {
         }
     }
 
-    /// The naive textbook formula used by edgePython's GLM path. Must disagree
+    /// The naive textbook formula. Must disagree
     /// with ours, otherwise the regime switching does nothing.
     fn naive(y: f64, mu: f64, phi: f64) -> f64 {
         if y > 0.0 {

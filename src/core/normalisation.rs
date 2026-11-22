@@ -1,8 +1,7 @@
 //! `calcNormFactors`: TMM, TMMwsp, RLE and upper-quartile scaling factors.
 //!
 //! A port of edgeR's `normLibSizes.default` and the four `.calcFactor*` helpers
-//! it dispatches to. Where edgePython and edgeR disagree, edgeR wins; see
-//! `calc_factor_tmmwsp`.
+//! it dispatches to. Where edgePython and edgeR disagree, edgeR wins.
 //!
 //! ### Access pattern
 //!
@@ -663,8 +662,7 @@ fn calc_factor_tmm(
 /// Genes zero in both are still dropped.
 ///
 /// The trim window is `[floor(n * trim) + 1, n + 1 - that]` in 1-based
-/// positions, as in [`calc_factor_tmm`]. edgePython trims one gene too many at
-/// each end here. See `UPSTREAM_DEVIATIONS.md` A1.
+/// positions, as in [`calc_factor_tmm`].
 ///
 /// ### Notes
 ///

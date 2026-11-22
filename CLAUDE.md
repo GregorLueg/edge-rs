@@ -71,7 +71,7 @@ drifted back. **Any new deliberate deviation belongs there.** NEBULA is ported
 from the `nebula` package's own C++, not from edgePython, whose standard errors
 are 6 to 89 per cent off.
 
-The edgePython entries were read against version 0.2.6, commit `1e572ae`, and the
+The edgePython entries were read against version 0.5.1, commit `4be67c8`, and the
 doc says so. A file-and-line citation with no commit behind it rots the moment
 upstream edits the file. Re-pin the header if you check the claims against a
 newer checkout.

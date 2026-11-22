@@ -21,7 +21,7 @@
 //!   round trip is replaced by the linear map it equals, and the upper gamma
 //!   tail uses a log-space incomplete gamma defined here, because
 //!   [`crate::numeric::dist`] only has natural-scale `gamma_cdf` and
-//!   `gamma_ppf`. See `UPSTREAM_DEVIATIONS.md` A16.
+//!   `gamma_ppf`.
 //! * `exactTestBySmallP` and `binomTest` have bugs in edgeR that are not
 //!   reproduced. See `UPSTREAM_DEVIATIONS.md` B3 and B4.
 
@@ -416,8 +416,7 @@ fn q2q_one(x: f64, input_mean: f64, output_mean: f64, dispersion: f64) -> Result
 ///
 /// ### Notes
 ///
-/// **Two departures from edgeR's arithmetic** (see `UPSTREAM_DEVIATIONS.md`
-/// A16):
+/// **Two departures from edgeR's arithmetic:**
 ///
 /// * The normal half is the linear map `output_mean + sd_out (x - input_mean) / sd_in`,
 ///   which `qnorm(pnorm(...))` reduces to. Agrees to the last bit or two.

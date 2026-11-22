@@ -27,8 +27,7 @@
 //! ([`crate::limma::lowess::lowess`]), not `weightedLowess`. The exception is
 //! `voomLmFit` once it finds structural zeros: it then uses
 //! [`crate::limma::lowess::weighted_lowess`] with the residual degrees of
-//! freedom as prior weights. edgePython uses `weightedLowess` unconditionally.
-//! See `UPSTREAM_DEVIATIONS.md` A13.
+//! freedom as prior weights.
 
 use faer::MatRef;
 use rayon::prelude::*;
@@ -206,26 +205,9 @@ pub struct VoomResult {
 /// With fewer than two genes having residual degrees of freedom, every weight
 /// is one (limma warns and does the same).
 ///
-/// ### Where edgePython disagrees with limma
-///
-/// Reproduced as limma has them. The list is local, not `UPSTREAM_DEVIATIONS.md`
-/// numbering, except the first (A13).
-///
-/// * edgePython always smooths with `weightedLowess`; limma's `voom` uses
-///   `stats::lowess`. See `UPSTREAM_DEVIATIONS.md` A13.
-/// * edgePython uses `npts = 120` and three iterations for the unweighted
-///   smooth; neither is a limma default.
-/// * edgePython never drops the all-zero rows from the trend.
-/// * edgePython restricts the trend to genes with residual degrees of freedom;
-///   only `voomLmFit` does, not `voom`.
-/// * edgePython floors `sigma`, the trend and the fitted counts at `1e-8`;
-///   limma clamps nothing.
-/// * edgePython collapses tied trend abscissae to the first ordinate;
-///   `approxfun(ties = list("ordered", mean))` takes the mean.
-/// * edgePython multiplies prior weights into the returned weights; limma
-///   returns the voom weights alone.
-/// * edgePython's `normalize_method` is `normalizeBetweenArrays`; this port
-///   takes edgeR's `calcNormFactors`. Quantile normalisation is not available.
+/// limma's `normalize.method` (`normalizeBetweenArrays`) is not ported: library
+/// sizes come from edgeR's `calcNormFactors`, so quantile normalisation is not
+/// available.
 ///
 /// Two guards are added on top of limma, both no-ops when limma gives a usable
 /// answer: non-finite `(sx, sy)` pairs and genes with no residual degrees of
@@ -313,14 +295,8 @@ pub fn voom<T: EdgeFloat>(
 ///
 /// ### Where edgePython disagrees with edgeR
 ///
-/// In addition to the list on [`voom`]:
-///
-/// * edgePython passes `block` and `correlation` to the *first* fit; edgeR uses
-///   prior weights only there (moot here, neither is supported).
-/// * edgePython clamps the trend's prior weights to at least one; edgeR passes
-///   `df.residual` unchanged.
-/// * edgePython runs structural-zero detection from `voom` behind a flag; in
-///   edgeR it exists only in `voomLmFit`.
+/// edgePython runs structural-zero detection from `voom` behind a flag; in
+/// edgeR it exists only in `voomLmFit`.
 #[allow(clippy::too_many_arguments)]
 pub fn voom_lmfit<T: EdgeFloat>(
     counts: &[T],

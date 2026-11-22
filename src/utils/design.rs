@@ -364,7 +364,7 @@ pub fn contrast_as_coef(
 ///
 /// Port of limma's `chooseLowessSpan`: wider windows for small experiments,
 /// tapering towards `min_span`. [`LIMMA_LOWESS_DEFAULTS`] carries limma's
-/// defaults; edgePython passes different ones. See `UPSTREAM_DEVIATIONS.md` A8.
+/// defaults.
 ///
 /// ### Params
 ///
@@ -649,7 +649,6 @@ mod tests {
 
     /// limma: `chooseLowessSpan(10)`, `(100)`, `(1000)` give 1, 0.8555904,
     /// 0.5578822 at limma's own defaults of `small.n = 50, min.span = 0.3`.
-    /// edgePython passes 25 and 0.2 instead, which is `UPSTREAM_DEVIATIONS.md` A8.
     #[test]
     fn test_choose_lowess_span_matches_limma() {
         let (small_n, min_span, power) = LIMMA_LOWESS_DEFAULTS;
