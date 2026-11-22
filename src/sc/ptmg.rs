@@ -642,7 +642,7 @@ pub(crate) fn ptmg_value_gradient_hessian_with(
 /// Fills the exponentiated linear predictor and its subject sums, and
 /// accumulates `sum y * eta`.
 ///
-/// Past [`HESSIAN_LOCAL_COEF`] columns, `X beta` is one matrix-vector product
+/// Past [`MAX_UNROLLED_WIDTH`] columns, `X beta` is one matrix-vector product
 /// into `extb`, then a pass adds the offset and exponentiates in place: a
 /// per-row dot product is a single dependency chain over `n_coef`, which is
 /// latency bound on wide designs. Narrow designs accumulate each row onto its
@@ -663,7 +663,7 @@ fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch
     let n_cells = data.n_cells();
     let mut total = 0.0;
 
-    let wide = nb > HESSIAN_LOCAL_COEF;
+    let wide = nb > MAX_UNROLLED_WIDTH;
     if wide {
         matmul(
             MatMut::from_column_major_slice_mut(&mut scratch.extb, n_cells, 1),
