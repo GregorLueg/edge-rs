@@ -74,9 +74,8 @@ use crate::sc::pml::{
     check_convergence, gamma_prior, opt_pml_tabled,
 };
 use crate::sc::ptmg::{
-    GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y,
-    design_cv, offset_summary, positive_indices, ptmg_value_and_gradient_with,
-    ptmg_value_gradient_hessian_with,
+    GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
+    positive_indices, ptmg_value_and_gradient_with, ptmg_value_gradient_hessian_with,
 };
 use crate::sc::test::packed_len;
 use crate::sc::zeros::ZeroCells;
@@ -960,7 +959,11 @@ pub(crate) fn finish_gene(
                 if plan.refit == Refit::Both {
                     gamma = v[1];
                 }
-                if failed { CONV_OUTER_FAILED } else { CONV_SUCCESS }
+                if failed {
+                    CONV_OUTER_FAILED
+                } else {
+                    CONV_SUCCESS
+                }
             }
             None => CONV_OUTER_FAILED,
         };

@@ -19,7 +19,9 @@ use crate::glm::fit::{GlmFit, glm_fit};
 use crate::glm::levenberg::{LevenbergParams, mglm_levenberg};
 use crate::numeric::dist::{chisq_sf, f_sf, norm_cdf, norm_ppf, t_sf};
 use crate::prelude::*;
-use crate::utils::design::{contrast_as_coef, design_as_factor, drop_columns, matrix_rank, non_estimable};
+use crate::utils::design::{
+    contrast_as_coef, design_as_factor, drop_columns, matrix_rank, non_estimable,
+};
 
 ////////////
 // Consts //

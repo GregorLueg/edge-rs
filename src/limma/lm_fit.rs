@@ -54,7 +54,6 @@ use crate::utils::linalg::{
 };
 use crate::utils::recycled::{Recycled, RecycledRow};
 
-
 /// Weights at or below this drop the observation rather than scaling it.
 ///
 /// limma's `gls.series` sets `M[weights < 1e-15] <- NA`; `lm.series` sets

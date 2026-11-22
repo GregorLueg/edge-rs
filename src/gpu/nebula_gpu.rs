@@ -339,7 +339,10 @@ impl ResidentBatch {
             .zip(genes.par_iter())
             .zip(gene_ptr.par_iter())
             .for_each(|((dst, gene), &base)| {
-                for (d, p) in dst.iter_mut().zip(positive_runs(gene.cell_index, subject_start)) {
+                for (d, p) in dst
+                    .iter_mut()
+                    .zip(positive_runs(gene.cell_index, subject_start))
+                {
                     *d = base + p as u32;
                 }
             });
