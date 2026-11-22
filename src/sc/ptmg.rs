@@ -632,9 +632,12 @@ pub(crate) fn ptmg_value_gradient_hessian_with(
 /// Fills the exponentiated linear predictor and its subject sums, and
 /// accumulates `sum y * eta`.
 ///
-/// `X beta` is one matrix-vector product into `extb`, then a pass adds the
-/// offset and exponentiates in place. A per-row dot product is a single
-/// dependency chain over `n_coef`, which is latency bound on wide designs.
+/// Past [`HESSIAN_LOCAL_COEF`] columns, `X beta` is one matrix-vector product
+/// into `extb`, then a pass adds the offset and exponentiates in place: a
+/// per-row dot product is a single dependency chain over `n_coef`, which is
+/// latency bound on wide designs. Narrow designs accumulate each row onto its
+/// offset instead, which is as fast there and keeps the bits `sc_high` parity
+/// needs; adding a separate `X beta` to an offset near `log(5e3)` drops them.
 ///
 /// ### Params
 ///
@@ -650,24 +653,36 @@ fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch
     let n_cells = data.n_cells();
     let mut total = 0.0;
 
-    matmul(
-        MatMut::from_column_major_slice_mut(&mut scratch.extb, n_cells, 1),
-        Accum::Replace,
-        MatRef::from_row_major_slice(data.design, n_cells, nb),
-        MatRef::from_column_major_slice(beta, nb, 1),
-        1.0,
-        Par::Seq,
-    );
+    let wide = nb > HESSIAN_LOCAL_COEF;
+    if wide {
+        matmul(
+            MatMut::from_column_major_slice_mut(&mut scratch.extb, n_cells, 1),
+            Accum::Replace,
+            MatRef::from_row_major_slice(data.design, n_cells, nb),
+            MatRef::from_column_major_slice(beta, nb, 1),
+            1.0,
+            Par::Seq,
+        );
+    }
 
     for (s, csx_s) in scratch.cumsumxtb.iter_mut().enumerate() {
         let span = data.fid[s]..data.fid[s + 1];
         let mut csx = 0.0;
-        for ((&offset, &y), extb_i) in data.log_offset[span.clone()]
-            .iter()
+        for (((row, &offset), &y), extb_i) in data.design[span.start * nb..span.end * nb]
+            .chunks_exact(nb)
+            .zip(&data.log_offset[span.clone()])
             .zip(&scratch.y_cell[span.clone()])
             .zip(&mut scratch.extb[span])
         {
-            let eta = offset + *extb_i;
+            let eta = if wide {
+                offset + *extb_i
+            } else {
+                let mut eta = offset;
+                for (&x, &b) in row.iter().zip(beta) {
+                    eta += x * b;
+                }
+                eta
+            };
             // Guarded so a huge eta paired with a zero count cannot make `0 * inf`.
             if y != 0.0 {
                 total += eta * y;

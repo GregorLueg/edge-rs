@@ -213,9 +213,10 @@ const CPU_TOLS: NebulaTols = NebulaTols {
 ///   the other five pure genes are held to them too.
 /// * `sc_high`: means of `1e3` to `1e4`, the set most sensitive to how the
 ///   platform's `exp` and `log` round: the profile likelihood's `1e-6` jitter
-///   carries an ulp into the optimum. Needs on macOS `1.5e-4` on the
-///   coefficients, `4.8e-4` on `sigma^2` and `8.9e-3` on the covariance; Linux
-///   has needed two to four times the macOS figures on this set.
+///   carries an ulp into the optimum. Needs on macOS `5.9e-5` on the
+///   coefficients, `4.1e-4` on `sigma^2` and `3.5e-3` on the covariance; Linux
+///   has needed two to four times the macOS figures on this set. Standard
+///   errors stay on the base gate: macOS needs `3.6e-5`.
 ///
 /// The `sc_blocks` and `sc_cat_ln` gene is not settled as a port fault or an R
 /// one.
