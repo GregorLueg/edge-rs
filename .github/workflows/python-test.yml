@@ -29,7 +29,7 @@ jobs:
   test:
     uses: GregorLueg/personal-actions/.github/workflows/python-maturin-test.yml@v1
     with:
-      package: edge-rs
+      package: edge_rs
       # abi3-py311 and requires-python >=3.11: the shared default starts at 3.10.
       python-versions: '["3.11","3.13"]'
       # Pure CPU, so Windows builds as the crate's own CI does.
