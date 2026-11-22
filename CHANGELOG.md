@@ -6,12 +6,19 @@
 
 * NEBULA is much faster on wide designs (many covariates or factor levels).
   Results agree with the previous release to rounding at the same seed.
+* `voom`, `voom_lmfit`, `glm_ql_fit`, `glm_fit`, `estimate_disp` and RLE /
+  upper-quartile normalisation are faster. Results are identical at the same
+  seed.
 
 ### Changes
 
 * NEBULA stage one now stops on nebula's own absolute tolerance (`1e-6`)
   rather than a far tighter relative one. Results move slightly at the same
   seed, within the parity tolerances against R.
+* Internal cleanup: duplicated solvers and helpers merged, documentation
+  trimmed. No API change; results are identical at the same seed.
+* A bad library size in `calc_norm_factors` now reports the shared "library
+  sizes must be positive and finite" error instead of naming the sample.
 
 ### Notes
 
