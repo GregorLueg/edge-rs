@@ -113,12 +113,26 @@ fn check_lib_sizes(lib_sizes: &Recycled<f64>) -> Result<(), EdgeErrors> {
         Recycled::Scalar(v) => std::slice::from_ref(v),
         Recycled::ByGene(v) | Recycled::BySample(v) | Recycled::Full(v) => v,
     };
-    if let Some(bad) = stored.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library sizes must be positive and finite, found {bad}"
-        )));
+    check_positive_finite(stored, "library sizes")
+}
+
+/// Rejects any entry that is not strictly positive and finite.
+///
+/// ### Params
+///
+/// * `values` - Values to check
+/// * `name` - Argument name, for the error message
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the first bad entry.
+pub(crate) fn check_positive_finite(values: &[f64], name: &str) -> Result<(), EdgeErrors> {
+    match values.iter().find(|v| !v.is_finite() || **v <= 0.0) {
+        Some(bad) => Err(EdgeErrors::InvalidArgument(format!(
+            "{name} must be positive and finite, found {bad}"
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Rejects gene lengths that cannot be divided by.
@@ -145,12 +159,7 @@ fn check_gene_length(
             got: lengths.len(),
         });
     }
-    if let Some(bad) = lengths.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "{name} must be positive and finite, found {bad}"
-        )));
-    }
-    Ok(())
+    check_positive_finite(lengths, name)
 }
 
 /// Rejects a dispersion outside `[0, inf)`.

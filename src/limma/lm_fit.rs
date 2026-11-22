@@ -47,17 +47,13 @@ use faer::{Accum, MatMut, MatRef, Par};
 use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
+use crate::limma::RANK_TOL;
 use crate::utils::design::non_estimable;
 use crate::utils::linalg::{
     cholesky_lower, cross_inverse, forward_substitute, invert_upper_triangular,
 };
 use crate::utils::recycled::{Recycled, RecycledRow};
 
-/// Relative tolerance for declaring a design column linearly dependent.
-/// R's `lm.fit` (LINPACK `dqrdc2`) cycles a column to the back when its
-/// remaining norm falls below `1e-7` times its original norm. limma inherits the
-/// threshold through `lm.fit`.
-const RANK_TOL: f64 = 1e-7;
 
 /// Weights at or below this drop the observation rather than scaling it.
 ///

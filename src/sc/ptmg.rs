@@ -30,13 +30,41 @@ use rayon::prelude::*;
 
 use crate::numeric::gamma::{digamma, ln_gamma, trigamma};
 use crate::prelude::*;
-use crate::sc::pml::positive_runs;
+use crate::sc::pml::{MAX_UNROLLED_WIDTH, positive_runs};
 use crate::sc::zeros::ZeroCells;
 use crate::utils::linalg::weighted_gram;
 
 ///////////////
 // Gene data //
 ///////////////
+
+/// Checks that cell indices are in range and strictly increasing.
+///
+/// ### Params
+///
+/// * `cells` - Cell index of each positive count
+/// * `n_cells` - Number of cells
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] on the first bad index.
+pub(crate) fn check_cell_index(cells: &[usize], n_cells: usize) -> Result<(), EdgeErrors> {
+    let mut previous: Option<usize> = None;
+    for &c in cells {
+        if c >= n_cells {
+            return Err(EdgeErrors::InvalidArgument(format!(
+                "Cell index {c} is out of range for {n_cells} cells."
+            )));
+        }
+        if previous.is_some_and(|p| c <= p) {
+            return Err(EdgeErrors::InvalidArgument(
+                "Cell indices must be strictly increasing.".to_string(),
+            ));
+        }
+        previous = Some(c);
+    }
+    Ok(())
+}
 
 /// Per-gene data laid out the way the kernels want it.
 ///
@@ -140,20 +168,7 @@ impl<'a> GeneData<'a> {
                 got: cells.len(),
             });
         }
-        let mut previous: Option<usize> = None;
-        for &c in cells {
-            if c >= n_cells {
-                return Err(EdgeErrors::InvalidArgument(format!(
-                    "Cell index {c} is out of range for {n_cells} cells."
-                )));
-            }
-            if previous.is_some_and(|p| c <= p) {
-                return Err(EdgeErrors::InvalidArgument(
-                    "Cell indices must be strictly increasing.".to_string(),
-                ));
-            }
-            previous = Some(c);
-        }
+        check_cell_index(cells, n_cells)?;
 
         Ok(Self {
             design,
@@ -196,11 +211,6 @@ impl<'a> GeneData<'a> {
         self.n_coef + 2
     }
 }
-
-/// Widest design whose per-subject gradient sums live on the stack, where the
-/// compiler keeps them in registers (236 against 258 us per evaluation on a
-/// 20000-cell, three-coefficient gene). Wider designs use the heap.
-const LOCAL_COEF: usize = 8;
 
 /// Per-gene buffers for the kernels, so repeated evaluations of one gene
 /// allocate nothing.
@@ -943,9 +953,9 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
     for s in 0..k {
         let rows = s * nb..(s + 1) * nb;
         let acc;
-        if nb <= LOCAL_COEF {
-            let mut xf = [0.0; LOCAL_COEF];
-            let mut d41 = [0.0; LOCAL_COEF];
+        if nb <= MAX_UNROLLED_WIDTH {
+            let mut xf = [0.0; MAX_UNROLLED_WIDTH];
+            let mut d41 = [0.0; MAX_UNROLLED_WIDTH];
             (sums, acc) = cells(s, sums, &mut xf[..nb], &mut d41[..nb]);
             xexb_f[rows.clone()].copy_from_slice(&xf[..nb]);
             dbeta_41[rows].copy_from_slice(&d41[..nb]);
@@ -970,7 +980,7 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
 /// the three symmetric `x x' e` blocks weighted by `1`, `g` and `g e/w`. The
 /// formulas that follow are [`evaluate`]'s, applied to those sums.
 ///
-/// Wider than [`HESSIAN_LOCAL_COEF`], the three blocks only ever enter the
+/// Wider than [`MAX_UNROLLED_WIDTH`], the three blocks only ever enter the
 /// Hessian in one subject-weighted combination, so they are folded into a
 /// single `X' diag(w) X` once the subject weights are known. That is a second
 /// pass over the cells, but a GEMM instead of three scalar triangle updates per
@@ -1022,7 +1032,7 @@ fn evaluate_hessian(
     // Per-subject sums, row-major `k * nb` vectors and `k * nb * nb` blocks
     // (upper triangle filled). A wide design keeps `g e` and `g e^2 / w` per
     // cell for the Gram instead of the blocks.
-    let wide = nb > HESSIAN_LOCAL_COEF;
+    let wide = nb > MAX_UNROLLED_WIDTH;
     let n_block = if wide { 0 } else { k * nn };
     let mut xexb_f = vec![0.0; k * nb];
     let mut dbeta_41 = vec![0.0; k * nb];
@@ -1275,9 +1285,6 @@ struct SubjectBlock<'a> {
     cell: &'a mut [f64],
 }
 
-/// Widest design whose per-subject Hessian sums live on the stack.
-pub(crate) const HESSIAN_LOCAL_COEF: usize = 8;
-
 /// One subject's sweep for [`evaluate_hessian`], at a compile-time design
 /// width (`NB == 0` reads it from `data`).
 ///
@@ -1311,7 +1318,7 @@ fn hessian_subject<const NB: usize>(
     scalars: &mut HessianScalars,
 ) -> (f64, f64, f64) {
     let nb = if NB == 0 { data.n_coef } else { NB };
-    const V: usize = HESSIAN_LOCAL_COEF;
+    const V: usize = MAX_UNROLLED_WIDTH;
     let mut vecs = [[0.0f64; V]; 4];
     let mut blocks = [[0.0f64; V * V]; 3];
     let local = NB != 0;
@@ -2521,7 +2528,7 @@ mod tests {
     }
 
     /// Fixture W: 240 cells over four subjects and ten design columns, past
-    /// [`HESSIAN_LOCAL_COEF`], so the Hessian takes the weighted Gram.
+    /// [`MAX_UNROLLED_WIDTH`], so the Hessian takes the weighted Gram.
     ///
     /// ### Returns
     ///
@@ -2566,7 +2573,7 @@ mod tests {
     fn test_wide_hessian_agrees_with_finite_differences() {
         let (design, log_offset, counts, cells, subject_totals, fid) = fixture_wide();
         let n_coef = 10;
-        assert!(n_coef > HESSIAN_LOCAL_COEF);
+        assert!(n_coef > MAX_UNROLLED_WIDTH);
         let data = GeneData::new(
             &design,
             &log_offset,

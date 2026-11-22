@@ -22,6 +22,7 @@ use rayon::prelude::*;
 
 use crate::limma::marray::MArrayLm;
 use crate::prelude::*;
+use crate::utils::design::select_columns;
 use crate::utils::linalg::{cholesky_lower, cov2cor};
 
 ////////////
@@ -49,26 +50,6 @@ const NA_DETECT: f64 = 1e20;
 /////////////
 // Kernels //
 /////////////
-
-/// Picks a subset of columns out of a row-major matrix.
-///
-/// ### Params
-///
-/// * `x` - Row-major `n_rows * n_cols`
-/// * `n_rows` - Number of rows
-/// * `n_cols` - Number of columns
-/// * `cols` - Column indices to keep, in the order wanted
-///
-/// ### Returns
-///
-/// Row-major `n_rows * cols.len()`.
-fn subset_columns(x: &[f64], n_rows: usize, n_cols: usize, cols: &[usize]) -> Vec<f64> {
-    let mut out = Vec::with_capacity(n_rows * cols.len());
-    for row in x.chunks_exact(n_cols).take(n_rows) {
-        out.extend(cols.iter().map(|&j| row[j]));
-    }
-    out
-}
 
 /// Multiplies a row-major matrix by a column-major one.
 ///
@@ -276,8 +257,8 @@ pub fn contrasts_fit(
         (
             c,
             rank,
-            subset_columns(&fit.coefficients, fit.n_genes, n_coef, est),
-            subset_columns(&fit.stdev_unscaled, fit.n_genes, n_coef, est),
+            select_columns(&fit.coefficients, fit.n_genes, n_coef, est),
+            select_columns(&fit.stdev_unscaled, fit.n_genes, n_coef, est),
         )
     } else {
         (
@@ -309,8 +290,8 @@ pub fn contrasts_fit(
         (
             c,
             keep.len(),
-            subset_columns(&coefficients, fit.n_genes, n_coef, &keep),
-            subset_columns(&stdev_unscaled, fit.n_genes, n_coef, &keep),
+            select_columns(&coefficients, fit.n_genes, n_coef, &keep),
+            select_columns(&stdev_unscaled, fit.n_genes, n_coef, &keep),
             v,
         )
     } else {

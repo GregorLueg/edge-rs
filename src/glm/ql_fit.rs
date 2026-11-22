@@ -28,7 +28,7 @@ use crate::glm::test::QlSummary;
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 use crate::prelude::*;
 use crate::ql::weights::{compute_adjust_vec, update_prior};
-use crate::utils::design::choose_lowess_span;
+use crate::utils::design::{choose_lowess_span, gather_rows};
 
 ////////////
 // Consts //
@@ -247,10 +247,7 @@ fn dispersion_from_top_genes<T: EdgeFloat>(
     order.sort_by(|&a, &b| ave_log_cpm[b].total_cmp(&ave_log_cpm[a]));
     let kept = &order[..n_top];
 
-    let mut selected = Vec::with_capacity(n_top * n_samples);
-    for &gene in kept {
-        selected.extend_from_slice(&counts[gene * n_samples..(gene + 1) * n_samples]);
-    }
+    let selected = gather_rows(counts, n_samples, kept);
     let selected_offset = offset.subset(kept, n_samples);
     let selected_weights = weights.map(|w| w.subset(kept, n_samples));
 

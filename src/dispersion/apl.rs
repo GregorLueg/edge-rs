@@ -13,6 +13,7 @@
 use rayon::prelude::*;
 
 use crate::glm::fit::GLM_FIT_MAX_ITER;
+use crate::glm::{ETA_CLAMP, MIN_POSITIVE};
 use crate::glm::levenberg::{LevenbergParams, Scratch, initial_coefficients};
 use crate::glm::one_group::{OneGroupParams, fit_one_gene as fit_one_group_gene};
 use crate::numeric::gamma::ln_gamma;
@@ -22,12 +23,6 @@ use crate::utils::design::design_as_factor;
 ////////////
 // Consts //
 ////////////
-
-/// Floor applied to fitted means and working weights.
-const MIN_POSITIVE: f64 = 1e-300;
-
-/// Bound on the linear predictor before exponentiating.
-const ETA_CLAMP: f64 = 500.0;
 
 /// Floor applied to the information matrix pivots before taking logarithms.
 ///
@@ -211,14 +206,12 @@ fn assemble_information(
 /// * `dispersion` - Dispersion row
 /// * `offset` - Offset row
 /// * `weights` - Optional weight row
-/// * `n_samples` - Number of samples
 fn fit_one_way_gene(
     scratch: &mut GeneScratch,
     members: &[Vec<usize>],
     dispersion: RecycledRow<'_, f64>,
     offset: RecycledRow<'_, f64>,
     weights: Option<RecycledRow<'_, f64>>,
-    n_samples: usize,
 ) {
     let params = OneGroupParams::default();
 
@@ -239,7 +232,6 @@ fn fit_one_way_gene(
             scratch.mu[sample] = eta.exp().max(MIN_POSITIVE);
         }
     }
-    let _ = n_samples;
 }
 
 /// Fits one gene on the general path and writes its fitted means.
@@ -518,7 +510,6 @@ impl<'a> AplWorkspace<'a> {
                 disp_row,
                 self.offset,
                 self.weights,
-                self.n_samples,
             );
         } else {
             fit_general_gene(

@@ -50,15 +50,13 @@
 
 use rayon::prelude::*;
 
+use crate::limma::RANK_TOL;
 use crate::numeric::stats::trimmed_mean;
 use crate::prelude::*;
 
 ////////////
 // Consts //
 ////////////
-
-/// Relative tolerance below which a column counts as linearly dependent.
-const LM_RANK_TOL: f64 = 1e-7;
 
 /// Residual variances below this are treated as structurally zero.
 ///
@@ -251,7 +249,7 @@ fn contr_sum(n: usize) -> Vec<f64> {
 ///
 /// This is not faer's QR, deliberately. `dqrdc2` walks the columns left to right
 /// and moves a column aside only when the part of it orthogonal to its
-/// predecessors has lost a factor [`LM_RANK_TOL`] of its length. Survivors keep
+/// predecessors has lost a factor [`RANK_TOL`] of its length. Survivors keep
 /// their original order, which is what makes `QR$pivot[1:rank]` in `arrayWeights`
 /// an order-preserving subset.
 ///
@@ -301,7 +299,7 @@ impl LinpackQr {
                 break;
             }
             let remaining = euclidean_norm(&a[j * n + l..(j + 1) * n]);
-            if remaining < original[j] * LM_RANK_TOL {
+            if remaining < original[j] * RANK_TOL {
                 continue;
             }
 
@@ -345,7 +343,7 @@ impl LinpackQr {
     ///
     /// ### Returns
     ///
-    /// The number of columns that survived the [`LM_RANK_TOL`] test.
+    /// The number of columns that survived the [`RANK_TOL`] test.
     fn rank(&self) -> usize {
         self.pivot.len()
     }
@@ -635,7 +633,7 @@ fn reduce_design(design: &[f64], n_samples: usize, n_coef: usize) -> (Vec<f64>, 
 ///
 /// With no user basis this is `contr.sum(n_samples)`. Otherwise limma centres
 /// every column and drops the linearly dependent ones, so a user-supplied
-/// intercept becomes a zero column and fails the [`LM_RANK_TOL`] test.
+/// intercept becomes a zero column and fails the [`RANK_TOL`] test.
 ///
 /// ### Params
 ///

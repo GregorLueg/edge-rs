@@ -10,6 +10,8 @@
 //! upper tail directly: the upper incomplete gamma for normal and chi-squared,
 //! the incomplete beta with swapped arguments for t, F and beta.
 
+use std::f64::consts::SQRT_2;
+
 use statrs::function::beta::{beta_reg, ln_beta};
 use statrs::function::erf::erfc_inv;
 use statrs::function::gamma::ln_gamma;
@@ -19,9 +21,6 @@ use crate::errors::EdgeErrors;
 ////////////
 // Consts //
 ////////////
-
-/// `sqrt(2)`, the scale between the standard normal and the error function.
-const SQRT_2: f64 = std::f64::consts::SQRT_2;
 
 /// Relative convergence tolerance for the incomplete gamma series and continued
 /// fraction: one ulp.
@@ -218,8 +217,6 @@ fn gamma_series(a: f64, x: f64) -> f64 {
 
 /// Continued fraction representation of `Q(a, x)`, for `x >= a + 1`.
 ///
-/// Evaluated by modified Lentz.
-///
 /// ### Params
 ///
 /// * `a` - Shape, strictly positive
@@ -229,6 +226,27 @@ fn gamma_series(a: f64, x: f64) -> f64 {
 ///
 /// `Q(a, x)`.
 fn gamma_cont_frac(a: f64, x: f64) -> f64 {
+    gamma_cont_frac_raw(a, x) * inc_gamma_prefactor(a, x)
+}
+
+/// Modified Lentz evaluation of the continued fraction behind `Q(a, x)`.
+///
+/// Leaves out the `exp(a ln x - x - ln Gamma(a))` prefactor so a caller can
+/// keep it in logs. Only valid for `x >= a + 1`, where it converges quickly.
+///
+/// ### Params
+///
+/// * `a` - Shape, strictly positive
+/// * `x` - Argument, at least `a + 1`
+///
+/// ### Returns
+///
+/// The continued fraction value.
+///
+/// ### References
+///
+/// Press et al., Numerical Recipes, 3rd ed., section 6.2
+pub(crate) fn gamma_cont_frac_raw(a: f64, x: f64) -> f64 {
     let mut b = x + 1.0 - a;
     let mut c = 1.0 / LENTZ_TINY;
     let mut d = 1.0 / b;
@@ -252,7 +270,7 @@ fn gamma_cont_frac(a: f64, x: f64) -> f64 {
             break;
         }
     }
-    h * inc_gamma_prefactor(a, x)
+    h
 }
 
 /////////////////////////
@@ -997,6 +1015,107 @@ pub fn f_ppf(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
     // complement are accurate, so no cancelled difference.
     let (z, one_minus_z) = inv_beta_reg_pair(0.5 * df1, 0.5 * df2, p)?;
     Ok(df2 * z / (df1 * one_minus_z))
+}
+
+/// Lower tail of the F distribution, R's `pf(q, df1, df2, lower.tail = TRUE)`.
+///
+/// Uses whichever side of the incomplete beta is not squeezed against one, as R
+/// does, so it is not simply `1 - f_sf`.
+///
+/// ### Params
+///
+/// * `x` - Test statistic
+/// * `df1` - Numerator degrees of freedom, finite and strictly positive
+/// * `df2` - Denominator degrees of freedom, finite and strictly positive
+///
+/// ### Returns
+///
+/// `P(F <= x)`, or [`EdgeErrors::InvalidArgument`] for a non-positive `df`.
+pub(crate) fn f_cdf(x: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
+    if x <= 0.0 {
+        return Ok(0.0);
+    }
+    if x.is_infinite() {
+        return Ok(1.0);
+    }
+    if df1 * x > df2 {
+        beta_sf(df2 / (df2 + df1 * x), 0.5 * df2, 0.5 * df1)
+    } else {
+        beta_cdf(df1 * x / (df2 + df1 * x), 0.5 * df1, 0.5 * df2)
+    }
+}
+
+/// F quantile that also accepts an infinite denominator.
+///
+/// `F(df1, Inf)` is `chi^2_df1 / df1`, so the infinite case is a gamma quantile.
+///
+/// ### Params
+///
+/// * `p` - Probability in `[0, 1]`
+/// * `df1` - Numerator degrees of freedom, positive
+/// * `df2` - Denominator degrees of freedom, positive or infinite
+///
+/// ### Returns
+///
+/// The quantile, or [`EdgeErrors`] from the underlying inversion.
+pub(crate) fn f_quantile(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
+    if df2.is_infinite() {
+        Ok(gamma_ppf(p, 0.5 * df1, 2.0)? / df1)
+    } else {
+        f_ppf(p, df1, df2)
+    }
+}
+
+/// F density that also accepts an infinite denominator.
+///
+/// Evaluated through logs so the two large powers never overflow separately.
+///
+/// ### Params
+///
+/// * `x` - Quantile, positive
+/// * `df1` - Numerator degrees of freedom, positive
+/// * `df2` - Denominator degrees of freedom, positive or infinite
+///
+/// ### Returns
+///
+/// The density at `x`.
+pub(crate) fn f_density(x: f64, df1: f64, df2: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if df2.is_infinite() {
+        // df1 * dchisq(df1 x, df1)
+        let y = df1 * x;
+        let k = 0.5 * df1;
+        return df1
+            * ((k - 1.0) * y.ln() - 0.5 * y - ln_gamma(k) - k * std::f64::consts::LN_2).exp();
+    }
+    let (a, b) = (0.5 * df1, 0.5 * df2);
+    let ln_beta = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
+    (a * (df1 * x).ln() + b * df2.ln() - (a + b) * (df1 * x + df2).ln() - x.ln() - ln_beta).exp()
+}
+
+/// Inverse of the F survival function.
+///
+/// Built from the beta quantile, since `f_ppf(1 - p)` rounds a small upper-tail
+/// probability to one and returns `inf`. Uses
+/// `sf(x) = I(df2 / (df1 x + df2); df2/2, df1/2)`.
+///
+/// ### Params
+///
+/// * `p` - Upper-tail probability in `[0, 1]`
+/// * `df1` - Numerator degrees of freedom, positive
+/// * `df2` - Denominator degrees of freedom, positive
+///
+/// ### Returns
+///
+/// The `x` with `P(F > x) = p`.
+pub(crate) fn f_isf(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
+    let w = beta_ppf(p, 0.5 * df2, 0.5 * df1)?;
+    if w <= 0.0 {
+        return Ok(f64::INFINITY);
+    }
+    Ok(df2 * (1.0 - w) / (df1 * w))
 }
 
 //////////

@@ -19,7 +19,7 @@ use crate::glm::fit::{GlmFit, glm_fit};
 use crate::glm::levenberg::{LevenbergParams, mglm_levenberg};
 use crate::numeric::dist::{chisq_sf, f_sf, norm_cdf, norm_ppf, t_sf};
 use crate::prelude::*;
-use crate::utils::design::{contrast_as_coef, design_as_factor, matrix_rank, non_estimable};
+use crate::utils::design::{contrast_as_coef, design_as_factor, drop_columns, matrix_rank, non_estimable};
 
 ////////////
 // Consts //
@@ -572,27 +572,6 @@ fn poisson_fit<T: EdgeFloat>(input: &GlmTestInput<'_, T>) -> Result<GlmFit, Edge
         input.weights,
         0.0,
     )
-}
-
-/// Drops columns from a row-major design.
-///
-/// ### Params
-///
-/// * `design` - Row-major `n_rows * n_cols`
-/// * `n_rows` - Number of samples
-/// * `n_cols` - Number of coefficients
-/// * `drop` - Column indices to remove
-///
-/// ### Returns
-///
-/// The design without those columns, still row-major.
-fn drop_columns(design: &[f64], n_rows: usize, n_cols: usize, drop: &[usize]) -> Vec<f64> {
-    let kept: Vec<usize> = (0..n_cols).filter(|c| !drop.contains(c)).collect();
-    let mut out = Vec::with_capacity(n_rows * kept.len());
-    for row in design.chunks_exact(n_cols) {
-        out.extend(kept.iter().map(|c| row[*c]));
-    }
-    out
 }
 
 /// Adds a per-sample shift to a recycled offset matrix.

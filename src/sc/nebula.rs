@@ -70,15 +70,17 @@ use crate::numeric::lbfgsb::{LbfgsbParams, minimise};
 use crate::numeric::optimise::{NelderMeadParams, NelderMeadStepper};
 use crate::prelude::*;
 use crate::sc::pml::{
-    CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml_tabled,
+    CONV_SINGULAR, CONV_SUCCESS, MAX_UNROLLED_WIDTH, PmlData, PmlParams, PmlResult, PmlVariance,
+    check_convergence, gamma_prior, opt_pml_tabled,
 };
 use crate::sc::ptmg::{
-    GeneData, HESSIAN_LOCAL_COEF, PtmgScratch, cell_level_columns, centre_design, cumsum_y,
+    GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y,
     design_cv, offset_summary, positive_indices, ptmg_value_and_gradient_with,
     ptmg_value_gradient_hessian_with,
 };
 use crate::sc::test::packed_len;
 use crate::sc::zeros::ZeroCells;
+use crate::utils::linalg::{back_substitute_transpose, cholesky_lower, forward_substitute};
 
 ////////////
 // Consts //
@@ -630,8 +632,7 @@ where
         .map(|(j, _)| j)
         .collect();
 
-    let sparse = counts;
-    let totals = cumsum_y(sparse, &fid)?;
+    let totals = cumsum_y(counts, &fid)?;
 
     let cells_per_subject = n_cells as f64 / n_subjects as f64;
     let method = if cells_per_subject < MIN_CELLS_PER_SUBJECT_LN {
@@ -646,7 +647,7 @@ where
         .filter(|&g| {
             let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
             let total: f64 = subject_totals.iter().sum();
-            let (indices, _) = sparse.outer(g);
+            let (indices, _) = counts.outer(g);
             let pooled = total / (n_cells as f64) > params.cpc && indices.len() >= params.mincp;
             pooled
                 && (params.min_subjects == 0
@@ -680,7 +681,7 @@ where
         zeros: zeros.as_ref(),
     };
 
-    let outcomes = fit(&shared, sparse, &totals, &kept)?;
+    let outcomes = fit(&shared, counts, &totals, &kept)?;
 
     Ok(assemble(
         outcomes,
@@ -952,31 +953,17 @@ pub(crate) fn finish_gene(
     let mut gamma = plan.gamma;
     let mut convergence = plan.convergence;
 
-    match (plan.refit, refit) {
-        (Refit::Both, Some(found)) => match found {
+    if let (Refit::Both | Refit::SubjectOnly, Some(found)) = (plan.refit, refit) {
+        convergence = match found {
             Some((v, failed)) => {
                 sigma = v[0];
-                gamma = v[1];
-                convergence = if failed {
-                    CONV_OUTER_FAILED
-                } else {
-                    CONV_SUCCESS
-                };
+                if plan.refit == Refit::Both {
+                    gamma = v[1];
+                }
+                if failed { CONV_OUTER_FAILED } else { CONV_SUCCESS }
             }
-            None => convergence = CONV_OUTER_FAILED,
-        },
-        (Refit::SubjectOnly, Some(found)) => match found {
-            Some((v, failed)) => {
-                sigma = v[0];
-                convergence = if failed {
-                    CONV_OUTER_FAILED
-                } else {
-                    CONV_SUCCESS
-                };
-            }
-            None => convergence = CONV_OUTER_FAILED,
-        },
-        _ => {}
+            None => CONV_OUTER_FAILED,
+        };
     }
 
     // Stage three: the final penalised fit, always at the leading Laplace order.
@@ -1271,10 +1258,10 @@ fn newton_marginal(
     if !finite(f, &g, &h) {
         return None;
     }
-    // Up to `HESSIAN_LOCAL_COEF` a Hessian costs about one gradient, so trial
+    // Up to `MAX_UNROLLED_WIDTH` a Hessian costs about one gradient, so trial
     // points take it in case they are accepted. Wider, it costs
     // `O(n_cells * n_coef^2)` and trials need only the value.
-    let speculative = gene.n_coef <= HESSIAN_LOCAL_COEF;
+    let speculative = gene.n_coef <= MAX_UNROLLED_WIDTH;
     for _ in 0..STAGE_ONE_NEWTON_MAX_ITER {
         let projected = (0..n)
             .map(|i| ((x[i] - g[i]).clamp(lower[i], upper[i]) - x[i]).abs())
@@ -1379,6 +1366,17 @@ pub(crate) struct InnerFit {
     pub(crate) second_order: f64,
 }
 
+impl From<&PmlResult> for InnerFit {
+    fn from(fit: &PmlResult) -> Self {
+        Self {
+            log_likelihood: fit.log_likelihood,
+            log_likelihood_prev: fit.log_likelihood_prev,
+            log_det: fit.log_det,
+            second_order: fit.second_order,
+        }
+    }
+}
+
 /// nebula's `pql_ll`: the marginal likelihood with the fixed effects and the
 /// random effects profiled out by a penalised fit.
 ///
@@ -1477,9 +1475,7 @@ impl VarianceObjective<'_> {
         if fit.second_order < -1.0 {
             return f64::INFINITY;
         }
-        let exps = subject.exp();
-        let alpha = 1.0 / (exps - 1.0);
-        let lambda = 1.0 / (exps.sqrt() * (exps - 1.0));
+        let (alpha, lambda) = gamma_prior(subject.exp());
 
         let base = if fit.log_likelihood.is_nan() {
             fit.log_likelihood_prev
@@ -1525,13 +1521,7 @@ impl VarianceObjective<'_> {
             Ok(f) => f,
             Err(_) => return f64::INFINITY,
         };
-        let inner = InnerFit {
-            log_likelihood: fit.log_likelihood,
-            log_likelihood_prev: fit.log_likelihood_prev,
-            log_det: fit.log_det,
-            second_order: fit.second_order,
-        };
-        self.assemble(subject, cell, &inner, self.tail(cell))
+        self.assemble(subject, cell, &InnerFit::from(&fit), self.tail(cell))
     }
 }
 
@@ -2105,7 +2095,9 @@ pub(crate) fn variance_objective<'a>(
 // Linear algebra //
 ////////////////////
 
-/// Cholesky factor of a symmetric positive definite matrix.
+/// Lower Cholesky factor of a symmetric positive definite matrix.
+///
+/// Stricter than [`cholesky_lower`]: an infinite pivot is rejected too.
 ///
 /// ### Params
 ///
@@ -2114,27 +2106,28 @@ pub(crate) fn variance_objective<'a>(
 ///
 /// ### Returns
 ///
-/// The lower triangular factor, row-major, or `None` if `a` is not positive
-/// definite.
+/// The factor, row-major, or `None` if `a` is not positive definite.
 fn cholesky_factor(a: &[f64], n: usize) -> Option<Vec<f64>> {
-    let mut l = vec![0.0; n * n];
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[i * n + j];
-            for k in 0..j {
-                sum -= l[i * n + k] * l[j * n + k];
-            }
-            if i == j {
-                if !(sum.is_finite() && sum > 0.0) {
-                    return None;
-                }
-                l[i * n + j] = sum.sqrt();
-            } else {
-                l[i * n + j] = sum / l[j * n + j];
-            }
-        }
-    }
-    Some(l)
+    let mut l = a.to_vec();
+    let finite = cholesky_lower(&mut l, n, n) && (0..n).all(|i| l[i * n + i].is_finite());
+    finite.then_some(l)
+}
+
+/// Solves `L L' x = b` against a factor from [`cholesky_factor`], in place.
+///
+/// ### Params
+///
+/// * `l` - Lower factor, row-major `n * n`
+/// * `n` - Side length
+/// * `x` - Right-hand side, overwritten by the solution
+///
+/// ### Returns
+///
+/// `false` if the solution is not finite.
+fn solve_factored(l: &[f64], n: usize, x: &mut [f64]) -> bool {
+    forward_substitute(l, n, n, x);
+    back_substitute_transpose(l, n, n, x);
+    x.iter().all(|v| v.is_finite())
 }
 
 /// Solves `A x = b` for symmetric positive definite `A`.
@@ -2151,25 +2144,7 @@ fn cholesky_factor(a: &[f64], n: usize) -> Option<Vec<f64>> {
 fn cholesky_solve(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
     let l = cholesky_factor(a, n)?;
     let mut x = b.to_vec();
-    for i in 0..n {
-        let mut sum = x[i];
-        for k in 0..i {
-            sum -= l[i * n + k] * x[k];
-        }
-        x[i] = sum / l[i * n + i];
-    }
-    for i in (0..n).rev() {
-        let mut sum = x[i];
-        for k in (i + 1)..n {
-            sum -= l[k * n + i] * x[k];
-        }
-        x[i] = sum / l[i * n + i];
-    }
-    if x.iter().all(|v| v.is_finite()) {
-        Some(x)
-    } else {
-        None
-    }
+    solve_factored(&l, n, &mut x).then_some(x)
 }
 
 /// Inverse of a symmetric positive definite matrix, nebula's `Rfast::spdinv`.
@@ -2183,12 +2158,15 @@ fn cholesky_solve(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
 ///
 /// The inverse, row-major, or `None` if `a` is not positive definite.
 fn cholesky_inverse(a: &[f64], n: usize) -> Option<Vec<f64>> {
+    let l = cholesky_factor(a, n)?;
     let mut inverse = vec![0.0; n * n];
-    let mut unit = vec![0.0; n];
+    let mut column = vec![0.0; n];
     for j in 0..n {
-        unit.iter_mut().for_each(|v| *v = 0.0);
-        unit[j] = 1.0;
-        let column = cholesky_solve(a, n, &unit)?;
+        column.fill(0.0);
+        column[j] = 1.0;
+        if !solve_factored(&l, n, &mut column) {
+            return None;
+        }
         for i in 0..n {
             inverse[i * n + j] = column[i];
         }

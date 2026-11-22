@@ -30,13 +30,14 @@ use std::f64::consts::LN_2;
 use rayon::prelude::*;
 
 use crate::core::dgelist::DgeList;
-use crate::core::expression::{ave_log_cpm, column_sums};
+use crate::core::expression::{ave_log_cpm, check_positive_finite, column_sums};
 use crate::glm::deviance::unit_nb_deviance;
 use crate::glm::one_group::mglm_one_group;
-use crate::numeric::dist::nbinom_ln_pmf;
+use crate::numeric::dist::{gamma_cont_frac_raw, nbinom_ln_pmf};
 use crate::numeric::dist::{beta_cdf, beta_ppf, beta_sf, chisq_sf, gamma_cdf, gamma_ppf};
 use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
+use crate::utils::design::select_columns;
 
 ////////////
 // Consts //
@@ -84,16 +85,6 @@ const GAMMA_ISF_REL_TOL: f64 = 1e-15;
 /// A bracket 128 wide in `ln(x)` covers everything an `f64` can represent, so
 /// this is a runaway guard, not a working limit.
 const GAMMA_ISF_MAX_ITER: usize = 256;
-
-/// Floor for the modified Lentz continued fraction, guarding a zero pivot.
-///
-/// ### References
-///
-/// Press et al., Numerical Recipes, 3rd ed., section 6.2
-const LENTZ_TINY: f64 = 1e-300;
-
-/// Relative convergence tolerance for the continued fraction.
-const LENTZ_EPS: f64 = 2.220446049250313e-16;
 
 /// Slack allowed when deciding whether an outcome is as improbable as the
 /// observed one, in [`binom_test_one`].
@@ -193,51 +184,6 @@ impl ExactTestParams {
 // Log-space upper incomplete gamma //
 //////////////////////////////////////
 
-/// Modified Lentz evaluation of the continued fraction behind `Q(a, x)`.
-///
-/// Returns the fraction without the `exp(a ln x - x - ln Gamma(a))` prefactor,
-/// so the caller can keep that in logs. Only valid for `x >= a + 1`, where it
-/// converges quickly.
-///
-/// ### Params
-///
-/// * `a` - Shape, strictly positive
-/// * `x` - Argument, at least `a + 1`
-///
-/// ### Returns
-///
-/// The continued fraction value.
-///
-/// ### References
-///
-/// Press et al., Numerical Recipes, 3rd ed., section 6.2
-fn gamma_cont_frac(a: f64, x: f64) -> f64 {
-    let mut b = x + 1.0 - a;
-    let mut c = 1.0 / LENTZ_TINY;
-    let mut d = 1.0 / b;
-    let mut h = d;
-    for i in 1..=GAMMA_ISF_MAX_ITER * 4 {
-        let i = i as f64;
-        let an = -i * (i - a);
-        b += 2.0;
-        d = an * d + b;
-        if d.abs() < LENTZ_TINY {
-            d = LENTZ_TINY;
-        }
-        c = b + an / c;
-        if c.abs() < LENTZ_TINY {
-            c = LENTZ_TINY;
-        }
-        d = 1.0 / d;
-        let delta = d * c;
-        h *= delta;
-        if (delta - 1.0).abs() <= LENTZ_EPS {
-            break;
-        }
-    }
-    h
-}
-
 /// Log of the regularised upper incomplete gamma, `ln Q(a, x)`.
 ///
 /// Exists instead of `gamma_sf(...).ln()` because `q2qnbinom` can map counts
@@ -266,7 +212,7 @@ fn ln_reg_gamma_upper(a: f64, x: f64) -> Result<f64, EdgeErrors> {
         // Q is at least about 0.15 here, so there is nothing to lose to the log.
         return Ok(chisq_sf(2.0 * x, 2.0 * a)?.ln());
     }
-    Ok(a * x.ln() - x - ln_gamma(a) + gamma_cont_frac(a, x).ln())
+    Ok(a * x.ln() - x - ln_gamma(a) + gamma_cont_frac_raw(a, x).ln())
 }
 
 /// Starting point for [`ln_reg_gamma_upper_inv`], in `x` at unit scale.
@@ -578,36 +524,6 @@ fn group_columns(group: &[usize]) -> Vec<Vec<usize>> {
     columns
 }
 
-/// Copies a subset of columns out of a row-major matrix, as `f64`.
-///
-/// ### Params
-///
-/// * `counts` - Row-major counts, `n_genes * n_samples`
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples in `counts`
-/// * `columns` - Sample indices to keep, in the order wanted
-///
-/// ### Returns
-///
-/// A row-major `n_genes * columns.len()` matrix.
-fn select_columns<T: EdgeFloat>(
-    counts: &[T],
-    n_genes: usize,
-    n_samples: usize,
-    columns: &[usize],
-) -> Vec<f64> {
-    let mut out = vec![0.0_f64; n_genes * columns.len()];
-    out.par_chunks_mut(columns.len())
-        .enumerate()
-        .for_each(|(gene, row)| {
-            let src = &counts[gene * n_samples..(gene + 1) * n_samples];
-            for (dst, &col) in row.iter_mut().zip(columns.iter()) {
-                *dst = src[col].to_f64().unwrap_or(f64::NAN);
-            }
-        });
-    out
-}
-
 /// Expands a recycled dispersion into one value per gene.
 ///
 /// Only the gene axis is meaningful here, so [`Recycled::BySample`] and
@@ -730,11 +646,7 @@ pub fn equalize_lib_sizes<T: EdgeFloat>(
             &derived
         }
     };
-    if let Some(bad) = lib_size.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library sizes must be positive and finite, found {bad}"
-        )));
-    }
+    check_positive_finite(lib_size, "library sizes")?;
 
     let common_lib_size = (lib_size.iter().map(|l| l.ln()).sum::<f64>() / n_samples as f64).exp();
 
@@ -1387,11 +1299,7 @@ pub fn exact_test<T: EdgeFloat>(
     let (n1, n2) = (columns1.len(), columns2.len());
 
     let effective = y.norm_lib_sizes();
-    if let Some(bad) = effective.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library sizes must be positive and finite, found {bad}"
-        )));
-    }
+    check_positive_finite(&effective, "library sizes")?;
     let lib1: Vec<f64> = columns1.iter().map(|&j| effective[j]).collect();
     let lib2: Vec<f64> = columns2.iter().map(|&j| effective[j]).collect();
 

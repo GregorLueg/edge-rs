@@ -33,14 +33,16 @@
 use faer::MatRef;
 use rayon::prelude::*;
 
-use crate::core::expression::PER_MILLION;
+use crate::core::expression::{PER_MILLION, check_positive_finite, column_sums};
 use crate::core::normalisation::{NormMethod, calc_norm_factors};
 use crate::errors::EdgeErrors;
 use crate::glm::fit::glm_fit;
 use crate::limma::lm_fit::{LmFitResult, lm_fit};
 use crate::limma::lowess::{LowessParams, lowess, weighted_lowess};
 use crate::numeric::interpolate::interp_linear_extrap;
-use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, hat_diagonal, is_full_rank};
+use crate::utils::design::{
+    LIMMA_LOWESS_DEFAULTS, choose_lowess_span, gather_rows, hat_diagonal, matrix_rank,
+};
 use crate::utils::recycled::Recycled;
 use crate::utils::traits::EdgeFloat;
 
@@ -471,7 +473,7 @@ pub fn voom_basic<T: EdgeFloat>(
             check_lib_size(l, n_samples)?;
             l.to_vec()
         }
-        None => column_sums(counts, n_genes, n_samples),
+        None => column_sums(counts, n_samples),
     };
     if let Some(nf) = norm_factors {
         if nf.len() != n_samples {
@@ -481,11 +483,7 @@ pub fn voom_basic<T: EdgeFloat>(
                 got: nf.len(),
             });
         }
-        if let Some(bad) = nf.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "normalisation factors must be positive and finite, found {bad}"
-            )));
-        }
+        check_positive_finite(nf, "normalisation factors")?;
         for (l, f) in effective.iter_mut().zip(nf.iter()) {
             *l *= f;
         }
@@ -585,11 +583,9 @@ fn prepare<T: EdgeFloat>(
             got: design.len(),
         });
     }
-    if !is_full_rank(design, n_samples, n_coef)? {
-        return Err(EdgeErrors::DesignNotFullRank {
-            n_cols: n_coef,
-            rank: crate::utils::design::matrix_rank(design, n_samples, n_coef)?,
-        });
+    let rank = matrix_rank(design, n_samples, n_coef)?;
+    if rank != n_coef {
+        return Err(EdgeErrors::DesignNotFullRank { n_cols: n_coef, rank });
     }
     // Explicit rather than a negated comparison, so a NaN prior count is
     // rejected instead of slipping through.
@@ -608,7 +604,7 @@ fn prepare<T: EdgeFloat>(
             check_lib_size(l, n_samples)?;
             l.to_vec()
         }
-        None => column_sums(counts, n_genes, n_samples),
+        None => column_sums(counts, n_samples),
     };
     if params.normalize_method != NormMethod::None {
         let factors = calc_norm_factors(
@@ -662,28 +658,6 @@ fn prepare<T: EdgeFloat>(
     })
 }
 
-/// Column sums of a count matrix, which is voom's default library size.
-///
-/// ### Params
-///
-/// * `counts` - Row-major counts
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// One total per sample.
-fn column_sums<T: EdgeFloat>(counts: &[T], n_genes: usize, n_samples: usize) -> Vec<f64> {
-    let mut out = vec![0.0_f64; n_samples];
-    for gene in 0..n_genes {
-        let row = &counts[gene * n_samples..(gene + 1) * n_samples];
-        for (acc, v) in out.iter_mut().zip(row.iter()) {
-            *acc += v.to_f64().unwrap_or(f64::NAN);
-        }
-    }
-    out
-}
-
 /// Checks that a library size vector is the right length and strictly positive.
 ///
 /// ### Params
@@ -702,12 +676,7 @@ fn check_lib_size(lib_size: &[f64], n_samples: usize) -> Result<(), EdgeErrors> 
             got: lib_size.len(),
         });
     }
-    if let Some(bad) = lib_size.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library sizes must be positive and finite, found {bad}"
-        )));
-    }
-    Ok(())
+    check_positive_finite(lib_size, "library sizes")
 }
 
 /// Arithmetic mean of a gene's row.
@@ -1077,10 +1046,7 @@ fn detect_structural_zeros<T: EdgeFloat>(
         return Ok(empty);
     }
 
-    let mut sub = Vec::with_capacity(candidates.len() * n_samples);
-    for &g in &candidates {
-        sub.extend_from_slice(&counts[g * n_samples..(g + 1) * n_samples]);
-    }
+    let sub = gather_rows(counts, n_samples, &candidates);
     let offset = Recycled::by_sample(lib_size.iter().map(|l| l.ln()).collect());
     let poisson = glm_fit(
         &sub,

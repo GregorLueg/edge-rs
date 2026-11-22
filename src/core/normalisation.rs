@@ -14,7 +14,7 @@
 
 use rayon::prelude::*;
 
-use crate::core::expression::column_sums;
+use crate::core::expression::{check_positive_finite, column_sums};
 use crate::errors::EdgeErrors;
 use crate::numeric::stats::{quantile_type7, rank_average};
 use crate::utils::traits::EdgeFloat;
@@ -263,12 +263,7 @@ fn resolve_lib_size<T: EdgeFloat>(
     };
 
     // edgeR carries a zero library size through to a NaN factor; refuse early.
-    if let Some(j) = lib.iter().position(|v| !v.is_finite() || *v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library size for sample {j} must be finite and positive; got {}.",
-            lib[j]
-        )));
-    }
+    check_positive_finite(&lib, "library sizes")?;
     Ok(lib)
 }
 

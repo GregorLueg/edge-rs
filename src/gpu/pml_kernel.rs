@@ -90,12 +90,11 @@ use crate::errors::EdgeErrors;
 // Consts //
 ////////////
 
-/// Magnitude past which a Newton component is treated as unbounded rather than
-/// damped. `STEP_CUTOFF` in [`crate::sc::pml`].
-const STEP_CUTOFF: f32 = 40.0;
+/// [`crate::sc::pml::STEP_CUTOFF`] in `f32`.
+const STEP_CUTOFF: f32 = crate::sc::pml::STEP_CUTOFF as f32;
 
-/// Largest gradient component still called a critical point, nebula's `convd`.
-const GRADIENT_TOLERANCE: f32 = 0.01;
+/// [`crate::sc::pml::GRADIENT_TOLERANCE`] in `f32`.
+const GRADIENT_TOLERANCE: f32 = crate::sc::pml::GRADIENT_TOLERANCE as f32;
 
 /// Requests per workgroup, one plane each.
 ///

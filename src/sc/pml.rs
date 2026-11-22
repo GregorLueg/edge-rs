@@ -38,6 +38,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::errors::EdgeErrors;
+use crate::sc::ptmg::check_cell_index;
 use crate::sc::zeros::ZeroCells;
 use crate::utils::linalg::weighted_gram;
 
@@ -63,14 +64,14 @@ const DEFAULT_EPS: f64 = 1e-6;
 ///
 /// Reached only when backtracking has been exhausted: a stalled step with every
 /// gradient below this is `-10`, with any gradient above it `-40`.
-const GRADIENT_TOLERANCE: f64 = 0.01;
+pub(crate) const GRADIENT_TOLERANCE: f64 = 0.01;
 
 /// Magnitude past which a Newton component is treated as unbounded rather than
 /// damped.
 ///
 /// nebula replaces such a step with a fixed displacement, seeded by the same
 /// constant and halved once per backtrack, instead of halving it forty times.
-const STEP_CUTOFF: f64 = 40.0;
+pub(crate) const STEP_CUTOFF: f64 = 40.0;
 
 /// Smallest eigenvalue of the information matrix nebula will invert.
 ///
@@ -211,21 +212,7 @@ impl PmlData<'_> {
                 return Err(EdgeErrors::SubjectsNotContiguous { subject: s });
             }
         }
-        let mut previous: Option<usize> = None;
-        for &c in self.cell_index {
-            if c >= n_cells {
-                return Err(EdgeErrors::InvalidArgument(format!(
-                    "cell_index {c} is out of range for {n_cells} cells."
-                )));
-            }
-            if previous.is_some_and(|p| c <= p) {
-                return Err(EdgeErrors::InvalidArgument(
-                    "cell_index must be strictly increasing.".to_string(),
-                ));
-            }
-            previous = Some(c);
-        }
-        Ok(())
+        check_cell_index(self.cell_index, n_cells)
     }
 }
 
@@ -445,6 +432,40 @@ impl Penalty {
 // Front end //
 ///////////////
 
+/// Shape and rate of the gamma prior on `w` at `exps = e^s`.
+///
+/// ### Params
+///
+/// * `exps` - `e^s`, `s` the subject-level variance; must exceed one
+///
+/// ### Returns
+///
+/// `(alpha, lambda)`: `1 / (e^s - 1)` and `1 / (sqrt(e^s) (e^s - 1))`.
+pub(crate) fn gamma_prior(exps: f64) -> (f64, f64) {
+    (1.0 / (exps - 1.0), 1.0 / (exps.sqrt() * (exps - 1.0)))
+}
+
+/// The gamma penalty for a subject-level variance, checked.
+///
+/// ### Params
+///
+/// * `subject` - [`PmlVariance::subject`]
+///
+/// ### Returns
+///
+/// [`Penalty::Gamma`], or [`EdgeErrors::InvalidArgument`] unless
+/// `e^subject` is finite and above one.
+fn gamma_penalty(subject: f64) -> Result<Penalty, EdgeErrors> {
+    let exps = subject.exp();
+    if !(exps.is_finite() && exps > 1.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "PmlVariance::subject must be finite and strictly positive for opt_pml; got {subject}."
+        )));
+    }
+    let (alpha, lambda) = gamma_prior(exps);
+    Ok(Penalty::Gamma { alpha, lambda })
+}
+
 /// Penalised maximum likelihood fit with a gamma random effect, NEBULA's NBGMM.
 ///
 /// Joint Newton iteration over `beta` and `log_w` (Schur complement,
@@ -500,17 +521,7 @@ pub(crate) fn opt_pml_tabled(
     variance: &PmlVariance,
     params: Option<PmlParams>,
 ) -> Result<PmlResult, EdgeErrors> {
-    let exps = variance.subject.exp();
-    if !(exps.is_finite() && exps > 1.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "PmlVariance::subject must be finite and strictly positive for opt_pml; got {}.",
-            variance.subject
-        )));
-    }
-    let penalty = Penalty::Gamma {
-        alpha: 1.0 / (exps - 1.0),
-        lambda: 1.0 / (exps.sqrt() * (exps - 1.0)),
-    };
+    let penalty = gamma_penalty(variance.subject)?;
     optimise(
         data,
         zeros,
@@ -656,17 +667,7 @@ pub(crate) fn opt_pml_from(
     variance: &PmlVariance,
     params: Option<PmlParams>,
 ) -> Result<PmlResult, EdgeErrors> {
-    let exps = variance.subject.exp();
-    if !(exps.is_finite() && exps > 1.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "PmlVariance::subject must be finite and strictly positive for opt_pml; got {}.",
-            variance.subject
-        )));
-    }
-    let penalty = Penalty::Gamma {
-        alpha: 1.0 / (exps - 1.0),
-        lambda: 1.0 / (exps.sqrt() * (exps - 1.0)),
-    };
+    let penalty = gamma_penalty(variance.subject)?;
     optimise(
         data,
         None,
@@ -920,8 +921,7 @@ fn newton_finish_width<const NB: usize>(
     }) {
         return None;
     }
-    let alpha = 1.0 / (exps - 1.0);
-    let lambda = 1.0 / (exps.sqrt() * (exps - 1.0));
+    let (alpha, lambda) = gamma_prior(exps);
 
     let run = positive_runs(data.cell_index, data.subject_start);
 
@@ -1206,7 +1206,7 @@ pub(crate) fn positive_runs(cells: &[usize], starts: &[usize]) -> Vec<usize> {
 /// Widest design whose per-subject sums sit in fixed-size arrays, so the loops
 /// over design columns unroll and the sums stay in registers. Wider designs run
 /// the same sweep with the width read at run time and the sums on the heap.
-const MAX_UNROLLED_WIDTH: usize = 8;
+pub(crate) const MAX_UNROLLED_WIDTH: usize = 8;
 
 /// Penalised log-likelihood, gradient and curvature at one point.
 ///

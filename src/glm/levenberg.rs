@@ -13,6 +13,7 @@ use crate::core::expression::check_dispersion;
 use crate::errors::EdgeErrors;
 use crate::glm::deviance::unit_nb_deviance;
 use crate::glm::{EMPTY_GENE_COEF, ETA_CLAMP, MIN_POSITIVE};
+use crate::utils::linalg::cholesky_solve_in_place;
 use crate::utils::recycled::{Recycled, RecycledRow};
 use crate::utils::simd::EdgeSimd;
 use crate::utils::traits::EdgeFloat;
@@ -163,59 +164,6 @@ impl Scratch {
 // Helpers //
 /////////////
 
-/// Solves a small symmetric positive definite system in place by Cholesky.
-///
-/// The systems are `n_coef` square with `n_coef` in the low single digits, so a
-/// faer call would be dominated by its dispatch overhead. Row-major.
-///
-/// ### Params
-///
-/// * `a` - The matrix, overwritten by its lower Cholesky factor
-/// * `b` - Right-hand side, overwritten by the solution
-/// * `n` - System size
-///
-/// ### Returns
-///
-/// `false` if a pivot is not positive: the matrix is not positive definite and
-/// the step has failed.
-fn solve_spd_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[i * n + j];
-            for k in 0..j {
-                sum -= a[i * n + k] * a[j * n + k];
-            }
-            if i == j {
-                // Rejects NaN as well as a non-positive pivot.
-                if sum <= 0.0 || sum.is_nan() {
-                    return false;
-                }
-                a[i * n + i] = sum.sqrt();
-            } else {
-                a[i * n + j] = sum / a[j * n + j];
-            }
-        }
-    }
-
-    // Forward substitution.
-    for i in 0..n {
-        let mut sum = b[i];
-        for k in 0..i {
-            sum -= a[i * n + k] * b[k];
-        }
-        b[i] = sum / a[i * n + i];
-    }
-    // Back substitution against the transpose.
-    for i in (0..n).rev() {
-        let mut sum = b[i];
-        for k in (i + 1)..n {
-            sum -= a[k * n + i] * b[k];
-        }
-        b[i] = sum / a[i * n + i];
-    }
-    true
-}
-
 /// Fills `eta` with `design * beta + offset`, then exponentiates into `mu`.
 ///
 /// ### Params
@@ -320,7 +268,7 @@ fn project_onto_design(
         }
     }
 
-    if !solve_spd_in_place(&mut xtx, &mut xtz, n_coef) {
+    if !cholesky_solve_in_place(&mut xtx, &mut xtz, n_coef) {
         return false;
     }
     beta.copy_from_slice(&xtz);
@@ -487,7 +435,7 @@ pub(crate) fn fit_one_gene(
         }
         scratch.delta.copy_from_slice(&scratch.xtwz);
 
-        if !solve_spd_in_place(&mut scratch.damped, &mut scratch.delta, n_coef) {
+        if !cholesky_solve_in_place(&mut scratch.damped, &mut scratch.delta, n_coef) {
             // Not positive definite: damp harder and try again.
             singular = true;
             damping = (damping * 10.0).min(MAX_DAMPING);
@@ -802,7 +750,7 @@ mod tests {
         // [[4, 2], [2, 3]] x = [10, 8] has solution [1.75, 1.5].
         let mut a = vec![4.0, 2.0, 2.0, 3.0];
         let mut b = vec![10.0, 8.0];
-        assert!(solve_spd_in_place(&mut a, &mut b, 2));
+        assert!(cholesky_solve_in_place(&mut a, &mut b, 2));
         assert_relative_eq!(b[0], 1.75, max_relative = 1e-12);
         assert_relative_eq!(b[1], 1.5, max_relative = 1e-12);
     }
@@ -811,7 +759,7 @@ mod tests {
     fn test_solve_spd_rejects_an_indefinite_matrix() {
         let mut a = vec![1.0, 2.0, 2.0, 1.0];
         let mut b = vec![1.0, 1.0];
-        assert!(!solve_spd_in_place(&mut a, &mut b, 2));
+        assert!(!cholesky_solve_in_place(&mut a, &mut b, 2));
     }
 
     /// A two-group fit with no offset must recover the group log-means exactly,

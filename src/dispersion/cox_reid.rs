@@ -13,6 +13,7 @@
 use crate::dispersion::apl::apl_at;
 use crate::numeric::optimise::brent_fmin;
 use crate::prelude::*;
+use crate::utils::design::gather_rows;
 
 ////////////
 // Consts //
@@ -173,10 +174,7 @@ pub fn common_dispersion_cox_reid<T: EdgeFloat>(
         _ => kept,
     };
 
-    let mut selected = Vec::with_capacity(chosen.len() * n_samples);
-    for &gene in &chosen {
-        selected.extend_from_slice(&counts[gene * n_samples..(gene + 1) * n_samples]);
-    }
+    let selected = gather_rows(counts, n_samples, &chosen);
     let selected_offset = offset.subset(&chosen, n_samples);
     let selected_weights = weights.map(|w| w.subset(&chosen, n_samples));
 

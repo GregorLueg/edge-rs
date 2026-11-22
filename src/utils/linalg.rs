@@ -72,6 +72,44 @@ pub(crate) fn forward_substitute(l: &[f64], stride: usize, n: usize, b: &mut [f6
     }
 }
 
+/// Solves `L' x = b` in place for lower triangular `L`.
+///
+/// ### Params
+///
+/// * `l` - Lower triangular factor, row-major with row stride `stride`
+/// * `stride` - Row stride of `l`
+/// * `n` - Order of the system
+/// * `b` - Right-hand side, overwritten by the solution
+pub(crate) fn back_substitute_transpose(l: &[f64], stride: usize, n: usize, b: &mut [f64]) {
+    for i in (0..n).rev() {
+        let mut sum = b[i];
+        for k in (i + 1)..n {
+            sum -= l[k * stride + i] * b[k];
+        }
+        b[i] = sum / l[i * stride + i];
+    }
+}
+
+/// Solves a symmetric positive definite system `A x = b` in place by Cholesky.
+///
+/// ### Params
+///
+/// * `a` - Row-major `n * n` matrix, overwritten by its lower Cholesky factor
+/// * `b` - Right-hand side, overwritten by the solution
+/// * `n` - Order of the system
+///
+/// ### Returns
+///
+/// `false` if `a` is not positive definite.
+pub(crate) fn cholesky_solve_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
+    if !cholesky_lower(a, n, n) {
+        return false;
+    }
+    forward_substitute(a, n, n, b);
+    back_substitute_transpose(a, n, n, b);
+    true
+}
+
 ////////////////
 // Triangular //
 ////////////////

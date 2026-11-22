@@ -46,9 +46,10 @@ use faer::linalg::solvers::SolveLstsq;
 use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
+use crate::limma::RANK_TOL;
 use crate::limma::lowess::lowess;
 use crate::limma::lowess::{LowessParams, weighted_lowess};
-use crate::numeric::dist::{beta_cdf, beta_ppf, beta_sf, chisq_sf, f_ppf, f_sf, gamma_ppf};
+use crate::numeric::dist::{beta_cdf, chisq_sf, f_cdf, f_density, f_isf, f_ppf, f_quantile, f_sf};
 use crate::numeric::gamma::{ln_gamma, logmdigamma, trigamma, trigamma_inverse};
 use crate::numeric::interpolate::{interp_linear_extrap, natural_spline_basis};
 use crate::numeric::optimise::{OPTIMIZE_TOL, brent_fmin, brentq};
@@ -121,10 +122,6 @@ const ROOT_RTOL: f64 = 8.0 * f64::EPSILON;
 
 /// Iteration budget for the `df2` root search.
 const ROOT_MAX_ITER: usize = 200;
-
-/// Relative tolerance on the QR diagonal used to rank the spline basis,
-/// matching the default `tol` of R's `lm.fit`.
-const RANK_TOL: f64 = 1e-7;
 
 /// Gene count above which the per-gene tail probabilities run over rayon.
 ///
@@ -1601,34 +1598,6 @@ fn all_positive_df_equal(df: &[f64]) -> bool {
     lo == hi
 }
 
-/// Lower tail of the F distribution, R's `pf(q, df1, df2, lower.tail = TRUE)`.
-///
-/// Uses whichever side of the incomplete beta is not squeezed against one, as R
-/// does, so it is not simply `1 - f_sf`.
-///
-/// ### Params
-///
-/// * `x` - Test statistic
-/// * `df1` - Numerator degrees of freedom, finite and strictly positive
-/// * `df2` - Denominator degrees of freedom, finite and strictly positive
-///
-/// ### Returns
-///
-/// `P(F <= x)`, or [`EdgeErrors::InvalidArgument`] for a non-positive `df`.
-fn f_cdf(x: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
-    if x <= 0.0 {
-        return Ok(0.0);
-    }
-    if x.is_infinite() {
-        return Ok(1.0);
-    }
-    if df1 * x > df2 {
-        beta_sf(df2 / (df2 + df1 * x), 0.5 * df2, 0.5 * df1)
-    } else {
-        beta_cdf(df1 * x / (df2 + df1 * x), 0.5 * df1, 0.5 * df2)
-    }
-}
-
 ////////////////////////
 // Winsorised moments //
 ////////////////////////
@@ -1769,83 +1738,6 @@ fn link_fun(d: f64) -> f64 {
 #[inline]
 fn link_inv(p: f64) -> f64 {
     p / (1.0 - p)
-}
-
-////////////////////////////
-// F distribution helpers //
-////////////////////////////
-
-/// F quantile that also accepts an infinite denominator.
-///
-/// `F(df1, Inf)` is `chi^2_df1 / df1`, so the infinite case is a gamma quantile.
-///
-/// ### Params
-///
-/// * `p` - Probability in `[0, 1]`
-/// * `df1` - Numerator degrees of freedom, positive
-/// * `df2` - Denominator degrees of freedom, positive or infinite
-///
-/// ### Returns
-///
-/// The quantile, or [`EdgeErrors`] from the underlying inversion.
-fn f_quantile(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
-    if df2.is_infinite() {
-        Ok(gamma_ppf(p, 0.5 * df1, 2.0)? / df1)
-    } else {
-        f_ppf(p, df1, df2)
-    }
-}
-
-/// F density that also accepts an infinite denominator.
-///
-/// Evaluated through logs so the two large powers never overflow separately.
-///
-/// ### Params
-///
-/// * `x` - Quantile, positive
-/// * `df1` - Numerator degrees of freedom, positive
-/// * `df2` - Denominator degrees of freedom, positive or infinite
-///
-/// ### Returns
-///
-/// The density at `x`.
-fn f_density(x: f64, df1: f64, df2: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if df2.is_infinite() {
-        // df1 * dchisq(df1 x, df1)
-        let y = df1 * x;
-        let k = 0.5 * df1;
-        return df1
-            * ((k - 1.0) * y.ln() - 0.5 * y - ln_gamma(k) - k * std::f64::consts::LN_2).exp();
-    }
-    let (a, b) = (0.5 * df1, 0.5 * df2);
-    let ln_beta = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
-    (a * (df1 * x).ln() + b * df2.ln() - (a + b) * (df1 * x + df2).ln() - x.ln() - ln_beta).exp()
-}
-
-/// Inverse of the F survival function.
-///
-/// Built from the beta quantile, since `f_ppf(1 - p)` rounds a small upper-tail
-/// probability to one and returns `inf`. Uses
-/// `sf(x) = I(df2 / (df1 x + df2); df2/2, df1/2)`.
-///
-/// ### Params
-///
-/// * `p` - Upper-tail probability in `[0, 1]`
-/// * `df1` - Numerator degrees of freedom, positive
-/// * `df2` - Denominator degrees of freedom, positive
-///
-/// ### Returns
-///
-/// The `x` with `P(F > x) = p`.
-fn f_isf(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
-    let w = beta_ppf(p, 0.5 * df2, 0.5 * df1)?;
-    if w <= 0.0 {
-        return Ok(f64::INFINITY);
-    }
-    Ok(df2 * (1.0 - w) / (df1 * w))
 }
 
 ////////////////

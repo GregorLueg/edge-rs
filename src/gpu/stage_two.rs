@@ -760,15 +760,7 @@ fn finish_at_argmax(
         Some(params),
     )
     .ok()?;
-    Some((
-        InnerFit {
-            log_likelihood: fit.log_likelihood,
-            log_likelihood_prev: fit.log_likelihood_prev,
-            log_det: fit.log_det,
-            second_order: fit.second_order,
-        },
-        fit.iterations,
-    ))
+    Some((InnerFit::from(&fit), fit.iterations))
 }
 
 /// Distinct positive counts other than one and two, with their multiplicities.

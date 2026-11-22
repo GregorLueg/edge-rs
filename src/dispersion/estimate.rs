@@ -25,8 +25,9 @@ use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 use crate::numeric::dist::beta_cdf;
 use crate::numeric::interpolate::{maximize_interpolant, maximize_interpolant_many};
 use crate::numeric::stats::moving_average_by_col;
+use crate::core::expression::column_sums;
 use crate::prelude::*;
-use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, matrix_rank};
+use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, gather_rows, matrix_rank};
 
 ////////////
 // Consts //
@@ -201,12 +202,7 @@ fn smooth_surface(
     match method {
         TrendMethod::None => {
             // Every gene shares the column means.
-            let mut mean = vec![0.0; n_grid];
-            for row in loglik.chunks_exact(n_grid) {
-                for (acc, v) in mean.iter_mut().zip(row.iter()) {
-                    *acc += v;
-                }
-            }
+            let mut mean = column_sums(loglik, n_grid);
             for v in mean.iter_mut() {
                 *v /= n_genes as f64;
             }
@@ -336,13 +332,7 @@ pub fn wleb(
     let span = params.span.unwrap_or_else(|| default_span(n_genes));
 
     let overall = if params.overall {
-        let mut summed = vec![0.0; n_grid];
-        for row in loglik.chunks_exact(n_grid) {
-            for (acc, v) in summed.iter_mut().zip(row.iter()) {
-                *acc += v;
-            }
-        }
-        Some(maximize_interpolant(theta, &summed)?)
+        Some(maximize_interpolant(theta, &column_sums(loglik, n_grid))?)
     } else {
         None
     };
@@ -708,10 +698,7 @@ pub fn estimate_disp<T: EdgeFloat>(
     let kept =
         crate::dispersion::filter_by_min_row_sum(counts, n_genes, n_samples, params.min_row_sum)?;
 
-    let mut selected = Vec::with_capacity(kept.len() * n_samples);
-    for &gene in &kept {
-        selected.extend_from_slice(&counts[gene * n_samples..(gene + 1) * n_samples]);
-    }
+    let selected = gather_rows(counts, n_samples, &kept);
     let selected_offset = offset.subset(&kept, n_samples);
     let selected_weights = weights.map(|w| w.subset(&kept, n_samples));
 
@@ -737,12 +724,7 @@ pub fn estimate_disp<T: EdgeFloat>(
     )?;
 
     // Common dispersion: maximise the summed curve.
-    let mut summed = vec![0.0; n_grid];
-    for row in loglik.chunks_exact(n_grid) {
-        for (acc, v) in summed.iter_mut().zip(row.iter()) {
-            *acc += v;
-        }
-    }
+    let summed = column_sums(&loglik, n_grid);
     let common = GRID_CENTRE * 2.0_f64.powf(maximize_interpolant(&spline_pts, &summed)?);
 
     // As in edgeR: recomputed at the common dispersion, over the full matrix
