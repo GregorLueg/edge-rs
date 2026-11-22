@@ -178,48 +178,50 @@ pub fn mglm_one_way<T: EdgeFloat>(
         .par_chunks_mut(n_coef)
         .zip(fitted.par_chunks_mut(n_samples))
         .enumerate()
-        .for_each(|(gene, (beta, fit))| {
-            let disp_row = dispersion.row(gene, n_samples);
-            let offset_row = offset.row(gene, n_samples);
-            let weight_row = weights.map(|w| w.row(gene, n_samples));
-            let y = &counts[gene * n_samples..(gene + 1) * n_samples];
+        .for_each_init(
+            || vec![0.0; n_groups],
+            |group_means, (gene, (beta, fit))| {
+                let disp_row = dispersion.row(gene, n_samples);
+                let offset_row = offset.row(gene, n_samples);
+                let weight_row = weights.map(|w| w.row(gene, n_samples));
+                let y = &counts[gene * n_samples..(gene + 1) * n_samples];
 
-            // One intercept per group.
-            let mut group_means = vec![0.0; n_groups];
-            for (g, group_members) in members.iter().enumerate() {
-                let start = initial_coefficient(y, group_members, offset_row, weight_row);
-                group_means[g] = fit_one_gene(
-                    y,
-                    group_members,
-                    disp_row,
-                    offset_row,
-                    weight_row,
-                    start,
-                    &params,
-                )
-                .max(MIN_COEF);
-            }
-
-            // Fitted values come from the group means, before rotation.
-            for (g, group_members) in members.iter().enumerate() {
-                for &sample in group_members {
-                    let eta =
-                        (group_means[g] + offset_row.get(sample)).clamp(-ETA_CLAMP, ETA_CLAMP);
-                    fit[sample] = eta.exp();
+                // One intercept per group.
+                for (g, group_members) in members.iter().enumerate() {
+                    let start = initial_coefficient(y, group_members, offset_row, weight_row);
+                    group_means[g] = fit_one_gene(
+                        y,
+                        group_members,
+                        disp_row,
+                        offset_row,
+                        weight_row,
+                        start,
+                        &params,
+                    )
+                    .max(MIN_COEF);
                 }
-            }
 
-            match &rotation {
-                Some(lu) => {
-                    let rhs = MatRef::from_column_major_slice(&group_means, n_groups, 1);
-                    let solved = lu.solve(rhs);
-                    for (k, slot) in beta.iter_mut().enumerate() {
-                        *slot = solved[(k, 0)];
+                // Fitted values come from the group means, before rotation.
+                for (g, group_members) in members.iter().enumerate() {
+                    for &sample in group_members {
+                        let eta =
+                            (group_means[g] + offset_row.get(sample)).clamp(-ETA_CLAMP, ETA_CLAMP);
+                        fit[sample] = eta.exp();
                     }
                 }
-                None => beta.copy_from_slice(&group_means),
-            }
-        });
+
+                match &rotation {
+                    Some(lu) => {
+                        let rhs = MatRef::from_column_major_slice(group_means, n_groups, 1);
+                        let solved = lu.solve(rhs);
+                        for (k, slot) in beta.iter_mut().enumerate() {
+                            *slot = solved[(k, 0)];
+                        }
+                    }
+                    None => beta.copy_from_slice(group_means),
+                }
+            },
+        );
 
     Ok(OneWayFit {
         coefficients,

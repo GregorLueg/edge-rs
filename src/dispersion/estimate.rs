@@ -18,6 +18,9 @@
 //! Chen, Lun and Smyth, F1000Research 5:1438, 2016
 //! McCarthy, Chen and Smyth, Nucleic Acids Research 40(10), 2012
 
+use rayon::prelude::*;
+
+use crate::core::expression::column_sums;
 use crate::dispersion::apl::apl_grid;
 use crate::glm::fit::glm_fit;
 use crate::limma::smoothing::{locfit_by_col, loess_by_col};
@@ -25,7 +28,6 @@ use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 use crate::numeric::dist::beta_cdf;
 use crate::numeric::interpolate::{maximize_interpolant, maximize_interpolant_many};
 use crate::numeric::stats::moving_average_by_col;
-use crate::core::expression::column_sums;
 use crate::prelude::*;
 use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, gather_rows, matrix_rank};
 
@@ -590,39 +592,32 @@ pub fn residual_df<T: EdgeFloat>(
     n_coef: usize,
 ) -> Result<Vec<f64>, EdgeErrors> {
     let base = (n_samples - n_coef) as f64;
-    let mut out = vec![base; n_genes];
+    (0..n_genes)
+        .into_par_iter()
+        .map(|gene| {
+            let y = &counts[gene * n_samples..(gene + 1) * n_samples];
+            let mu = &fitted[gene * n_samples..(gene + 1) * n_samples];
+            let is_zero = |j: usize| {
+                y[j].to_f64().unwrap_or(0.0) < ZERO_TOLERANCE && mu[j] < ZERO_TOLERANCE
+            };
+            let n_zero = (0..n_samples).filter(|&j| is_zero(j)).count();
 
-    for gene in 0..n_genes {
-        let y = &counts[gene * n_samples..(gene + 1) * n_samples];
-        let mu = &fitted[gene * n_samples..(gene + 1) * n_samples];
+            if n_zero == 0 {
+                return Ok(base);
+            }
+            if n_zero >= n_samples - 1 {
+                return Ok(0.0);
+            }
 
-        let zero: Vec<bool> = y
-            .iter()
-            .zip(mu.iter())
-            .map(|(v, m)| v.to_f64().unwrap_or(0.0) < ZERO_TOLERANCE && *m < ZERO_TOLERANCE)
-            .collect();
-        let n_zero = zero.iter().filter(|z| **z).count();
-
-        if n_zero == 0 {
-            continue;
-        }
-        if n_zero >= n_samples - 1 {
-            out[gene] = 0.0;
-            continue;
-        }
-
-        let mut reduced = Vec::with_capacity((n_samples - n_zero) * n_coef);
-        for (sample, is_zero) in zero.iter().enumerate() {
-            if !is_zero {
+            let mut reduced = Vec::with_capacity((n_samples - n_zero) * n_coef);
+            for sample in (0..n_samples).filter(|&j| !is_zero(j)) {
                 reduced.extend_from_slice(&design[sample * n_coef..(sample + 1) * n_coef]);
             }
-        }
-        let rows = n_samples - n_zero;
-        let rank = matrix_rank(&reduced, rows, n_coef)?;
-        out[gene] = (rows - rank) as f64;
-    }
-
-    Ok(out)
+            let rows = n_samples - n_zero;
+            let rank = matrix_rank(&reduced, rows, n_coef)?;
+            Ok((rows - rank) as f64)
+        })
+        .collect()
 }
 
 ///////////////

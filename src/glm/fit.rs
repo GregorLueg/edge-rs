@@ -7,6 +7,8 @@
 //! of coefficients, [`crate::glm::one_way`] fits it in closed form. Otherwise
 //! [`crate::glm::levenberg`] runs with a larger iteration budget.
 
+use rayon::prelude::*;
+
 use crate::core::dgelist::DgeList;
 use crate::core::expression::{augment_counts, resolve_lib_sizes};
 use crate::glm::deviance::unit_nb_deviance;
@@ -72,6 +74,18 @@ pub struct GlmFit {
 // Helpers //
 /////////////
 
+/// What [`fit_dispatch`] returns.
+struct Dispatched {
+    /// Coefficients, row-major `n_genes * n_coef`.
+    coefficients: Vec<f64>,
+    /// Fitted means, row-major `n_genes * n_samples`.
+    fitted: Vec<f64>,
+    /// Deviance per gene, where the fitter already computed it.
+    deviance: Option<Vec<f64>>,
+    /// Which fitter ran.
+    method: FitMethod,
+}
+
 /// Chooses a fitter and runs it.
 ///
 /// ### Params
@@ -87,7 +101,7 @@ pub struct GlmFit {
 ///
 /// ### Returns
 ///
-/// Coefficients, fitted means and which fitter ran.
+/// The fit; see [`Dispatched`].
 #[allow(clippy::too_many_arguments)]
 fn fit_dispatch<T: EdgeFloat>(
     counts: &[T],
@@ -98,7 +112,7 @@ fn fit_dispatch<T: EdgeFloat>(
     dispersion: &Recycled<f64>,
     offset: &Recycled<f64>,
     weights: Option<&Recycled<f64>>,
-) -> Result<(Vec<f64>, Vec<f64>, FitMethod), EdgeErrors> {
+) -> Result<Dispatched, EdgeErrors> {
     let (labels, n_groups) = design_as_factor(design, n_samples, n_coef)?;
 
     if n_groups == n_coef {
@@ -114,7 +128,12 @@ fn fit_dispatch<T: EdgeFloat>(
             weights,
             None,
         )?;
-        Ok((fit.coefficients, fit.fitted, FitMethod::OneWay))
+        Ok(Dispatched {
+            coefficients: fit.coefficients,
+            fitted: fit.fitted,
+            deviance: None,
+            method: FitMethod::OneWay,
+        })
     } else {
         let params = LevenbergParams {
             max_iter: GLM_FIT_MAX_ITER,
@@ -132,7 +151,12 @@ fn fit_dispatch<T: EdgeFloat>(
             None,
             Some(params),
         )?;
-        Ok((fit.coefficients, fit.fitted, FitMethod::Levenberg))
+        Ok(Dispatched {
+            coefficients: fit.coefficients,
+            fitted: fit.fitted,
+            deviance: Some(fit.deviance),
+            method: FitMethod::Levenberg,
+        })
     }
 }
 
@@ -159,6 +183,7 @@ fn residual_deviance<T: EdgeFloat>(
     weights: Option<&Recycled<f64>>,
 ) -> Vec<f64> {
     (0..n_genes)
+        .into_par_iter()
         .map(|gene| {
             let disp = dispersion.row(gene, n_samples);
             let weight = weights.map(|w| w.row(gene, n_samples));
@@ -289,11 +314,17 @@ pub fn glm_fit<T: EdgeFloat>(
         )));
     }
 
-    let (coefficients, fitted, method) = fit_dispatch(
+    let Dispatched {
+        coefficients,
+        fitted,
+        deviance,
+        method,
+    } = fit_dispatch(
         counts, n_genes, n_samples, design, n_coef, dispersion, offset, weights,
     )?;
-
-    let deviance = residual_deviance(counts, n_genes, n_samples, &fitted, dispersion, weights);
+    let deviance = deviance.unwrap_or_else(|| {
+        residual_deviance(counts, n_genes, n_samples, &fitted, dispersion, weights)
+    });
 
     // Shrinkage refits the augmented data and replaces the coefficients only;
     // fitted values and deviance stay from the unshrunk fit, as in edgeR.
@@ -302,7 +333,7 @@ pub fn glm_fit<T: EdgeFloat>(
         let library_sizes = resolve_lib_sizes(counts, n_genes, n_samples, None, Some(offset))?;
         let (augmented, augmented_offsets) =
             augment_counts(counts, n_genes, n_samples, &library_sizes, prior_count)?;
-        let (shrunk, _, _) = fit_dispatch(
+        let shrunk = fit_dispatch(
             &augmented,
             n_genes,
             n_samples,
@@ -312,7 +343,7 @@ pub fn glm_fit<T: EdgeFloat>(
             &augmented_offsets,
             weights,
         )?;
-        (shrunk, Some(coefficients))
+        (shrunk.coefficients, Some(coefficients))
     } else {
         (coefficients, None)
     };

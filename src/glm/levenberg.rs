@@ -370,8 +370,9 @@ pub(crate) fn initial_coefficients(
 ///
 /// ### Returns
 ///
-/// The number of iterations used and whether the normal equations ever went
-/// singular.
+/// The number of iterations used, whether the normal equations ever went
+/// singular, and the deviance at the returned `beta`, whose fitted means are
+/// left in `scratch.mu`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_one_gene(
     scratch: &mut Scratch,
@@ -383,7 +384,7 @@ pub(crate) fn fit_one_gene(
     offset: RecycledRow<'_, f64>,
     weights: Option<RecycledRow<'_, f64>>,
     params: &LevenbergParams,
-) -> (usize, bool) {
+) -> (usize, bool, f64) {
     let mut damping = INITIAL_DAMPING;
     let mut singular = false;
 
@@ -440,7 +441,7 @@ pub(crate) fn fit_one_gene(
             singular = true;
             damping = (damping * 10.0).min(MAX_DAMPING);
             if damping >= MAX_DAMPING {
-                return (iteration + 1, singular);
+                return (iteration + 1, singular, dev_current);
             }
             continue;
         }
@@ -473,14 +474,14 @@ pub(crate) fn fit_one_gene(
             let threshold = params.tol * (dev_current.abs() + 0.1);
             dev_current = dev_trial;
             if change < threshold {
-                return (iteration + 1, singular);
+                return (iteration + 1, singular, dev_current);
             }
         } else {
             damping = (damping * 10.0).min(MAX_DAMPING);
         }
     }
 
-    (params.max_iter, singular)
+    (params.max_iter, singular, dev_current)
 }
 
 ///////////////
@@ -602,22 +603,12 @@ pub fn mglm_levenberg<T: EdgeFloat>(
                     ),
                 }
 
-                let (used, singular) = fit_one_gene(
+                let (used, singular, deviance) = fit_one_gene(
                     scratch, beta, design, n_samples, n_coef, disp_row, offset_row, weight_row,
                     &params,
                 );
-
-                linear_predictor(
-                    design,
-                    beta,
-                    offset_row,
-                    n_samples,
-                    n_coef,
-                    &mut scratch.eta,
-                    &mut scratch.mu,
-                );
                 fit.copy_from_slice(&scratch.mu[..n_samples]);
-                *dev = deviance_of(&scratch.y, &scratch.mu, disp_row, weight_row);
+                *dev = deviance;
                 *iters = used;
                 *fail = singular;
             },

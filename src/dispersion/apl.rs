@@ -13,9 +13,9 @@
 use rayon::prelude::*;
 
 use crate::glm::fit::GLM_FIT_MAX_ITER;
-use crate::glm::{ETA_CLAMP, MIN_POSITIVE};
 use crate::glm::levenberg::{LevenbergParams, Scratch, initial_coefficients};
 use crate::glm::one_group::{OneGroupParams, fit_one_gene as fit_one_group_gene};
+use crate::glm::{ETA_CLAMP, MIN_POSITIVE};
 use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
 use crate::utils::design::design_as_factor;
@@ -39,6 +39,8 @@ const PIVOT_FLOOR: f64 = 1e-10;
 struct GeneScratch {
     /// Counts for the current gene, widened to `f64`.
     y: Vec<f64>,
+    /// `ln_gamma(y + 1)`, fixed across dispersions.
+    ln_factorial: Vec<f64>,
     /// Fitted means at the current grid point.
     mu: Vec<f64>,
     /// Information matrix, row-major.
@@ -64,6 +66,7 @@ impl GeneScratch {
     fn new(n_samples: usize, n_coef: usize) -> Self {
         Self {
             y: vec![0.0; n_samples],
+            ln_factorial: vec![0.0; n_samples],
             mu: vec![0.0; n_samples],
             information: vec![0.0; n_coef * n_coef],
             beta: vec![0.0; n_coef],
@@ -121,6 +124,7 @@ fn cox_reid_adjustment(xtwx: &mut [f64], n_coef: usize) -> f64 {
 /// ### Params
 ///
 /// * `y` - Counts for this gene
+/// * `ln_factorial` - `ln_gamma(y + 1)`
 /// * `mu` - Fitted means
 /// * `dispersion` - Dispersion for this gene
 /// * `weights` - Optional weight row
@@ -130,6 +134,7 @@ fn cox_reid_adjustment(xtwx: &mut [f64], n_coef: usize) -> f64 {
 /// The weighted log-likelihood summed across samples.
 fn log_likelihood(
     y: &[f64],
+    ln_factorial: &[f64],
     mu: &[f64],
     dispersion: f64,
     weights: Option<RecycledRow<'_, f64>>,
@@ -142,15 +147,14 @@ fn log_likelihood(
         let r_ln_r = r * r.ln();
         for (j, (&y_j, &mu_j)) in y.iter().zip(mu.iter()).enumerate() {
             let mu_j = mu_j.max(MIN_POSITIVE);
-            let term =
-                ln_gamma(y_j + r) - ln_gamma_r - ln_gamma(y_j + 1.0) + r_ln_r + y_j * mu_j.ln()
-                    - (r + y_j) * (r + mu_j).ln();
+            let term = ln_gamma(y_j + r) - ln_gamma_r - ln_factorial[j] + r_ln_r + y_j * mu_j.ln()
+                - (r + y_j) * (r + mu_j).ln();
             total += weights.map_or(term, |w| w.get(j) * term);
         }
     } else {
         for (j, (&y_j, &mu_j)) in y.iter().zip(mu.iter()).enumerate() {
             let mu_j = mu_j.max(MIN_POSITIVE);
-            let term = y_j * mu_j.ln() - mu_j - ln_gamma(y_j + 1.0);
+            let term = y_j * mu_j.ln() - mu_j - ln_factorial[j];
             total += weights.map_or(term, |w| w.get(j) * term);
         }
     }
@@ -437,8 +441,15 @@ impl<'a> AplWorkspace<'a> {
             return Err(EdgeErrors::InvalidDispersion(dispersion));
         }
 
-        for (slot, value) in self.scratch.y.iter_mut().zip(counts) {
+        for ((slot, lf), value) in self
+            .scratch
+            .y
+            .iter_mut()
+            .zip(self.scratch.ln_factorial.iter_mut())
+            .zip(counts)
+        {
             *slot = value.to_f64().unwrap_or(0.0);
+            *lf = ln_gamma(*slot + 1.0);
         }
         self.offset = offset;
         self.weights = weights;
@@ -523,7 +534,13 @@ impl<'a> AplWorkspace<'a> {
             );
         }
 
-        let ll = log_likelihood(&self.scratch.y, &self.scratch.mu, dispersion, self.weights);
+        let ll = log_likelihood(
+            &self.scratch.y,
+            &self.scratch.ln_factorial,
+            &self.scratch.mu,
+            dispersion,
+            self.weights,
+        );
         assemble_information(
             &self.scratch.mu,
             self.design,
