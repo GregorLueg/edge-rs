@@ -10,8 +10,8 @@ use crate::prelude::*;
 /// Relative tolerance for declaring a column linearly dependent.
 ///
 /// R's `lm.fit` (LINPACK `dqrdc2`) cycles a column to the back when its
-/// remaining norm falls below `1e-7` times its original norm. limma inherits the
-/// threshold through `lm.fit`.
+/// remaining norm falls below `1e-7` times its original norm. limma inherits
+/// the threshold through `lm.fit`.
 pub(crate) const RANK_TOL: f64 = 1e-7;
 
 pub mod array_weights;

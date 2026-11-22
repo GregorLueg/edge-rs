@@ -191,8 +191,9 @@ fn correlated_stdev(
 ///
 /// * `fit` - The fit to rotate, consumed
 /// * `contrasts` - Contrast matrix, **column-major** `n_coef * n_contrasts`:
-///   contrast `k` occupies `contrasts[k * n_coef..(k + 1) * n_coef]`. The layout
-///   of [`crate::utils::design::contrast_as_coef`] and [`make_contrasts`].
+///   contrast `k` occupies `contrasts[k * n_coef..(k + 1) * n_coef]`. The
+///   layout of [`crate::utils::design::contrast_as_coef`] and
+///   [`make_contrasts`].
 /// * `n_contrasts` - Number of contrasts
 ///
 /// ### Returns
@@ -230,10 +231,6 @@ pub fn contrasts_fit(
     fit.clear_tests();
     fit.contrasts = Some(contrasts.to_vec());
 
-    // ------------------------------------ //
-    // reduce to the estimable coefficients //
-    // ------------------------------------ //
-    //
     // `cov_coefficients` only describes the accepted columns, so contrast rows
     // must line up with those. A contrast weighting a rejected column has no
     // answer (`R/contrasts.R:64`).
@@ -269,10 +266,6 @@ pub fn contrasts_fit(
         )
     };
 
-    // ------------------------------------- //
-    // drop coefficients no contrast touches //
-    // ------------------------------------- //
-    //
     // Not needed for correctness; limma does it to shrink the per-gene loop
     // (`R/contrasts.R:77`).
     let keep: Vec<usize> = (0..n_coef)
@@ -304,9 +297,6 @@ pub fn contrasts_fit(
         )
     };
 
-    // -------------------------------------------------------- //
-    // let a zero contrast entry clobber an aliased coefficient //
-    // -------------------------------------------------------- //
     let any_na = coefficients.iter().any(|v| v.is_nan());
     if any_na {
         for (c, s) in coefficients.iter_mut().zip(stdev_unscaled.iter_mut()) {
@@ -321,14 +311,8 @@ pub fn contrasts_fit(
     let orthogonal = n_coef < 2
         || (0..n_coef).all(|i| (0..i).all(|j| cormatrix[i * n_coef + j].abs() < ORTHOGONAL_TOL));
 
-    // ------------------------ //
-    // new coefficients: beta C //
-    // ------------------------ //
     let new_coef = gemm(&coefficients, fit.n_genes, n_coef, &contrasts, n_contrasts);
 
-    // --------------------------------------------- //
-    // new covariance: (L' C)' (L' C), with V = L L' //
-    // --------------------------------------------- //
     let mut chol = cov.clone();
     if !cholesky_lower(&mut chol, n_coef, n_coef) {
         return Err(EdgeErrors::CholeskyFailed(
@@ -339,9 +323,6 @@ pub fn contrasts_fit(
     }
     let new_cov = crossprod_whitened(&chol, &contrasts, n_coef, n_contrasts);
 
-    // -------------------------------- //
-    // new unscaled standard deviations //
-    // -------------------------------- //
     let mut new_stdev = if orthogonal {
         // sqrt(u^2 C^2), elementwise squares on both sides.
         let u2: Vec<f64> = stdev_unscaled.iter().map(|v| v * v).collect();
@@ -368,9 +349,6 @@ pub fn contrasts_fit(
         )
     };
 
-    // ---------------------------- //
-    // put the aliased entries back //
-    // ---------------------------- //
     let mut new_coef = new_coef;
     if any_na {
         for (c, s) in new_coef.iter_mut().zip(new_stdev.iter_mut()) {

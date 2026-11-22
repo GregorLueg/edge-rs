@@ -249,9 +249,9 @@ pub(crate) fn resolve_lib_sizes<T: EdgeFloat>(
 /// Adds library-size-scaled prior counts to one gene.
 ///
 /// edgeR's `addPriorCount` rule: the prior is scaled by each library size
-/// relative to the mean of *that gene's row*. With per-sample library sizes this
-/// is the usual formula; with a gene-varying offset it is not, and edgeR does
-/// use the row mean.
+/// relative to the mean of *that gene's row*. With per-sample library sizes
+/// this is the usual formula; with a gene-varying offset it is not, and edgeR
+/// does use the row mean.
 ///
 /// ### Params
 ///
@@ -540,8 +540,8 @@ pub fn tpm<T: EdgeFloat>(
 ///
 /// ### Returns
 ///
-/// One log2-CPM per gene, or [`EdgeErrors`] if a shape disagrees, a library size
-/// is not positive, or a dispersion is negative.
+/// One log2-CPM per gene, or [`EdgeErrors`] if a shape disagrees, a library
+/// size is not positive, or a dispersion is negative.
 pub fn ave_log_cpm<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,

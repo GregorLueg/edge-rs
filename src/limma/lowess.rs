@@ -47,8 +47,8 @@ pub(crate) const PARALLEL_WORK_THRESHOLD: usize = 1 << 16;
 ///
 /// Guards three comparisons: a window of coincident points (weighted mean), a
 /// local regression with no spread in `x` (weighted mean of `y`), and the
-/// residual scale below which the robustness loop stops early. limma uses `1e-7`
-/// for all three; the fits only agree to the last digit if this matches.
+/// residual scale below which the robustness loop stops early. limma uses
+/// `1e-7` for all three; the fits only agree to the last digit if this matches.
 const THRESHOLD: f64 = 1e-7;
 
 /// Fraction of the covariate range used as the lowess interpolation cell width,

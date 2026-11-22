@@ -287,9 +287,9 @@ pub fn voom<T: EdgeFloat>(
 /// Differs from [`voom`] in two ways. Genes with a whole group of exact zeros
 /// have those observations masked out and their residual scale and degrees of
 /// freedom recomputed, so structural zeros do not look like low variance; if
-/// any such gene exists the trend uses [`crate::limma::lowess::weighted_lowess`]
-/// with the residual degrees of freedom as prior weights. The model is then
-/// refitted with the voom weights.
+/// any such gene exists the trend uses
+/// [`crate::limma::lowess::weighted_lowess`] with the residual degrees of
+/// freedom as prior weights. The model is then refitted with the voom weights.
 ///
 /// Equivalent to `voomLmFit(counts, design, block = NULL, sample.weights =
 /// FALSE)`: no block correlation or array weight loops.

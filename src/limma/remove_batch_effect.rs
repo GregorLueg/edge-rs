@@ -104,15 +104,15 @@ fn check_len(name: &'static str, len: usize, n_samples: usize) -> Result<(), Edg
 /// * `batch2` - Optional second batch label per sample
 /// * `covariates` - Optional numeric covariates, row-major `n_samples * n_cov`,
 ///   with `n_cov`
-/// * `design` - Optional design of interest, row-major `n_samples * n_coef`, with
-///   `n_coef`. `None` is an intercept only.
-/// * `weights` - Optional observation weights, forwarded to [`lm_fit`] as limma's
-///   `...` does
+/// * `design` - Optional design of interest, row-major `n_samples * n_coef`,
+///   with `n_coef`. `None` is an intercept only.
+/// * `weights` - Optional observation weights, forwarded to [`lm_fit`] as
+///   limma's `...` does
 ///
 /// ### Returns
 ///
-/// The corrected matrix, row-major `n_genes * n_samples`, or [`EdgeErrors`] if a
-/// shape disagrees or a batch factor has fewer than two levels.
+/// The corrected matrix, row-major `n_genes * n_samples`, or [`EdgeErrors`] if
+/// a shape disagrees or a batch factor has fewer than two levels.
 ///
 /// ### References
 ///

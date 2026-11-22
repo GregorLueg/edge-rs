@@ -44,8 +44,8 @@ const TMMWSP_WEIGHT_RIDGE: f64 = 1e-6;
 /// Median upper-quartile factor below which the reference column is picked by
 /// root-count totals instead.
 ///
-/// If more than half the samples have a zero upper quartile, edgeR falls back to
-/// `which.max(colSums(sqrt(x)))`, the rule TMMwsp always uses.
+/// If more than half the samples have a zero upper quartile, edgeR falls back
+/// to `which.max(colSums(sqrt(x)))`, the rule TMMwsp always uses.
 const F75_DEGENERATE: f64 = 1e-20;
 
 /// Probability of the quantile used to choose the TMM reference column.
@@ -82,8 +82,8 @@ pub enum NormMethod {
 
 /// Parses edgeR's `method` string.
 ///
-/// Case-insensitive. `TMMwzp` is accepted as the old spelling of `TMMwsp`, as in
-/// edgeR.
+/// Case-insensitive. `TMMwzp` is accepted as the old spelling of `TMMwsp`, as
+/// in edgeR.
 ///
 /// ### Params
 ///
@@ -266,8 +266,8 @@ fn resolve_lib_size<T: EdgeFloat>(
 /// Drops the all-zero genes and transposes the survivors to column-major `f64`.
 ///
 /// Two passes: mark the genes with a positive count anywhere, then scatter the
-/// survivors into the transposed buffer (sequential reads, strided writes, since
-/// the rest of the module reads the buffer repeatedly).
+/// survivors into the transposed buffer (sequential reads, strided writes,
+/// since the rest of the module reads the buffer repeatedly).
 ///
 /// ### Params
 ///
@@ -377,7 +377,10 @@ fn resolve_ref_column(
     let f75: Vec<f64> = (0..n_samples)
         .into_par_iter()
         .map(|j| {
-            Ok(quantile_type7(&x[j * n_kept..(j + 1) * n_kept], REF_COLUMN_QUANTILE)? / lib_size[j])
+            Ok(
+                quantile_type7(&x[j * n_kept..(j + 1) * n_kept], REF_COLUMN_QUANTILE)?
+                    / lib_size[j],
+            )
         })
         .collect::<Result<_, EdgeErrors>>()?;
 
@@ -665,8 +668,8 @@ fn calc_factor_tmm(
 ///
 /// ### Notes
 ///
-/// **Tie-breaking:** M-values are ordered by `order(M, M.shrunk)`, a stable sort
-/// on `M` with the add-0.5 shrunk log-ratio as tiebreak. On sparse integer
+/// **Tie-breaking:** M-values are ordered by `order(M, M.shrunk)`, a stable
+/// sort on `M` with the add-0.5 shrunk log-ratio as tiebreak. On sparse integer
 /// counts many pairs share an `M` exactly and the trim boundary lands inside a
 /// tied run, so without the tiebreak the result would depend on the sort's
 /// internal order. Ties in both keys keep input order, so the sort must be
@@ -795,9 +798,10 @@ fn calc_factor_tmmwsp(
 /// Marks the central `n + 2 - 2 * (floor(n * trim) + 1)` entries of an
 /// ordering.
 ///
-/// The window is R's 1-based `[lo, n + 1 - lo]` with `lo = floor(n * trim) + 1`,
-/// as a half-open 0-based slice. R would count *down* if `lo` exceeded the upper
-/// bound (trims at or above 0.5 on small `n`); this keeps nothing instead.
+/// The window is R's 1-based
+/// `[lo, n + 1 - lo]` with `lo = floor(n * trim) + 1`, as a half-open 0-based
+/// slice. R would count *down* if `lo` exceeded the upper bound (trims at or
+/// above 0.5 on small `n`); this keeps nothing instead.
 ///
 /// ### Params
 ///
@@ -828,8 +832,8 @@ fn trim_window(order: &[usize], n: usize, trim: f64) -> Vec<bool> {
 /// Normalisation factors for a count matrix, as edgeR's `calcNormFactors`.
 ///
 /// Genes zero in every sample are dropped first, as in edgeR; library sizes are
-/// *not* recomputed afterwards. If no gene survives, or there is one sample, the
-/// method degrades to [`NormMethod::None`], as in edgeR.
+/// *not* recomputed afterwards. If no gene survives, or there is one sample,
+/// the method degrades to [`NormMethod::None`], as in edgeR.
 ///
 /// The returned factors have geometric mean one.
 ///

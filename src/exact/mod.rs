@@ -262,8 +262,8 @@ fn gamma_isf_start(ln_q: f64, a: f64) -> f64 {
 ///
 /// ### Returns
 ///
-/// `x` with `ln Q(a, x) = ln_q`, or [`EdgeErrors::NoConvergence`] if the bracket
-/// has not closed within [`GAMMA_ISF_MAX_ITER`].
+/// `x` with `ln Q(a, x) = ln_q`, or [`EdgeErrors::NoConvergence`] if the
+/// bracket has not closed within [`GAMMA_ISF_MAX_ITER`].
 fn ln_reg_gamma_upper_inv(ln_q: f64, a: f64) -> Result<f64, EdgeErrors> {
     if ln_q >= 0.0 {
         return Ok(0.0);
@@ -411,16 +411,16 @@ fn q2q_one(x: f64, input_mean: f64, output_mean: f64, dispersion: f64) -> Result
 /// The NB quantile has no closed form, so edgeR averages a normal and a gamma
 /// approximation with matching mean and variance.
 ///
-/// The tail is chosen per element by `x >= input_mean`, so the small probability
-/// is never formed as one minus a large one.
+/// The tail is chosen per element by `x >= input_mean`, so the small
+/// probability is never formed as one minus a large one.
 ///
 /// ### Notes
 ///
 /// **Two departures from edgeR's arithmetic** (see `UPSTREAM_DEVIATIONS.md`
 /// A16):
 ///
-/// * The normal half is the linear map `output_mean + sd_out (x - input_mean) /
-///   sd_in`, which `qnorm(pnorm(...))` reduces to. Agrees to the last bit or two.
+/// * The normal half is the linear map `output_mean + sd_out (x - input_mean) / sd_in`,
+///   which `qnorm(pnorm(...))` reduces to. Agrees to the last bit or two.
 /// * The upper gamma tail uses `ln_reg_gamma_upper` and its inverse, not
 ///   `gamma_cdf` and `gamma_ppf`.
 ///
@@ -1045,7 +1045,8 @@ fn small_p_one(
 
 /// Runs one of the three rejection regions over every gene.
 ///
-/// Each thread keeps one convolution buffer, grown to the largest total it sees.
+/// Each thread keeps one convolution buffer, grown to the largest total it
+/// sees.
 ///
 /// [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`] fall back to
 /// the double-tail test when the groups have equal size, as in edgeR.
@@ -1178,8 +1179,8 @@ fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> V
 ///
 /// Per gene, three things from three places:
 ///
-/// * the log2 fold change, from one intercept-only NB GLM per group with a small
-///   prior count;
+/// * the log2 fold change, from one intercept-only NB GLM per group with a
+///   small prior count;
 /// * the average log2-CPM, from `aveLogCPM` over the whole object, including
 ///   samples outside the pair;
 /// * the p-value, from pseudo-counts equalised onto a common library size and
@@ -1203,9 +1204,9 @@ fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> V
 ///
 /// The three columns, one entry per gene in the input order. Errors are
 /// [`EdgeErrors::InvalidArgument`] for a missing group, a degenerate pair or a
-/// group with no samples, [`EdgeErrors::InvalidDispersion`] if none is available
-/// or one is negative, and whatever the GLM fit and the distribution routines
-/// propagate.
+/// group with no samples, [`EdgeErrors::InvalidDispersion`] if none is
+/// available or one is negative, and whatever the GLM fit and the distribution
+/// routines propagate.
 ///
 /// ### References
 ///

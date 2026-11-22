@@ -257,10 +257,11 @@ pub fn trigamma(x: f64) -> f64 {
 ///
 /// ```text
 /// psi^(n)(z) = (-1)^(n-1) [ (n-1)!/z^n + n!/(2 z^(n+1))
-///                           + sum_k B_2k (2k+n-1)!/(2k)! z^-(2k+n) ]
+/// + sum_k B_2k (2k+n-1)!/(2k)! z^-(2k+n) ]
 /// ```
 ///
-/// The shift target grows with `n` because the series is in `n/z` as much as `1/z`.
+/// The shift target grows with `n` because the series is in `n/z` as much as
+/// `1/z`.
 ///
 /// ### Params
 ///
@@ -292,9 +293,10 @@ pub fn polygamma(n: usize, x: f64) -> f64 {
 
 /// Inverse of the trigamma function.
 ///
-/// Port of limma's `trigammaInverse()`. Newton runs on `f(y) = 1/psi'(y) - 1/x`,
-/// which is near-linear in `y`, so the `0.5 + 1/x` start converges in a handful
-/// of steps. Two clamps cover the tails. For `x > 1e7` the root is `1/sqrt(x)`
+/// Port of limma's `trigammaInverse()`. Newton runs on
+/// `f(y) = 1/psi'(y) - 1/x`, which is near-linear in `y`, so the `0.5 + 1/x`
+/// start converges in a handful of steps. Two clamps cover the tails. For
+/// `x > 1e7` the root is `1/sqrt(x)`
 /// (edgePython returns `1/x`, which is wrong). See `UPSTREAM_DEVIATIONS.md` A9.
 ///
 /// ### Params

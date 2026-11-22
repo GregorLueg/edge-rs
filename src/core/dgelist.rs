@@ -173,8 +173,8 @@ impl<T: EdgeFloat> DgeList<T> {
     ///
     /// ### Returns
     ///
-    /// The offsets, or [`EdgeErrors::InvalidArgument`] if a derived library size
-    /// is not positive and finite.
+    /// The offsets, or [`EdgeErrors::InvalidArgument`] if a derived library
+    /// size is not positive and finite.
     pub fn offset(&self) -> Result<Recycled<f64>, EdgeErrors> {
         if let Some(offset) = &self.offset {
             return Ok(offset.clone());

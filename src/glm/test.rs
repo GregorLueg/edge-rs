@@ -60,7 +60,8 @@ struct Resolved {
 /// Works out which columns a test drops and what fold change it reports.
 ///
 /// For a contrast this runs [`contrast_as_coef`] with `first = true`, so the
-/// contrasts land in the leading columns, as in edgeR's `glmLRT` and `glmTreat`.
+/// contrasts land in the leading columns, as in edgeR's `glmLRT` and
+/// `glmTreat`.
 ///
 /// ### Params
 ///
@@ -837,9 +838,10 @@ pub struct QlSummary<'a> {
 pub struct GlmTest {
     /// Log2 fold change per gene.
     ///
-    /// The shrunk coefficient of the first tested column, or the contrast applied
-    /// to the shrunk coefficients, divided by `ln 2`. With several coefficients
-    /// only the first is reported, as in edgeR's first `logFC` column.
+    /// The shrunk coefficient of the first tested column, or the contrast
+    /// applied to the shrunk coefficients, divided by `ln 2`. With several
+    /// coefficients only the first is reported, as in edgeR's first `logFC`
+    /// column.
     pub log_fc: Vec<f64>,
     /// Average log-CPM per gene, passed through from the input.
     pub log_cpm: Option<Vec<f64>>,
@@ -847,7 +849,8 @@ pub struct GlmTest {
     ///
     /// The likelihood ratio for [`glm_lrt`], the F statistic for
     /// [`glm_ql_ftest`], and `z_right` (the larger threshold z-score) for
-    /// [`glm_treat`]. edgeR reports no `glmTreat` statistic; this is our choice.
+    /// [`glm_treat`]. edgeR reports no `glmTreat` statistic; this is our
+    /// choice.
     pub statistic: Vec<f64>,
     /// P-value per gene.
     pub p_value: Vec<f64>,
@@ -868,8 +871,8 @@ pub struct GlmTest {
 /// fit's own dispersion and offsets, and reads the deviance difference off a
 /// chi-squared on as many degrees of freedom as columns dropped. A contrast
 /// first rotates the design through [`contrast_as_coef`]; the p-value depends
-/// only on the column space the null keeps, so the rotation's signs do not reach
-/// it.
+/// only on the column space the null keeps, so the rotation's signs do not
+/// reach it.
 ///
 /// ### Params
 ///
@@ -877,8 +880,8 @@ pub struct GlmTest {
 /// * `fit` - The full-model fit, from [`glm_fit`]
 /// * `tested` - Coefficients or contrast under test
 /// * `ql` - Quasi-likelihood summary when the fit came from `glmQLFit`, so
-///   `average_ql_dispersion` can be divided out before the null refit. `None` for
-///   a plain `glmFit`.
+///   `average_ql_dispersion` can be divided out before the null refit. `None`
+///   for a plain `glmFit`.
 ///
 /// ### Returns
 ///
@@ -996,8 +999,8 @@ pub fn glm_lrt<T: EdgeFloat>(
 ///
 /// ### References
 ///
-/// Lund, Nettleton, McCarthy and Smyth, Statistical Applications in Genetics and
-/// Molecular Biology, 2012
+/// Lund, Nettleton, McCarthy and Smyth, Statistical Applications in Genetics
+/// and Molecular Biology, 2012
 pub fn glm_ql_ftest<T: EdgeFloat>(
     input: &GlmTestInput<'_, T>,
     fit: &GlmFit,

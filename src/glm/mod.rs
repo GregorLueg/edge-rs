@@ -23,7 +23,8 @@ pub(crate) const ETA_CLAMP: f64 = 500.0;
 
 /// Floor applied to fitted means and working weights.
 ///
-/// Both appear in denominators. Never binds on real data; keeps reciprocals finite.
+/// Both appear in denominators. Never binds on real data; keeps reciprocals
+/// finite.
 pub(crate) const MIN_POSITIVE: f64 = 1e-300;
 
 /// Coefficient, or starting log-rate, assigned to a gene with nothing to fit.

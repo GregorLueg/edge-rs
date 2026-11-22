@@ -34,15 +34,15 @@ const MIN_ROOT: f64 = 1e-10;
 pub struct CoxReidParams {
     /// Search interval for the dispersion itself, not its fourth root.
     pub interval: (f64, f64),
-    /// Tolerance of the Brent search (R's `optimize`), on the fourth root of the
-    /// dispersion. edgeR's default is 1e-5.
+    /// Tolerance of the Brent search (R's `optimize`), on the fourth root of
+    /// the dispersion. edgeR's default is 1e-5.
     pub tol: f64,
     /// Genes whose total count falls below this are excluded.
     pub min_row_sum: f64,
     /// Number of genes to subsample on large experiments.
     ///
-    /// Only applies with at least twice this many genes, as in edgeR. `None` uses
-    /// every gene: slower, more accurate.
+    /// Only applies with at least twice this many genes, as in edgeR. `None`
+    /// uses every gene: slower, more accurate.
     pub subset: Option<usize>,
 }
 

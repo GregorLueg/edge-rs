@@ -277,9 +277,10 @@ fn vertex_capacity(span: f64) -> usize {
 
 /// Decides whether a cell still needs splitting.
 ///
-/// locfit's `atree_split` in one dimension: split while the cell width, in units
-/// of the smaller corner bandwidth, exceeds [`LOCFIT_CELL_CUT`]. A cell with
-/// zero bandwidth at both corners is scored against the full covariate range.
+/// locfit's `atree_split` in one dimension: split while the cell width, in
+/// units of the smaller corner bandwidth, exceeds [`LOCFIT_CELL_CUT`]. A cell
+/// with zero bandwidth at both corners is scored against the full covariate
+/// range.
 ///
 /// ### Params
 ///

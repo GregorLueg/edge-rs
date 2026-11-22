@@ -102,8 +102,8 @@ const PROBE_ROUNDS: usize = 8;
 /// Running searches below which the cohorts merge into one.
 ///
 /// A launch of a few dozen fits costs the device its fixed latency, far more
-/// than the host's finish. Nothing is left to overlap, and two cohorts would make every straggler also wait out the
-/// other cohort's launch.
+/// than the host's finish. Nothing is left to overlap, and two cohorts would
+/// make every straggler also wait out the other cohort's launch.
 const MERGE_BELOW: usize = 64;
 
 /// Bins of the Newton-step histograms; the last one collects everything above.

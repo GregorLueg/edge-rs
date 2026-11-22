@@ -194,8 +194,8 @@ impl Memory {
 
     /// Column `j` of `W`, evaluated at row `i`.
     ///
-    /// `W = [Y, theta*S]`, so the first `k` columns are gradient differences and
-    /// the next `k` are scaled step differences.
+    /// `W = [Y, theta*S]`, so the first `k` columns are gradient differences
+    /// and the next `k` are scaled step differences.
     ///
     /// ### Params
     ///
@@ -306,7 +306,8 @@ impl Memory {
 ///
 /// ### Params
 ///
-/// * `a` - Row-major `dim` by `dim` matrix, consumed by value into a scratch copy
+/// * `a` - Row-major `dim` by `dim` matrix, consumed by value into a scratch
+///   copy
 /// * `b` - Right-hand side of length `dim`
 /// * `dim` - System size
 ///
@@ -374,7 +375,8 @@ struct CauchyPoint {
     c: Vec<f64>,
 }
 
-/// Locates the generalised Cauchy point along the projected steepest descent path.
+/// Locates the generalised Cauchy point along the projected steepest descent
+/// path.
 ///
 /// Walks the piecewise-linear path, tracking the model's first and second
 /// derivatives per segment, and stops at the first segment containing its

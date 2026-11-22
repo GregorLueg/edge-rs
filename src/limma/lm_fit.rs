@@ -390,9 +390,6 @@ fn fit_gene(
         chol,
     } = scratch;
 
-    // -------------------------- //
-    // which observations survive //
-    // -------------------------- //
     obs.clear();
     for (sample, &value) in y_row.iter().enumerate() {
         let usable = value.is_finite()
@@ -418,9 +415,6 @@ fn fit_gene(
         return;
     }
 
-    // --------------------------------------------------------------------- //
-    // whiten: scale rows by sqrt(w), then apply the inverse Cholesky factor //
-    // --------------------------------------------------------------------- //
     for (i, &sample) in obs.iter().enumerate() {
         let scale = match weights {
             Some(w) => w.get(sample).sqrt(),
@@ -465,9 +459,6 @@ fn fit_gene(
         }
     }
 
-    // ------------------------------------------------------------- //
-    // rank-revealing Householder QR, columns accepted left to right //
-    // ------------------------------------------------------------- //
     let rank = rank_revealing_qr(
         a,
         Some(z.as_mut_slice()),
@@ -482,9 +473,6 @@ fn fit_gene(
         pivot,
     );
 
-    // -------------- //
-    // residual scale //
-    // -------------- //
     let df = m - rank;
     let rss: f64 = z[rank..m].iter().map(|v| v * v).sum();
     *out.df = df as f64;
@@ -494,9 +482,6 @@ fn fit_gene(
         0.0
     };
 
-    // ------------------------------------------------------------------- //
-    // coefficients: back substitution against the leading rank block of R //
-    // ------------------------------------------------------------------- //
     for i in (0..rank).rev() {
         let mut sum = z[i];
         for t in (i + 1)..rank {
@@ -510,10 +495,6 @@ fn fit_gene(
         out.coef[j] = beta[t];
     }
 
-    // ----------------------------------------------- //
-    // unscaled standard deviations: row norms of R^-1 //
-    // ----------------------------------------------- //
-    //
     // diag((R'R)^-1) = diag(R^-1 R^-T), so entry i is the sum of squares of row
     // i of R^-1. Inverting a tiny triangular matrix beats a solve per coefficient.
     invert_upper_triangular(r, r_inv, rank, n_coef);
@@ -524,9 +505,6 @@ fn fit_gene(
         out.stdev[j] = row.sqrt();
     }
 
-    // ---------------------------------------------------- //
-    // fitted values on the original scale, at every sample //
-    // ---------------------------------------------------- //
     for (sample, slot) in out.fitted.iter_mut().enumerate() {
         let row = &design[sample * n_coef..(sample + 1) * n_coef];
         let mut acc = 0.0;
@@ -910,9 +888,6 @@ fn lm_fit_impl(
         w.validate(n_genes, n_samples)?;
     }
 
-    // ------------------------------------------------- //
-    // block correlation set-up, done once for all genes //
-    // ------------------------------------------------- //
     let gls = match block {
         None => None,
         Some(b) => {

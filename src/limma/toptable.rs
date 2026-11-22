@@ -316,9 +316,6 @@ pub fn top_table(
         }
     };
 
-    // ---- //
-    // thin //
-    // ---- //
     let mut kept: Vec<usize> = (0..n_genes).collect();
     if params.p_value < 1.0 || params.lfc > 0.0 {
         kept.retain(|&g| {
@@ -329,9 +326,6 @@ pub fn top_table(
         });
     }
 
-    // ------------------- //
-    // sort, then truncate //
-    // ------------------- //
     let keys: Vec<f64> = match params.sort_by {
         TopTableSort::B => kept.iter().map(|&g| b[g]).collect(),
         TopTableSort::LogFc => kept.iter().map(|&g| log_fc[g].abs()).collect(),
@@ -350,9 +344,6 @@ pub fn top_table(
     }
     kept.truncate(params.number);
 
-    // ------ //
-    // resort //
-    // ------ //
     if let Some(by) = params.resort_by {
         let keys: Vec<f64> = match by {
             TopTableResort::LogFc => kept.iter().map(|&g| log_fc[g]).collect(),
@@ -445,9 +436,6 @@ pub fn top_table_f(
     let n_coef = fit.n_coef;
     let adj = p_adjust_bh(p_value);
 
-    // --------------------------------------------------------- //
-    // thin: any coefficient over the threshold, and significant //
-    // --------------------------------------------------------- //
     let mut kept: Vec<usize> = (0..n_genes).collect();
     if params.p_value < 1.0 || params.lfc > 0.0 {
         kept.retain(|&g| {

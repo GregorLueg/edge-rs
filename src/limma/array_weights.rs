@@ -219,23 +219,24 @@ fn contr_sum(n: usize) -> Vec<f64> {
 
 /// A LINPACK `dqrdc2` Householder QR: the factorisation R's `lm.fit` uses.
 ///
-/// This is not faer's QR, deliberately. `dqrdc2` walks the columns left to right
-/// and moves a column aside only when the part of it orthogonal to its
+/// This is not faer's QR, deliberately. `dqrdc2` walks the columns left to
+/// right and moves a column aside only when the part of it orthogonal to its
 /// predecessors has lost a factor [`RANK_TOL`] of its length. Survivors keep
-/// their original order, which is what makes `QR$pivot[1:rank]` in `arrayWeights`
-/// an order-preserving subset.
+/// their original order, which is what makes `QR$pivot[1:rank]` in
+/// `arrayWeights` an order-preserving subset.
 ///
 /// Rejected columns stay in place instead of being cycled to the end as LINPACK
 /// does; nothing reads them, and it keeps [`LinpackQr::pivot`] ascending.
 struct LinpackQr {
-    /// Column-major `n * p` working store. For each accepted step `l` sitting in
-    /// original column `j`, row `l` holds `R[l, l]` and rows `l + 1..n` hold the
-    /// tail of that step's Householder vector.
+    /// Column-major `n * p` working store. For each accepted step `l` sitting
+    /// in original column `j`, row `l` holds `R[l, l]` and rows `l + 1..n` hold
+    /// the tail of that step's Householder vector.
     qr: Vec<f64>,
     /// Leading element of each accepted step's Householder vector, LINPACK's
     /// `qraux`. Kept out of `qr` because `R`'s diagonal needs that slot.
     qraux: Vec<f64>,
-    /// Original index of each accepted column, ascending. Its length is the rank.
+    /// Original index of each accepted column, ascending. Its length is the
+    /// rank.
     pivot: Vec<usize>,
     /// Number of rows.
     n: usize,
@@ -432,8 +433,9 @@ pub struct ArrayWeightParams {
     pub method: ArrayWeightMethod,
     /// Prior number of genes pulling the weights towards one.
     ///
-    /// Enters as a ridge `prior_n * Z2' Z2` on the information and, for the REML
-    /// sweep, a matching `prior_n * (w - 1)` on the score. limma's default is 10.
+    /// Enters as a ridge `prior_n * Z2' Z2` on the information and, for the
+    /// REML sweep, a matching `prior_n * (w - 1)` on the score. limma's default
+    /// is 10.
     pub prior_n: f64,
     /// Iteration budget for the REML sweep. Ignored by the gene-by-gene sweep.
     pub max_iter: usize,
@@ -444,7 +446,8 @@ pub struct ArrayWeightParams {
     /// Variance design, row-major `n_samples * n_var_coef`.
     ///
     /// `None` uses `contr.sum(n_samples)`: one free weight per sample, logs
-    /// summing to zero. A coarser basis, such as group indicators, pools samples.
+    /// summing to zero. A coarser basis, such as group indicators, pools
+    /// samples.
     pub var_design: Option<Vec<f64>>,
     /// Number of columns in `var_design`. Ignored when `var_design` is `None`.
     pub n_var_coef: usize,
@@ -453,9 +456,9 @@ pub struct ArrayWeightParams {
 impl Default for ArrayWeightParams {
     /// limma's defaults, with the method fixed at [`ArrayWeightMethod::Reml`].
     ///
-    /// limma's `method = "auto"` resolves to `"reml"` for a complete, unweighted
-    /// matrix and `"genebygene"` otherwise. There is no `Auto` variant, so the
-    /// default matches a bare `arrayWeights(y, design)`; pass
+    /// limma's `method = "auto"` resolves to `"reml"` for a complete,
+    /// unweighted matrix and `"genebygene"` otherwise. There is no `Auto`
+    /// variant, so the default matches a bare `arrayWeights(y, design)`; pass
     /// [`ArrayWeightMethod::GeneByGene`] for weights or missing values.
     fn default() -> Self {
         ArrayWeightParams {
@@ -475,10 +478,12 @@ impl ArrayWeightParams {
     /// ### Params
     ///
     /// * `method` - Which sweep to run
-    /// * `prior_n` - Prior gene count shrinking the weights towards one, limma's 10
+    /// * `prior_n` - Prior gene count shrinking the weights towards one,
+    ///   limma's 10
     /// * `max_iter` - REML iteration budget, limma's 50
     /// * `tol` - REML convergence tolerance, limma's 1e-5
-    /// * `var_design` - Optional variance design, row-major `n_samples * n_var_coef`
+    /// * `var_design` - Optional variance design, row-major
+    ///   `n_samples * n_var_coef`
     /// * `n_var_coef` - Number of columns in `var_design`
     ///
     /// ### Returns
@@ -554,8 +559,8 @@ fn validate_shapes(
 
 /// Drops the linearly dependent columns of a design.
 ///
-/// limma keeps `design[, QR$pivot[1:QR$rank]]`, so a rank deficient design loses
-/// columns silently.
+/// limma keeps `design[, QR$pivot[1:QR$rank]]`, so a rank deficient design
+/// loses columns silently.
 ///
 /// ### Params
 ///
@@ -712,7 +717,8 @@ fn weighted_fit(x: &[f64], y: &[f64], w: &[f64], n: usize, p: usize) -> Weighted
     }
 }
 
-/// Accumulates `info[-1, -1] - info[-1, 1] info[1, -1] / info[1, 1]` into `info2`.
+/// Accumulates `info[-1, -1] - info[-1, 1] info[1, -1] / info[1, 1]` into
+/// `info2`.
 ///
 /// `Z = [1 | Z2]`, so the leading row and column of `info` are the intercept's;
 /// sweeping them out leaves the information for `gamma`. The pieces are kept
@@ -962,9 +968,9 @@ fn prior_ridge(z2: &[f64], n_samples: usize, ngam: usize, prior_n: f64) -> Vec<f
 
 /// limma's `.arrayWeightsGeneByGene`.
 ///
-/// One Fisher scoring step per gene with weights refreshed after each step. Gene
-/// `i + 1` is fitted under the weights gene `i` produced, so this is the one
-/// estimator in the module that runs on a single thread.
+/// One Fisher scoring step per gene with weights refreshed after each step.
+/// Gene `i + 1` is fitted under the weights gene `i` produced, so this is the
+/// one estimator in the module that runs on a single thread.
 ///
 /// ### Params
 ///
@@ -1093,9 +1099,9 @@ fn array_weights_gene_by_gene(
 /// Builds limma's `Q2` and the leverages from a fitted QR.
 ///
 /// `Q2` holds every product `Q[, i] * Q[, j]` for `i <= j` over the leading `p`
-/// columns of `Q`, off-diagonal blocks scaled by `sqrt(2)`, so `Q2' Q2` gives the
-/// second moments of the residual projection (the second-derivative term of the
-/// REML information).
+/// columns of `Q`, off-diagonal blocks scaled by `sqrt(2)`, so `Q2' Q2` gives
+/// the second moments of the residual projection (the second-derivative term of
+/// the REML information).
 ///
 /// ### Params
 ///
@@ -1130,7 +1136,8 @@ fn residual_moments(qr: &LinpackQr, n_samples: usize, p: usize) -> (Vec<f64>, Ve
     (q2, hat)
 }
 
-/// The REML information for `gamma`, `crossprod(Z, (1 - 2h) Z) + crossprod(crossprod(Q2, Z))`.
+/// The REML information for `gamma`,
+/// `crossprod(Z, (1 - 2h) Z) + crossprod(crossprod(Q2, Z))`.
 ///
 /// ### Params
 ///
@@ -1384,9 +1391,9 @@ fn reml_gene_pass(
 
 /// limma's `.arrayWeightsPrWtsREML`, the pooled sweep with gene-level weights.
 ///
-/// Each gene has its own weighted design, so the QR is refactorised per gene per
-/// iteration. Score and information are accumulated by chunk and summed in index
-/// order for reproducibility.
+/// Each gene has its own weighted design, so the QR is refactorised per gene
+/// per iteration. Score and information are accumulated by chunk and summed in
+/// index order for reproducibility.
 ///
 /// Unlike [`array_weights_reml`], convergence is tested only for finiteness and
 /// falling below `tol`, not for improvement. That is limma's behaviour.
@@ -1697,10 +1704,10 @@ pub fn duplicate_correlation(
 /// coefficients are the residual and block variance components.
 ///
 /// `w` scales the response and fixed effects but not the block design, as in
-/// `statmod`. Left singular vectors beyond the rank are an arbitrary orthonormal
-/// completion (faer's differs from LAPACK's), which does not matter: those rows
-/// share a squared singular value of zero and enter the fit only through their
-/// sum.
+/// `statmod`. Left singular vectors beyond the rank are an arbitrary
+/// orthonormal completion (faer's differs from LAPACK's), which does not
+/// matter: those rows share a squared singular value of zero and enter the fit
+/// only through their sum.
 ///
 /// ### Params
 ///
@@ -1803,12 +1810,13 @@ fn mixed_model_varcomp(
 ///
 /// A gamma GLM with identity link, fitted by Levenberg-damped Fisher scoring on
 /// the deviance. The damping schedule is reproduced verbatim because the
-/// objective is nearly flat at the optimum, so where the iteration stops decides
-/// the answer.
+/// objective is nearly flat at the optimum, so where the iteration stops
+/// decides the answer.
 ///
 /// ### Params
 ///
-/// * `x` - Column-major `n * 2` design, an intercept and the squared singular values
+/// * `x` - Column-major `n * 2` design, an intercept and the squared singular
+///   values
 /// * `y` - Squared rotated residuals, non-negative
 /// * `start` - Starting coefficients, from the linear fit
 /// * `n` - Number of observations

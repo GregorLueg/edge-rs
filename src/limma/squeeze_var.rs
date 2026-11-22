@@ -13,13 +13,13 @@
 //! Var[z_g] = psi'(df0/2) + psi'(df_g/2)
 //! ```
 //!
-//! So `e_g = z_g + logmdigamma(df_g/2)` has mean `log(s0^2) - logmdigamma(df0/2)`
-//! and variance `trigamma(df0/2)` plus the known genewise term. Subtracting the
-//! mean of `trigamma(df_g/2)` from the sample variance of `e` and inverting
-//! `trigamma` closes the fit. [`fit_f_dist`] takes the mean of `e` as one
-//! number, [`fit_f_dist_trend`] as a natural cubic spline in a covariate, and
-//! [`fit_f_dist_robustly`] uses Winsorised moments so a few wild genes cannot
-//! drag `df0` down.
+//! So `e_g = z_g + logmdigamma(df_g/2)` has mean
+//! `log(s0^2) - logmdigamma(df0/2)` and variance `trigamma(df0/2)` plus the
+//! known genewise term. Subtracting the mean of `trigamma(df_g/2)` from the
+//! sample variance of `e` and inverting `trigamma` closes the fit.
+//! [`fit_f_dist`] takes the mean of `e` as one number, [`fit_f_dist_trend`] as
+//! a natural cubic spline in a covariate, and [`fit_f_dist_robustly`] uses
+//! Winsorised moments so a few wild genes cannot drag `df0` down.
 //!
 //! ### Which limma this is
 //!
@@ -488,9 +488,9 @@ pub fn fit_f_dist(x: &[f64], df1: &[f64]) -> Result<(f64, f64), EdgeErrors> {
 /// * `var` - Genewise variances
 /// * `df1` - Residual degrees of freedom, one shared value or one per gene
 /// * `covariate` - Covariate, one per gene, typically the average log CPM
-/// * `span` - Validated to lie in `(0, 1]` but otherwise unused: limma's trended
-///   `fitFDist` is a spline with no span. Kept for signature parity with the
-///   robust fit.
+/// * `span` - Validated to lie in `(0, 1]` but otherwise unused: limma's
+///   trended `fitFDist` is a spline with no span. Kept for signature parity
+///   with the robust fit.
 ///
 /// ### Returns
 ///
@@ -1959,9 +1959,9 @@ fn loess_fit_weighted(
 
 /// Fitted values of a weighted straight line, `lm.wfit(cbind(1, x), y, w)`.
 ///
-/// Solved from the two-by-two weighted normal equations. Without weighted spread
-/// in the covariate the slope is dropped and every fit is the weighted mean, as
-/// `lm.wfit` does for a rank deficient design.
+/// Solved from the two-by-two weighted normal equations. Without weighted
+/// spread in the covariate the slope is dropped and every fit is the weighted
+/// mean, as `lm.wfit` does for a rank deficient design.
 ///
 /// ### Params
 ///

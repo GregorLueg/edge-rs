@@ -57,8 +57,8 @@ const GAMMA_PPF_MAX_ITER: usize = 128;
 /// The masses inside `(0, |x|)` and beyond `|x|` are equal at the upper
 /// quartile, which runs from 1.0 at `df = 1` down to 0.4549 as `df` grows.
 /// Using the inner form below this and the outer form above evaluates the
-/// smaller mass directly; the larger comes from `0.5 - .`. At 0.7 neither branch
-/// is worse than about a factor of two from balanced for any `df`.
+/// smaller mass directly; the larger comes from `0.5 - .`. At 0.7 neither
+/// branch is worse than about a factor of two from balanced for any `df`.
 const T_INNER_OUTER_SWITCH: f64 = 0.7;
 
 /// Relative convergence tolerance for the gamma quantile, in `ln(x)`.
@@ -802,7 +802,8 @@ pub fn t_cdf(x: f64, df: f64) -> Result<f64, EdgeErrors> {
 /// Student's t survival function.
 ///
 /// For `x > 0` this is the incomplete beta itself, so `t_sf(50, 100)` is
-/// 7.24e-73. Used for moderated t p-values and the t-to-z conversion in `glmTreat`.
+/// 7.24e-73. Used for moderated t p-values and the t-to-z conversion in
+/// `glmTreat`.
 ///
 /// ### Params
 ///
@@ -934,8 +935,8 @@ pub fn t_isf_log(log_p: f64, df: f64) -> Result<f64, EdgeErrors> {
 /// F survival function.
 ///
 /// `I(df2 / (df1 x + df2); df2/2, df1/2)`, from the ratio directly. The
-/// `1 - df1 x / (df1 x + df2)` form is where `statrs`' `FisherSnedecor::sf` loses
-/// the tail that `glmQLFTest` reads.
+/// `1 - df1 x / (df1 x + df2)` form is where `statrs`' `FisherSnedecor::sf`
+/// loses the tail that `glmQLFTest` reads.
 ///
 /// ### Params
 ///
@@ -961,7 +962,8 @@ pub fn f_sf(x: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
 /// F quantile function.
 ///
 /// Inverts the incomplete beta on the smaller tail and recovers `x` from the
-/// uncancelled side, so `f_ppf(1 - eps, ..)` never divides by a rounded `1 - z`.
+/// uncancelled side, so `f_ppf(1 - eps, ..)` never divides by a rounded
+/// `1 - z`.
 ///
 /// ### Params
 ///
@@ -1020,7 +1022,8 @@ pub(crate) fn f_cdf(x: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
 
 /// F quantile that also accepts an infinite denominator.
 ///
-/// `F(df1, Inf)` is `chi^2_df1 / df1`, so the infinite case is a gamma quantile.
+/// `F(df1, Inf)` is `chi^2_df1 / df1`, so the infinite case is a gamma
+/// quantile.
 ///
 /// ### Params
 ///

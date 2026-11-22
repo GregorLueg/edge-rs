@@ -44,7 +44,8 @@ const DIAGONAL_FLOOR: f64 = 1e-10;
 /// How the coefficients are initialised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartMethod {
-    /// Fit an intercept-only model from the total counts and total library size.
+    /// Fit an intercept-only model from the total counts and total library
+    /// size.
     ///
     /// Cheap, and edgeR's default.
     Null,
@@ -281,8 +282,8 @@ fn project_onto_design(
 /// log-scale target and project it onto the design by least squares:
 ///
 /// * [`StartMethod::Null`] uses one working-weighted log rate for every sample,
-///   `log(sum(cw * y/N) / sum(cw))` with `cw = w N / (1 + phi N)`. This differs
-///   from the plain ratio of totals unless all libraries are equal.
+///   `log(sum(cw * y/N) / sum(cw))` with `cw = w N / (1 + phi N)`. This
+///   differs from the plain ratio of totals unless all libraries are equal.
 /// * [`StartMethod::LogCounts`] uses each sample's own log rate.
 ///
 /// The projection is required. Putting the scalar in `beta[0]` and zeroing the
@@ -505,13 +506,15 @@ pub(crate) fn fit_one_gene(
 /// * `dispersion` - Dispersion, recycled over genes and samples
 /// * `offset` - Log-scale offsets, recycled over genes and samples
 /// * `weights` - Optional observation weights
-/// * `coef_start` - Optional starting coefficients, row-major `n_genes * n_coef`
+/// * `coef_start` - Optional starting coefficients, row-major
+///   `n_genes * n_coef`
 /// * `params` - Tuning knobs, or [`LevenbergParams::default`]
 ///
 /// ### Returns
 ///
-/// Coefficients, fitted means, residual deviances and per-gene iteration counts,
-/// or [`EdgeErrors`] if the shapes disagree or a dispersion is negative.
+/// Coefficients, fitted means, residual deviances and per-gene iteration
+/// counts, or [`EdgeErrors`] if the shapes disagree or a dispersion is
+/// negative.
 #[allow(clippy::too_many_arguments)]
 pub fn mglm_levenberg<T: EdgeFloat>(
     counts: &[T],

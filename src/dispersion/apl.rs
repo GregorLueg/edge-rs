@@ -155,7 +155,8 @@ fn log_likelihood(
 
 /// Assembles `X'WX` for one gene from its fitted means.
 ///
-/// The working weight is `w mu / (1 + phi mu)`; `phi = 0` gives the Poisson `w mu`.
+/// The working weight is
+/// `w mu / (1 + phi mu)`; `phi = 0` gives the Poisson `w mu`.
 ///
 /// ### Params
 ///
@@ -359,9 +360,11 @@ impl<'a> AplWorkspace<'a> {
         ))
     }
 
-    /// Builds a workspace from a design whose factor structure is already known.
+    /// Builds a workspace from a design whose factor structure is already
+    /// known.
     ///
-    /// [`apl_grid`] derives the structure once and hands each worker a workspace.
+    /// [`apl_grid`] derives the structure once and hands each worker a
+    /// workspace.
     ///
     /// ### Params
     ///
@@ -397,10 +400,10 @@ impl<'a> AplWorkspace<'a> {
 
     /// Loads a gene and cold-starts its coefficients.
     ///
-    /// Coefficients carry over between [`AplWorkspace::eval`] calls, so a new gene
-    /// must clear them: the previous gene's answer can be far enough out to land
-    /// on the wrong optimum. Matches `estimateDisp`, which clears its warm start
-    /// per gene.
+    /// Coefficients carry over between [`AplWorkspace::eval`] calls, so a new
+    /// gene must clear them: the previous gene's answer can be far enough out
+    /// to land on the wrong optimum. Matches `estimateDisp`, which clears its
+    /// warm start per gene.
     ///
     /// ### Params
     ///
@@ -555,8 +558,8 @@ impl<'a> AplWorkspace<'a> {
 /// [`crate::numeric::interpolate::maximize_interpolant`], which splines through
 /// the grid.
 ///
-/// Each gene is cold-started, so a gene's row does not depend on the batch or on
-/// how rayon splits the work.
+/// Each gene is cold-started, so a gene's row does not depend on the batch or
+/// on how rayon splits the work.
 ///
 /// ### Params
 ///

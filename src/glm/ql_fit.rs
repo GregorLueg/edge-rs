@@ -36,8 +36,8 @@ use crate::utils::design::{choose_lowess_span, gather_rows};
 
 /// Largest negative binomial dispersion the current pipeline will accept.
 ///
-/// edgeR clamps here rather than erroring: above 4 the Chebyshev fits behind the
-/// quasi-likelihood weights do not cover the regime.
+/// edgeR clamps here rather than erroring: above 4 the Chebyshev fits behind
+/// the quasi-likelihood weights do not cover the regime.
 const MAX_DISPERSION: f64 = 4.0;
 
 /// Floor on the residual degrees of freedom before dividing a deviance by it.

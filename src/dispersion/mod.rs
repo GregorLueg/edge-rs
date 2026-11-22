@@ -12,7 +12,8 @@ pub mod estimate;
 
 /// Drops genes carrying too little information about the dispersion.
 ///
-/// Shared by [`cox_reid::common_dispersion_cox_reid`] and [`estimate::estimate_disp`].
+/// Shared by [`cox_reid::common_dispersion_cox_reid`] and
+/// [`estimate::estimate_disp`].
 ///
 /// ### Params
 ///
