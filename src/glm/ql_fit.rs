@@ -506,7 +506,7 @@ pub fn glm_ql_fit<T: EdgeFloat>(
             robust: params.robust,
             winsor_tail_p: params.winsor_tail_p,
             span: None,
-            legacy: None,
+            legacy: Some(params.legacy),
         }),
     )?;
 
@@ -641,9 +641,9 @@ mod tests {
         }
 
         // The reference is `glmQLFit` given a *vector* offset, not the matrix
-        // form used for the deviances above: edgeR's `aveLogCPM` corrupts the
-        // first gene for a matrix offset, which moves the trended prior for every
-        // gene. See `UPSTREAM_DEVIATIONS.md` B1.
+        // form used for the deviances above: edgeR 4.8.2's `aveLogCPM` corrupts
+        // the first gene for a matrix offset (fixed by 4.10.7), which moves the
+        // trended prior for every gene.
         #[rustfmt::skip]
         let expected_s2_post = [
             2.345_460_198_842_870_3, 0.445_691_045_010_048_86, 0.00006973623748113801,
@@ -731,6 +731,54 @@ mod tests {
         // Every gene is fully observed: the nominal residual df is unchanged.
         for d in fit.df_residual_zeros.as_ref().unwrap() {
             assert_relative_eq!(d, &4.0, max_relative = 1e-12);
+        }
+    }
+
+    /// edgeR passes `legacy` through to `squeezeVar`. A structural zero makes the
+    /// legacy residual df unequal, where limma's own rule would switch to
+    /// `fitFDistUnequalDF1` and give `df.prior` 2.0004 instead of 0.2956.
+    ///
+    /// ```r
+    /// # Rscript, edgeR 4.10.7; y is fixture() with gene 2 set to c(0,0,0,8,16,16)
+    /// fit <- glmQLFit(y, cbind(1, c(0,0,0,1,1,1)), dispersion = 0.1,
+    ///                 offset = log(1024), legacy = TRUE)
+    /// ```
+    #[test]
+    fn test_legacy_pipeline_squeezes_with_the_legacy_prior() {
+        let (mut counts, design, mut ave_log_cpm, offset) = fixture();
+        counts[6..9].fill(0.0);
+        ave_log_cpm[1] = 13.041421237550233;
+        let fit = glm_ql_fit(
+            &counts,
+            8,
+            6,
+            &design,
+            2,
+            Some(&Recycled::scalar(0.1)),
+            &offset,
+            None,
+            &ave_log_cpm,
+            Some(QlFitParams {
+                legacy: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(fit.df_residual_zeros.as_ref().unwrap()[1], 2.0);
+        assert_relative_eq!(
+            fit.df_prior[0],
+            0.295_599_989_640_195_2,
+            max_relative = 1e-8
+        );
+        #[rustfmt::skip]
+        let s2_post = [
+            3.3369814443511463e+00, 6.898_314_212_606_382e-1, 8.335_550_382_821_362e-6,
+            8.613_685_517_537_618e-1, 7.947_578_849_633_867e-2, 6.1210127541059314e-06,
+            3.2845225861811655e-02, 2.227_530_026_880_55e-1,
+        ];
+        for (got, want) in fit.s2_post.iter().zip(&s2_post) {
+            assert_relative_eq!(got, want, max_relative = 1e-8);
         }
     }
 

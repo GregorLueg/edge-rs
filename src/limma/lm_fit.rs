@@ -257,7 +257,7 @@ impl Scratch {
 ///
 /// The rank achieved, which is `est.len()`.
 #[allow(clippy::too_many_arguments)]
-fn rank_revealing_qr(
+pub(crate) fn rank_revealing_qr(
     a: &mut [f64],
     mut z: Option<&mut [f64]>,
     hh: &mut [f64],

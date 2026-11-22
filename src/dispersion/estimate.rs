@@ -23,6 +23,7 @@ use rayon::prelude::*;
 use crate::core::expression::column_sums;
 use crate::dispersion::apl::apl_grid;
 use crate::glm::fit::glm_fit;
+use crate::limma::lm_fit::rank_revealing_qr;
 use crate::limma::smoothing::{locfit_by_col, loess_by_col};
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 use crate::numeric::dist::beta_cdf;
@@ -158,7 +159,7 @@ pub struct WlebResult {
 /// Default smoothing span for a given number of genes.
 ///
 /// `chooseLowessSpan(ntags)` at limma's defaults, as edgeR's `WLEB` uses when
-/// `span` is `NULL` (see `UPSTREAM_DEVIATIONS.md` A8).
+/// `span` is `NULL`.
 ///
 /// The pre-4.0 rule (`legacy.span = TRUE`) is
 /// `chooseLowessSpan(ntags, small.n = 50, min.span = 0.25, power = 0.5)`. Both
@@ -267,6 +268,31 @@ fn smooth_surface(
     }
 }
 
+/// edgeR's `locfit.mixed` unimodality pass over the smoothed surface.
+///
+/// Scanning each row right to left, wherever column `c - 1` is a local minimum
+/// (`m[c] > m[c-1] < m[c-2]`), every column left of it is set to `m[c-1]`. The
+/// scan works in place, so later (leftward) steps see earlier overwrites, as
+/// in edgeR's column loop.
+///
+/// ### Params
+///
+/// * `m0` - Row-major `n_genes * n_grid` surface, modified in place
+/// * `n_grid` - Number of grid points
+fn make_rows_unimodal(m0: &mut [f64], n_grid: usize) {
+    if n_grid < 3 {
+        return;
+    }
+    for row in m0.chunks_exact_mut(n_grid) {
+        for c in (2..n_grid).rev() {
+            if row[c] - row[c - 1] > 0.0 && row[c - 1] - row[c - 2] < 0.0 {
+                let fill = row[c - 1];
+                row[..=c - 2].fill(fill);
+            }
+        }
+    }
+}
+
 //////////
 // WLEP //
 //////////
@@ -339,7 +365,7 @@ pub fn wleb(
         None
     };
 
-    let shared = match m0 {
+    let mut shared = match m0 {
         Some(precomputed) => {
             if precomputed.len() != n_genes * n_grid {
                 return Err(EdgeErrors::LengthMismatch {
@@ -352,6 +378,10 @@ pub fn wleb(
         }
         None => smooth_surface(loglik, n_genes, n_grid, covariate, trend_method, span)?,
     };
+    // edgeR applies this to a passed-in m0 as well, so it sits outside the match.
+    if trend_method == TrendMethod::LocfitMixed {
+        make_rows_unimodal(&mut shared, n_grid);
+    }
 
     let trend = if params.trend {
         Some(maximize_interpolant_many(theta, &shared, n_genes)?)
@@ -597,9 +627,8 @@ pub fn residual_df<T: EdgeFloat>(
         .map(|gene| {
             let y = &counts[gene * n_samples..(gene + 1) * n_samples];
             let mu = &fitted[gene * n_samples..(gene + 1) * n_samples];
-            let is_zero = |j: usize| {
-                y[j].to_f64().unwrap_or(0.0) < ZERO_TOLERANCE && mu[j] < ZERO_TOLERANCE
-            };
+            let is_zero =
+                |j: usize| y[j].to_f64().unwrap_or(0.0) < ZERO_TOLERANCE && mu[j] < ZERO_TOLERANCE;
             let n_zero = (0..n_samples).filter(|&j| is_zero(j)).count();
 
             if n_zero == 0 {
@@ -618,6 +647,149 @@ pub fn residual_df<T: EdgeFloat>(
             Ok((rows - rank) as f64)
         })
         .collect()
+}
+
+/// Design columns R's `qr()` keeps, in order: LINPACK `dqrdc2` at tol `1e-7`.
+///
+/// ### Params
+///
+/// * `design` - Row-major design
+/// * `n_rows` - Number of rows
+/// * `n_coef` - Number of columns
+///
+/// ### Returns
+///
+/// The accepted column indices, increasing.
+fn independent_columns(design: &[f64], n_rows: usize, n_coef: usize) -> Vec<usize> {
+    let mut a = vec![0.0; n_rows * n_coef];
+    for i in 0..n_rows {
+        for j in 0..n_coef {
+            a[j * n_rows + i] = design[i * n_coef + j];
+        }
+    }
+    let col_norm: Vec<f64> = a
+        .chunks_exact(n_rows)
+        .map(|c| c.iter().map(|v| v * v).sum::<f64>().sqrt())
+        .collect();
+    let mut hh = vec![0.0; n_rows * n_coef];
+    let mut tau = vec![0.0; n_coef];
+    let mut r = vec![0.0; n_coef * n_coef];
+    let mut est = Vec::with_capacity(n_coef);
+    rank_revealing_qr(
+        &mut a, None, &mut hh, &mut tau, &col_norm, &mut r, &mut est, n_rows, n_rows, n_coef, true,
+    );
+    est
+}
+
+/// [`apl_grid`] as `estimateDisp` calls it in GLM mode.
+///
+/// edgeR fits once at dispersion 0.05 and, per gene, drops the libraries where
+/// both count and fitted value are below `1e-4`, keeps the columns of the
+/// reduced design `qr()` keeps, and leaves the row at zero when nothing is left
+/// or the reduced design is saturated. Without this a gene with an all-zero
+/// group is evaluated on a singular `X'WX`, and it moves the common dispersion.
+///
+/// ### Params
+///
+/// As [`apl_grid`].
+///
+/// ### Returns
+///
+/// A row-major `n_genes * grid.len()` matrix of adjusted profile
+/// log-likelihoods.
+#[allow(clippy::too_many_arguments)]
+fn apl_grid_without_zero_fits<T: EdgeFloat>(
+    counts: &[T],
+    n_genes: usize,
+    n_samples: usize,
+    design: &[f64],
+    n_coef: usize,
+    grid: &[f64],
+    offset: &Recycled<f64>,
+    weights: Option<&Recycled<f64>>,
+) -> Result<Vec<f64>, EdgeErrors> {
+    // edgeR leaves weights out of this fit on purpose.
+    let fit = glm_fit(
+        counts,
+        n_genes,
+        n_samples,
+        design,
+        n_coef,
+        &Recycled::scalar(0.05),
+        offset,
+        None,
+        0.0,
+    )?;
+    let nonzero = |gene: usize, j: usize| {
+        let k = gene * n_samples + j;
+        counts[k].to_f64().unwrap_or(0.0) >= ZERO_TOLERANCE || fit.fitted[k] >= ZERO_TOLERANCE
+    };
+
+    let mut groups: std::collections::BTreeMap<Vec<usize>, Vec<usize>> = Default::default();
+    for gene in 0..n_genes {
+        let samples: Vec<usize> = (0..n_samples).filter(|&j| nonzero(gene, j)).collect();
+        groups.entry(samples).or_default().push(gene);
+    }
+    if groups.len() == 1 && groups.contains_key(&(0..n_samples).collect::<Vec<_>>()) {
+        return apl_grid(
+            counts, n_genes, n_samples, design, n_coef, grid, offset, weights,
+        );
+    }
+
+    let n_grid = grid.len();
+    let mut out = vec![0.0; n_genes * n_grid];
+    for (samples, genes) in &groups {
+        if samples.is_empty() {
+            continue;
+        }
+        let m = samples.len();
+        let rows: Vec<f64> = samples
+            .iter()
+            .flat_map(|&j| design[j * n_coef..(j + 1) * n_coef].iter().copied())
+            .collect();
+        let cols = if m == n_samples {
+            (0..n_coef).collect()
+        } else {
+            independent_columns(&rows, m, n_coef)
+        };
+        if m < n_samples && cols.len() == m {
+            continue;
+        }
+        let redesign: Vec<f64> = (0..m)
+            .flat_map(|i| {
+                cols.iter()
+                    .map(|&j| rows[i * n_coef + j])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let block = |r: &Recycled<f64>| {
+            let v = genes
+                .iter()
+                .flat_map(|&g| samples.iter().map(move |&j| r.get(g, j, n_samples)))
+                .collect();
+            Recycled::full(v, genes.len(), m)
+        };
+        let y: Vec<T> = genes
+            .iter()
+            .flat_map(|&g| samples.iter().map(move |&j| counts[g * n_samples + j]))
+            .collect();
+        let w = weights.map(block).transpose()?;
+        let l0 = apl_grid(
+            &y,
+            genes.len(),
+            m,
+            &redesign,
+            cols.len(),
+            grid,
+            &block(offset)?,
+            w.as_ref(),
+        )?;
+        for (row, &gene) in l0.chunks_exact(n_grid).zip(genes) {
+            out[gene * n_grid..(gene + 1) * n_grid].copy_from_slice(row);
+        }
+    }
+    Ok(out)
 }
 
 ///////////////
@@ -707,7 +879,7 @@ pub fn estimate_disp<T: EdgeFloat>(
         .map(|t| GRID_CENTRE * 2.0_f64.powf(*t))
         .collect();
 
-    let loglik = apl_grid(
+    let loglik = apl_grid_without_zero_fits(
         &selected,
         kept.len(),
         n_samples,
@@ -1019,24 +1191,10 @@ mod tests {
         }
     }
 
-    /// A 40 gene by 6 sample run from raw counts, with no covariate supplied.
-    ///
-    /// ```r
-    /// set.seed(23); n <- 40
-    /// y <- matrix(rnbinom(n*6, mu = rep(c(20,200,2000,50), length.out = n),
-    ///                     size = 1/0.2), nrow = n)
-    /// X <- cbind(1, c(0,0,0,1,1,1))
-    /// d <- estimateDisp(DGEList(counts = y), design = X, robust = FALSE)
-    /// ```
-    ///
-    /// The one test that does not pass edgeR's `AveLogCPM`, so it pins the
-    /// two-pass structure: a covariate taken at any dispersion other than the
-    /// common one moves the trend by around 2e-3 relative and the prior degrees of
-    /// freedom by 7e-3.
-    #[test]
-    fn test_matches_edger_estimate_disp_from_raw_counts() {
+    /// The `set.seed(23)` 40 by 6 matrix behind the raw-count `estimate_disp` tests.
+    fn raw_counts_fixture() -> Vec<f64> {
         #[rustfmt::skip]
-        let counts: Vec<f64> = vec![
+        let counts = vec![
             17.0, 25.0, 2.0, 26.0, 27.0, 13.0,
             176.0, 236.0, 33.0, 206.0, 318.0, 103.0,
             2847.0, 2053.0, 917.0, 1262.0, 917.0, 2824.0,
@@ -1078,6 +1236,26 @@ mod tests {
             1037.0, 1399.0, 1746.0, 2543.0, 1242.0, 1027.0,
             32.0, 70.0, 31.0, 62.0, 17.0, 56.0,
         ];
+        counts
+    }
+
+    /// A 40 gene by 6 sample run from raw counts, with no covariate supplied.
+    ///
+    /// ```r
+    /// set.seed(23); n <- 40
+    /// y <- matrix(rnbinom(n*6, mu = rep(c(20,200,2000,50), length.out = n),
+    ///                     size = 1/0.2), nrow = n)
+    /// X <- cbind(1, c(0,0,0,1,1,1))
+    /// d <- estimateDisp(DGEList(counts = y), design = X, robust = FALSE)
+    /// ```
+    ///
+    /// The one test that does not pass edgeR's `AveLogCPM`, so it pins the
+    /// two-pass structure: a covariate taken at any dispersion other than the
+    /// common one moves the trend by around 2e-3 relative and the prior degrees of
+    /// freedom by 7e-3.
+    #[test]
+    fn test_matches_edger_estimate_disp_from_raw_counts() {
+        let counts = raw_counts_fixture();
         #[rustfmt::skip]
         let expected_trended: [f64; 40] = [
             0.21837504923102202, 0.22114546362792034, 0.2207356614118576,
@@ -1134,6 +1312,99 @@ mod tests {
         for (got, want) in tagwise.iter().zip(expected_tagwise.iter()) {
             assert_relative_eq!(got, want, max_relative = 1e-11);
         }
+    }
+
+    /// Genes 1, 5 and 9 of the raw-count fixture with the second group zeroed,
+    /// on a design that is not one-way, so the general fit sees the zeros.
+    ///
+    /// ```r
+    /// # (y from the raw-count test above)
+    /// y[c(1, 5, 9), 4:6] <- 0
+    /// X <- cbind(1, c(0,0,0,1,1,1), c(0.1,0.5,0.2,0.4,0.9,0.3))
+    /// d <- estimateDisp(DGEList(counts = y), design = X, robust = FALSE)
+    /// ```
+    ///
+    /// Evaluated on the full design those genes put a singular `X'WX` into the
+    /// grid and move the common dispersion by 4e-6 and gene 1's tagwise by
+    /// 1.6e-5. With edgeR's reduced designs the gap is back to the 1e-7 this
+    /// design shows with no zeros at all, a Levenberg convergence-path
+    /// difference. Worst measured: common 1.2e-7, prior df 1.6e-6, trended 2.1e-7,
+    /// tagwise 5.9e-7.
+    #[test]
+    fn test_estimate_disp_drops_libraries_fitted_as_zero() {
+        let mut counts = raw_counts_fixture();
+        for g in [0, 4, 8] {
+            counts[g * 6 + 3..g * 6 + 6].fill(0.0);
+        }
+        let x = [0.1, 0.5, 0.2, 0.4, 0.9, 0.3];
+        let design: Vec<f64> = (0..6)
+            .flat_map(|j| [1.0, if j < 3 { 0.0 } else { 1.0 }, x[j]])
+            .collect();
+        let libraries: Vec<f64> = (0..6)
+            .map(|j| (0..40).map(|g| counts[g * 6 + j]).sum::<f64>().ln())
+            .collect();
+        #[rustfmt::skip]
+        let expected_trended: [f64; 40] = [
+            0.226_606_989_562_672_4, 0.21935013801167488, 0.22463082373271615,
+            0.222_788_811_724_890_9, 0.22650769692653805, 0.219_525_388_682_311_1,
+            0.22478663788879705, 0.22418703654159733, 0.226_766_502_301_318_9,
+            0.21990640690191327, 0.225_009_432_771_099_6, 0.221_975_394_862_694_4,
+            0.22614117664659214, 0.21936298937541499, 0.22490436225553045,
+            0.22212412723553232, 0.22551419793810457, 0.21961760955761334,
+            0.22487588783009588, 0.22325870796558817, 0.226_037_025_145_613_6,
+            0.219_283_595_211_752_5, 0.224_576_136_307_868_4, 0.22364791309315107,
+            0.22612756137778245, 0.21970455813687978, 0.22470874586752007,
+            0.22410096063401094, 0.22615311570719934, 0.21875095322854127,
+            0.22482413013823985, 0.22383597261842772, 0.226_210_940_063_786_9,
+            0.21909049193224603, 0.224_633_019_966_515_4, 0.22152638821052612,
+            0.22616882959363807, 0.219_124_961_505_179_8, 0.22433127940056977,
+            0.223_466_363_261_923_5,
+        ];
+        #[rustfmt::skip]
+        let expected_tagwise: [f64; 40] = [
+            0.24947427685970933, 0.23860861494167437, 0.24104492931305607,
+            0.221_611_693_263_565_8, 0.23038917147891583, 0.220_215_311_028_767_5,
+            0.21568028126540872, 0.21585975851509676, 0.224_364_770_416_868_1,
+            0.214_168_194_040_883_6, 0.21504858923574022, 0.220_057_269_449_145_4,
+            0.21308530267576675, 0.22195960289735647, 0.250_590_557_626_824_5,
+            0.21508096851398462, 0.24527306312353483, 0.208_183_876_699_555_6,
+            0.237_911_010_093_163_9, 0.21385722111193078, 0.21560536251810897,
+            0.23227520438214913, 0.21788564902725993, 0.21356691511069048,
+            0.21750420261477152, 0.21438117770241572, 0.214_648_488_000_162_5,
+            0.23067309019871593, 0.23371828346686221, 0.214_276_255_508_416_9,
+            0.22009339618055154, 0.21033518803738105, 0.22191962697864542,
+            0.223_930_253_683_361_4, 0.21299045825301996, 0.215_658_334_284_883_6,
+            0.236_849_240_308_114_3, 0.219_513_149_160_733, 0.22031327636939724,
+            0.245_022_787_271_342_3,
+        ];
+
+        let out = estimate_disp(
+            &counts,
+            40,
+            6,
+            &design,
+            3,
+            &Recycled::by_sample(libraries),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let worst = |got: &[f64], want: &[f64]| {
+            got.iter()
+                .zip(want)
+                .map(|(g, w)| ((g - w) / w).abs())
+                .fold(0.0_f64, f64::max)
+        };
+        assert_relative_eq!(out.common, 0.22671506450742585, max_relative = 5e-7);
+        assert_relative_eq!(
+            out.prior_df.as_ref().unwrap()[0],
+            47.105_541_057_718_02,
+            max_relative = 4e-6
+        );
+        assert!(worst(out.trended.as_ref().unwrap(), &expected_trended) < 1e-6);
+        assert!(worst(out.tagwise.as_ref().unwrap(), &expected_tagwise) < 2e-6);
     }
 
     /// The span rule against edgeR's current default, not the legacy one.
@@ -1254,6 +1525,75 @@ mod tests {
             gap_strong < gap_weak,
             "strong prior gap {gap_strong} should be under weak {gap_weak}"
         );
+    }
+
+    /// `locfit.mixed` flattens each smoothed row left of a local minimum so it
+    /// is unimodal. Every row of this surface triggers it.
+    ///
+    /// ```r
+    /// # Rscript, edgeR 4.10.7 (same loop in 4.8.2's estimateDisp.R)
+    /// g <- 1:30; theta <- seq(-6, 6, length.out = 9); x <- g / 10
+    /// cg <- ((g * 7) %% 11) / 2 + 0.5
+    /// l0 <- outer(cg, theta, function(c, t) -(t - c)^2 / 40) +
+    ///   outer(2 + ((g * 5) %% 7), theta, function(a, t) a * exp(-(t + 6)^2 / 2))
+    /// out <- WLEB(theta, l0, prior.n = 3, covariate = x,
+    ///             trend.method = "locfit.mixed", span = 0.5)
+    /// ```
+    #[test]
+    fn test_wleb_locfit_mixed_makes_rows_unimodal() {
+        let n_genes = 30;
+        let theta: Vec<f64> = (0..9).map(|k| -6.0 + 1.5 * k as f64).collect();
+        let x: Vec<f64> = (1..=n_genes).map(|g| g as f64 / 10.0).collect();
+        let mut loglik = Vec::with_capacity(n_genes * theta.len());
+        for g in 1..=n_genes {
+            let c = ((g * 7) % 11) as f64 / 2.0 + 0.5;
+            let a = (2 + (g * 5) % 7) as f64;
+            for &t in &theta {
+                loglik.push(-(t - c).powi(2) / 40.0 + a * (-(t + 6.0).powi(2) / 2.0).exp());
+            }
+        }
+        let out = wleb(
+            &theta,
+            &loglik,
+            n_genes,
+            Some(&x),
+            None,
+            Some(WlebParams {
+                prior_n: vec![3.0],
+                span: Some(0.5),
+                trend_method: TrendMethod::LocfitMixed,
+                overall: false,
+                trend: true,
+                individual: true,
+            }),
+        )
+        .unwrap();
+
+        #[rustfmt::skip]
+        let trend = [
+            3.7747680310096214, 3.6446780751302126, 3.5131863827491907, 3.381_427_389_476_268,
+            3.2501230770020757, 3.1246405084612014, 3.0072606807745172, 2.897_520_343_447_402,
+            2.826_863_986_462_334, 2.827_236_890_665_217, 2.878_371_796_790_793, 2.9631696722891174,
+            3.0346078336904716, 3.0745072215471865, 3.1005843465191543, 3.0939165961707342,
+            3.0370229257898425, 2.962_918_407_000_191, 2.8800858276670898, 2.8644526526077763,
+            2.8863295740995394, 2.921_697_134_065_622, 2.953_367_302_788_78, 2.9552493880234767,
+            2.950_017_966_689_014, 2.946_049_720_336_907, 2.945_985_343_777_523, 2.9468498325489887,
+            2.948_402_497_501_968, 2.9500742762505343,
+        ];
+        #[rustfmt::skip]
+        let individual = [
+            -6.0, -6.0, 4.0140756685475445, -6.0, -6.0, 3.597_625_020_597_285,
+            3.0021239971807825, -6.0, 3.244_855_849_825_242, 2.7385468178747097, -6.0, -6.0,
+            2.765_041_477_045_47, 3.686_504_682_671_82, -6.0, -6.0, 3.532_082_074_164_322, -6.0,
+            -6.0, 3.274_403_409_665_385, 2.784_884_504_467_214, -6.0, -6.0, 2.7084696251186386,
+            -6.0, -6.0, -6.0, 3.4647002897657995, -6.0, -6.0,
+        ];
+        for (got, want) in out.trend.unwrap().iter().zip(&trend) {
+            assert_relative_eq!(got, want, max_relative = 1e-12);
+        }
+        for (got, want) in out.individual.unwrap().iter().zip(&individual) {
+            assert_relative_eq!(got, want, max_relative = 1e-12);
+        }
     }
 
     #[test]
