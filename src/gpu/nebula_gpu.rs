@@ -34,6 +34,7 @@ use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
 use crate::gpu::pml_kernel::{OUT_HEADER, PmlGpuTensors, SUBJECT_SLOTS, launch_opt_pml};
+use crate::sc::pml::{gamma_prior, positive_runs};
 
 ///////////
 // Input //
@@ -331,19 +332,20 @@ impl ResidentBatch {
         }
 
         // Start of each subject's run within each gene's counts, as an absolute
-        // index into the concatenated buffer. Counts and subjects are both in
-        // cell order, so one merge per gene does it.
+        // index into the concatenated buffer.
         let mut subject_ptr = vec![0u32; n_genes * (k + 1)];
-        for (g, gene) in genes.iter().enumerate() {
-            let base = gene_ptr[g] as usize;
-            let mut p = 0usize;
-            for s in 0..=k {
-                while p < gene.cell_index.len() && gene.cell_index[p] < subject_start[s] {
-                    p += 1;
+        subject_ptr
+            .par_chunks_mut(k + 1)
+            .zip(genes.par_iter())
+            .zip(gene_ptr.par_iter())
+            .for_each(|((dst, gene), &base)| {
+                for (d, p) in dst
+                    .iter_mut()
+                    .zip(positive_runs(gene.cell_index, subject_start))
+                {
+                    *d = base + p as u32;
                 }
-                subject_ptr[g * (k + 1) + s] = (base + p) as u32;
-            }
-        }
+            });
 
         let mut subject_total = vec![0.0f32; k * n_genes];
         for (g, gene) in genes.iter().enumerate() {
@@ -510,8 +512,9 @@ impl ResidentBatch {
                 return Err(EdgeErrors::InvalidDispersion(req.cell));
             }
             request_gene[q] = req.gene as u32;
-            request_params[q] = (1.0 / (exps - 1.0)) as f32;
-            request_params[n_req + q] = (1.0 / (exps.sqrt() * (exps - 1.0))) as f32;
+            let (alpha, lambda) = gamma_prior(exps);
+            request_params[q] = alpha as f32;
+            request_params[n_req + q] = lambda as f32;
             request_params[2 * n_req + q] = req.cell as f32;
             if !(req.log_w_init.is_empty() || req.log_w_init.len() == k) {
                 return Err(EdgeErrors::LengthMismatch {

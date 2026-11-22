@@ -34,9 +34,9 @@ use crate::utils::linalg::{cov2cor, self_adjoint_eigen_desc};
 /// Prior degrees of freedom above which the posterior variance is treated as
 /// the prior exactly.
 ///
-/// limma's `Infdf <- df.prior > 10^6` (`R/ebayes.R:78`). Past it the B-statistic
-/// kernel switches to its limit, so an infinite `df.prior` gives a number
-/// rather than `NaN`.
+/// limma's `Infdf <- df.prior > 10^6` (`R/ebayes.R:78`). Past it the
+/// B-statistic kernel switches to its limit, so an infinite `df.prior` gives a
+/// number rather than `NaN`.
 const INFINITE_DF_PRIOR: f64 = 1e6;
 
 /// Relative size below which an eigenvalue of the correlation matrix counts as
@@ -378,8 +378,8 @@ fn moderated_f(
 /// Empirical Bayes moderation of a linear model fit.
 ///
 /// Port of limma's `eBayes`. Shrinks each gene's residual variance towards a
-/// fitted prior, forms moderated t statistics and log-odds, and, when the design
-/// is full rank, the moderated F.
+/// fitted prior, forms moderated t statistics and log-odds, and, when the
+/// design is full rank, the moderated F.
 ///
 /// The fit must come from [`crate::limma::lm_fit::lm_fit`], and through
 /// [`crate::limma::contrasts::contrasts_fit`] first if the hypotheses are
@@ -403,9 +403,6 @@ fn moderated_f(
 /// Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004
 pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayLm, EdgeErrors> {
     let params = params.unwrap_or_default();
-    // ------ //
-    // checks //
-    // ------ //
     if !(params.proportion > 0.0 && params.proportion < 1.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
             "proportion must lie strictly inside (0, 1); got {}",
@@ -426,9 +423,6 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
     let n_genes = fit.n_genes;
     let n_coef = fit.n_coef;
 
-    // ------------------------------------------ //
-    // the covariate the prior is trended against //
-    // ------------------------------------------ //
     let covariate: Option<Vec<f64>> = match &params.trend {
         EBayesTrend::None => None,
         EBayesTrend::Amean => Some(fit.amean.clone().ok_or_else(|| {
@@ -450,9 +444,6 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
         }
     };
 
-    // ------------------ //
-    // the variance prior //
-    // ------------------ //
     let var: Vec<f64> = fit.sigma.iter().map(|s| s * s).collect();
     let squeezed = squeeze_var(
         &var,
@@ -469,10 +460,6 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
     let s2_prior = squeezed.var_prior;
     let df_prior = squeezed.df_prior;
 
-    // ---------------------------------------------------------- //
-    // moderated t, and the degrees of freedom it is read against //
-    // ---------------------------------------------------------- //
-    //
     // The pooled cap matters on small designs: without it a gene can get more
     // degrees of freedom than the whole experiment (`R/ebayes.R:62-64`).
     let df_pooled: f64 = fit.df_residual.iter().filter(|v| v.is_finite()).sum();
@@ -501,9 +488,6 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
             Ok(())
         })?;
 
-    // ---------------------------------------------- //
-    // prior coefficient variance for the B-statistic //
-    // ---------------------------------------------- //
     let median_prior = median(&s2_prior);
     let limits = (
         params.stdev_coef_lim.0.powi(2) / median_prior,
@@ -538,9 +522,6 @@ pub fn ebayes(mut fit: MArrayLm, params: Option<EBayesParams>) -> Result<MArrayL
         params.proportion,
     );
 
-    // ------------------------------------------------ //
-    // moderated F, when every coefficient is estimable //
-    // ------------------------------------------------ //
     let (f_stat, f_p_value) = if is_full_rank(&fit.design, fit.n_samples, fit.pivot.len())? {
         let df2: Vec<f64> = (0..n_genes)
             .map(|g| fit.df_residual[g] + recycled(&df_prior, g))
@@ -599,7 +580,9 @@ mod tests {
         ];
         let y: Vec<f64> = (0..24).map(|i| ((i * 13) % 29) as f64 / 8.0).collect();
         let amean: Vec<f64> = y
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|r| r.iter().sum::<f64>() / 4.0)
             .collect();
         let fit = lm_fit(&y, 6, 4, &design, 2, None, None, None).unwrap();

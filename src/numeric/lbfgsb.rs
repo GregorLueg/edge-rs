@@ -140,14 +140,6 @@ struct Memory {
 
 impl Memory {
     /// Creates an empty memory.
-    ///
-    /// ### Params
-    ///
-    /// * `limit` - Maximum number of correction pairs
-    ///
-    /// ### Returns
-    ///
-    /// A memory holding no pairs, with `theta` at 1.
     fn new(limit: usize) -> Self {
         Self {
             s: Vec::with_capacity(limit),
@@ -158,10 +150,6 @@ impl Memory {
     }
 
     /// Number of pairs currently held.
-    ///
-    /// ### Returns
-    ///
-    /// The pair count, at most `limit`.
     fn k(&self) -> usize {
         self.s.len()
     }
@@ -206,8 +194,8 @@ impl Memory {
 
     /// Column `j` of `W`, evaluated at row `i`.
     ///
-    /// `W = [Y, theta*S]`, so the first `k` columns are gradient differences and
-    /// the next `k` are scaled step differences.
+    /// `W = [Y, theta*S]`, so the first `k` columns are gradient differences
+    /// and the next `k` are scaled step differences.
     ///
     /// ### Params
     ///
@@ -302,15 +290,6 @@ impl Memory {
     }
 
     /// Solves `M^{-1} z = v`, that is, applies `M`.
-    ///
-    /// ### Params
-    ///
-    /// * `v` - Right-hand side of length `2k`
-    ///
-    /// ### Returns
-    ///
-    /// The solution, or `None` if the middle matrix is numerically singular, in
-    /// which case the caller falls back to a steepest descent step.
     fn apply_m(&self, v: &[f64]) -> Option<Vec<f64>> {
         let dim = 2 * self.k();
         if dim == 0 {
@@ -327,7 +306,8 @@ impl Memory {
 ///
 /// ### Params
 ///
-/// * `a` - Row-major `dim` by `dim` matrix, consumed by value into a scratch copy
+/// * `a` - Row-major `dim` by `dim` matrix, consumed by value into a scratch
+///   copy
 /// * `b` - Right-hand side of length `dim`
 /// * `dim` - System size
 ///
@@ -395,7 +375,8 @@ struct CauchyPoint {
     c: Vec<f64>,
 }
 
-/// Locates the generalised Cauchy point along the projected steepest descent path.
+/// Locates the generalised Cauchy point along the projected steepest descent
+/// path.
 ///
 /// Walks the piecewise-linear path, tracking the model's first and second
 /// derivatives per segment, and stops at the first segment containing its
@@ -512,15 +493,6 @@ fn cauchy_point(
 }
 
 /// Dot product of two equal-length slices.
-///
-/// ### Params
-///
-/// * `a` - Left operand
-/// * `b` - Right operand
-///
-/// ### Returns
-///
-/// The sum of elementwise products.
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()

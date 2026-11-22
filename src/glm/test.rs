@@ -19,7 +19,9 @@ use crate::glm::fit::{GlmFit, glm_fit};
 use crate::glm::levenberg::{LevenbergParams, mglm_levenberg};
 use crate::numeric::dist::{chisq_sf, f_sf, norm_cdf, norm_ppf, t_sf};
 use crate::prelude::*;
-use crate::utils::design::{contrast_as_coef, design_as_factor, matrix_rank, non_estimable};
+use crate::utils::design::{
+    contrast_as_coef, design_as_factor, drop_columns, matrix_rank, non_estimable,
+};
 
 ////////////
 // Consts //
@@ -58,7 +60,8 @@ struct Resolved {
 /// Works out which columns a test drops and what fold change it reports.
 ///
 /// For a contrast this runs [`contrast_as_coef`] with `first = true`, so the
-/// contrasts land in the leading columns, as in edgeR's `glmLRT` and `glmTreat`.
+/// contrasts land in the leading columns, as in edgeR's `glmLRT` and
+/// `glmTreat`.
 ///
 /// ### Params
 ///
@@ -410,14 +413,6 @@ fn integrate_pnorm(a: f64, b: f64) -> f64 {
 }
 
 /// Standard normal density.
-///
-/// ### Params
-///
-/// * `x` - Quantile
-///
-/// ### Returns
-///
-/// `exp(-x^2 / 2) / sqrt(2 pi)`.
 #[inline]
 fn norm_pdf(x: f64) -> f64 {
     INV_SQRT_2PI * (-0.5 * x * x).exp()
@@ -574,27 +569,6 @@ fn poisson_fit<T: EdgeFloat>(input: &GlmTestInput<'_, T>) -> Result<GlmFit, Edge
     )
 }
 
-/// Drops columns from a row-major design.
-///
-/// ### Params
-///
-/// * `design` - Row-major `n_rows * n_cols`
-/// * `n_rows` - Number of samples
-/// * `n_cols` - Number of coefficients
-/// * `drop` - Column indices to remove
-///
-/// ### Returns
-///
-/// The design without those columns, still row-major.
-fn drop_columns(design: &[f64], n_rows: usize, n_cols: usize, drop: &[usize]) -> Vec<f64> {
-    let kept: Vec<usize> = (0..n_cols).filter(|c| !drop.contains(c)).collect();
-    let mut out = Vec::with_capacity(n_rows * kept.len());
-    for row in design.chunks_exact(n_cols) {
-        out.extend(kept.iter().map(|c| row[*c]));
-    }
-    out
-}
-
 /// Adds a per-sample shift to a recycled offset matrix.
 ///
 /// A scalar or per-sample offset stays per-sample; a per-gene or full offset
@@ -651,15 +625,6 @@ fn shift_offset(
 }
 
 /// Reads a per-gene quantity that may have been supplied as a single value.
-///
-/// ### Params
-///
-/// * `values` - Either one value or one per gene
-/// * `gene` - Gene index
-///
-/// ### Returns
-///
-/// The value for that gene.
 #[inline]
 fn recycle(values: &[f64], gene: usize) -> f64 {
     if values.len() == 1 {
@@ -873,9 +838,10 @@ pub struct QlSummary<'a> {
 pub struct GlmTest {
     /// Log2 fold change per gene.
     ///
-    /// The shrunk coefficient of the first tested column, or the contrast applied
-    /// to the shrunk coefficients, divided by `ln 2`. With several coefficients
-    /// only the first is reported, as in edgeR's first `logFC` column.
+    /// The shrunk coefficient of the first tested column, or the contrast
+    /// applied to the shrunk coefficients, divided by `ln 2`. With several
+    /// coefficients only the first is reported, as in edgeR's first `logFC`
+    /// column.
     pub log_fc: Vec<f64>,
     /// Average log-CPM per gene, passed through from the input.
     pub log_cpm: Option<Vec<f64>>,
@@ -883,7 +849,8 @@ pub struct GlmTest {
     ///
     /// The likelihood ratio for [`glm_lrt`], the F statistic for
     /// [`glm_ql_ftest`], and `z_right` (the larger threshold z-score) for
-    /// [`glm_treat`]. edgeR reports no `glmTreat` statistic; this is our choice.
+    /// [`glm_treat`]. edgeR reports no `glmTreat` statistic; this is our
+    /// choice.
     pub statistic: Vec<f64>,
     /// P-value per gene.
     pub p_value: Vec<f64>,
@@ -904,8 +871,8 @@ pub struct GlmTest {
 /// fit's own dispersion and offsets, and reads the deviance difference off a
 /// chi-squared on as many degrees of freedom as columns dropped. A contrast
 /// first rotates the design through [`contrast_as_coef`]; the p-value depends
-/// only on the column space the null keeps, so the rotation's signs do not reach
-/// it.
+/// only on the column space the null keeps, so the rotation's signs do not
+/// reach it.
 ///
 /// ### Params
 ///
@@ -913,8 +880,8 @@ pub struct GlmTest {
 /// * `fit` - The full-model fit, from [`glm_fit`]
 /// * `tested` - Coefficients or contrast under test
 /// * `ql` - Quasi-likelihood summary when the fit came from `glmQLFit`, so
-///   `average_ql_dispersion` can be divided out before the null refit. `None` for
-///   a plain `glmFit`.
+///   `average_ql_dispersion` can be divided out before the null refit. `None`
+///   for a plain `glmFit`.
 ///
 /// ### Returns
 ///
@@ -1032,8 +999,8 @@ pub fn glm_lrt<T: EdgeFloat>(
 ///
 /// ### References
 ///
-/// Lund, Nettleton, McCarthy and Smyth, Statistical Applications in Genetics and
-/// Molecular Biology, 2012
+/// Lund, Nettleton, McCarthy and Smyth, Statistical Applications in Genetics
+/// and Molecular Biology, 2012
 pub fn glm_ql_ftest<T: EdgeFloat>(
     input: &GlmTestInput<'_, T>,
     fit: &GlmFit,

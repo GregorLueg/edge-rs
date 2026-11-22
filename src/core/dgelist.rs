@@ -7,7 +7,7 @@
 //! Counts carry the generic `T`; everything derived from them (library sizes,
 //! factors, offsets, dispersions) is `f64`.
 
-use crate::core::expression::column_sums;
+use crate::core::expression::{check_positive_finite, column_sums};
 use crate::prelude::*;
 
 ////////////////////
@@ -173,18 +173,14 @@ impl<T: EdgeFloat> DgeList<T> {
     ///
     /// ### Returns
     ///
-    /// The offsets, or [`EdgeErrors::InvalidArgument`] if a derived library size
-    /// is not positive and finite.
+    /// The offsets, or [`EdgeErrors::InvalidArgument`] if a derived library
+    /// size is not positive and finite.
     pub fn offset(&self) -> Result<Recycled<f64>, EdgeErrors> {
         if let Some(offset) = &self.offset {
             return Ok(offset.clone());
         }
         let effective = self.norm_lib_sizes();
-        if let Some(bad) = effective.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "library sizes must be positive and finite, found {bad}"
-            )));
-        }
+        check_positive_finite(&effective, "library sizes")?;
         Ok(Recycled::by_sample(
             effective.iter().map(|v| v.ln()).collect(),
         ))

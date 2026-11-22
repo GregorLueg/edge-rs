@@ -21,7 +21,7 @@
 //!   round trip is replaced by the linear map it equals, and the upper gamma
 //!   tail uses a log-space incomplete gamma defined here, because
 //!   [`crate::numeric::dist`] only has natural-scale `gamma_cdf` and
-//!   `gamma_ppf`. See `UPSTREAM_DEVIATIONS.md` A16.
+//!   `gamma_ppf`.
 //! * `exactTestBySmallP` and `binomTest` have bugs in edgeR that are not
 //!   reproduced. See `UPSTREAM_DEVIATIONS.md` B3 and B4.
 
@@ -30,13 +30,14 @@ use std::f64::consts::LN_2;
 use rayon::prelude::*;
 
 use crate::core::dgelist::DgeList;
-use crate::core::expression::{ave_log_cpm, column_sums};
+use crate::core::expression::{ave_log_cpm, check_positive_finite, column_sums};
 use crate::glm::deviance::unit_nb_deviance;
 use crate::glm::one_group::mglm_one_group;
-use crate::numeric::dist::nbinom_ln_pmf;
 use crate::numeric::dist::{beta_cdf, beta_ppf, beta_sf, chisq_sf, gamma_cdf, gamma_ppf};
+use crate::numeric::dist::{gamma_cont_frac_raw, nbinom_ln_pmf};
 use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
+use crate::utils::design::select_columns;
 
 ////////////
 // Consts //
@@ -84,16 +85,6 @@ const GAMMA_ISF_REL_TOL: f64 = 1e-15;
 /// A bracket 128 wide in `ln(x)` covers everything an `f64` can represent, so
 /// this is a runaway guard, not a working limit.
 const GAMMA_ISF_MAX_ITER: usize = 256;
-
-/// Floor for the modified Lentz continued fraction, guarding a zero pivot.
-///
-/// ### References
-///
-/// Press et al., Numerical Recipes, 3rd ed., section 6.2
-const LENTZ_TINY: f64 = 1e-300;
-
-/// Relative convergence tolerance for the continued fraction.
-const LENTZ_EPS: f64 = 2.220446049250313e-16;
 
 /// Slack allowed when deciding whether an outcome is as improbable as the
 /// observed one, in [`binom_test_one`].
@@ -193,51 +184,6 @@ impl ExactTestParams {
 // Log-space upper incomplete gamma //
 //////////////////////////////////////
 
-/// Modified Lentz evaluation of the continued fraction behind `Q(a, x)`.
-///
-/// Returns the fraction without the `exp(a ln x - x - ln Gamma(a))` prefactor,
-/// so the caller can keep that in logs. Only valid for `x >= a + 1`, where it
-/// converges quickly.
-///
-/// ### Params
-///
-/// * `a` - Shape, strictly positive
-/// * `x` - Argument, at least `a + 1`
-///
-/// ### Returns
-///
-/// The continued fraction value.
-///
-/// ### References
-///
-/// Press et al., Numerical Recipes, 3rd ed., section 6.2
-fn gamma_cont_frac(a: f64, x: f64) -> f64 {
-    let mut b = x + 1.0 - a;
-    let mut c = 1.0 / LENTZ_TINY;
-    let mut d = 1.0 / b;
-    let mut h = d;
-    for i in 1..=GAMMA_ISF_MAX_ITER * 4 {
-        let i = i as f64;
-        let an = -i * (i - a);
-        b += 2.0;
-        d = an * d + b;
-        if d.abs() < LENTZ_TINY {
-            d = LENTZ_TINY;
-        }
-        c = b + an / c;
-        if c.abs() < LENTZ_TINY {
-            c = LENTZ_TINY;
-        }
-        d = 1.0 / d;
-        let delta = d * c;
-        h *= delta;
-        if (delta - 1.0).abs() <= LENTZ_EPS {
-            break;
-        }
-    }
-    h
-}
-
 /// Log of the regularised upper incomplete gamma, `ln Q(a, x)`.
 ///
 /// Exists instead of `gamma_sf(...).ln()` because `q2qnbinom` can map counts
@@ -266,7 +212,7 @@ fn ln_reg_gamma_upper(a: f64, x: f64) -> Result<f64, EdgeErrors> {
         // Q is at least about 0.15 here, so there is nothing to lose to the log.
         return Ok(chisq_sf(2.0 * x, 2.0 * a)?.ln());
     }
-    Ok(a * x.ln() - x - ln_gamma(a) + gamma_cont_frac(a, x).ln())
+    Ok(a * x.ln() - x - ln_gamma(a) + gamma_cont_frac_raw(a, x).ln())
 }
 
 /// Starting point for [`ln_reg_gamma_upper_inv`], in `x` at unit scale.
@@ -316,8 +262,8 @@ fn gamma_isf_start(ln_q: f64, a: f64) -> f64 {
 ///
 /// ### Returns
 ///
-/// `x` with `ln Q(a, x) = ln_q`, or [`EdgeErrors::NoConvergence`] if the bracket
-/// has not closed within [`GAMMA_ISF_MAX_ITER`].
+/// `x` with `ln Q(a, x) = ln_q`, or [`EdgeErrors::NoConvergence`] if the
+/// bracket has not closed within [`GAMMA_ISF_MAX_ITER`].
 fn ln_reg_gamma_upper_inv(ln_q: f64, a: f64) -> Result<f64, EdgeErrors> {
     if ln_q >= 0.0 {
         return Ok(0.0);
@@ -394,14 +340,6 @@ fn ln_reg_gamma_upper_inv(ln_q: f64, a: f64) -> Result<f64, EdgeErrors> {
 ////////////////
 
 /// Rejects a dispersion outside `[0, inf)`.
-///
-/// ### Params
-///
-/// * `dispersion` - Value supplied by the caller
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidDispersion`].
 fn check_dispersion(dispersion: f64) -> Result<(), EdgeErrors> {
     if !dispersion.is_finite() || dispersion < 0.0 {
         return Err(EdgeErrors::InvalidDispersion(dispersion));
@@ -410,15 +348,6 @@ fn check_dispersion(dispersion: f64) -> Result<(), EdgeErrors> {
 }
 
 /// Rejects a slice holding a negative or non-finite value.
-///
-/// ### Params
-///
-/// * `name` - Argument name, used verbatim in the error message
-/// * `values` - Values to check
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the offending value.
 fn check_non_negative(name: &str, values: &[f64]) -> Result<(), EdgeErrors> {
     if let Some(bad) = values.iter().find(|v| !v.is_finite() || **v < 0.0) {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -482,16 +411,15 @@ fn q2q_one(x: f64, input_mean: f64, output_mean: f64, dispersion: f64) -> Result
 /// The NB quantile has no closed form, so edgeR averages a normal and a gamma
 /// approximation with matching mean and variance.
 ///
-/// The tail is chosen per element by `x >= input_mean`, so the small probability
-/// is never formed as one minus a large one.
+/// The tail is chosen per element by `x >= input_mean`, so the small
+/// probability is never formed as one minus a large one.
 ///
 /// ### Notes
 ///
-/// **Two departures from edgeR's arithmetic** (see `UPSTREAM_DEVIATIONS.md`
-/// A16):
+/// **Two departures from edgeR's arithmetic:**
 ///
-/// * The normal half is the linear map `output_mean + sd_out (x - input_mean) /
-///   sd_in`, which `qnorm(pnorm(...))` reduces to. Agrees to the last bit or two.
+/// * The normal half is the linear map `output_mean + sd_out (x - input_mean) / sd_in`,
+///   which `qnorm(pnorm(...))` reduces to. Agrees to the last bit or two.
 /// * The upper gamma tail uses `ln_reg_gamma_upper` and its inverse, not
 ///   `gamma_cdf` and `gamma_ppf`.
 ///
@@ -576,36 +504,6 @@ fn group_columns(group: &[usize]) -> Vec<Vec<usize>> {
         }
     }
     columns
-}
-
-/// Copies a subset of columns out of a row-major matrix, as `f64`.
-///
-/// ### Params
-///
-/// * `counts` - Row-major counts, `n_genes * n_samples`
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples in `counts`
-/// * `columns` - Sample indices to keep, in the order wanted
-///
-/// ### Returns
-///
-/// A row-major `n_genes * columns.len()` matrix.
-fn select_columns<T: EdgeFloat>(
-    counts: &[T],
-    n_genes: usize,
-    n_samples: usize,
-    columns: &[usize],
-) -> Vec<f64> {
-    let mut out = vec![0.0_f64; n_genes * columns.len()];
-    out.par_chunks_mut(columns.len())
-        .enumerate()
-        .for_each(|(gene, row)| {
-            let src = &counts[gene * n_samples..(gene + 1) * n_samples];
-            for (dst, &col) in row.iter_mut().zip(columns.iter()) {
-                *dst = src[col].to_f64().unwrap_or(f64::NAN);
-            }
-        });
-    out
 }
 
 /// Expands a recycled dispersion into one value per gene.
@@ -730,11 +628,7 @@ pub fn equalize_lib_sizes<T: EdgeFloat>(
             &derived
         }
     };
-    if let Some(bad) = lib_size.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library sizes must be positive and finite, found {bad}"
-        )));
-    }
+    check_positive_finite(lib_size, "library sizes")?;
 
     let common_lib_size = (lib_size.iter().map(|l| l.ln()).sum::<f64>() / n_samples as f64).exp();
 
@@ -815,17 +709,6 @@ fn log_sum_exp(values: &[f64]) -> f64 {
 }
 
 /// Binomial log-PMF, for the Poisson limit of the exact test.
-///
-/// ### Params
-///
-/// * `k` - Number of successes, in `0..=n`
-/// * `n` - Number of trials
-/// * `ln_p` - Log of the success probability
-/// * `ln_q` - Log of one minus the success probability
-///
-/// ### Returns
-///
-/// `ln P(K = k)`.
 #[inline]
 fn binom_ln_pmf(k: f64, n: f64, ln_p: f64, ln_q: f64) -> f64 {
     ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0) + k * ln_p + (n - k) * ln_q
@@ -1161,7 +1044,8 @@ fn small_p_one(
 
 /// Runs one of the three rejection regions over every gene.
 ///
-/// Each thread keeps one convolution buffer, grown to the largest total it sees.
+/// Each thread keeps one convolution buffer, grown to the largest total it
+/// sees.
 ///
 /// [`RejectionRegion::Deviance`] and [`RejectionRegion::SmallP`] fall back to
 /// the double-tail test when the groups have equal size, as in edgeR.
@@ -1274,18 +1158,6 @@ fn augmented_abundance(
 }
 
 /// Joins two per-group matrices, first group's columns first.
-///
-/// ### Params
-///
-/// * `y1` - First group's counts, row-major `n_genes * n1`
-/// * `y2` - Second group's counts, row-major `n_genes * n2`
-/// * `n_genes` - Number of genes
-/// * `n1` - Number of samples in the first group
-/// * `n2` - Number of samples in the second group
-///
-/// ### Returns
-///
-/// A row-major `n_genes * (n1 + n2)` matrix.
 fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> Vec<f64> {
     let mut out = vec![0.0_f64; n_genes * (n1 + n2)];
     out.par_chunks_mut(n1 + n2)
@@ -1306,8 +1178,8 @@ fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> V
 ///
 /// Per gene, three things from three places:
 ///
-/// * the log2 fold change, from one intercept-only NB GLM per group with a small
-///   prior count;
+/// * the log2 fold change, from one intercept-only NB GLM per group with a
+///   small prior count;
 /// * the average log2-CPM, from `aveLogCPM` over the whole object, including
 ///   samples outside the pair;
 /// * the p-value, from pseudo-counts equalised onto a common library size and
@@ -1331,9 +1203,9 @@ fn interleave(y1: &[f64], y2: &[f64], n_genes: usize, n1: usize, n2: usize) -> V
 ///
 /// The three columns, one entry per gene in the input order. Errors are
 /// [`EdgeErrors::InvalidArgument`] for a missing group, a degenerate pair or a
-/// group with no samples, [`EdgeErrors::InvalidDispersion`] if none is available
-/// or one is negative, and whatever the GLM fit and the distribution routines
-/// propagate.
+/// group with no samples, [`EdgeErrors::InvalidDispersion`] if none is
+/// available or one is negative, and whatever the GLM fit and the distribution
+/// routines propagate.
 ///
 /// ### References
 ///
@@ -1387,11 +1259,7 @@ pub fn exact_test<T: EdgeFloat>(
     let (n1, n2) = (columns1.len(), columns2.len());
 
     let effective = y.norm_lib_sizes();
-    if let Some(bad) = effective.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library sizes must be positive and finite, found {bad}"
-        )));
-    }
+    check_positive_finite(&effective, "library sizes")?;
     let lib1: Vec<f64> = columns1.iter().map(|&j| effective[j]).collect();
     let lib2: Vec<f64> = columns2.iter().map(|&j| effective[j]).collect();
 

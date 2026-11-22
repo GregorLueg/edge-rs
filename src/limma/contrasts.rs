@@ -22,6 +22,7 @@ use rayon::prelude::*;
 
 use crate::limma::marray::MArrayLm;
 use crate::prelude::*;
+use crate::utils::design::select_columns;
 use crate::utils::linalg::{cholesky_lower, cov2cor};
 
 ////////////
@@ -49,26 +50,6 @@ const NA_DETECT: f64 = 1e20;
 /////////////
 // Kernels //
 /////////////
-
-/// Picks a subset of columns out of a row-major matrix.
-///
-/// ### Params
-///
-/// * `x` - Row-major `n_rows * n_cols`
-/// * `n_rows` - Number of rows
-/// * `n_cols` - Number of columns
-/// * `cols` - Column indices to keep, in the order wanted
-///
-/// ### Returns
-///
-/// Row-major `n_rows * cols.len()`.
-fn subset_columns(x: &[f64], n_rows: usize, n_cols: usize, cols: &[usize]) -> Vec<f64> {
-    let mut out = Vec::with_capacity(n_rows * cols.len());
-    for row in x.chunks_exact(n_cols).take(n_rows) {
-        out.extend(cols.iter().map(|&j| row[j]));
-    }
-    out
-}
 
 /// Multiplies a row-major matrix by a column-major one.
 ///
@@ -210,8 +191,9 @@ fn correlated_stdev(
 ///
 /// * `fit` - The fit to rotate, consumed
 /// * `contrasts` - Contrast matrix, **column-major** `n_coef * n_contrasts`:
-///   contrast `k` occupies `contrasts[k * n_coef..(k + 1) * n_coef]`. The layout
-///   of [`crate::utils::design::contrast_as_coef`] and [`make_contrasts`].
+///   contrast `k` occupies `contrasts[k * n_coef..(k + 1) * n_coef]`. The
+///   layout of [`crate::utils::design::contrast_as_coef`] and
+///   [`make_contrasts`].
 /// * `n_contrasts` - Number of contrasts
 ///
 /// ### Returns
@@ -249,10 +231,6 @@ pub fn contrasts_fit(
     fit.clear_tests();
     fit.contrasts = Some(contrasts.to_vec());
 
-    // ------------------------------------ //
-    // reduce to the estimable coefficients //
-    // ------------------------------------ //
-    //
     // `cov_coefficients` only describes the accepted columns, so contrast rows
     // must line up with those. A contrast weighting a rejected column has no
     // answer (`R/contrasts.R:64`).
@@ -276,8 +254,8 @@ pub fn contrasts_fit(
         (
             c,
             rank,
-            subset_columns(&fit.coefficients, fit.n_genes, n_coef, est),
-            subset_columns(&fit.stdev_unscaled, fit.n_genes, n_coef, est),
+            select_columns(&fit.coefficients, fit.n_genes, n_coef, est),
+            select_columns(&fit.stdev_unscaled, fit.n_genes, n_coef, est),
         )
     } else {
         (
@@ -288,10 +266,6 @@ pub fn contrasts_fit(
         )
     };
 
-    // ------------------------------------- //
-    // drop coefficients no contrast touches //
-    // ------------------------------------- //
-    //
     // Not needed for correctness; limma does it to shrink the per-gene loop
     // (`R/contrasts.R:77`).
     let keep: Vec<usize> = (0..n_coef)
@@ -309,8 +283,8 @@ pub fn contrasts_fit(
         (
             c,
             keep.len(),
-            subset_columns(&coefficients, fit.n_genes, n_coef, &keep),
-            subset_columns(&stdev_unscaled, fit.n_genes, n_coef, &keep),
+            select_columns(&coefficients, fit.n_genes, n_coef, &keep),
+            select_columns(&stdev_unscaled, fit.n_genes, n_coef, &keep),
             v,
         )
     } else {
@@ -323,9 +297,6 @@ pub fn contrasts_fit(
         )
     };
 
-    // -------------------------------------------------------- //
-    // let a zero contrast entry clobber an aliased coefficient //
-    // -------------------------------------------------------- //
     let any_na = coefficients.iter().any(|v| v.is_nan());
     if any_na {
         for (c, s) in coefficients.iter_mut().zip(stdev_unscaled.iter_mut()) {
@@ -340,14 +311,8 @@ pub fn contrasts_fit(
     let orthogonal = n_coef < 2
         || (0..n_coef).all(|i| (0..i).all(|j| cormatrix[i * n_coef + j].abs() < ORTHOGONAL_TOL));
 
-    // ------------------------ //
-    // new coefficients: beta C //
-    // ------------------------ //
     let new_coef = gemm(&coefficients, fit.n_genes, n_coef, &contrasts, n_contrasts);
 
-    // --------------------------------------------- //
-    // new covariance: (L' C)' (L' C), with V = L L' //
-    // --------------------------------------------- //
     let mut chol = cov.clone();
     if !cholesky_lower(&mut chol, n_coef, n_coef) {
         return Err(EdgeErrors::CholeskyFailed(
@@ -358,9 +323,6 @@ pub fn contrasts_fit(
     }
     let new_cov = crossprod_whitened(&chol, &contrasts, n_coef, n_contrasts);
 
-    // -------------------------------- //
-    // new unscaled standard deviations //
-    // -------------------------------- //
     let mut new_stdev = if orthogonal {
         // sqrt(u^2 C^2), elementwise squares on both sides.
         let u2: Vec<f64> = stdev_unscaled.iter().map(|v| v * v).collect();
@@ -387,9 +349,6 @@ pub fn contrasts_fit(
         )
     };
 
-    // ---------------------------- //
-    // put the aliased entries back //
-    // ---------------------------- //
     let mut new_coef = new_coef;
     if any_na {
         for (c, s) in new_coef.iter_mut().zip(new_stdev.iter_mut()) {
@@ -437,15 +396,6 @@ enum Operand {
 
 impl<'a> Parser<'a> {
     /// Starts a parse.
-    ///
-    /// ### Params
-    ///
-    /// * `expr` - The expression text
-    /// * `levels` - Level names, in design order
-    ///
-    /// ### Returns
-    ///
-    /// A parser positioned at the start of `expr`.
     fn new(expr: &'a str, levels: &'a [&'a str]) -> Self {
         Self {
             src: expr.as_bytes(),
@@ -456,14 +406,6 @@ impl<'a> Parser<'a> {
     }
 
     /// Builds a syntax error naming the expression and position.
-    ///
-    /// ### Params
-    ///
-    /// * `what` - What went wrong
-    ///
-    /// ### Returns
-    ///
-    /// The error.
     fn error(&self, what: &str) -> EdgeErrors {
         EdgeErrors::InvalidArgument(format!(
             "contrast '{}': {what} at position {}",
@@ -479,20 +421,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Returns the next non-space byte without consuming it.
-    ///
-    /// ### Returns
-    ///
-    /// The byte, or `None` at the end of the input.
     fn peek(&mut self) -> Option<u8> {
         self.skip_space();
         self.src.get(self.pos).copied()
     }
 
     /// Checks that the whole expression was consumed.
-    ///
-    /// ### Returns
-    ///
-    /// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the leftover.
     fn finish(&mut self) -> Result<(), EdgeErrors> {
         match self.peek() {
             None => Ok(()),

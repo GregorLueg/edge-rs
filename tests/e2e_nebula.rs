@@ -23,6 +23,13 @@
 //! * `sc_wide`: eight columns (the kernel's cap), 40 subjects of 12 cells.
 //! * `sc_high`: means of `1e3` to `1e4` on offsets around `5e3`.
 //!
+//! One more is wider than the GPU kernel takes, so only the CPU path sees it:
+//!
+//! * `sc_xwide`: thirteen columns, ten of them continuous cell-level ones, 30
+//!   subjects of 40 cells, LN. Past the eight columns the CPU kernels keep on
+//!   the stack, so stage one's Hessian and the penalised fits' curvature are
+//!   weighted Grams.
+//!
 //! Three more have a categorical cell type in place of the continuous
 //! cell-level column, so the CPU kernels sum the zero counts from tables:
 //!
@@ -56,19 +63,19 @@ use edge_rs::sc::test::{ScTested, glm_sc_test, packed_len};
 // Tolerances //
 ////////////////
 
-/// Coefficients on the pure paths. Needs `7.4e-6`, against `1.0e-6` in the
-/// in-crate eight-gene golden.
+/// Coefficients on the pure paths. Needs `1.1e-5` (`sc_intercept`), against
+/// `1.0e-6` in the in-crate eight-gene golden.
 const TOL_COEF: Tol = Tol::new(3e-5, 1e-9);
 
 /// Standard errors. Needs `2.3e-5`.
 const TOL_SE: Tol = Tol::rel(1e-4);
 
 /// Covariance entries, which are standard errors squared and so carry twice the
-/// relative error. Needs `2.3e-4`.
+/// relative error. Needs `6.2e-4` (`sc_small`).
 const TOL_COV: Tol = Tol::new(1e-3, 1e-12);
 
 /// Subject-level overdispersion. The profile likelihood is flatter in this
-/// direction than in the cell-level one. Needs `5.9e-5` relative
+/// direction than in the cell-level one. Needs `6.7e-5` relative
 /// (`sc_cat_sparse`), except near the lower bound: BOBYQA stops at a radius of
 /// `1e-6` times its first step, so a small `sigma^2` is resolved to a few `1e-7`
 /// absolute, by nebula as by this crate (`sc_intercept` gene 18: `2.2e-4`
@@ -200,14 +207,16 @@ const CPU_TOLS: NebulaTols = NebulaTols {
 ///   cell overdispersion, and a p-value `1.2e-2` off at `p = 6e-238`, which the
 ///   `1e-12` floor absorbs.
 /// * `sc_cat_ln`: the same planted near-Poisson gene, `gene_id` 29, where R
-///   stops at `phi = 322`. Needs `5.6e-4` on the coefficients and on
-///   `sigma^2`, and `2.1e-3` absolute on the cell overdispersion. The gates are
-///   per dataset, so the other five pure genes are held to them too.
+///   stops at `phi = 322`. Needs `5.8e-4` on the coefficients, `6.1e-4` on
+///   `sigma^2`, `2.1e-3` absolute on the cell overdispersion, and `9.7e-3` on
+///   its p-value against the unloosened `1e-2`. The gates are per dataset, so
+///   the other five pure genes are held to them too.
 /// * `sc_high`: means of `1e3` to `1e4`, the set most sensitive to how the
 ///   platform's `exp` and `log` round: the profile likelihood's `1e-6` jitter
-///   carries an ulp into the optimum. Needs, macOS then Linux: `6.1e-5` and
-///   `1.24e-4` on the coefficients, `2.1e-4` and `8.5e-4` on `sigma^2`,
-///   `3.5e-3` and `1.1e-2` on the covariance.
+///   carries an ulp into the optimum. Needs on macOS `5.9e-5` on the
+///   coefficients, `4.1e-4` on `sigma^2` and `3.5e-3` on the covariance; Linux
+///   has needed two to four times the macOS figures on this set. Standard
+///   errors stay on the base gate: macOS needs `3.6e-5`.
 ///
 /// The `sc_blocks` and `sc_cat_ln` gene is not settled as a port fault or an R
 /// one.
@@ -271,10 +280,12 @@ struct Dataset {
 const NAMES_SC: &[&str] = &["int", "grp", "cov2"];
 
 /// Coefficient suffixes of the edge datasets (numbered by R).
-const NAMES_EDGE: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
+const NAMES_EDGE: [&str; 13] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
+];
 
 /// Every single-cell dataset. `sc` is first; single-set tests read it by index.
-const DATASETS: [Dataset; 10] = [
+const DATASETS: [Dataset; 11] = [
     Dataset {
         tag: "sc",
         method: NebulaMethod::Ln,
@@ -320,7 +331,7 @@ const DATASETS: [Dataset; 10] = [
         method: NebulaMethod::Hl,
         expect_ln: false,
         has_offset: true,
-        names: &NAMES_EDGE,
+        names: NAMES_EDGE.split_at(8).0,
         design_file: true,
     },
     Dataset {
@@ -329,6 +340,14 @@ const DATASETS: [Dataset; 10] = [
         expect_ln: true,
         has_offset: true,
         names: NAMES_EDGE.split_at(3).0,
+        design_file: true,
+    },
+    Dataset {
+        tag: "sc_xwide",
+        method: NebulaMethod::Ln,
+        expect_ln: true,
+        has_offset: true,
+        names: &NAMES_EDGE,
         design_file: true,
     },
     Dataset {
@@ -1015,6 +1034,9 @@ fn test_gpu_nebula_matches_the_r_package() {
 
     for d in &DATASETS {
         let l = load(d);
+        if l.n_coef > edge_rs::gpu::pml_kernel::MAX_BETA_CAP {
+            continue;
+        }
         let mut data = Vec::new();
         let mut indices = Vec::new();
         let mut indptr = vec![0u32];

@@ -35,7 +35,7 @@ use crate::glm::test::{GlmTestInput, Tested, glm_lrt};
 use crate::limma::squeeze_var::{SqueezeVarParams, squeeze_var};
 use crate::numeric::dist::{chisq_sf, f_sf};
 use crate::prelude::*;
-use crate::utils::design::contrast_as_coef;
+use crate::utils::design::{contrast_as_coef, drop_columns};
 
 ////////////
 // Consts //
@@ -301,7 +301,7 @@ pub fn diff_splice<T: EdgeFloat>(
     };
     let weights = input.weights.map(|w| w.subset(&kept_exons, n_samples));
 
-    let design0 = drop_column(&resolved.design, n_samples, n_coef, resolved.coef);
+    let design0 = drop_columns(&resolved.design, n_samples, n_coef, &[resolved.coef]);
     let fit0 = glm_fit(
         &counts_kept,
         n_kept_exons,
@@ -1111,30 +1111,6 @@ fn validate<T: EdgeFloat>(
         }
     }
     Ok(())
-}
-
-/// Drops one column from a row-major matrix.
-///
-/// ### Params
-///
-/// * `matrix` - Row-major values, `n_rows * n_cols`
-/// * `n_rows` - Number of rows
-/// * `n_cols` - Number of columns
-/// * `drop` - Column to remove
-///
-/// ### Returns
-///
-/// A fresh `n_rows * (n_cols - 1)` matrix, row-major.
-fn drop_column(matrix: &[f64], n_rows: usize, n_cols: usize, drop: usize) -> Vec<f64> {
-    let mut out = Vec::with_capacity(n_rows * (n_cols - 1));
-    for row in matrix.chunks_exact(n_cols) {
-        for (col, v) in row.iter().enumerate() {
-            if col != drop {
-                out.push(*v);
-            }
-        }
-    }
-    out
 }
 
 ///////////

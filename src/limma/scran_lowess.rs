@@ -346,15 +346,6 @@ fn weighted_mad(abs_dev: &[f64], ws: &[f64], half_weight: f64, order: &mut Vec<u
 }
 
 /// Range of `y` over the points that still carry robustness weight.
-///
-/// ### Params
-///
-/// * `ys` - Responses
-/// * `rw` - Robustness weights in the same order
-///
-/// ### Returns
-///
-/// `max - min` over the points with non-zero weight, or zero if there are none.
 fn robust_range(ys: &[f64], rw: &[f64]) -> f64 {
     let (lo, hi) = ys
         .iter()

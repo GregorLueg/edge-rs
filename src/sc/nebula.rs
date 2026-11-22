@@ -7,56 +7,32 @@
 //!
 //! ### The three stages of one gene
 //!
-//! 1. Bounded L-BFGS-B on the marginal likelihood
-//!    ([`ptmg_value_and_gradient`](crate::sc::ptmg::ptmg_value_and_gradient))
-//!    over `[beta, sigma, phi]`. Only the variance components survive; the
-//!    fixed effects restart from `log(mean count) - mean log offset`.
+//! 1. The marginal likelihood over `[beta, sigma, phi]`: projected Newton on a
+//!    dense design, bounded L-BFGS-B where the zero-count tables apply. Only the
+//!    variance components survive; the fixed effects restart from
+//!    `log(mean count) - mean log offset`.
 //! 2. A bounded search over the two variance components, with the fixed effects
 //!    profiled out by [`opt_pml`](crate::sc::pml::opt_pml) at every evaluation.
 //!    NEBULA-HL always runs it; NEBULA-LN runs it, a one-dimensional
-//!    restriction of it, or neither, depending on how well the large-sample
-//!    approximation is expected to hold.
+//!    restriction of it, or neither.
 //! 3. A final [`opt_pml`](crate::sc::pml::opt_pml) at the chosen variances; its
 //!    observed information inverts to the covariance of `beta`.
 //!
 //! ### Deviations from the R package
 //!
-//! nebula drives stage one with `nloptr`'s `NLOPT_LD_LBFGS` (`ftol_abs =
-//! 1e-6`), which is not in this crate. Stage two over both variance components
-//! is `nloptr::bobyqa` here as there: [`crate::numeric::bobyqa`] is NLopt
-//! 2.7.1's BOBYQA, set-up included, and retraces it point for point. The
-//! two evaluations nloptr itself makes at the start before NLopt runs are
-//! skipped. The objective is not bit-identical to nebula's (the inner fit sums
-//! in a different order), and it jitters at the `1e-6` level because
-//! [`opt_pml`](crate::sc::pml::opt_pml) stops on an absolute improvement of
-//! `eps = 1e-6`, so the two searches part company once a step lands on a
-//! different side of a jitter. They then stop within BOBYQA's own resolution
-//! of each other.
+//! - Stage two over both components is NLopt 2.7.1's BOBYQA
+//!   ([`crate::numeric::bobyqa`]), as `nloptr::bobyqa` is. The objective jitters
+//!   at the `1e-6` level ([`opt_pml`](crate::sc::pml::opt_pml) stops on an
+//!   absolute `eps`), so the two searches can part company but stop within
+//!   BOBYQA's resolution of each other.
+//! - A non-finite objective fails the gene instead of poisoning NLopt's model.
+//! - The one-component LN refit (nebula's `nlminb`) is a bounded Nelder-Mead
+//!   plus a quadratic least-squares polish, which averages the jitter out. A
+//!   simplex collapsed on a bound is restarted once.
+//! - Stage one restarts off a spurious minimum on the lower bound of `sigma`.
+//! - Only `model = "NBGMM"` is implemented.
 //!
-//! A non-finite objective ends the BOBYQA pass. nebula stops there only on its
-//! `second < -1` error (raised at a higher Laplace order, which this port
-//! retries at order one, as nebula does) and otherwise hands the value to
-//! NLopt, whose quadratic model it then poisons. At order one the only source
-//! is a non-finite penalised likelihood, so this port reports the gene as
-//! failed instead of continuing on a broken model.
-//!
-//! The one-component restriction NEBULA-LN refits (nebula's `nlminb`) runs a
-//! bounded Nelder-Mead followed by a local quadratic least-squares polish. A
-//! stencil wide compared with the noise averages the jitter out, which a
-//! simplex chasing individual values cannot. Clamping a simplex into the box
-//! can collapse it onto a bound it cannot leave, so a simplex that ends on a
-//! bound the start was inside is restarted once from between the two, and the
-//! better minimiser kept.
-//!
-//! Stage one has an exact gradient and no jitter, so it needs no polish. It does
-//! need restarting: its objective can have a spurious minimum on the lower bound
-//! of `sigma` that nebula's own L-BFGS falls into too, so it is restarted off
-//! that bound and the lowest objective kept. See `UPSTREAM_DEVIATIONS.md` B5.
-//!
-//! Only `model = "NBGMM"` is implemented. `PMM` needs Poisson-gamma kernels this
-//! crate lacks; `NBLMM` needs the log-normal outer objective, which has no
-//! golden to validate against. For the Hessian and `_opt_pml_nb` differences
-//! from edgePython, see `UPSTREAM_DEVIATIONS.md` A20 and A21.
+//! Details in `UPSTREAM_DEVIATIONS.md` A20, A21 and B5.
 //!
 //! ### References
 //!
@@ -70,7 +46,8 @@ use crate::numeric::lbfgsb::{LbfgsbParams, minimise};
 use crate::numeric::optimise::{NelderMeadParams, NelderMeadStepper};
 use crate::prelude::*;
 use crate::sc::pml::{
-    CONV_SINGULAR, CONV_SUCCESS, PmlData, PmlParams, PmlVariance, check_convergence, opt_pml_tabled,
+    CONV_SINGULAR, CONV_SUCCESS, MAX_UNROLLED_WIDTH, PmlData, PmlParams, PmlResult, PmlVariance,
+    check_convergence, gamma_prior, opt_pml_tabled,
 };
 use crate::sc::ptmg::{
     GeneData, PtmgScratch, cell_level_columns, centre_design, cumsum_y, design_cv, offset_summary,
@@ -78,6 +55,7 @@ use crate::sc::ptmg::{
 };
 use crate::sc::test::packed_len;
 use crate::sc::zeros::ZeroCells;
+use crate::utils::linalg::{back_substitute_transpose, cholesky_lower, forward_substitute};
 
 ////////////
 // Consts //
@@ -108,9 +86,9 @@ const HIGH_ORDER: u32 = 3;
 /// Relative slack allowed when deciding a fitted value sits on its lower bound.
 ///
 /// The optimiser can stop a few parts in `1e6` above the constraint, inside its
-/// own tolerance. Strict equality missed two of 118 genes R reports as pinned on
-/// the small fixture. The smallest genuinely fitted subject variance on any
-/// fixture is four times the bound; this admits values within one part in `1e4`.
+/// own tolerance, so strict equality misses genes R reports as pinned. Genuinely
+/// fitted subject variances sit far above the bound; this admits values within
+/// one part in `1e4`.
 const BOUND_SLACK: f64 = 1.0 + 1e-4;
 
 /// Value of `kappa_obs` below which NEBULA-LN always refits the subject-level
@@ -139,14 +117,14 @@ const POLISH_FLOOR: [f64; 2] = [1e-5, 1e-4];
 /// step means the model is wrong and the incumbent is kept.
 const POLISH_MAX_STEP: f64 = 2.0;
 
-/// Relative objective tolerance for the stage-one quasi-Newton.
+/// Absolute objective tolerance for stage one, nebula's `eps`, which it hands
+/// nlopt's L-BFGS as `ftol_abs`.
 ///
-/// nebula stops nlopt's L-BFGS on an absolute change of `eps = 1e-6`, about
-/// `1e-10` relative on the log-likelihoods seen here. [`minimise`] tests a
-/// relative change, so passing `eps` through would stop four orders too early,
-/// and NEBULA-LN carries the cell-level overdispersion out of this stage
-/// untouched. A fixed tight value converges past nebula in every case.
-const STAGE_ONE_FTOL: f64 = 1e-13;
+/// The Newton search tests it as is. [`minimise`] tests a change relative to
+/// the objective, so the quasi-Newton is given this over the starting
+/// objective's magnitude; passing `eps` straight through would stop orders of
+/// magnitude early on log-likelihoods in the thousands.
+const STAGE_ONE_FTOL_ABS: f64 = 1e-6;
 
 /// Projected gradient tolerance for the stage-one quasi-Newton.
 const STAGE_ONE_PGTOL: f64 = 1e-7;
@@ -629,8 +607,7 @@ where
         .map(|(j, _)| j)
         .collect();
 
-    let sparse = counts;
-    let totals = cumsum_y(sparse, &fid)?;
+    let totals = cumsum_y(counts, &fid)?;
 
     let cells_per_subject = n_cells as f64 / n_subjects as f64;
     let method = if cells_per_subject < MIN_CELLS_PER_SUBJECT_LN {
@@ -645,7 +622,7 @@ where
         .filter(|&g| {
             let subject_totals = &totals[g * n_subjects..(g + 1) * n_subjects];
             let total: f64 = subject_totals.iter().sum();
-            let (indices, _) = sparse.outer(g);
+            let (indices, _) = counts.outer(g);
             let pooled = total / (n_cells as f64) > params.cpc && indices.len() >= params.mincp;
             pooled
                 && (params.min_subjects == 0
@@ -679,7 +656,7 @@ where
         zeros: zeros.as_ref(),
     };
 
-    let outcomes = fit(&shared, sparse, &totals, &kept)?;
+    let outcomes = fit(&shared, counts, &totals, &kept)?;
 
     Ok(assemble(
         outcomes,
@@ -951,31 +928,21 @@ pub(crate) fn finish_gene(
     let mut gamma = plan.gamma;
     let mut convergence = plan.convergence;
 
-    match (plan.refit, refit) {
-        (Refit::Both, Some(found)) => match found {
+    if let (Refit::Both | Refit::SubjectOnly, Some(found)) = (plan.refit, refit) {
+        convergence = match found {
             Some((v, failed)) => {
                 sigma = v[0];
-                gamma = v[1];
-                convergence = if failed {
+                if plan.refit == Refit::Both {
+                    gamma = v[1];
+                }
+                if failed {
                     CONV_OUTER_FAILED
                 } else {
                     CONV_SUCCESS
-                };
+                }
             }
-            None => convergence = CONV_OUTER_FAILED,
-        },
-        (Refit::SubjectOnly, Some(found)) => match found {
-            Some((v, failed)) => {
-                sigma = v[0];
-                convergence = if failed {
-                    CONV_OUTER_FAILED
-                } else {
-                    CONV_SUCCESS
-                };
-            }
-            None => convergence = CONV_OUTER_FAILED,
-        },
-        _ => {}
+            None => CONV_OUTER_FAILED,
+        };
     }
 
     // Stage three: the final penalised fit, always at the leading Laplace order.
@@ -1072,9 +1039,10 @@ fn fit_gene(
 /// Minimises the marginal negative log-likelihood over `[beta, sigma, phi]`.
 ///
 /// nebula's stage one, an L-BFGS on an exact gradient. Here a dense design
-/// takes a projected Newton step on the exact Hessian instead, which costs
-/// about one gradient evaluation and converges in ten or so where the
-/// quasi-Newton takes 35 to 120 evaluations. A design with zero-count tables
+/// takes a projected Newton step on the exact Hessian instead. On a narrow
+/// design that costs about one gradient evaluation and converges in far fewer
+/// steps than the quasi-Newton; on a wide one the Hessian is a GEMM and Newton
+/// stays level with the quasi-Newton. A design with zero-count tables
 /// keeps the quasi-Newton: its gradient walks only the positive counts, the
 /// Hessian every cell. A Newton search that has not converged falls back to the
 /// quasi-Newton. `sigma` runs to its lower bound on most genes; see the
@@ -1178,7 +1146,7 @@ fn descend_marginal(
     }
 
     let params = LbfgsbParams {
-        ftol: STAGE_ONE_FTOL,
+        ftol: STAGE_ONE_FTOL_ABS / f0.abs().max(1.0),
         pgtol: STAGE_ONE_PGTOL,
         max_iter: STAGE_ONE_MAX_ITER,
         max_line_search: STAGE_ONE_MAX_LINE_SEARCH,
@@ -1240,7 +1208,7 @@ fn bound_restart(best: &[f64], start: &[f64], lower: &[f64], upper: &[f64]) -> O
 /// Levenberg-style until it factors, then an Armijo backtracking along the
 /// projected path. Stops when the projected gradient is under
 /// [`STAGE_ONE_PGTOL`] or a step improves the objective by less than
-/// [`STAGE_ONE_FTOL`] relative, the quasi-Newton's own tests.
+/// [`STAGE_ONE_FTOL_ABS`], nebula's stopping rule.
 ///
 /// ### Params
 ///
@@ -1269,6 +1237,10 @@ fn newton_marginal(
     if !finite(f, &g, &h) {
         return None;
     }
+    // Up to `MAX_UNROLLED_WIDTH` a Hessian costs about one gradient, so trial
+    // points take it in case they are accepted. Wider, it costs
+    // `O(n_cells * n_coef^2)` and trials need only the value.
+    let speculative = gene.n_coef <= MAX_UNROLLED_WIDTH;
     for _ in 0..STAGE_ONE_NEWTON_MAX_ITER {
         let projected = (0..n)
             .map(|i| ((x[i] - g[i]).clamp(lower[i], upper[i]) - x[i]).abs())
@@ -1318,19 +1290,36 @@ fn newton_marginal(
                 .map(|i| (x[i] + alpha * d[i]).clamp(lower[i], upper[i]))
                 .collect();
             let decrease: f64 = (0..n).map(|i| g[i] * (xt[i] - x[i])).sum();
-            let (ft, gt, ht) = ptmg_value_gradient_hessian_with(gene, &xt, scratch);
-            if finite(ft, &gt, &ht) && ft <= f + STAGE_ONE_ARMIJO * decrease {
-                accepted = Some((xt, ft, gt, ht));
+            let trial = if speculative {
+                let (ft, gt, ht) = ptmg_value_gradient_hessian_with(gene, &xt, scratch);
+                finite(ft, &gt, &ht).then_some((ft, Some((gt, ht))))
+            } else {
+                let ft = ptmg_value_and_gradient_with(gene, &xt, scratch).0;
+                ft.is_finite().then_some((ft, None))
+            };
+            if let Some((ft, derivatives)) = trial
+                && ft <= f + STAGE_ONE_ARMIJO * decrease
+            {
+                accepted = Some((xt, ft, derivatives));
                 break;
             }
             alpha *= 0.5;
         }
-        let (xt, ft, gt, ht) = accepted?;
-        let done = (f - ft) <= STAGE_ONE_FTOL * f.abs();
-        (x, f, g, h) = (xt, ft, gt, ht);
-        if done {
-            return Some((x, f));
+        let (xt, ft, derivatives) = accepted?;
+        if (f - ft) <= STAGE_ONE_FTOL_ABS {
+            return Some((xt, ft));
         }
+        let (ft, gt, ht) = match derivatives {
+            Some((gt, ht)) => (ft, gt, ht),
+            None => {
+                let (ft, gt, ht) = ptmg_value_gradient_hessian_with(gene, &xt, scratch);
+                if !finite(ft, &gt, &ht) {
+                    return None;
+                }
+                (ft, gt, ht)
+            }
+        };
+        (x, f, g, h) = (xt, ft, gt, ht);
     }
     None
 }
@@ -1354,6 +1343,17 @@ pub(crate) struct InnerFit {
     pub(crate) log_det: f64,
     /// Higher-order Laplace correction, zero at order one.
     pub(crate) second_order: f64,
+}
+
+impl From<&PmlResult> for InnerFit {
+    fn from(fit: &PmlResult) -> Self {
+        Self {
+            log_likelihood: fit.log_likelihood,
+            log_likelihood_prev: fit.log_likelihood_prev,
+            log_det: fit.log_det,
+            second_order: fit.second_order,
+        }
+    }
 }
 
 /// nebula's `pql_ll`: the marginal likelihood with the fixed effects and the
@@ -1454,9 +1454,7 @@ impl VarianceObjective<'_> {
         if fit.second_order < -1.0 {
             return f64::INFINITY;
         }
-        let exps = subject.exp();
-        let alpha = 1.0 / (exps - 1.0);
-        let lambda = 1.0 / (exps.sqrt() * (exps - 1.0));
+        let (alpha, lambda) = gamma_prior(subject.exp());
 
         let base = if fit.log_likelihood.is_nan() {
             fit.log_likelihood_prev
@@ -1502,13 +1500,7 @@ impl VarianceObjective<'_> {
             Ok(f) => f,
             Err(_) => return f64::INFINITY,
         };
-        let inner = InnerFit {
-            log_likelihood: fit.log_likelihood,
-            log_likelihood_prev: fit.log_likelihood_prev,
-            log_det: fit.log_det,
-            second_order: fit.second_order,
-        };
-        self.assemble(subject, cell, &inner, self.tail(cell))
+        self.assemble(subject, cell, &InnerFit::from(&fit), self.tail(cell))
     }
 }
 
@@ -1741,14 +1733,6 @@ impl StageTwoSearch {
     }
 
     /// Clamps a point into the box.
-    ///
-    /// ### Params
-    ///
-    /// * `x` - The point
-    ///
-    /// ### Returns
-    ///
-    /// The clamped copy.
     fn clamped(&self, x: &[f64]) -> Vec<f64> {
         (0..x.len())
             .map(|j| x[j].clamp(self.lower[j], self.upper[j]))
@@ -1792,10 +1776,6 @@ impl StageTwoSearch {
     }
 
     /// Ends a pass, retrying at the leading order where nebula would.
-    ///
-    /// ### Params
-    ///
-    /// * `found` - What the pass produced
     fn end_pass(&mut self, found: Option<Vec<f64>>) {
         if (found.is_some() && !self.invalid) || self.order == 1 {
             self.found = found;
@@ -2082,7 +2062,9 @@ pub(crate) fn variance_objective<'a>(
 // Linear algebra //
 ////////////////////
 
-/// Cholesky factor of a symmetric positive definite matrix.
+/// Lower Cholesky factor of a symmetric positive definite matrix.
+///
+/// Stricter than [`cholesky_lower`]: an infinite pivot is rejected too.
 ///
 /// ### Params
 ///
@@ -2091,62 +2073,25 @@ pub(crate) fn variance_objective<'a>(
 ///
 /// ### Returns
 ///
-/// The lower triangular factor, row-major, or `None` if `a` is not positive
-/// definite.
+/// The factor, row-major, or `None` if `a` is not positive definite.
 fn cholesky_factor(a: &[f64], n: usize) -> Option<Vec<f64>> {
-    let mut l = vec![0.0; n * n];
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[i * n + j];
-            for k in 0..j {
-                sum -= l[i * n + k] * l[j * n + k];
-            }
-            if i == j {
-                if !(sum.is_finite() && sum > 0.0) {
-                    return None;
-                }
-                l[i * n + j] = sum.sqrt();
-            } else {
-                l[i * n + j] = sum / l[j * n + j];
-            }
-        }
-    }
-    Some(l)
+    let mut l = a.to_vec();
+    let finite = cholesky_lower(&mut l, n, n) && (0..n).all(|i| l[i * n + i].is_finite());
+    finite.then_some(l)
+}
+
+/// Solves `L L' x = b` against a factor from [`cholesky_factor`], in place.
+fn solve_factored(l: &[f64], n: usize, x: &mut [f64]) -> bool {
+    forward_substitute(l, n, n, x);
+    back_substitute_transpose(l, n, n, x);
+    x.iter().all(|v| v.is_finite())
 }
 
 /// Solves `A x = b` for symmetric positive definite `A`.
-///
-/// ### Params
-///
-/// * `a` - Row-major `n * n` matrix
-/// * `n` - Side length
-/// * `b` - Right-hand side, length `n`
-///
-/// ### Returns
-///
-/// The solution, or `None` if `a` is not positive definite.
 fn cholesky_solve(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
     let l = cholesky_factor(a, n)?;
     let mut x = b.to_vec();
-    for i in 0..n {
-        let mut sum = x[i];
-        for k in 0..i {
-            sum -= l[i * n + k] * x[k];
-        }
-        x[i] = sum / l[i * n + i];
-    }
-    for i in (0..n).rev() {
-        let mut sum = x[i];
-        for k in (i + 1)..n {
-            sum -= l[k * n + i] * x[k];
-        }
-        x[i] = sum / l[i * n + i];
-    }
-    if x.iter().all(|v| v.is_finite()) {
-        Some(x)
-    } else {
-        None
-    }
+    solve_factored(&l, n, &mut x).then_some(x)
 }
 
 /// Inverse of a symmetric positive definite matrix, nebula's `Rfast::spdinv`.
@@ -2160,12 +2105,15 @@ fn cholesky_solve(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
 ///
 /// The inverse, row-major, or `None` if `a` is not positive definite.
 fn cholesky_inverse(a: &[f64], n: usize) -> Option<Vec<f64>> {
+    let l = cholesky_factor(a, n)?;
     let mut inverse = vec![0.0; n * n];
-    let mut unit = vec![0.0; n];
+    let mut column = vec![0.0; n];
     for j in 0..n {
-        unit.iter_mut().for_each(|v| *v = 0.0);
-        unit[j] = 1.0;
-        let column = cholesky_solve(a, n, &unit)?;
+        column.fill(0.0);
+        column[j] = 1.0;
+        if !solve_factored(&l, n, &mut column) {
+            return None;
+        }
         for i in 0..n {
             inverse[i * n + j] = column[i];
         }
@@ -2206,16 +2154,6 @@ fn subject_boundaries(subject_id: &[usize]) -> Result<Vec<usize>, EdgeErrors> {
 }
 
 /// Converts a generic slice to `f64`, rejecting anything that will not fit.
-///
-/// ### Params
-///
-/// * `name` - Name used in the error message
-/// * `values` - The slice to convert
-///
-/// ### Returns
-///
-/// The converted values, or [`EdgeErrors::InvalidArgument`] on a value that does
-/// not convert.
 fn to_f64<T: EdgeFloat>(name: &str, values: &[T]) -> Result<Vec<f64>, EdgeErrors> {
     values
         .iter()
@@ -3815,7 +3753,9 @@ mod tests {
             &lower,
             &upper,
             Some(LbfgsbParams {
-                ftol: STAGE_ONE_FTOL,
+                // Converged well past stage one's own stop, so it is the optimum
+                // Newton is held to.
+                ftol: 1e-14,
                 pgtol: STAGE_ONE_PGTOL,
                 max_iter: STAGE_ONE_MAX_ITER,
                 max_line_search: STAGE_ONE_MAX_LINE_SEARCH,
@@ -3831,7 +3771,7 @@ mod tests {
         // From its own optimum it gains no more than its stopping tolerance.
         let (x2, f2) =
             newton_marginal(&gene, &mut scratch, &x, &lower, &upper).expect("already converged");
-        assert!(f2 <= f && f - f2 <= STAGE_ONE_FTOL * f.abs());
+        assert!(f2 <= f && f - f2 <= STAGE_ONE_FTOL_ABS);
         for (a, b) in x2.iter().zip(&x) {
             assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
         }

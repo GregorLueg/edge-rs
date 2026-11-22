@@ -2,8 +2,8 @@
 #
 # Reference fixtures for the end-to-end parity tests in tests/e2e_*.rs.
 #
-# Generated against R 4.5.1 with edgeR 4.8.2, limma 3.66.0, statmod 1.5.2 and
-# nebula 1.5.8. CI never runs this: the outputs are committed and the Rust side
+# Generated against R 4.6.1 with edgeR 4.10.7, limma 3.68.5, statmod 1.5.2 and
+# nebula 1.5.9. CI never runs this: the outputs are committed and the Rust side
 # reads them. Run it by hand after an upstream bump and inspect the diff.
 #
 #   Rscript tests/r/generate_fixtures.R
@@ -425,10 +425,12 @@ run_core <- function(tag, counts, des, des_grp, grp, coef, pair) {
     cbind(
       default = aveLogCPM(cf, lib.size = eff_lib),
       disp02 = aveLogCPM(cf, lib.size = eff_lib, dispersion = 0.2),
-      with_offset = aveLogCPM(cf, offset = off)
+      with_offset = aveLogCPM(cf, offset = off),
+      # The same model as a matrix. edgeR 4.8.2 corrupted gene 1 here; 4.10.7 does not.
+      with_matrix_offset = aveLogCPM(cf, offset = matrix(off, nrow(cf), ncol(cf), byrow = TRUE))
     ),
     paste0(tag, "_avelogcpm.csv"),
-    c("default", "disp02", "with_offset")
+    c("default", "disp02", "with_offset", "with_matrix_offset")
   )
 
   # -- dispersions.
@@ -1119,6 +1121,12 @@ SC_EDGE <- list(
   # wider than one carries a cell-level column.
   list(tag = "sc_high", seed = 20260927, sizes = rep(50, 10), subj = 1,
        cell = 1, lo = 10, hi = 13, off = 5000, plant = FALSE, method = "HL"),
+  # Thirteen columns, past the eight the CPU kernels keep on the stack, all
+  # cell-level ones continuous so nothing is tabled: stage one takes Newton on
+  # the GEMM Hessian and the penalised fits sum their curvature as a Gram.
+  # Its expected values were generated under R 4.6.1 with nebula 1.5.8.
+  list(tag = "sc_xwide", seed = 20261113, sizes = rep(40, 30), subj = 2,
+       cell = 10, lo = 0, hi = 4, off = 1000, plant = FALSE, method = "LN"),
   # Categorical cell types, so the CPU kernels sum the zero counts from tables.
   # LN over uneven subjects, offsets spread over two orders of magnitude.
   list(tag = "sc_cat_ln", seed = 20261007,

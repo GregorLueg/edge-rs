@@ -123,13 +123,12 @@ pub fn median(x: &[f64]) -> f64 {
     if x.is_empty() {
         return f64::NAN;
     }
-    let mut sorted = x.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let n = sorted.len();
+    let n = x.len();
     if n.is_multiple_of(2) {
-        0.5 * (sorted[n / 2 - 1] + sorted[n / 2])
+        let (a, b) = order_pair(x, n / 2 - 1);
+        0.5 * (a + b)
     } else {
-        sorted[n / 2]
+        order_pair(x, n / 2).0
     }
 }
 
@@ -144,7 +143,7 @@ pub fn median(x: &[f64]) -> f64 {
 ///
 /// ### Params
 ///
-/// * `x` - Sample values. Copied and sorted with [`f64::total_cmp`], so a NaN
+/// * `x` - Sample values, ordered by [`f64::total_cmp`], so a NaN
 ///   sorts to the top and is returned for probabilities near 1.
 /// * `prob` - Probability in `[0, 1]`.
 ///
@@ -164,17 +163,32 @@ pub fn quantile_type7(x: &[f64], prob: f64) -> Result<f64, EdgeErrors> {
         )));
     }
 
-    let mut sorted = x.to_vec();
-    sorted.sort_unstable_by(f64::total_cmp);
-
-    let n = sorted.len();
+    let n = x.len();
     let h = (n - 1) as f64 * prob;
     let lo = h.floor() as usize;
     let frac = h - lo as f64;
-    // `lo` is already n - 1 when prob is 1, and then `frac` is 0, so the upper
-    // neighbour is only there to keep the index in bounds.
-    let hi = (lo + 1).min(n - 1);
-    Ok((1.0 - frac) * sorted[lo] + frac * sorted[hi])
+    let (lo_value, hi_value) = order_pair(x, lo);
+    Ok((1.0 - frac) * lo_value + frac * hi_value)
+}
+
+/// Order statistics `k` and `k + 1` (capped at the last) under [`f64::total_cmp`].
+///
+/// Selection rather than a full sort, so O(n). Under a total order the values
+/// are exactly those a sort would put at `k` and `k + 1`.
+///
+/// ### Params
+///
+/// * `x` - Values, non-empty; copied
+/// * `k` - Lower rank, below `x.len()`
+///
+/// ### Returns
+///
+/// The two order statistics.
+fn order_pair(x: &[f64], k: usize) -> (f64, f64) {
+    let mut v = x.to_vec();
+    let (_, &mut lo, upper) = v.select_nth_unstable_by(k, f64::total_cmp);
+    let hi = upper.iter().copied().min_by(f64::total_cmp).unwrap_or(lo);
+    (lo, hi)
 }
 
 ///////////////////

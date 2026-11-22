@@ -37,6 +37,7 @@
 //! right and rejects any whose residual norm has collapsed (LINPACK `dqrdc2`,
 //! as in R's `lm.fit`). Rejected columns report `NaN` for their coefficient and
 //! unscaled standard deviation, as R reports `NA`.
+//!
 //! ### References
 //!
 //! Smyth, Statistical Applications in Genetics and Molecular Biology 3(1), 2004
@@ -47,17 +48,12 @@ use faer::{Accum, MatMut, MatRef, Par};
 use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
+use crate::limma::RANK_TOL;
 use crate::utils::design::non_estimable;
 use crate::utils::linalg::{
     cholesky_lower, cross_inverse, forward_substitute, invert_upper_triangular,
 };
 use crate::utils::recycled::{Recycled, RecycledRow};
-
-/// Relative tolerance for declaring a design column linearly dependent.
-/// R's `lm.fit` (LINPACK `dqrdc2`) cycles a column to the back when its
-/// remaining norm falls below `1e-7` times its original norm. limma inherits the
-/// threshold through `lm.fit`.
-const RANK_TOL: f64 = 1e-7;
 
 /// Weights at or below this drop the observation rather than scaling it.
 ///
@@ -261,7 +257,7 @@ impl Scratch {
 ///
 /// The rank achieved, which is `est.len()`.
 #[allow(clippy::too_many_arguments)]
-fn rank_revealing_qr(
+pub(crate) fn rank_revealing_qr(
     a: &mut [f64],
     mut z: Option<&mut [f64]>,
     hh: &mut [f64],
@@ -394,9 +390,6 @@ fn fit_gene(
         chol,
     } = scratch;
 
-    // -------------------------- //
-    // which observations survive //
-    // -------------------------- //
     obs.clear();
     for (sample, &value) in y_row.iter().enumerate() {
         let usable = value.is_finite()
@@ -422,9 +415,6 @@ fn fit_gene(
         return;
     }
 
-    // --------------------------------------------------------------------- //
-    // whiten: scale rows by sqrt(w), then apply the inverse Cholesky factor //
-    // --------------------------------------------------------------------- //
     for (i, &sample) in obs.iter().enumerate() {
         let scale = match weights {
             Some(w) => w.get(sample).sqrt(),
@@ -469,9 +459,6 @@ fn fit_gene(
         }
     }
 
-    // ------------------------------------------------------------- //
-    // rank-revealing Householder QR, columns accepted left to right //
-    // ------------------------------------------------------------- //
     let rank = rank_revealing_qr(
         a,
         Some(z.as_mut_slice()),
@@ -486,9 +473,6 @@ fn fit_gene(
         pivot,
     );
 
-    // -------------- //
-    // residual scale //
-    // -------------- //
     let df = m - rank;
     let rss: f64 = z[rank..m].iter().map(|v| v * v).sum();
     *out.df = df as f64;
@@ -498,9 +482,6 @@ fn fit_gene(
         0.0
     };
 
-    // ------------------------------------------------------------------- //
-    // coefficients: back substitution against the leading rank block of R //
-    // ------------------------------------------------------------------- //
     for i in (0..rank).rev() {
         let mut sum = z[i];
         for t in (i + 1)..rank {
@@ -514,10 +495,6 @@ fn fit_gene(
         out.coef[j] = beta[t];
     }
 
-    // ----------------------------------------------- //
-    // unscaled standard deviations: row norms of R^-1 //
-    // ----------------------------------------------- //
-    //
     // diag((R'R)^-1) = diag(R^-1 R^-T), so entry i is the sum of squares of row
     // i of R^-1. Inverting a tiny triangular matrix beats a solve per coefficient.
     invert_upper_triangular(r, r_inv, rank, n_coef);
@@ -528,9 +505,6 @@ fn fit_gene(
         out.stdev[j] = row.sqrt();
     }
 
-    // ---------------------------------------------------- //
-    // fitted values on the original scale, at every sample //
-    // ---------------------------------------------------- //
     for (sample, slot) in out.fitted.iter_mut().enumerate() {
         let row = &design[sample * n_coef..(sample + 1) * n_coef];
         let mut acc = 0.0;
@@ -914,9 +888,6 @@ fn lm_fit_impl(
         w.validate(n_genes, n_samples)?;
     }
 
-    // ------------------------------------------------- //
-    // block correlation set-up, done once for all genes //
-    // ------------------------------------------------- //
     let gls = match block {
         None => None,
         Some(b) => {
@@ -1762,7 +1733,7 @@ mod tests {
         assert_close(&fit.coefficients, &B_COEF);
         assert_close(&fit.sigma, &B_SIGMA);
         // Per-sample weights are shared by every gene, so is the design metric.
-        for row in fit.stdev_unscaled.chunks_exact(2) {
+        for row in fit.stdev_unscaled.as_chunks::<2>().0.iter() {
             assert_close(row, &B_SDU);
         }
     }
@@ -1870,7 +1841,7 @@ mod tests {
         assert_close(&fit.coefficients, &F_COEF);
         assert_close(&fit.sigma, &F_SIGMA);
         assert_close(&fit.df_residual, &[3.0; 8]);
-        for row in fit.stdev_unscaled.chunks_exact(2) {
+        for row in fit.stdev_unscaled.as_chunks::<2>().0.iter() {
             assert_close(row, &F_SDU);
         }
     }
@@ -1911,7 +1882,7 @@ mod tests {
         .unwrap();
         assert_close(&fit.coefficients, &K_COEF);
         assert_close(&fit.sigma, &K_SIGMA);
-        for row in fit.stdev_unscaled.chunks_exact(2) {
+        for row in fit.stdev_unscaled.as_chunks::<2>().0.iter() {
             assert_close(row, &K_SDU);
         }
     }
@@ -2300,7 +2271,9 @@ mod tests {
     fn test_shared_path_matches_per_gene_path_rank_deficient() {
         // Column 4 is the sum of the two factor columns, so it is aliased.
         let design: Vec<f64> = design_factor_covariate()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|r| [r[0], r[1], r[2], r[3], r[1] + r[2]])
             .collect();
         assert_shared_matches_per_gene(&design, 30, 5, None);

@@ -180,7 +180,7 @@ fn resolve_min_sample_size(
 /// first `rank` columns of `Q`. This checks whether the intercept is already in
 /// the column space and hands a full rank matrix to [`hat_diagonal`]: a rank
 /// deficient one would give a thin `Q` with arbitrary extra columns and inflate
-/// every leverage. See `UPSTREAM_DEVIATIONS.md` A2.
+/// every leverage.
 ///
 /// ### Params
 ///

@@ -21,6 +21,9 @@
 //! * `disp` - [`estimate_disp`], trended and tagwise.
 //! * `glm` - [`glm_fit`] at the trended dispersion, the Levenberg path.
 //! * `ql` - [`glm_ql_fit`] with its own dispersion.
+//! * `qlf` - [`glm_ql_ftest`] on the group coefficient of that fit.
+//! * `norm` - [`calc_norm_factors`], TMM then RLE.
+//! * `exact` - [`exact_test`] between the two groups at the trended dispersion.
 //!
 //! Run with:
 //! ```text
@@ -38,10 +41,14 @@ use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rand_distr::{Distribution, Gamma, LogNormal, Normal, Poisson};
 
+use edge_rs::core::dgelist::DgeList;
 use edge_rs::core::expression::ave_log_cpm;
+use edge_rs::core::normalisation::{NormMethod, calc_norm_factors};
 use edge_rs::dispersion::estimate::estimate_disp;
 use edge_rs::glm::fit::glm_fit;
+use edge_rs::exact::exact_test;
 use edge_rs::glm::ql_fit::glm_ql_fit;
+use edge_rs::glm::test::{GlmTestInput, Tested, glm_ql_ftest};
 use edge_rs::limma::lm_fit::lm_fit;
 use edge_rs::limma::remove_batch_effect::remove_batch_effect;
 use edge_rs::limma::voom::voom_lmfit;
@@ -273,5 +280,42 @@ fn main() {
             glm_ql_fit(&p.counts, g, n, d, N_COEF, None, &offset, None, &alc, None)
                 .expect("glm_ql_fit failed"),
         );
+    });
+
+    let ql_fit = glm_ql_fit(&p.counts, g, n, d, N_COEF, None, &offset, None, &alc, None)
+        .expect("glm_ql_fit failed");
+    let base = ql_fit.as_glm_fit();
+    let summary = ql_fit.ql_summary();
+    let input = GlmTestInput {
+        counts: &p.counts,
+        n_genes: g,
+        n_samples: n,
+        design: d,
+        n_coef: N_COEF,
+        dispersion: &ql_fit.dispersion,
+        offset: &offset,
+        weights: None,
+        log_cpm: Some(&alc),
+    };
+    time("qlf", || {
+        black_box(
+            glm_ql_ftest(&input, &base, &summary, &Tested::Coef(vec![1]), false)
+                .expect("glm_ql_ftest failed"),
+        );
+    });
+
+    time("norm", || {
+        for method in [NormMethod::Tmm, NormMethod::Rle] {
+            black_box(
+                calc_norm_factors(&p.counts, g, n, None, method, None, None)
+                    .expect("calc_norm_factors failed"),
+            );
+        }
+    });
+
+    let group: Vec<usize> = (0..n).map(|s| s % 2).collect();
+    let dge = DgeList::new(p.counts.clone(), g, n, Some(group)).expect("DgeList::new failed");
+    time("exact", || {
+        black_box(exact_test(&dge, (0, 1), Some(&trended), None).expect("exact_test failed"));
     });
 }

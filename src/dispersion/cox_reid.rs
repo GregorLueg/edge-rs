@@ -13,6 +13,7 @@
 use crate::dispersion::apl::apl_at;
 use crate::numeric::optimise::brent_fmin;
 use crate::prelude::*;
+use crate::utils::design::gather_rows;
 
 ////////////
 // Consts //
@@ -33,15 +34,15 @@ const MIN_ROOT: f64 = 1e-10;
 pub struct CoxReidParams {
     /// Search interval for the dispersion itself, not its fourth root.
     pub interval: (f64, f64),
-    /// Tolerance of the Brent search (R's `optimize`), on the fourth root of the
-    /// dispersion. edgeR's default is 1e-5.
+    /// Tolerance of the Brent search (R's `optimize`), on the fourth root of
+    /// the dispersion. edgeR's default is 1e-5.
     pub tol: f64,
     /// Genes whose total count falls below this are excluded.
     pub min_row_sum: f64,
     /// Number of genes to subsample on large experiments.
     ///
-    /// Only applies with at least twice this many genes, as in edgeR. `None` uses
-    /// every gene: slower, more accurate.
+    /// Only applies with at least twice this many genes, as in edgeR. `None`
+    /// uses every gene: slower, more accurate.
     pub subset: Option<usize>,
 }
 
@@ -173,10 +174,7 @@ pub fn common_dispersion_cox_reid<T: EdgeFloat>(
         _ => kept,
     };
 
-    let mut selected = Vec::with_capacity(chosen.len() * n_samples);
-    for &gene in &chosen {
-        selected.extend_from_slice(&counts[gene * n_samples..(gene + 1) * n_samples]);
-    }
+    let selected = gather_rows(counts, n_samples, &chosen);
     let selected_offset = offset.subset(&chosen, n_samples);
     let selected_weights = weights.map(|w| w.subset(&chosen, n_samples));
 

@@ -10,8 +10,9 @@
 //! [`ave_log_cpm`] is called by `estimateDisp` on every analysis. It adds a
 //! library-size-scaled prior count and fits an intercept-only NB GLM with
 //! [`mglm_one_group`] instead of averaging log-CPMs, which keeps it stable for
-//! genes that are zero in most samples. edgeR has a matrix-offset bug here that
-//! this port does not reproduce. See `UPSTREAM_DEVIATIONS.md` B1.
+//! genes that are zero in most samples. edgeR 4.8.2 corrupts the first gene
+//! under a matrix offset (fixed by 4.10.7); this port treats both offset forms
+//! as the same model.
 
 use std::f64::consts::LN_2;
 
@@ -78,14 +79,6 @@ pub(crate) fn check_counts<T: EdgeFloat>(
 }
 
 /// Rejects a prior count that cannot be scaled.
-///
-/// ### Params
-///
-/// * `prior_count` - Prior count before library-size scaling
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] if it is negative or non-finite.
 fn check_prior_count(prior_count: f64) -> Result<(), EdgeErrors> {
     if !prior_count.is_finite() || prior_count < 0.0 {
         return Err(EdgeErrors::InvalidArgument(format!(
@@ -113,26 +106,29 @@ fn check_lib_sizes(lib_sizes: &Recycled<f64>) -> Result<(), EdgeErrors> {
         Recycled::Scalar(v) => std::slice::from_ref(v),
         Recycled::ByGene(v) | Recycled::BySample(v) | Recycled::Full(v) => v,
     };
-    if let Some(bad) = stored.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library sizes must be positive and finite, found {bad}"
-        )));
-    }
-    Ok(())
+    check_positive_finite(stored, "library sizes")
 }
 
-/// Rejects gene lengths that cannot be divided by.
+/// Rejects any entry that is not strictly positive and finite.
 ///
 /// ### Params
 ///
-/// * `lengths` - One length per gene
-/// * `n_genes` - Number of genes
+/// * `values` - Values to check
 /// * `name` - Argument name, for the error message
 ///
 /// ### Returns
 ///
-/// `Ok(())`, or [`EdgeErrors::LengthMismatch`] on the wrong length and
-/// [`EdgeErrors::InvalidArgument`] on a non-positive entry.
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] naming the first bad entry.
+pub(crate) fn check_positive_finite(values: &[f64], name: &str) -> Result<(), EdgeErrors> {
+    match values.iter().find(|v| !v.is_finite() || **v <= 0.0) {
+        Some(bad) => Err(EdgeErrors::InvalidArgument(format!(
+            "{name} must be positive and finite, found {bad}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Rejects gene lengths that cannot be divided by.
 fn check_gene_length(
     lengths: &[f64],
     n_genes: usize,
@@ -145,12 +141,7 @@ fn check_gene_length(
             got: lengths.len(),
         });
     }
-    if let Some(bad) = lengths.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "{name} must be positive and finite, found {bad}"
-        )));
-    }
-    Ok(())
+    check_positive_finite(lengths, name)
 }
 
 /// Rejects a dispersion outside `[0, inf)`.
@@ -259,9 +250,9 @@ pub(crate) fn resolve_lib_sizes<T: EdgeFloat>(
 /// Adds library-size-scaled prior counts to one gene.
 ///
 /// edgeR's `addPriorCount` rule: the prior is scaled by each library size
-/// relative to the mean of *that gene's row*. With per-sample library sizes this
-/// is the usual formula; with a gene-varying offset it is not, and edgeR does
-/// use the row mean.
+/// relative to the mean of *that gene's row*. With per-sample library sizes
+/// this is the usual formula; with a gene-varying offset it is not, and edgeR
+/// does use the row mean.
 ///
 /// ### Params
 ///
@@ -550,8 +541,8 @@ pub fn tpm<T: EdgeFloat>(
 ///
 /// ### Returns
 ///
-/// One log2-CPM per gene, or [`EdgeErrors`] if a shape disagrees, a library size
-/// is not positive, or a dispersion is negative.
+/// One log2-CPM per gene, or [`EdgeErrors`] if a shape disagrees, a library
+/// size is not positive, or a dispersion is negative.
 pub fn ave_log_cpm<T: EdgeFloat>(
     counts: &[T],
     n_genes: usize,
@@ -1104,7 +1095,7 @@ mod tests {
     /// edgeR 4.8.2 does not: `aveLogCPM(y, offset = matrix(log(ls), nrow(y),
     /// ncol(y), byrow = TRUE), dispersion = 0.1)` returns 24.62 for the first
     /// gene against 4.675 from `offset = log(ls)`. The reference here is the
-    /// vector-offset call. See `UPSTREAM_DEVIATIONS.md` B1.
+    /// vector-offset call. Fixed in edgeR 4.10.7.
     #[test]
     fn test_ave_log_cpm_with_a_constant_full_offset_matches_the_per_sample_form() {
         let dispersion = Recycled::scalar(0.1);

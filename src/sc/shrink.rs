@@ -252,14 +252,6 @@ fn unshrunk(phi_raw: Vec<f64>, df_residual: f64, dispersion: &[f64]) -> ShrinkRe
 }
 
 /// Median of a slice, ignoring non-finite entries.
-///
-/// ### Params
-///
-/// * `values` - Values to reduce
-///
-/// ### Returns
-///
-/// The median, or `NaN` when nothing finite is present.
 fn median(values: &[f64]) -> f64 {
     let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
     numeric_median(&finite)

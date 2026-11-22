@@ -47,8 +47,8 @@ pub(crate) const PARALLEL_WORK_THRESHOLD: usize = 1 << 16;
 ///
 /// Guards three comparisons: a window of coincident points (weighted mean), a
 /// local regression with no spread in `x` (weighted mean of `y`), and the
-/// residual scale below which the robustness loop stops early. limma uses `1e-7`
-/// for all three; the fits only agree to the last digit if this matches.
+/// residual scale below which the robustness loop stops early. limma uses
+/// `1e-7` for all three; the fits only agree to the last digit if this matches.
 const THRESHOLD: f64 = 1e-7;
 
 /// Fraction of the covariate range used as the lowess interpolation cell width,
@@ -656,29 +656,31 @@ fn clowess(x: &[f64], y: &[f64], f: f64, n_steps: usize, delta: f64) -> Vec<f64>
     let mut res = vec![0.0; n];
     let mut work = vec![0.0; n];
 
+    // The anchors and their windows depend on `x` and `delta` only, never on
+    // the fit, so they are found once and the local fits fan out per pass.
+    let anchors = clowess_anchors(x, ns, delta);
+    let parallel = anchors.len() * ns >= PARALLEL_WORK_THRESHOLD;
+    let mut fits = vec![None; anchors.len()];
+
     let mut iter = 1;
     loop {
-        let mut nleft = 0;
-        let mut nright = ns - 1;
+        let fit_at = |work: &mut Vec<f64>, a: &Anchor| {
+            lowest(x, y, x[a.i], a.nleft, a.nright, work, iter > 1, &rw)
+        };
+        if parallel {
+            fits.par_iter_mut()
+                .zip(anchors.par_iter())
+                .for_each_init(|| vec![0.0; n], |work, (out, a)| *out = fit_at(work, a));
+        } else {
+            for (out, a) in fits.iter_mut().zip(anchors.iter()) {
+                *out = fit_at(&mut work, a);
+            }
+        }
+
         let mut last: Option<usize> = None;
-        let mut i = 0;
-
-        loop {
-            while nright < n - 1 {
-                let d1 = x[i] - x[nleft];
-                let d2 = x[nright + 1] - x[i];
-                if d1 <= d2 {
-                    break;
-                }
-                nleft += 1;
-                nright += 1;
-            }
-
-            match lowest(x, y, x[i], nleft, nright, &mut work, iter > 1, &rw) {
-                Some(v) => ys[i] = v,
-                None => ys[i] = y[i],
-            }
-
+        for (a, fit) in anchors.iter().zip(fits.iter()) {
+            let i = a.i;
+            ys[i] = fit.unwrap_or(y[i]);
             if let Some(prev) = last
                 && prev + 1 < i
             {
@@ -688,25 +690,10 @@ fn clowess(x: &[f64], y: &[f64], f: f64, n_steps: usize, delta: f64) -> Vec<f64>
                     ys[j] = alpha * ys[i] + (1.0 - alpha) * ys[prev];
                 }
             }
-
-            let mut last_i = i;
-            let cut = x[last_i] + delta;
-            i = last_i + 1;
-            while i < n {
-                if x[i] > cut {
-                    break;
-                }
-                if x[i] == x[last_i] {
-                    ys[i] = ys[last_i];
-                    last_i = i;
-                }
-                i += 1;
+            for j in i + 1..=a.last {
+                ys[j] = ys[i];
             }
-            i = (last_i + 1).max(i - 1);
-            last = Some(last_i);
-            if last_i >= n - 1 {
-                break;
-            }
+            last = Some(a.last);
         }
 
         for j in 0..n {
@@ -746,6 +733,73 @@ fn clowess(x: &[f64], y: &[f64], f: f64, n_steps: usize, delta: f64) -> Vec<f64>
         iter += 1;
     }
     ys
+}
+
+/// One fitted point of [`clowess`] and its window.
+struct Anchor {
+    /// Index fitted at.
+    i: usize,
+    /// First index of the window.
+    nleft: usize,
+    /// Nominal last index of the window.
+    nright: usize,
+    /// Last index of the run of ties at `x[i]`, which copy its fit.
+    last: usize,
+}
+
+/// The points [`clowess`] fits at, walking the window exactly as the C does.
+///
+/// ### Params
+///
+/// * `x` - Covariate, sorted ascending
+/// * `ns` - Window size
+/// * `delta` - Minimum spacing between fitted points
+///
+/// ### Returns
+///
+/// The anchors in increasing `x`.
+fn clowess_anchors(x: &[f64], ns: usize, delta: f64) -> Vec<Anchor> {
+    let n = x.len();
+    let mut anchors = Vec::new();
+    let mut nleft = 0;
+    let mut nright = ns - 1;
+    let mut i = 0;
+    loop {
+        while nright < n - 1 {
+            let d1 = x[i] - x[nleft];
+            let d2 = x[nright + 1] - x[i];
+            if d1 <= d2 {
+                break;
+            }
+            nleft += 1;
+            nright += 1;
+        }
+
+        let anchor = i;
+        let mut last_i = i;
+        let cut = x[last_i] + delta;
+        i = last_i + 1;
+        while i < n {
+            if x[i] > cut {
+                break;
+            }
+            if x[i] == x[last_i] {
+                last_i = i;
+            }
+            i += 1;
+        }
+        i = (last_i + 1).max(i - 1);
+        anchors.push(Anchor {
+            i: anchor,
+            nleft,
+            nright,
+            last: last_i,
+        });
+        if last_i >= n - 1 {
+            break;
+        }
+    }
+    anchors
 }
 
 /// One tricube-weighted local linear fit, the `lowest` of Cleveland's code.

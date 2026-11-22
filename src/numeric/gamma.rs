@@ -257,10 +257,11 @@ pub fn trigamma(x: f64) -> f64 {
 ///
 /// ```text
 /// psi^(n)(z) = (-1)^(n-1) [ (n-1)!/z^n + n!/(2 z^(n+1))
-///                           + sum_k B_2k (2k+n-1)!/(2k)! z^-(2k+n) ]
+/// + sum_k B_2k (2k+n-1)!/(2k)! z^-(2k+n) ]
 /// ```
 ///
-/// The shift target grows with `n` because the series is in `n/z` as much as `1/z`.
+/// The shift target grows with `n` because the series is in `n/z` as much as
+/// `1/z`.
 ///
 /// ### Params
 ///
@@ -292,9 +293,10 @@ pub fn polygamma(n: usize, x: f64) -> f64 {
 
 /// Inverse of the trigamma function.
 ///
-/// Port of limma's `trigammaInverse()`. Newton runs on `f(y) = 1/psi'(y) - 1/x`,
-/// which is near-linear in `y`, so the `0.5 + 1/x` start converges in a handful
-/// of steps. Two clamps cover the tails. For `x > 1e7` the root is `1/sqrt(x)`
+/// Port of limma's `trigammaInverse()`. Newton runs on
+/// `f(y) = 1/psi'(y) - 1/x`, which is near-linear in `y`, so the `0.5 + 1/x`
+/// start converges in a handful of steps. Two clamps cover the tails. For
+/// `x > 1e7` the root is `1/sqrt(x)`
 /// (edgePython returns `1/x`, which is wrong). See `UPSTREAM_DEVIATIONS.md` A9.
 ///
 /// ### Params
@@ -398,7 +400,7 @@ mod tests {
         (0.001, -1000.5755719318103),
         (0.1, -10.423754940411076),
         (0.5, -1.9635100260214235),
-        (1.0, -0.5772156649015329),
+        (1.0, -std::f64::consts::EULER_GAMMA),
         (2.5, 0.7031566406452432),
         (7.0, 1.872784335098467),
         (19.9, 2.965383724267679),
@@ -461,7 +463,7 @@ mod tests {
     const LOGMDIGAMMA_REF: [(f64, f64); 9] = [
         (0.001, 993.6678166528282),
         (0.5, 1.2703628454614782),
-        (1.0, 0.5772156649015329),
+        (1.0, std::f64::consts::EULER_GAMMA),
         (2.5, 0.2131340912289119),
         (7.0, 0.07312581395684617),
         (100.0, 0.005008333250003967),
@@ -557,13 +559,13 @@ mod tests {
         }
         assert_relative_eq!(
             digamma(1.0),
-            -0.577_215_664_901_532_9_f64,
+            -std::f64::consts::EULER_GAMMA,
             max_relative = 1e-15
         );
         // psi(1/2) = -gamma - 2 ln 2
         assert_relative_eq!(
             digamma(0.5),
-            -0.577_215_664_901_532_9_f64 - 2.0 * std::f64::consts::LN_2,
+            -std::f64::consts::EULER_GAMMA - 2.0 * std::f64::consts::LN_2,
             max_relative = 1e-15
         );
     }

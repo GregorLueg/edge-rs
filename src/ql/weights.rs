@@ -9,11 +9,6 @@
 //! Each gene needs its own weighted design and QR, so the gene fan-out carries
 //! a per-thread scratch buffer.
 //!
-//! ### Deviations from edgePython
-//!
-//! [`compute_prior`] smooths with Cleveland's `lowess` as edgeR does, not
-//! limma's `weightedLowess`. See `UPSTREAM_DEVIATIONS.md` A11.
-//!
 //! ### Deviation from edgeR
 //!
 //! Leverages come from an unpivoted QR, not LINPACK's rank-revealing `dqrdc2`.
@@ -318,15 +313,6 @@ struct Scratch {
 
 impl Scratch {
     /// Allocates scratch for one worker.
-    ///
-    /// ### Params
-    ///
-    /// * `n_samples` - Number of samples
-    /// * `n_coef` - Number of coefficients
-    ///
-    /// ### Returns
-    ///
-    /// Buffers sized for a single gene.
     fn new(n_samples: usize, n_coef: usize) -> Self {
         Self {
             y: vec![0.0; n_samples],

@@ -1,4 +1,5 @@
-//! Small dense factorisations shared by the limma modules.
+//! Small dense factorisations shared by the limma modules, and the weighted
+//! Gram the NEBULA kernels use on wide designs.
 //!
 //! Matrices are of order `n_coef` or `n_samples` (tens of values), so these are
 //! hand-rolled: faer's call overhead dominates at this size, and failure is
@@ -7,8 +8,9 @@
 //! Matrices are row-major with an explicit stride, so a caller can factor a
 //! leading submatrix of a larger buffer in place.
 
+use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
-use faer::{MatRef, Side};
+use faer::{Accum, MatMut, MatRef, Par, Side};
 
 use crate::prelude::*;
 
@@ -68,6 +70,44 @@ pub(crate) fn forward_substitute(l: &[f64], stride: usize, n: usize, b: &mut [f6
         }
         b[i] = sum / l[i * stride + i];
     }
+}
+
+/// Solves `L' x = b` in place for lower triangular `L`.
+///
+/// ### Params
+///
+/// * `l` - Lower triangular factor, row-major with row stride `stride`
+/// * `stride` - Row stride of `l`
+/// * `n` - Order of the system
+/// * `b` - Right-hand side, overwritten by the solution
+pub(crate) fn back_substitute_transpose(l: &[f64], stride: usize, n: usize, b: &mut [f64]) {
+    for i in (0..n).rev() {
+        let mut sum = b[i];
+        for k in (i + 1)..n {
+            sum -= l[k * stride + i] * b[k];
+        }
+        b[i] = sum / l[i * stride + i];
+    }
+}
+
+/// Solves a symmetric positive definite system `A x = b` in place by Cholesky.
+///
+/// ### Params
+///
+/// * `a` - Row-major `n * n` matrix, overwritten by its lower Cholesky factor
+/// * `b` - Right-hand side, overwritten by the solution
+/// * `n` - Order of the system
+///
+/// ### Returns
+///
+/// `false` if `a` is not positive definite.
+pub(crate) fn cholesky_solve_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
+    if !cholesky_lower(a, n, n) {
+        return false;
+    }
+    forward_substitute(a, n, n, b);
+    back_substitute_transpose(a, n, n, b);
+    true
 }
 
 ////////////////
@@ -214,6 +254,57 @@ pub(crate) fn self_adjoint_eigen_desc(
     Ok((values, vectors))
 }
 
+///////////////////
+// Weighted Gram //
+///////////////////
+
+/// Rows scaled per [`weighted_gram`] block. Keeps the scaled copy small enough
+/// to stay in L2 next to the rows it was read from.
+const GRAM_CHUNK: usize = 512;
+
+/// `X' diag(w) X` for a tall row-major `X`.
+///
+/// Sequential faer GEMMs over row blocks of [`GRAM_CHUNK`], so the caller can
+/// run it inside a parallel loop. Weights may be negative.
+///
+/// ### Params
+///
+/// * `x` - Row-major `n_rows * n_cols`
+/// * `n_cols` - Number of columns
+/// * `weight` - One weight per row, its length fixes `n_rows`
+///
+/// ### Returns
+///
+/// The symmetric `n_cols * n_cols` matrix, row-major and full.
+pub(crate) fn weighted_gram(x: &[f64], n_cols: usize, weight: &[f64]) -> Vec<f64> {
+    let n_rows = weight.len();
+    debug_assert_eq!(x.len(), n_rows * n_cols);
+    let mut gram = vec![0.0; n_cols * n_cols];
+    let mut scaled = vec![0.0; GRAM_CHUNK.min(n_rows) * n_cols];
+    for start in (0..n_rows).step_by(GRAM_CHUNK) {
+        let rows = GRAM_CHUNK.min(n_rows - start);
+        let block = &x[start * n_cols..(start + rows) * n_cols];
+        for ((dst, src), &w) in scaled
+            .chunks_exact_mut(n_cols)
+            .zip(block.chunks_exact(n_cols))
+            .zip(&weight[start..start + rows])
+        {
+            for (d, &v) in dst.iter_mut().zip(src) {
+                *d = v * w;
+            }
+        }
+        matmul(
+            MatMut::from_row_major_slice_mut(&mut gram, n_cols, n_cols),
+            Accum::Add,
+            MatRef::from_row_major_slice(block, rows, n_cols).transpose(),
+            MatRef::from_row_major_slice(&scaled[..rows * n_cols], rows, n_cols),
+            1.0,
+            Par::Seq,
+        );
+    }
+    gram
+}
+
 ///////////
 // Tests //
 ///////////
@@ -222,6 +313,53 @@ pub(crate) fn self_adjoint_eigen_desc(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// `X' diag(w) X` summed row by row, the definition.
+    fn explicit_gram(x: &[f64], n_cols: usize, weight: &[f64]) -> Vec<f64> {
+        let mut gram = vec![0.0; n_cols * n_cols];
+        for (row, &w) in x.chunks_exact(n_cols).zip(weight) {
+            for a in 0..n_cols {
+                for b in 0..n_cols {
+                    gram[a * n_cols + b] += w * row[a] * row[b];
+                }
+            }
+        }
+        gram
+    }
+
+    /// A deterministic tall matrix and weights of both signs.
+    fn gram_inputs(n_rows: usize, n_cols: usize) -> (Vec<f64>, Vec<f64>) {
+        let x = (0..n_rows * n_cols)
+            .map(|i| ((i * 37 % 101) as f64 - 50.0) / 25.0)
+            .collect();
+        let weight = (0..n_rows)
+            .map(|i| ((i * 13 % 29) as f64 - 9.0) / 7.0)
+            .collect();
+        (x, weight)
+    }
+
+    #[test]
+    fn test_weighted_gram_matches_the_explicit_sum_across_chunks() {
+        // Two full blocks and a ragged one.
+        let n_cols = 7;
+        let (x, weight) = gram_inputs(2 * GRAM_CHUNK + 37, n_cols);
+        let got = weighted_gram(&x, n_cols, &weight);
+        let want = explicit_gram(&x, n_cols, &weight);
+        for (g, w) in got.iter().zip(&want) {
+            assert_relative_eq!(*g, *w, max_relative = 1e-12, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_weighted_gram_with_fewer_rows_than_a_chunk() {
+        let n_cols = 4;
+        let (x, weight) = gram_inputs(5, n_cols);
+        let got = weighted_gram(&x, n_cols, &weight);
+        let want = explicit_gram(&x, n_cols, &weight);
+        for (g, w) in got.iter().zip(&want) {
+            assert_relative_eq!(*g, *w, max_relative = 1e-13, epsilon = 1e-12);
+        }
+    }
 
     #[test]
     fn test_cholesky_lower_reproduces_the_matrix() {

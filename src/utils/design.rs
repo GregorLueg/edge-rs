@@ -10,6 +10,7 @@
 //! Matrices are row-major: row `i` is `design[i * n_coef..(i + 1) * n_coef]`.
 
 use faer::MatRef;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::prelude::*;
@@ -33,17 +34,6 @@ pub const LIMMA_LOWESS_DEFAULTS: (usize, f64, f64) = (50, 0.3, 1.0 / 3.0);
 /////////////
 
 /// Wraps a row-major slice as a faer matrix, checking the shape first.
-///
-/// ### Params
-///
-/// * `design` - Row-major values
-/// * `n_rows` - Number of rows
-/// * `n_cols` - Number of columns
-///
-/// ### Returns
-///
-/// The borrowed matrix, or [`EdgeErrors::LengthMismatch`] if the slice does not
-/// match the stated shape.
 fn as_matrix(design: &[f64], n_rows: usize, n_cols: usize) -> Result<MatRef<'_, f64>, EdgeErrors> {
     validate_shape(design.len(), n_rows, n_cols)?;
     Ok(MatRef::from_row_major_slice(design, n_rows, n_cols))
@@ -374,7 +364,7 @@ pub fn contrast_as_coef(
 ///
 /// Port of limma's `chooseLowessSpan`: wider windows for small experiments,
 /// tapering towards `min_span`. [`LIMMA_LOWESS_DEFAULTS`] carries limma's
-/// defaults; edgePython passes different ones. See `UPSTREAM_DEVIATIONS.md` A8.
+/// defaults.
 ///
 /// ### Params
 ///
@@ -391,6 +381,81 @@ pub fn choose_lowess_span(n: usize, small_n: usize, min_span: f64, power: f64) -
         return 1.0;
     }
     (min_span + (1.0 - min_span) * (small_n as f64 / n as f64).powf(power)).min(1.0)
+}
+
+/////////////
+// Subsets //
+/////////////
+
+/// Copies whole rows out of a row-major matrix, in the order given.
+///
+/// ### Params
+///
+/// * `x` - Row-major, `n_cols` values per row
+/// * `n_cols` - Row length
+/// * `rows` - Row indices to keep
+///
+/// ### Returns
+///
+/// Row-major `rows.len() * n_cols`.
+pub(crate) fn gather_rows<T: Copy>(x: &[T], n_cols: usize, rows: &[usize]) -> Vec<T> {
+    let mut out = Vec::with_capacity(rows.len() * n_cols);
+    for &r in rows {
+        out.extend_from_slice(&x[r * n_cols..(r + 1) * n_cols]);
+    }
+    out
+}
+
+/// Copies a subset of columns out of a row-major matrix, as `f64`.
+///
+/// Parallel over rows, so it serves a count matrix as well as a design.
+///
+/// ### Params
+///
+/// * `x` - Row-major `n_rows * n_cols`
+/// * `n_rows` - Number of rows
+/// * `n_cols` - Number of columns in `x`
+/// * `cols` - Column indices to keep, in the order wanted
+///
+/// ### Returns
+///
+/// Row-major `n_rows * cols.len()`.
+pub(crate) fn select_columns<T: EdgeFloat>(
+    x: &[T],
+    n_rows: usize,
+    n_cols: usize,
+    cols: &[usize],
+) -> Vec<f64> {
+    let mut out = vec![0.0_f64; n_rows * cols.len()];
+    if cols.is_empty() {
+        return out;
+    }
+    out.par_chunks_mut(cols.len())
+        .enumerate()
+        .for_each(|(row, dst)| {
+            let src = &x[row * n_cols..(row + 1) * n_cols];
+            for (d, &c) in dst.iter_mut().zip(cols.iter()) {
+                *d = src[c].to_f64().unwrap_or(f64::NAN);
+            }
+        });
+    out
+}
+
+/// Drops columns from a row-major matrix.
+///
+/// ### Params
+///
+/// * `x` - Row-major `n_rows * n_cols`
+/// * `n_rows` - Number of rows
+/// * `n_cols` - Number of columns
+/// * `drop` - Column indices to remove
+///
+/// ### Returns
+///
+/// The matrix without those columns, still row-major.
+pub(crate) fn drop_columns(x: &[f64], n_rows: usize, n_cols: usize, drop: &[usize]) -> Vec<f64> {
+    let kept: Vec<usize> = (0..n_cols).filter(|c| !drop.contains(c)).collect();
+    select_columns(x, n_rows, n_cols, &kept)
 }
 
 ///////////
@@ -584,7 +649,6 @@ mod tests {
 
     /// limma: `chooseLowessSpan(10)`, `(100)`, `(1000)` give 1, 0.8555904,
     /// 0.5578822 at limma's own defaults of `small.n = 50, min.span = 0.3`.
-    /// edgePython passes 25 and 0.2 instead, which is `UPSTREAM_DEVIATIONS.md` A8.
     #[test]
     fn test_choose_lowess_span_matches_limma() {
         let (small_n, min_span, power) = LIMMA_LOWESS_DEFAULTS;

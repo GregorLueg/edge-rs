@@ -13,6 +13,7 @@ use crate::core::expression::check_dispersion;
 use crate::errors::EdgeErrors;
 use crate::glm::deviance::unit_nb_deviance;
 use crate::glm::{EMPTY_GENE_COEF, ETA_CLAMP, MIN_POSITIVE};
+use crate::utils::linalg::cholesky_solve_in_place;
 use crate::utils::recycled::{Recycled, RecycledRow};
 use crate::utils::simd::EdgeSimd;
 use crate::utils::traits::EdgeFloat;
@@ -43,7 +44,8 @@ const DIAGONAL_FLOOR: f64 = 1e-10;
 /// How the coefficients are initialised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartMethod {
-    /// Fit an intercept-only model from the total counts and total library size.
+    /// Fit an intercept-only model from the total counts and total library
+    /// size.
     ///
     /// Cheap, and edgeR's default.
     Null,
@@ -163,59 +165,6 @@ impl Scratch {
 // Helpers //
 /////////////
 
-/// Solves a small symmetric positive definite system in place by Cholesky.
-///
-/// The systems are `n_coef` square with `n_coef` in the low single digits, so a
-/// faer call would be dominated by its dispatch overhead. Row-major.
-///
-/// ### Params
-///
-/// * `a` - The matrix, overwritten by its lower Cholesky factor
-/// * `b` - Right-hand side, overwritten by the solution
-/// * `n` - System size
-///
-/// ### Returns
-///
-/// `false` if a pivot is not positive: the matrix is not positive definite and
-/// the step has failed.
-fn solve_spd_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[i * n + j];
-            for k in 0..j {
-                sum -= a[i * n + k] * a[j * n + k];
-            }
-            if i == j {
-                // Rejects NaN as well as a non-positive pivot.
-                if sum <= 0.0 || sum.is_nan() {
-                    return false;
-                }
-                a[i * n + i] = sum.sqrt();
-            } else {
-                a[i * n + j] = sum / a[j * n + j];
-            }
-        }
-    }
-
-    // Forward substitution.
-    for i in 0..n {
-        let mut sum = b[i];
-        for k in 0..i {
-            sum -= a[i * n + k] * b[k];
-        }
-        b[i] = sum / a[i * n + i];
-    }
-    // Back substitution against the transpose.
-    for i in (0..n).rev() {
-        let mut sum = b[i];
-        for k in (i + 1)..n {
-            sum -= a[k * n + i] * b[k];
-        }
-        b[i] = sum / a[i * n + i];
-    }
-    true
-}
-
 /// Fills `eta` with `design * beta + offset`, then exponentiates into `mu`.
 ///
 /// ### Params
@@ -320,7 +269,7 @@ fn project_onto_design(
         }
     }
 
-    if !solve_spd_in_place(&mut xtx, &mut xtz, n_coef) {
+    if !cholesky_solve_in_place(&mut xtx, &mut xtz, n_coef) {
         return false;
     }
     beta.copy_from_slice(&xtz);
@@ -333,8 +282,8 @@ fn project_onto_design(
 /// log-scale target and project it onto the design by least squares:
 ///
 /// * [`StartMethod::Null`] uses one working-weighted log rate for every sample,
-///   `log(sum(cw * y/N) / sum(cw))` with `cw = w N / (1 + phi N)`. This differs
-///   from the plain ratio of totals unless all libraries are equal.
+///   `log(sum(cw * y/N) / sum(cw))` with `cw = w N / (1 + phi N)`. This
+///   differs from the plain ratio of totals unless all libraries are equal.
 /// * [`StartMethod::LogCounts`] uses each sample's own log rate.
 ///
 /// The projection is required. Putting the scalar in `beta[0]` and zeroing the
@@ -422,8 +371,9 @@ pub(crate) fn initial_coefficients(
 ///
 /// ### Returns
 ///
-/// The number of iterations used and whether the normal equations ever went
-/// singular.
+/// The number of iterations used, whether the normal equations ever went
+/// singular, and the deviance at the returned `beta`, whose fitted means are
+/// left in `scratch.mu`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_one_gene(
     scratch: &mut Scratch,
@@ -435,7 +385,7 @@ pub(crate) fn fit_one_gene(
     offset: RecycledRow<'_, f64>,
     weights: Option<RecycledRow<'_, f64>>,
     params: &LevenbergParams,
-) -> (usize, bool) {
+) -> (usize, bool, f64) {
     let mut damping = INITIAL_DAMPING;
     let mut singular = false;
 
@@ -487,12 +437,12 @@ pub(crate) fn fit_one_gene(
         }
         scratch.delta.copy_from_slice(&scratch.xtwz);
 
-        if !solve_spd_in_place(&mut scratch.damped, &mut scratch.delta, n_coef) {
+        if !cholesky_solve_in_place(&mut scratch.damped, &mut scratch.delta, n_coef) {
             // Not positive definite: damp harder and try again.
             singular = true;
             damping = (damping * 10.0).min(MAX_DAMPING);
             if damping >= MAX_DAMPING {
-                return (iteration + 1, singular);
+                return (iteration + 1, singular, dev_current);
             }
             continue;
         }
@@ -525,14 +475,14 @@ pub(crate) fn fit_one_gene(
             let threshold = params.tol * (dev_current.abs() + 0.1);
             dev_current = dev_trial;
             if change < threshold {
-                return (iteration + 1, singular);
+                return (iteration + 1, singular, dev_current);
             }
         } else {
             damping = (damping * 10.0).min(MAX_DAMPING);
         }
     }
 
-    (params.max_iter, singular)
+    (params.max_iter, singular, dev_current)
 }
 
 ///////////////
@@ -556,13 +506,15 @@ pub(crate) fn fit_one_gene(
 /// * `dispersion` - Dispersion, recycled over genes and samples
 /// * `offset` - Log-scale offsets, recycled over genes and samples
 /// * `weights` - Optional observation weights
-/// * `coef_start` - Optional starting coefficients, row-major `n_genes * n_coef`
+/// * `coef_start` - Optional starting coefficients, row-major
+///   `n_genes * n_coef`
 /// * `params` - Tuning knobs, or [`LevenbergParams::default`]
 ///
 /// ### Returns
 ///
-/// Coefficients, fitted means, residual deviances and per-gene iteration counts,
-/// or [`EdgeErrors`] if the shapes disagree or a dispersion is negative.
+/// Coefficients, fitted means, residual deviances and per-gene iteration
+/// counts, or [`EdgeErrors`] if the shapes disagree or a dispersion is
+/// negative.
 #[allow(clippy::too_many_arguments)]
 pub fn mglm_levenberg<T: EdgeFloat>(
     counts: &[T],
@@ -654,22 +606,12 @@ pub fn mglm_levenberg<T: EdgeFloat>(
                     ),
                 }
 
-                let (used, singular) = fit_one_gene(
+                let (used, singular, deviance) = fit_one_gene(
                     scratch, beta, design, n_samples, n_coef, disp_row, offset_row, weight_row,
                     &params,
                 );
-
-                linear_predictor(
-                    design,
-                    beta,
-                    offset_row,
-                    n_samples,
-                    n_coef,
-                    &mut scratch.eta,
-                    &mut scratch.mu,
-                );
                 fit.copy_from_slice(&scratch.mu[..n_samples]);
-                *dev = deviance_of(&scratch.y, &scratch.mu, disp_row, weight_row);
+                *dev = deviance;
                 *iters = used;
                 *fail = singular;
             },
@@ -802,7 +744,7 @@ mod tests {
         // [[4, 2], [2, 3]] x = [10, 8] has solution [1.75, 1.5].
         let mut a = vec![4.0, 2.0, 2.0, 3.0];
         let mut b = vec![10.0, 8.0];
-        assert!(solve_spd_in_place(&mut a, &mut b, 2));
+        assert!(cholesky_solve_in_place(&mut a, &mut b, 2));
         assert_relative_eq!(b[0], 1.75, max_relative = 1e-12);
         assert_relative_eq!(b[1], 1.5, max_relative = 1e-12);
     }
@@ -811,7 +753,7 @@ mod tests {
     fn test_solve_spd_rejects_an_indefinite_matrix() {
         let mut a = vec![1.0, 2.0, 2.0, 1.0];
         let mut b = vec![1.0, 1.0];
-        assert!(!solve_spd_in_place(&mut a, &mut b, 2));
+        assert!(!cholesky_solve_in_place(&mut a, &mut b, 2));
     }
 
     /// A two-group fit with no offset must recover the group log-means exactly,

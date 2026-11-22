@@ -15,6 +15,7 @@ use rayon::prelude::*;
 use crate::glm::fit::GLM_FIT_MAX_ITER;
 use crate::glm::levenberg::{LevenbergParams, Scratch, initial_coefficients};
 use crate::glm::one_group::{OneGroupParams, fit_one_gene as fit_one_group_gene};
+use crate::glm::{ETA_CLAMP, MIN_POSITIVE};
 use crate::numeric::gamma::ln_gamma;
 use crate::prelude::*;
 use crate::utils::design::design_as_factor;
@@ -22,12 +23,6 @@ use crate::utils::design::design_as_factor;
 ////////////
 // Consts //
 ////////////
-
-/// Floor applied to fitted means and working weights.
-const MIN_POSITIVE: f64 = 1e-300;
-
-/// Bound on the linear predictor before exponentiating.
-const ETA_CLAMP: f64 = 500.0;
 
 /// Floor applied to the information matrix pivots before taking logarithms.
 ///
@@ -44,6 +39,8 @@ const PIVOT_FLOOR: f64 = 1e-10;
 struct GeneScratch {
     /// Counts for the current gene, widened to `f64`.
     y: Vec<f64>,
+    /// `ln_gamma(y + 1)`, fixed across dispersions.
+    ln_factorial: Vec<f64>,
     /// Fitted means at the current grid point.
     mu: Vec<f64>,
     /// Information matrix, row-major.
@@ -57,18 +54,10 @@ struct GeneScratch {
 
 impl GeneScratch {
     /// Allocates scratch for one worker.
-    ///
-    /// ### Params
-    ///
-    /// * `n_samples` - Number of samples
-    /// * `n_coef` - Number of coefficients
-    ///
-    /// ### Returns
-    ///
-    /// Buffers sized for a single gene across the whole grid.
     fn new(n_samples: usize, n_coef: usize) -> Self {
         Self {
             y: vec![0.0; n_samples],
+            ln_factorial: vec![0.0; n_samples],
             mu: vec![0.0; n_samples],
             information: vec![0.0; n_coef * n_coef],
             beta: vec![0.0; n_coef],
@@ -126,6 +115,7 @@ fn cox_reid_adjustment(xtwx: &mut [f64], n_coef: usize) -> f64 {
 /// ### Params
 ///
 /// * `y` - Counts for this gene
+/// * `ln_factorial` - `ln_gamma(y + 1)`
 /// * `mu` - Fitted means
 /// * `dispersion` - Dispersion for this gene
 /// * `weights` - Optional weight row
@@ -135,6 +125,7 @@ fn cox_reid_adjustment(xtwx: &mut [f64], n_coef: usize) -> f64 {
 /// The weighted log-likelihood summed across samples.
 fn log_likelihood(
     y: &[f64],
+    ln_factorial: &[f64],
     mu: &[f64],
     dispersion: f64,
     weights: Option<RecycledRow<'_, f64>>,
@@ -147,15 +138,14 @@ fn log_likelihood(
         let r_ln_r = r * r.ln();
         for (j, (&y_j, &mu_j)) in y.iter().zip(mu.iter()).enumerate() {
             let mu_j = mu_j.max(MIN_POSITIVE);
-            let term =
-                ln_gamma(y_j + r) - ln_gamma_r - ln_gamma(y_j + 1.0) + r_ln_r + y_j * mu_j.ln()
-                    - (r + y_j) * (r + mu_j).ln();
+            let term = ln_gamma(y_j + r) - ln_gamma_r - ln_factorial[j] + r_ln_r + y_j * mu_j.ln()
+                - (r + y_j) * (r + mu_j).ln();
             total += weights.map_or(term, |w| w.get(j) * term);
         }
     } else {
         for (j, (&y_j, &mu_j)) in y.iter().zip(mu.iter()).enumerate() {
             let mu_j = mu_j.max(MIN_POSITIVE);
-            let term = y_j * mu_j.ln() - mu_j - ln_gamma(y_j + 1.0);
+            let term = y_j * mu_j.ln() - mu_j - ln_factorial[j];
             total += weights.map_or(term, |w| w.get(j) * term);
         }
     }
@@ -165,7 +155,8 @@ fn log_likelihood(
 
 /// Assembles `X'WX` for one gene from its fitted means.
 ///
-/// The working weight is `w mu / (1 + phi mu)`; `phi = 0` gives the Poisson `w mu`.
+/// The working weight is
+/// `w mu / (1 + phi mu)`; `phi = 0` gives the Poisson `w mu`.
 ///
 /// ### Params
 ///
@@ -211,14 +202,12 @@ fn assemble_information(
 /// * `dispersion` - Dispersion row
 /// * `offset` - Offset row
 /// * `weights` - Optional weight row
-/// * `n_samples` - Number of samples
 fn fit_one_way_gene(
     scratch: &mut GeneScratch,
     members: &[Vec<usize>],
     dispersion: RecycledRow<'_, f64>,
     offset: RecycledRow<'_, f64>,
     weights: Option<RecycledRow<'_, f64>>,
-    n_samples: usize,
 ) {
     let params = OneGroupParams::default();
 
@@ -239,7 +228,6 @@ fn fit_one_way_gene(
             scratch.mu[sample] = eta.exp().max(MIN_POSITIVE);
         }
     }
-    let _ = n_samples;
 }
 
 /// Fits one gene on the general path and writes its fitted means.
@@ -372,9 +360,11 @@ impl<'a> AplWorkspace<'a> {
         ))
     }
 
-    /// Builds a workspace from a design whose factor structure is already known.
+    /// Builds a workspace from a design whose factor structure is already
+    /// known.
     ///
-    /// [`apl_grid`] derives the structure once and hands each worker a workspace.
+    /// [`apl_grid`] derives the structure once and hands each worker a
+    /// workspace.
     ///
     /// ### Params
     ///
@@ -410,10 +400,10 @@ impl<'a> AplWorkspace<'a> {
 
     /// Loads a gene and cold-starts its coefficients.
     ///
-    /// Coefficients carry over between [`AplWorkspace::eval`] calls, so a new gene
-    /// must clear them: the previous gene's answer can be far enough out to land
-    /// on the wrong optimum. Matches `estimateDisp`, which clears its warm start
-    /// per gene.
+    /// Coefficients carry over between [`AplWorkspace::eval`] calls, so a new
+    /// gene must clear them: the previous gene's answer can be far enough out
+    /// to land on the wrong optimum. Matches `estimateDisp`, which clears its
+    /// warm start per gene.
     ///
     /// ### Params
     ///
@@ -445,8 +435,15 @@ impl<'a> AplWorkspace<'a> {
             return Err(EdgeErrors::InvalidDispersion(dispersion));
         }
 
-        for (slot, value) in self.scratch.y.iter_mut().zip(counts) {
+        for ((slot, lf), value) in self
+            .scratch
+            .y
+            .iter_mut()
+            .zip(self.scratch.ln_factorial.iter_mut())
+            .zip(counts)
+        {
             *slot = value.to_f64().unwrap_or(0.0);
+            *lf = ln_gamma(*slot + 1.0);
         }
         self.offset = offset;
         self.weights = weights;
@@ -518,7 +515,6 @@ impl<'a> AplWorkspace<'a> {
                 disp_row,
                 self.offset,
                 self.weights,
-                self.n_samples,
             );
         } else {
             fit_general_gene(
@@ -532,7 +528,13 @@ impl<'a> AplWorkspace<'a> {
             );
         }
 
-        let ll = log_likelihood(&self.scratch.y, &self.scratch.mu, dispersion, self.weights);
+        let ll = log_likelihood(
+            &self.scratch.y,
+            &self.scratch.ln_factorial,
+            &self.scratch.mu,
+            dispersion,
+            self.weights,
+        );
         assemble_information(
             &self.scratch.mu,
             self.design,
@@ -556,8 +558,8 @@ impl<'a> AplWorkspace<'a> {
 /// [`crate::numeric::interpolate::maximize_interpolant`], which splines through
 /// the grid.
 ///
-/// Each gene is cold-started, so a gene's row does not depend on the batch or on
-/// how rayon splits the work.
+/// Each gene is cold-started, so a gene's row does not depend on the batch or
+/// on how rayon splits the work.
 ///
 /// ### Params
 ///

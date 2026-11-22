@@ -38,7 +38,9 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::errors::EdgeErrors;
+use crate::sc::ptmg::check_cell_index;
 use crate::sc::zeros::ZeroCells;
+use crate::utils::linalg::weighted_gram;
 
 //////////////////////
 // Tuning and codes //
@@ -62,14 +64,14 @@ const DEFAULT_EPS: f64 = 1e-6;
 ///
 /// Reached only when backtracking has been exhausted: a stalled step with every
 /// gradient below this is `-10`, with any gradient above it `-40`.
-const GRADIENT_TOLERANCE: f64 = 0.01;
+pub(crate) const GRADIENT_TOLERANCE: f64 = 0.01;
 
 /// Magnitude past which a Newton component is treated as unbounded rather than
 /// damped.
 ///
 /// nebula replaces such a step with a fixed displacement, seeded by the same
 /// constant and halved once per backtrack, instead of halving it forty times.
-const STEP_CUTOFF: f64 = 40.0;
+pub(crate) const STEP_CUTOFF: f64 = 40.0;
 
 /// Smallest eigenvalue of the information matrix nebula will invert.
 ///
@@ -210,21 +212,7 @@ impl PmlData<'_> {
                 return Err(EdgeErrors::SubjectsNotContiguous { subject: s });
             }
         }
-        let mut previous: Option<usize> = None;
-        for &c in self.cell_index {
-            if c >= n_cells {
-                return Err(EdgeErrors::InvalidArgument(format!(
-                    "cell_index {c} is out of range for {n_cells} cells."
-                )));
-            }
-            if previous.is_some_and(|p| c <= p) {
-                return Err(EdgeErrors::InvalidArgument(
-                    "cell_index must be strictly increasing.".to_string(),
-                ));
-            }
-            previous = Some(c);
-        }
-        Ok(())
+        check_cell_index(self.cell_index, n_cells)
     }
 }
 
@@ -407,15 +395,6 @@ impl Penalty {
     }
 
     /// The prior's contribution to the random-effect gradient.
-    ///
-    /// ### Params
-    ///
-    /// * `log_w_s` - Random effect for this subject
-    /// * `w_s` - `exp(log_w_s)`
-    ///
-    /// ### Returns
-    ///
-    /// The term added to `cumsumy - sum(gstar_extb_phi)` for this subject.
     fn gradient(&self, log_w_s: f64, w_s: f64) -> f64 {
         match *self {
             Penalty::Gamma { alpha, lambda } => alpha - lambda * w_s,
@@ -424,14 +403,6 @@ impl Penalty {
     }
 
     /// The prior's contribution to the random-effect curvature.
-    ///
-    /// ### Params
-    ///
-    /// * `w_s` - `exp(log_w_s)`
-    ///
-    /// ### Returns
-    ///
-    /// The term added to the data curvature for this subject.
     fn curvature(&self, w_s: f64) -> f64 {
         match *self {
             Penalty::Gamma { lambda, .. } => lambda * w_s,
@@ -443,6 +414,31 @@ impl Penalty {
 ///////////////
 // Front end //
 ///////////////
+
+/// Shape and rate of the gamma prior on `w` at `exps = e^s`.
+///
+/// ### Params
+///
+/// * `exps` - `e^s`, `s` the subject-level variance; must exceed one
+///
+/// ### Returns
+///
+/// `(alpha, lambda)`: `1 / (e^s - 1)` and `1 / (sqrt(e^s) (e^s - 1))`.
+pub(crate) fn gamma_prior(exps: f64) -> (f64, f64) {
+    (1.0 / (exps - 1.0), 1.0 / (exps.sqrt() * (exps - 1.0)))
+}
+
+/// The gamma penalty for a subject-level variance, checked.
+fn gamma_penalty(subject: f64) -> Result<Penalty, EdgeErrors> {
+    let exps = subject.exp();
+    if !(exps.is_finite() && exps > 1.0) {
+        return Err(EdgeErrors::InvalidArgument(format!(
+            "PmlVariance::subject must be finite and strictly positive for opt_pml; got {subject}."
+        )));
+    }
+    let (alpha, lambda) = gamma_prior(exps);
+    Ok(Penalty::Gamma { alpha, lambda })
+}
 
 /// Penalised maximum likelihood fit with a gamma random effect, NEBULA's NBGMM.
 ///
@@ -499,17 +495,7 @@ pub(crate) fn opt_pml_tabled(
     variance: &PmlVariance,
     params: Option<PmlParams>,
 ) -> Result<PmlResult, EdgeErrors> {
-    let exps = variance.subject.exp();
-    if !(exps.is_finite() && exps > 1.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "PmlVariance::subject must be finite and strictly positive for opt_pml; got {}.",
-            variance.subject
-        )));
-    }
-    let penalty = Penalty::Gamma {
-        alpha: 1.0 / (exps - 1.0),
-        lambda: 1.0 / (exps.sqrt() * (exps - 1.0)),
-    };
+    let penalty = gamma_penalty(variance.subject)?;
     optimise(
         data,
         zeros,
@@ -655,17 +641,7 @@ pub(crate) fn opt_pml_from(
     variance: &PmlVariance,
     params: Option<PmlParams>,
 ) -> Result<PmlResult, EdgeErrors> {
-    let exps = variance.subject.exp();
-    if !(exps.is_finite() && exps > 1.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "PmlVariance::subject must be finite and strictly positive for opt_pml; got {}.",
-            variance.subject
-        )));
-    }
-    let penalty = Penalty::Gamma {
-        alpha: 1.0 / (exps - 1.0),
-        lambda: 1.0 / (exps.sqrt() * (exps - 1.0)),
-    };
+    let penalty = gamma_penalty(variance.subject)?;
     optimise(
         data,
         None,
@@ -690,22 +666,13 @@ const EXP_SERIES_MAX: f64 = 1e-3;
 /// rounding at a converged point rather than a step that went wrong.
 ///
 /// From the device's `f32` optimum the `f64` step gains less than the rounding
-/// of a sum over all cells, so `likdif` is a few ulp negative on about 15 per
-/// cent of fits (S1: 10804 of 73650, between `1e-16` and `1e-15` relative).
+/// of a sum over all cells, so `likdif` is often a few ulp negative.
 /// [`opt_pml_from`] would backtrack to the same point. A real overshoot loses
 /// orders of magnitude more.
 #[cfg(feature = "gpu")]
 const LIKDIF_ROUNDING: f64 = 1e-12;
 
 /// `exp(z)` to fifth order, for `|z|` within [`EXP_SERIES_MAX`].
-///
-/// ### Params
-///
-/// * `z` - The exponent
-///
-/// ### Returns
-///
-/// `exp(z)`, to well under an ulp.
 #[cfg(feature = "gpu")]
 #[inline(always)]
 fn exp_series(z: f64) -> f64 {
@@ -748,10 +715,6 @@ impl LogSum {
     }
 
     /// Adds `ln(t)`.
-    ///
-    /// ### Params
-    ///
-    /// * `t` - The term, strictly positive
     #[inline(always)]
     fn push(&mut self, t: f64) {
         self.product *= t;
@@ -764,10 +727,6 @@ impl LogSum {
     }
 
     /// The sum, with the group in flight folded in.
-    ///
-    /// ### Returns
-    ///
-    /// `sum ln(t)` over everything pushed.
     fn finish(self) -> f64 {
         self.sum + self.product.ln()
     }
@@ -892,9 +851,8 @@ pub(crate) fn newton_finish(
 /// accumulators with a store-to-load round trip per cell.
 ///
 /// The first sweep takes a subject's `exp` in its own loop, so the accumulating
-/// loop has no call in it and the positive cells read the stored value. Together
-/// with the registers: 15.6 to 12.1 ns per cell per step on a 20000-cell gene;
-/// the split alone is slower.
+/// loop has no call in it and the positive cells read the stored value. The
+/// split only pays together with the registers.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn newton_finish_width<const NB: usize>(
@@ -919,8 +877,7 @@ fn newton_finish_width<const NB: usize>(
     }) {
         return None;
     }
-    let alpha = 1.0 / (exps - 1.0);
-    let lambda = 1.0 / (exps.sqrt() * (exps - 1.0));
+    let (alpha, lambda) = gamma_prior(exps);
 
     let run = positive_runs(data.cell_index, data.subject_start);
 
@@ -1205,7 +1162,7 @@ pub(crate) fn positive_runs(cells: &[usize], starts: &[usize]) -> Vec<usize> {
 /// Widest design whose per-subject sums sit in fixed-size arrays, so the loops
 /// over design columns unroll and the sums stay in registers. Wider designs run
 /// the same sweep with the width read at run time and the sums on the heap.
-const MAX_UNROLLED_WIDTH: usize = 8;
+pub(crate) const MAX_UNROLLED_WIDTH: usize = 8;
 
 /// Penalised log-likelihood, gradient and curvature at one point.
 ///
@@ -1480,6 +1437,16 @@ fn sweep_width<const NB: usize>(
         &mut local[..2 * nb + nb * nb]
     };
 
+    // Wide and dense, the curvature block is `gamma X' diag(p) X` over every
+    // fold, so the per-row weights are summed and the block is one Gram at the
+    // end instead of a triangle update per cell.
+    let gram = NB == 0 && zeros.is_none();
+    let mut row_weight = if gram {
+        vec![0.0; data.n_cells()]
+    } else {
+        Vec::new()
+    };
+
     out.db.fill(0.0);
     out.vb.fill(0.0);
     let ln_gamma = gamma.ln();
@@ -1499,9 +1466,18 @@ fn sweep_width<const NB: usize>(
 
         // `d` adds to the gradient, `p` to the curvature, the latter before the
         // factor of `gamma` the curvature blocks take at the end.
-        let mut fold = |row: &[f64], d: f64, p: f64| {
+        let mut fold = |r: usize, d: f64, p: f64| {
+            let row = &data.design[r * nb..(r + 1) * nb];
             resid += d;
             weight += p;
+            if gram {
+                row_weight[r] += p;
+                for a in 0..nb {
+                    score[a] += row[a] * d;
+                    first[a] += p * row[a];
+                }
+                return;
+            }
             for a in 0..nb {
                 score[a] += row[a] * d;
                 let pa = p * row[a];
@@ -1525,13 +1501,12 @@ fn sweep_width<const NB: usize>(
                     stored[r] = (eta + log_w_s).exp();
                 }
                 for r in cells {
-                    let row = &data.design[r * nb..(r + 1) * nb];
                     let extb = stored[r];
                     let t = extb + gamma;
                     sum_log += t.ln();
                     let inv = 1.0 / t;
                     let u = extb * inv;
-                    fold(row, -gamma * u, gamma * u * inv);
+                    fold(r, -gamma * u, gamma * u * inv);
                 }
             }
             Some(z) => {
@@ -1545,7 +1520,7 @@ fn sweep_width<const NB: usize>(
                     }
                     let [l, a, b] = g.eval::<0, 3>(log_tau);
                     sum_log += g.n * ln_gamma + l;
-                    fold(row, -gamma * a, b);
+                    fold(g.row, -gamma * a, b);
                 }
                 for &r in &z.loose[z.subject_loose[s]..z.subject_loose[s + 1]] {
                     let row = &data.design[r * nb..(r + 1) * nb];
@@ -1559,7 +1534,7 @@ fn sweep_width<const NB: usize>(
                     sum_log += t.ln();
                     let inv = 1.0 / t;
                     let u = extb * inv;
-                    fold(row, -gamma * u, gamma * u * inv);
+                    fold(r, -gamma * u, gamma * u * inv);
                 }
             }
         }
@@ -1583,7 +1558,7 @@ fn sweep_width<const NB: usize>(
             weighted_log += y * t.ln();
             let inv = 1.0 / t;
             let u = extb * inv;
-            fold(row, y * (1.0 - u), y * u * inv);
+            fold(c, y * (1.0 - u), y * u * inv);
         }
 
         log_likelihood += linear + log_w_s * data.subject_total[s] - gamma * sum_log - weighted_log;
@@ -1593,9 +1568,17 @@ fn sweep_width<const NB: usize>(
         for a in 0..nb {
             out.db[a] += score[a];
             out.vwb[s * nb + a] = gamma * first[a];
-            for b in a..nb {
-                out.vb[a * nb + b] += gamma * second[a * nb + b];
+            if !gram {
+                for b in a..nb {
+                    out.vb[a * nb + b] += gamma * second[a * nb + b];
+                }
             }
+        }
+    }
+    if gram {
+        let xwx = weighted_gram(data.design, nb, &row_weight);
+        for (v, x) in out.vb.iter_mut().zip(xwx) {
+            *v = gamma * x;
         }
     }
     for a in 0..nb {
@@ -2489,7 +2472,9 @@ mod tests {
     fn test_opt_pml_collinear_design_reports_minus_twentyfive() {
         // The covariate is duplicated, so the information matrix is singular.
         let design: Vec<f64> = DESIGN
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|r| [r[0], r[1], r[1]])
             .collect();
         let data = PmlData {
@@ -2856,6 +2841,85 @@ mod tests {
             }
         }
         (design, offset, counts, cell_index, subject_total, starts)
+    }
+
+    /// [`categorical_gene`] with a nine-level cell type in place of the
+    /// indicator, ten columns in all: past [`MAX_UNROLLED_WIDTH`], so the dense
+    /// sweep sums its curvature as a Gram while the tabled one keeps the
+    /// triangle update.
+    fn wide_categorical_gene() -> (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<f64>,
+        Vec<usize>,
+    ) {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(17);
+        let starts = vec![0usize, 400, 800, 1200];
+        let mut design = Vec::new();
+        let mut offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cell_index = Vec::new();
+        let mut subject_total = vec![0.0; 3];
+        for c in 0..1200 {
+            let s = c / 400;
+            let kind = rng.random_range(0..9usize);
+            design.extend([1.0, (s % 2) as f64]);
+            design.extend((1..9).map(|l| f64::from(kind == l)));
+            offset.push(rng.random_range(-2.3..2.3));
+            if rng.random_bool(0.1 + 0.02 * kind as f64) {
+                let y = rng.random_range(1..6) as f64;
+                counts.push(y);
+                cell_index.push(c);
+                subject_total[s] += y;
+            }
+        }
+        (design, offset, counts, cell_index, subject_total, starts)
+    }
+
+    #[test]
+    fn test_opt_pml_wide_gram_matches_the_tabled_sweep() {
+        let (design, offset, counts, cell_index, subject_total, starts) = wide_categorical_gene();
+        let n_coef = 10;
+        assert!(n_coef > MAX_UNROLLED_WIDTH);
+        let data = PmlData {
+            design: &design,
+            offset: &offset,
+            counts: &counts,
+            cell_index: &cell_index,
+            subject_start: &starts,
+            subject_total: &subject_total,
+        };
+        let zeros = ZeroCells::build(&design, &offset, &starts, n_coef).expect("categorical");
+        let mut start = vec![0.05; n_coef];
+        start[0] = -1.5;
+        for (subject, cell) in [(0.3, 0.05), (0.8, 2.0), (0.05, 40.0)] {
+            let variance = PmlVariance { subject, cell };
+            let params = PmlParams {
+                reml: true,
+                ord: 3,
+                ..Default::default()
+            };
+            let dense = opt_pml(&data, &start, &variance, Some(params)).expect("dense");
+            let tabled = opt_pml_tabled(&data, Some(&zeros), &start, &variance, Some(params))
+                .expect("tabled");
+            assert_eq!(dense.iterations, tabled.iterations);
+            for (a, b) in dense.beta.iter().zip(&tabled.beta) {
+                assert_relative_eq!(*a, *b, max_relative = 1e-10, epsilon = 1e-12);
+            }
+            for (a, b) in dense.information.iter().zip(&tabled.information) {
+                assert_relative_eq!(*a, *b, max_relative = 1e-10, epsilon = 1e-12);
+            }
+            assert_relative_eq!(
+                dense.log_likelihood,
+                tabled.log_likelihood,
+                max_relative = 1e-13
+            );
+            assert_relative_eq!(dense.log_det, tabled.log_det, max_relative = 1e-12);
+        }
     }
 
     #[test]

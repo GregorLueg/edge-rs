@@ -13,10 +13,8 @@
 //! stopping tests read is therefore identical in every lane, so the lanes never
 //! disagree about what to do next. No barrier, no shared memory.
 //!
-//! One fit per thread cost one thread's serial walk over every cell whatever
-//! the batch size (20000 cells: 455 fits took 152 ms, 3644 took 202 ms). A
-//! plane per fit measured 15x faster at 455 fits and 4.2x at 3644 on the
-//! likelihood pass.
+//! One fit per thread would cost one thread's serial walk over every cell
+//! whatever the batch size; a plane per fit spreads that walk over the lanes.
 //!
 //! ### Precision: the part better summation cannot fix
 //!
@@ -25,11 +23,8 @@
 //! fast-math on (`wgpu-hal-29.0.4/src/metal/device.rs:227`), which licenses
 //! reassociation. Kahan and double-single recover the rounding error through a
 //! `two_sum` whose exact-algebra value is zero, so the compiler folds them
-//! away. Measured: scaling the recovered low part by a thousand changed not one
-//! digit, and a bit-level round-trip, a multiply by a runtime one read from a
-//! buffer and a trip through global memory are all folded too. Integer
-//! fixed-point accumulation is exact and free, but exact summation would not be
-//! enough either (see below).
+//! away, and no barrier trick survives it. Integer fixed-point accumulation is
+//! exact, but exact summation would not be enough either (see below).
 //!
 //! So the arithmetic is arranged so that nothing cancels. Three places needed
 //! it, all exact rewrites.
@@ -54,13 +49,12 @@
 //!   two means against the spread, where about the origin it was the whole
 //!   intercept. Columns constant within a subject come out exactly zero. A
 //!   Welford update avoids the subtraction but costs two divisions and a branch
-//!   per cell plus a pairwise merge across the plane, and measured 1.3x to 1.45x
-//!   slower on the whole kernel.
+//!   per cell plus a pairwise merge across the plane, which is slower.
 //!
 //! What remains is the `f32` rounding of one `exp` and one `ln` per cell, which
-//! nothing here can undo: the objective is off by about `2e-3` at 20000 cells
-//! and jitters by `2e-5` to `2e-4` between nearby variance components, even
-//! with exact summation. That, not the summation, is why the host finishes
+//! nothing here can undo: the objective is off and jitters between nearby
+//! variance components far above the search's resolution, even with exact
+//! summation. That, not the summation, is why the host finishes
 //! every fit in `f64` (see [`crate::gpu::stage_two`]). Long sums run as a
 //! three-level tree (within a lane, across the plane, over the subjects), a
 //! change of association the compiler cannot fold.
@@ -90,12 +84,11 @@ use crate::errors::EdgeErrors;
 // Consts //
 ////////////
 
-/// Magnitude past which a Newton component is treated as unbounded rather than
-/// damped. `STEP_CUTOFF` in [`crate::sc::pml`].
-const STEP_CUTOFF: f32 = 40.0;
+/// [`crate::sc::pml::STEP_CUTOFF`] in `f32`.
+const STEP_CUTOFF: f32 = crate::sc::pml::STEP_CUTOFF as f32;
 
-/// Largest gradient component still called a critical point, nebula's `convd`.
-const GRADIENT_TOLERANCE: f32 = 0.01;
+/// [`crate::sc::pml::GRADIENT_TOLERANCE`] in `f32`.
+const GRADIENT_TOLERANCE: f32 = crate::sc::pml::GRADIENT_TOLERANCE as f32;
 
 /// Requests per workgroup, one plane each.
 ///
@@ -156,7 +149,7 @@ pub const OUT_HEADER: u32 = 6;
 /// their capacity is a compile-time constant. Dispatch compiles one shader per
 /// width, not per tier: register pressure bounds occupancy, and at the common
 /// `n_beta` of three a capacity of four wastes seven registers on the quadratic
-/// block alone. Dropping three such arrays moved the kernel 18 per cent.
+/// block alone.
 pub const MAX_BETA_CAP: usize = 8;
 
 ////////////
@@ -376,8 +369,7 @@ pub fn opt_pml_gpu<F: Float + CubeElement>(
             // So each subject is a dense pass over every cell at `y = 0`, then a
             // sparse pass over its positive counts adding the `y` parts. Both
             // stride across the lanes so a plane's loads fall on consecutive
-            // cells; a contiguous chunk per lane measured 2.4x slower on the
-            // scattered loads alone. The moments are order-free sums, so a
+            // cells; a contiguous chunk per lane scatters the loads. The moments are order-free sums, so a
             // count's curvature enters as one more observation at its cell.
             let mut resid = zero;
             let mut weight = zero;

@@ -33,8 +33,8 @@ The runtime probe in `detect_simd_level` handles dispatch below that.
 ## Parity testing
 
 The E2E suites in `tests/e2e_*.rs` gate against committed CSV fixtures under
-`tests/data/e2e`, written by `tests/r/generate_fixtures.R` against edgeR 4.8.2,
-limma 3.66.0, statmod 1.5.2 and nebula 1.5.8. CI never runs the R. Regenerate by
+`tests/data/e2e`, written by `tests/r/generate_fixtures.R` against edgeR 4.10.7,
+limma 3.68.5, statmod 1.5.2 and nebula 1.5.9. CI never runs the R. Regenerate by
 hand from the repository root after an upstream bump and inspect the diff:
 
 ```sh
@@ -71,7 +71,7 @@ drifted back. **Any new deliberate deviation belongs there.** NEBULA is ported
 from the `nebula` package's own C++, not from edgePython, whose standard errors
 are 6 to 89 per cent off.
 
-The edgePython entries were read against version 0.2.6, commit `1e572ae`, and the
+The edgePython entries were read against version 0.5.1, commit `4be67c8`, and the
 doc says so. A file-and-line citation with no commit behind it rots the moment
 upstream edits the file. Re-pin the header if you check the claims against a
 newer checkout.

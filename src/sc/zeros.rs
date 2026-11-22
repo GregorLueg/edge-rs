@@ -60,12 +60,9 @@ const NOISE_ULPS: f64 = 32.0;
 const MAX_DEPTH: u8 = 6;
 
 /// Largest tolerated sum of the last two Chebyshev coefficients of any of the
-/// six interpolated forms; a panel above it is halved.
-///
-/// Measured 2026-10-07 on 500 offsets spread over two orders of magnitude:
-/// worst relative error against the compensated direct sum `8e-14`, at the far
-/// small-`v` tail where `ln L` is near `-35` and its rounding dominates; inside
-/// the transition `1e-14`. 33 panels per group.
+/// six interpolated forms; a panel above it is halved. Keeps the tables within
+/// a few ulps of the compensated direct sum except in the far small-`v` tail,
+/// where the rounding of `ln L` itself dominates.
 const PANEL_TOL: f64 = 1e-14;
 
 /// How far into either tail, in `ln v`, the table reaches before the closed
@@ -423,10 +420,6 @@ struct Neumaier {
 
 impl Neumaier {
     /// Adds one term.
-    ///
-    /// ### Params
-    ///
-    /// * `x` - The term
     fn add(&mut self, x: f64) {
         let t = self.sum + x;
         if self.sum.abs() >= x.abs() {
@@ -438,24 +431,12 @@ impl Neumaier {
     }
 
     /// The compensated total.
-    ///
-    /// ### Returns
-    ///
-    /// `sum + carry`.
     fn total(self) -> f64 {
         self.sum + self.carry
     }
 }
 
 /// Compensated sum of an iterator.
-///
-/// ### Params
-///
-/// * `values` - The terms
-///
-/// ### Returns
-///
-/// Their sum.
 fn compensated(values: impl Iterator<Item = f64>) -> f64 {
     let mut acc = Neumaier::default();
     for v in values {

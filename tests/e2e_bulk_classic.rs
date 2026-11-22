@@ -516,8 +516,26 @@ fn test_ave_log_cpm_matches_edger() {
             &format!("{}/avelogcpm_disp02", d.tag),
         );
 
-        // The offset form. Vector offsets only: a matrix offset would hit
-        // UPSTREAM_DEVIATIONS.md B1, where edgeR corrupts the first gene.
+        // The offset form, as a vector and as the equivalent matrix.
+        let matrix_offset = Recycled::full(l.offset.repeat(l.n_kept), l.n_kept, l.n_samples)
+            .expect("matrix offset");
+        let got = ave_log_cpm(
+            &l.kept_counts,
+            l.n_kept,
+            l.n_samples,
+            None,
+            Some(&matrix_offset),
+            2.0,
+            Some(&Recycled::Scalar(0.05)),
+        )
+        .expect("ave_log_cpm failed");
+        assert_close(
+            &got,
+            want.column("with_matrix_offset"),
+            TOL_AVE_LOG_CPM,
+            &format!("{}/avelogcpm_matrix_offset", d.tag),
+        );
+
         let offset = Recycled::by_sample(l.offset.clone());
         let got = ave_log_cpm(
             &l.kept_counts,

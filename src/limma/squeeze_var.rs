@@ -13,13 +13,13 @@
 //! Var[z_g] = psi'(df0/2) + psi'(df_g/2)
 //! ```
 //!
-//! So `e_g = z_g + logmdigamma(df_g/2)` has mean `log(s0^2) - logmdigamma(df0/2)`
-//! and variance `trigamma(df0/2)` plus the known genewise term. Subtracting the
-//! mean of `trigamma(df_g/2)` from the sample variance of `e` and inverting
-//! `trigamma` closes the fit. [`fit_f_dist`] takes the mean of `e` as one
-//! number, [`fit_f_dist_trend`] as a natural cubic spline in a covariate, and
-//! [`fit_f_dist_robustly`] uses Winsorised moments so a few wild genes cannot
-//! drag `df0` down.
+//! So `e_g = z_g + logmdigamma(df_g/2)` has mean
+//! `log(s0^2) - logmdigamma(df0/2)` and variance `trigamma(df0/2)` plus the
+//! known genewise term. Subtracting the mean of `trigamma(df_g/2)` from the
+//! sample variance of `e` and inverting `trigamma` closes the fit.
+//! [`fit_f_dist`] takes the mean of `e` as one number, [`fit_f_dist_trend`] as
+//! a natural cubic spline in a covariate, and [`fit_f_dist_robustly`] uses
+//! Winsorised moments so a few wild genes cannot drag `df0` down.
 //!
 //! ### Which limma this is
 //!
@@ -46,9 +46,10 @@ use faer::linalg::solvers::SolveLstsq;
 use rayon::prelude::*;
 
 use crate::errors::EdgeErrors;
+use crate::limma::RANK_TOL;
 use crate::limma::lowess::lowess;
 use crate::limma::lowess::{LowessParams, weighted_lowess};
-use crate::numeric::dist::{beta_cdf, beta_ppf, beta_sf, chisq_sf, f_ppf, f_sf, gamma_ppf};
+use crate::numeric::dist::{beta_cdf, chisq_sf, f_cdf, f_density, f_isf, f_ppf, f_quantile, f_sf};
 use crate::numeric::gamma::{ln_gamma, logmdigamma, trigamma, trigamma_inverse};
 use crate::numeric::interpolate::{interp_linear_extrap, natural_spline_basis};
 use crate::numeric::optimise::{OPTIMIZE_TOL, brent_fmin, brentq};
@@ -121,10 +122,6 @@ const ROOT_RTOL: f64 = 8.0 * f64::EPSILON;
 
 /// Iteration budget for the `df2` root search.
 const ROOT_MAX_ITER: usize = 200;
-
-/// Relative tolerance on the QR diagonal used to rank the spline basis,
-/// matching the default `tol` of R's `lm.fit`.
-const RANK_TOL: f64 = 1e-7;
 
 /// Gene count above which the per-gene tail probabilities run over rayon.
 ///
@@ -491,9 +488,9 @@ pub fn fit_f_dist(x: &[f64], df1: &[f64]) -> Result<(f64, f64), EdgeErrors> {
 /// * `var` - Genewise variances
 /// * `df1` - Residual degrees of freedom, one shared value or one per gene
 /// * `covariate` - Covariate, one per gene, typically the average log CPM
-/// * `span` - Validated to lie in `(0, 1]` but otherwise unused: limma's trended
-///   `fitFDist` is a spline with no span. Kept for signature parity with the
-///   robust fit.
+/// * `span` - Validated to lie in `(0, 1]` but otherwise unused: limma's
+///   trended `fitFDist` is a spline with no span. Kept for signature parity
+///   with the robust fit.
 ///
 /// ### Returns
 ///
@@ -814,18 +811,6 @@ struct RobustFit {
 }
 
 /// [`fit_f_dist_robustly`] with the lowess span exposed.
-///
-/// ### Params
-///
-/// * `x` - Genewise variances
-/// * `df1` - Residual degrees of freedom, length one or one per gene
-/// * `covariate` - Covariate, one per gene, or `None`
-/// * `winsor_tail_p` - Lower and upper Winsorising proportions
-/// * `span` - Lowess span, or `None` for [`ROBUST_LOWESS_SPAN`]
-///
-/// ### Returns
-///
-/// The prior scale and the per-gene prior degrees of freedom.
 fn robust_fit(
     x: &[f64],
     df1: &[f64],
@@ -1561,14 +1546,6 @@ fn zero_out_weights(prior_weights: &mut Option<Vec<f64>>, mask: &[bool]) {
 }
 
 /// Index of the smallest element, the first one when they tie.
-///
-/// ### Params
-///
-/// * `v` - Values, non-empty
-///
-/// ### Returns
-///
-/// The index, as R's `which.min` picks it. Zero for an empty slice.
 fn which_min(v: &[f64]) -> usize {
     let mut best = 0;
     for i in 1..v.len() {
@@ -1599,34 +1576,6 @@ fn all_positive_df_equal(df: &[f64]) -> bool {
         hi = hi.max(d);
     }
     lo == hi
-}
-
-/// Lower tail of the F distribution, R's `pf(q, df1, df2, lower.tail = TRUE)`.
-///
-/// Uses whichever side of the incomplete beta is not squeezed against one, as R
-/// does, so it is not simply `1 - f_sf`.
-///
-/// ### Params
-///
-/// * `x` - Test statistic
-/// * `df1` - Numerator degrees of freedom, finite and strictly positive
-/// * `df2` - Denominator degrees of freedom, finite and strictly positive
-///
-/// ### Returns
-///
-/// `P(F <= x)`, or [`EdgeErrors::InvalidArgument`] for a non-positive `df`.
-fn f_cdf(x: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
-    if x <= 0.0 {
-        return Ok(0.0);
-    }
-    if x.is_infinite() {
-        return Ok(1.0);
-    }
-    if df1 * x > df2 {
-        beta_sf(df2 / (df2 + df1 * x), 0.5 * df2, 0.5 * df1)
-    } else {
-        beta_cdf(df1 * x / (df2 + df1 * x), 0.5 * df1, 0.5 * df2)
-    }
 }
 
 ////////////////////////
@@ -1744,108 +1693,15 @@ fn gauss_legendre_unit(n: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 /// The link `d -> d / (1 + d)` that maps `[0, inf]` onto `[0, 1]`.
-///
-/// ### Params
-///
-/// * `d` - Degrees of freedom, non-negative
-///
-/// ### Returns
-///
-/// `d / (1 + d)`, and 1 for an infinite argument.
 #[inline]
 fn link_fun(d: f64) -> f64 {
     if d.is_infinite() { 1.0 } else { d / (1.0 + d) }
 }
 
 /// Inverse of [`link_fun`].
-///
-/// ### Params
-///
-/// * `p` - Value in `[0, 1]`
-///
-/// ### Returns
-///
-/// `p / (1 - p)`, and `inf` at 1.
 #[inline]
 fn link_inv(p: f64) -> f64 {
     p / (1.0 - p)
-}
-
-////////////////////////////
-// F distribution helpers //
-////////////////////////////
-
-/// F quantile that also accepts an infinite denominator.
-///
-/// `F(df1, Inf)` is `chi^2_df1 / df1`, so the infinite case is a gamma quantile.
-///
-/// ### Params
-///
-/// * `p` - Probability in `[0, 1]`
-/// * `df1` - Numerator degrees of freedom, positive
-/// * `df2` - Denominator degrees of freedom, positive or infinite
-///
-/// ### Returns
-///
-/// The quantile, or [`EdgeErrors`] from the underlying inversion.
-fn f_quantile(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
-    if df2.is_infinite() {
-        Ok(gamma_ppf(p, 0.5 * df1, 2.0)? / df1)
-    } else {
-        f_ppf(p, df1, df2)
-    }
-}
-
-/// F density that also accepts an infinite denominator.
-///
-/// Evaluated through logs so the two large powers never overflow separately.
-///
-/// ### Params
-///
-/// * `x` - Quantile, positive
-/// * `df1` - Numerator degrees of freedom, positive
-/// * `df2` - Denominator degrees of freedom, positive or infinite
-///
-/// ### Returns
-///
-/// The density at `x`.
-fn f_density(x: f64, df1: f64, df2: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if df2.is_infinite() {
-        // df1 * dchisq(df1 x, df1)
-        let y = df1 * x;
-        let k = 0.5 * df1;
-        return df1
-            * ((k - 1.0) * y.ln() - 0.5 * y - ln_gamma(k) - k * std::f64::consts::LN_2).exp();
-    }
-    let (a, b) = (0.5 * df1, 0.5 * df2);
-    let ln_beta = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
-    (a * (df1 * x).ln() + b * df2.ln() - (a + b) * (df1 * x + df2).ln() - x.ln() - ln_beta).exp()
-}
-
-/// Inverse of the F survival function.
-///
-/// Built from the beta quantile, since `f_ppf(1 - p)` rounds a small upper-tail
-/// probability to one and returns `inf`. Uses
-/// `sf(x) = I(df2 / (df1 x + df2); df2/2, df1/2)`.
-///
-/// ### Params
-///
-/// * `p` - Upper-tail probability in `[0, 1]`
-/// * `df1` - Numerator degrees of freedom, positive
-/// * `df2` - Denominator degrees of freedom, positive
-///
-/// ### Returns
-///
-/// The `x` with `P(F > x) = p`.
-fn f_isf(p: f64, df1: f64, df2: f64) -> Result<f64, EdgeErrors> {
-    let w = beta_ppf(p, 0.5 * df2, 0.5 * df1)?;
-    if w <= 0.0 {
-        return Ok(f64::INFINITY);
-    }
-    Ok(df2 * (1.0 - w) / (df1 * w))
 }
 
 ////////////////
@@ -2103,9 +1959,9 @@ fn loess_fit_weighted(
 
 /// Fitted values of a weighted straight line, `lm.wfit(cbind(1, x), y, w)`.
 ///
-/// Solved from the two-by-two weighted normal equations. Without weighted spread
-/// in the covariate the slope is dropped and every fit is the weighted mean, as
-/// `lm.wfit` does for a rank deficient design.
+/// Solved from the two-by-two weighted normal equations. Without weighted
+/// spread in the covariate the slope is dropped and every fit is the weighted
+/// mean, as `lm.wfit` does for a rank deficient design.
 ///
 /// ### Params
 ///
@@ -2165,14 +2021,6 @@ fn check_fit_lengths(name: &'static str, x: &[f64], df1: &[f64]) -> Result<usize
 }
 
 /// Checks that both Winsorising proportions lie in `[0, 0.5)`.
-///
-/// ### Params
-///
-/// * `winsor_tail_p` - Lower and upper proportions
-///
-/// ### Returns
-///
-/// Nothing, or [`EdgeErrors::InvalidArgument`].
 fn check_winsor_tail_p(winsor_tail_p: (f64, f64)) -> Result<(), EdgeErrors> {
     for p in [winsor_tail_p.0, winsor_tail_p.1] {
         if !(0.0..0.5).contains(&p) {
@@ -2185,16 +2033,6 @@ fn check_winsor_tail_p(winsor_tail_p: (f64, f64)) -> Result<(), EdgeErrors> {
 }
 
 /// Which genes carry usable information, by limma's `fitFDist` rule.
-///
-/// ### Params
-///
-/// * `x` - Variances
-/// * `df1` - Residual degrees of freedom, length one or one per gene
-/// * `df_tol` - Smallest degrees of freedom to accept
-///
-/// ### Returns
-///
-/// One flag per gene.
 fn informative_mask(x: &[f64], df1: &[f64], df_tol: f64) -> Vec<bool> {
     (0..x.len())
         .map(|i| {
@@ -2269,30 +2107,12 @@ fn finitise_covariate(covariate: &[f64]) -> Result<Vec<f64>, EdgeErrors> {
 }
 
 /// Reads a length-one or full-length vector at a gene index.
-///
-/// ### Params
-///
-/// * `v` - Vector of length one or at least `i + 1`
-/// * `i` - Gene index
-///
-/// ### Returns
-///
-/// The recycled value.
 #[inline]
 fn at(v: &[f64], i: usize) -> f64 {
     if v.len() == 1 { v[0] } else { v[i] }
 }
 
 /// Expands a length-one vector to `n`, leaving longer ones alone.
-///
-/// ### Params
-///
-/// * `v` - Vector of length one or `n`
-/// * `n` - Target length
-///
-/// ### Returns
-///
-/// A vector of length `n`.
 fn recycle(v: &[f64], n: usize) -> Vec<f64> {
     if v.len() == 1 {
         vec![v[0]; n]
@@ -2302,15 +2122,6 @@ fn recycle(v: &[f64], n: usize) -> Vec<f64> {
 }
 
 /// Keeps the flagged entries.
-///
-/// ### Params
-///
-/// * `v` - Values
-/// * `ok` - Flags, same length
-///
-/// ### Returns
-///
-/// The flagged values in order.
 fn subset(v: &[f64], ok: &[bool]) -> Vec<f64> {
     v.iter()
         .zip(ok)
@@ -2341,14 +2152,6 @@ fn subset_recycled(v: &[f64], ok: &[bool]) -> Vec<f64> {
 }
 
 /// Arithmetic mean.
-///
-/// ### Params
-///
-/// * `x` - Values, non-empty
-///
-/// ### Returns
-///
-/// The mean.
 fn mean(x: &[f64]) -> f64 {
     x.iter().sum::<f64>() / x.len() as f64
 }
@@ -2370,14 +2173,6 @@ fn mean_trigamma(df: &[f64]) -> f64 {
 }
 
 /// Indices that sort `x` ascending, ties keeping their input order.
-///
-/// ### Params
-///
-/// * `x` - Values
-///
-/// ### Returns
-///
-/// The permutation, as R's `order` produces it.
 fn stable_order(x: &[f64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..x.len()).collect();
     order.sort_by(|&a, &b| x[a].total_cmp(&x[b]));
@@ -2385,11 +2180,6 @@ fn stable_order(x: &[f64]) -> Vec<usize> {
 }
 
 /// Running maximum applied along a permutation.
-///
-/// ### Params
-///
-/// * `v` - Values, modified in place
-/// * `order` - Permutation to walk
 fn cummax_in_order(v: &mut [f64], order: &[usize]) {
     let mut running = f64::NEG_INFINITY;
     for &i in order {
@@ -2461,15 +2251,6 @@ fn collapse_ties(x: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>) {
 
 /// Maps a fallible scalar function over a slice, in parallel above
 /// [`PARALLEL_THRESHOLD`].
-///
-/// ### Params
-///
-/// * `x` - Inputs
-/// * `f` - Function to apply
-///
-/// ### Returns
-///
-/// The mapped values, or the first error encountered.
 fn map_maybe_par<F>(x: &[f64], f: F) -> Result<Vec<f64>, EdgeErrors>
 where
     F: Fn(f64) -> Result<f64, EdgeErrors> + Sync + Send,

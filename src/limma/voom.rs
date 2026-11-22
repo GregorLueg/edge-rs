@@ -27,20 +27,21 @@
 //! ([`crate::limma::lowess::lowess`]), not `weightedLowess`. The exception is
 //! `voomLmFit` once it finds structural zeros: it then uses
 //! [`crate::limma::lowess::weighted_lowess`] with the residual degrees of
-//! freedom as prior weights. edgePython uses `weightedLowess` unconditionally.
-//! See `UPSTREAM_DEVIATIONS.md` A13.
+//! freedom as prior weights.
 
 use faer::MatRef;
 use rayon::prelude::*;
 
-use crate::core::expression::PER_MILLION;
+use crate::core::expression::{PER_MILLION, check_positive_finite, column_sums};
 use crate::core::normalisation::{NormMethod, calc_norm_factors};
 use crate::errors::EdgeErrors;
 use crate::glm::fit::glm_fit;
 use crate::limma::lm_fit::{LmFitResult, lm_fit};
 use crate::limma::lowess::{LowessParams, lowess, weighted_lowess};
-use crate::numeric::interpolate::interp_linear_extrap;
-use crate::utils::design::{LIMMA_LOWESS_DEFAULTS, choose_lowess_span, hat_diagonal, is_full_rank};
+use crate::numeric::interpolate::interp_one;
+use crate::utils::design::{
+    LIMMA_LOWESS_DEFAULTS, choose_lowess_span, gather_rows, hat_diagonal, matrix_rank,
+};
 use crate::utils::recycled::Recycled;
 use crate::utils::traits::EdgeFloat;
 
@@ -204,26 +205,9 @@ pub struct VoomResult {
 /// With fewer than two genes having residual degrees of freedom, every weight
 /// is one (limma warns and does the same).
 ///
-/// ### Where edgePython disagrees with limma
-///
-/// Reproduced as limma has them. The list is local, not `UPSTREAM_DEVIATIONS.md`
-/// numbering, except the first (A13).
-///
-/// * edgePython always smooths with `weightedLowess`; limma's `voom` uses
-///   `stats::lowess`. See `UPSTREAM_DEVIATIONS.md` A13.
-/// * edgePython uses `npts = 120` and three iterations for the unweighted
-///   smooth; neither is a limma default.
-/// * edgePython never drops the all-zero rows from the trend.
-/// * edgePython restricts the trend to genes with residual degrees of freedom;
-///   only `voomLmFit` does, not `voom`.
-/// * edgePython floors `sigma`, the trend and the fitted counts at `1e-8`;
-///   limma clamps nothing.
-/// * edgePython collapses tied trend abscissae to the first ordinate;
-///   `approxfun(ties = list("ordered", mean))` takes the mean.
-/// * edgePython multiplies prior weights into the returned weights; limma
-///   returns the voom weights alone.
-/// * edgePython's `normalize_method` is `normalizeBetweenArrays`; this port
-///   takes edgeR's `calcNormFactors`. Quantile normalisation is not available.
+/// limma's `normalize.method` (`normalizeBetweenArrays`) is not ported: library
+/// sizes come from edgeR's `calcNormFactors`, so quantile normalisation is not
+/// available.
 ///
 /// Two guards are added on top of limma, both no-ops when limma gives a usable
 /// answer: non-finite `(sx, sy)` pairs and genes with no residual degrees of
@@ -285,9 +269,9 @@ pub fn voom<T: EdgeFloat>(
 /// Differs from [`voom`] in two ways. Genes with a whole group of exact zeros
 /// have those observations masked out and their residual scale and degrees of
 /// freedom recomputed, so structural zeros do not look like low variance; if
-/// any such gene exists the trend uses [`crate::limma::lowess::weighted_lowess`]
-/// with the residual degrees of freedom as prior weights. The model is then
-/// refitted with the voom weights.
+/// any such gene exists the trend uses
+/// [`crate::limma::lowess::weighted_lowess`] with the residual degrees of
+/// freedom as prior weights. The model is then refitted with the voom weights.
 ///
 /// Equivalent to `voomLmFit(counts, design, block = NULL, sample.weights =
 /// FALSE)`: no block correlation or array weight loops.
@@ -311,14 +295,8 @@ pub fn voom<T: EdgeFloat>(
 ///
 /// ### Where edgePython disagrees with edgeR
 ///
-/// In addition to the list on [`voom`]:
-///
-/// * edgePython passes `block` and `correlation` to the *first* fit; edgeR uses
-///   prior weights only there (moot here, neither is supported).
-/// * edgePython clamps the trend's prior weights to at least one; edgeR passes
-///   `df.residual` unchanged.
-/// * edgePython runs structural-zero detection from `voom` behind a flag; in
-///   edgeR it exists only in `voomLmFit`.
+/// edgePython runs structural-zero detection from `voom` behind a flag; in
+/// edgeR it exists only in `voomLmFit`.
 #[allow(clippy::too_many_arguments)]
 pub fn voom_lmfit<T: EdgeFloat>(
     counts: &[T],
@@ -398,7 +376,7 @@ pub fn voom_lmfit<T: EdgeFloat>(
             });
     }
 
-    let full = Recycled::full(w.clone(), n_genes, n_samples)?;
+    let full = Recycled::full(w, n_genes, n_samples)?;
     let mut final_fit = lm_fit(
         &prep.e,
         n_genes,
@@ -409,6 +387,9 @@ pub fn voom_lmfit<T: EdgeFloat>(
         None,
         None,
     )?;
+    let Recycled::Full(w) = full else {
+        unreachable!("Recycled::full builds the Full variant")
+    };
     for (k, &g) in zeros.rows.iter().enumerate() {
         let mask = &zeros.observed[k * n_samples..(k + 1) * n_samples];
         let (sigma, df) = masked_fit(
@@ -471,7 +452,7 @@ pub fn voom_basic<T: EdgeFloat>(
             check_lib_size(l, n_samples)?;
             l.to_vec()
         }
-        None => column_sums(counts, n_genes, n_samples),
+        None => column_sums(counts, n_samples),
     };
     if let Some(nf) = norm_factors {
         if nf.len() != n_samples {
@@ -481,11 +462,7 @@ pub fn voom_basic<T: EdgeFloat>(
                 got: nf.len(),
             });
         }
-        if let Some(bad) = nf.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-            return Err(EdgeErrors::InvalidArgument(format!(
-                "normalisation factors must be positive and finite, found {bad}"
-            )));
-        }
+        check_positive_finite(nf, "normalisation factors")?;
         for (l, f) in effective.iter_mut().zip(nf.iter()) {
             *l *= f;
         }
@@ -585,10 +562,11 @@ fn prepare<T: EdgeFloat>(
             got: design.len(),
         });
     }
-    if !is_full_rank(design, n_samples, n_coef)? {
+    let rank = matrix_rank(design, n_samples, n_coef)?;
+    if rank != n_coef {
         return Err(EdgeErrors::DesignNotFullRank {
             n_cols: n_coef,
-            rank: crate::utils::design::matrix_rank(design, n_samples, n_coef)?,
+            rank,
         });
     }
     // Explicit rather than a negated comparison, so a NaN prior count is
@@ -608,7 +586,7 @@ fn prepare<T: EdgeFloat>(
             check_lib_size(l, n_samples)?;
             l.to_vec()
         }
-        None => column_sums(counts, n_genes, n_samples),
+        None => column_sums(counts, n_samples),
     };
     if params.normalize_method != NormMethod::None {
         let factors = calc_norm_factors(
@@ -662,38 +640,7 @@ fn prepare<T: EdgeFloat>(
     })
 }
 
-/// Column sums of a count matrix, which is voom's default library size.
-///
-/// ### Params
-///
-/// * `counts` - Row-major counts
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// One total per sample.
-fn column_sums<T: EdgeFloat>(counts: &[T], n_genes: usize, n_samples: usize) -> Vec<f64> {
-    let mut out = vec![0.0_f64; n_samples];
-    for gene in 0..n_genes {
-        let row = &counts[gene * n_samples..(gene + 1) * n_samples];
-        for (acc, v) in out.iter_mut().zip(row.iter()) {
-            *acc += v.to_f64().unwrap_or(f64::NAN);
-        }
-    }
-    out
-}
-
 /// Checks that a library size vector is the right length and strictly positive.
-///
-/// ### Params
-///
-/// * `lib_size` - Library size per sample
-/// * `n_samples` - Number of samples expected
-///
-/// ### Returns
-///
-/// `Ok(())`, or [`EdgeErrors`] on a length or positivity failure.
 fn check_lib_size(lib_size: &[f64], n_samples: usize) -> Result<(), EdgeErrors> {
     if lib_size.len() != n_samples {
         return Err(EdgeErrors::LengthMismatch {
@@ -702,12 +649,7 @@ fn check_lib_size(lib_size: &[f64], n_samples: usize) -> Result<(), EdgeErrors> 
             got: lib_size.len(),
         });
     }
-    if let Some(bad) = lib_size.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-        return Err(EdgeErrors::InvalidArgument(format!(
-            "library sizes must be positive and finite, found {bad}"
-        )));
-    }
-    Ok(())
+    check_positive_finite(lib_size, "library sizes")
 }
 
 /// Arithmetic mean of a gene's row.
@@ -935,12 +877,11 @@ fn voom_weights(
             // two libm entry points disagree in the last bit.
             *v = (INV_PER_MILLION * (2.0_f64.powf(*f) * l)).log2();
         }
-        // Cannot fail: `collapse` guarantees at least two strictly increasing
-        // knots, which is all `interp_linear_extrap` validates.
-        let t = interp_linear_extrap(row, &trend.x, &trend.y)
-            .expect("trend knots were validated when the trend was built");
-        for (v, ti) in row.iter_mut().zip(t.iter()) {
-            let square = ti * ti;
+        // `collapse` guarantees at least two strictly increasing knots, so the
+        // per-gene call skips the O(n_knots) validation.
+        for v in row.iter_mut() {
+            let t = interp_one(*v, &trend.x, &trend.y);
+            let square = t * t;
             *v = 1.0 / (square * square);
         }
     };
@@ -992,16 +933,6 @@ fn finish(
 }
 
 /// The result upstream returns when the design has no replication to speak of.
-///
-/// ### Params
-///
-/// * `e` - log2-CPM matrix
-/// * `n_genes` - Number of genes
-/// * `n_samples` - Number of samples
-///
-/// ### Returns
-///
-/// The expression matrix with every weight set to one and no trend.
 fn no_trend_result(e: Vec<f64>, n_genes: usize, n_samples: usize) -> VoomResult {
     let amean = e.chunks_exact(n_samples).map(row_mean).collect();
     VoomResult {
@@ -1077,10 +1008,7 @@ fn detect_structural_zeros<T: EdgeFloat>(
         return Ok(empty);
     }
 
-    let mut sub = Vec::with_capacity(candidates.len() * n_samples);
-    for &g in &candidates {
-        sub.extend_from_slice(&counts[g * n_samples..(g + 1) * n_samples]);
-    }
+    let sub = gather_rows(counts, n_samples, &candidates);
     let offset = Recycled::by_sample(lib_size.iter().map(|l| l.ln()).collect());
     let poisson = glm_fit(
         &sub,

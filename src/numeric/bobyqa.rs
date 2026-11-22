@@ -554,10 +554,6 @@ impl BobyqaStepper {
     }
 
     /// Pauses for the objective at `self.x`, resuming at `next`.
-    ///
-    /// ### Params
-    ///
-    /// * `next` - Label to resume at
     fn request(&mut self, next: Label) {
         for j in 1..=self.n {
             self.pending[j - 1] = self.x[j] * self.s[j - 1];
@@ -568,10 +564,6 @@ impl BobyqaStepper {
     }
 
     /// Whether the evaluation budget is spent, `nlopt_stop_evals`.
-    ///
-    /// ### Returns
-    ///
-    /// `true` once `maxeval` evaluations have been made.
     fn stop_evals(&self) -> bool {
         self.maxeval > 0 && self.nevals >= self.maxeval
     }
@@ -1577,14 +1569,6 @@ impl BobyqaStepper {
     }
 
     /// The integer parts `(p, q)` of a provisional point's identifier.
-    ///
-    /// ### Params
-    ///
-    /// * `k` - Point index
-    ///
-    /// ### Returns
-    ///
-    /// `ip = (int) ptsid(k)` and `iq = (int) (np * ptsid(k) - ip * np)`.
     fn pid_parts(&self, k: usize) -> (usize, usize) {
         let np = (self.n + 1) as f64;
         let v = self.w[self.pid(k)];

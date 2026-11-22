@@ -2,4 +2,5 @@
 //! deviances built on it.
 
 pub mod chebyshev;
+mod chebyshev_tables;
 pub mod weights;

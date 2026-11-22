@@ -24,16 +24,47 @@
 //!
 //! He et al., Communications Biology 4, 629, 2021
 
+use faer::linalg::matmul::matmul;
+use faer::{Accum, MatMut, MatRef, Par};
 use rayon::prelude::*;
 
 use crate::numeric::gamma::{digamma, ln_gamma, trigamma};
 use crate::prelude::*;
-use crate::sc::pml::positive_runs;
+use crate::sc::pml::{MAX_UNROLLED_WIDTH, positive_runs};
 use crate::sc::zeros::ZeroCells;
+use crate::utils::linalg::weighted_gram;
 
 ///////////////
 // Gene data //
 ///////////////
+
+/// Checks that cell indices are in range and strictly increasing.
+///
+/// ### Params
+///
+/// * `cells` - Cell index of each positive count
+/// * `n_cells` - Number of cells
+///
+/// ### Returns
+///
+/// `Ok(())`, or [`EdgeErrors::InvalidArgument`] on the first bad index.
+pub(crate) fn check_cell_index(cells: &[usize], n_cells: usize) -> Result<(), EdgeErrors> {
+    let mut previous: Option<usize> = None;
+    for &c in cells {
+        if c >= n_cells {
+            return Err(EdgeErrors::InvalidArgument(format!(
+                "Cell index {c} is out of range for {n_cells} cells."
+            )));
+        }
+        if previous.is_some_and(|p| c <= p) {
+            return Err(EdgeErrors::InvalidArgument(
+                "Cell indices must be strictly increasing.".to_string(),
+            ));
+        }
+        previous = Some(c);
+    }
+    Ok(())
+}
 
 /// Per-gene data laid out the way the kernels want it.
 ///
@@ -137,20 +168,7 @@ impl<'a> GeneData<'a> {
                 got: cells.len(),
             });
         }
-        let mut previous: Option<usize> = None;
-        for &c in cells {
-            if c >= n_cells {
-                return Err(EdgeErrors::InvalidArgument(format!(
-                    "Cell index {c} is out of range for {n_cells} cells."
-                )));
-            }
-            if previous.is_some_and(|p| c <= p) {
-                return Err(EdgeErrors::InvalidArgument(
-                    "Cell indices must be strictly increasing.".to_string(),
-                ));
-            }
-            previous = Some(c);
-        }
+        check_cell_index(cells, n_cells)?;
 
         Ok(Self {
             design,
@@ -193,11 +211,6 @@ impl<'a> GeneData<'a> {
         self.n_coef + 2
     }
 }
-
-/// Widest design whose per-subject gradient sums live on the stack, where the
-/// compiler keeps them in registers (236 against 258 us per evaluation on a
-/// 20000-cell, three-coefficient gene). Wider designs use the heap.
-const LOCAL_COEF: usize = 8;
 
 /// Per-gene buffers for the kernels, so repeated evaluations of one gene
 /// allocate nothing.
@@ -629,6 +642,13 @@ pub(crate) fn ptmg_value_gradient_hessian_with(
 /// Fills the exponentiated linear predictor and its subject sums, and
 /// accumulates `sum y * eta`.
 ///
+/// Past [`MAX_UNROLLED_WIDTH`] columns, `X beta` is one matrix-vector product
+/// into `extb`, then a pass adds the offset and exponentiates in place: a
+/// per-row dot product is a single dependency chain over `n_coef`, which is
+/// latency bound on wide designs. Narrow designs accumulate each row onto its
+/// offset instead, which is as fast there and keeps the bits `sc_high` parity
+/// needs; adding a separate `X beta` to an offset near `log(5e3)` drops them.
+///
 /// ### Params
 ///
 /// * `data` - The gene
@@ -640,7 +660,20 @@ pub(crate) fn ptmg_value_gradient_hessian_with(
 /// `sum_i y_i * eta_i`, the only part of the likelihood linear in `eta`.
 fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch<'_>) -> f64 {
     let nb = data.n_coef;
+    let n_cells = data.n_cells();
     let mut total = 0.0;
+
+    let wide = nb > MAX_UNROLLED_WIDTH;
+    if wide {
+        matmul(
+            MatMut::from_column_major_slice_mut(&mut scratch.extb, n_cells, 1),
+            Accum::Replace,
+            MatRef::from_row_major_slice(data.design, n_cells, nb),
+            MatRef::from_column_major_slice(beta, nb, 1),
+            1.0,
+            Par::Seq,
+        );
+    }
 
     for (s, csx_s) in scratch.cumsumxtb.iter_mut().enumerate() {
         let span = data.fid[s]..data.fid[s + 1];
@@ -651,10 +684,15 @@ fn linear_predictor(data: &GeneData<'_>, beta: &[f64], scratch: &mut PtmgScratch
             .zip(&scratch.y_cell[span.clone()])
             .zip(&mut scratch.extb[span])
         {
-            let mut eta = offset;
-            for (&x, &b) in row.iter().zip(beta.iter()) {
-                eta += x * b;
-            }
+            let eta = if wide {
+                offset + *extb_i
+            } else {
+                let mut eta = offset;
+                for (&x, &b) in row.iter().zip(beta) {
+                    eta += x * b;
+                }
+                eta
+            };
             // Guarded so a huge eta paired with a zero count cannot make `0 * inf`.
             if y != 0.0 {
                 total += eta * y;
@@ -915,9 +953,9 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
     for s in 0..k {
         let rows = s * nb..(s + 1) * nb;
         let acc;
-        if nb <= LOCAL_COEF {
-            let mut xf = [0.0; LOCAL_COEF];
-            let mut d41 = [0.0; LOCAL_COEF];
+        if nb <= MAX_UNROLLED_WIDTH {
+            let mut xf = [0.0; MAX_UNROLLED_WIDTH];
+            let mut d41 = [0.0; MAX_UNROLLED_WIDTH];
             (sums, acc) = cells(s, sums, &mut xf[..nb], &mut d41[..nb]);
             xexb_f[rows.clone()].copy_from_slice(&xf[..nb]);
             dbeta_41[rows].copy_from_slice(&d41[..nb]);
@@ -941,6 +979,12 @@ fn evaluate(data: &GeneData<'_>, params: &[f64], scratch: &mut PtmgScratch<'_>) 
 /// `sum g x e`, `sum x e (g/w - 1/w)` and `sum x e g e/w`, three scalars, and
 /// the three symmetric `x x' e` blocks weighted by `1`, `g` and `g e/w`. The
 /// formulas that follow are [`evaluate`]'s, applied to those sums.
+///
+/// Wider than [`MAX_UNROLLED_WIDTH`], the three blocks only ever enter the
+/// Hessian in one subject-weighted combination, so they are folded into a
+/// single `X' diag(w) X` once the subject weights are known. That is a second
+/// pass over the cells, but a GEMM instead of three scalar triangle updates per
+/// cell, and no `k * n_coef^2` storage.
 ///
 /// ### Params
 ///
@@ -986,14 +1030,18 @@ fn evaluate_hessian(
     } = &subjects;
 
     // Per-subject sums, row-major `k * nb` vectors and `k * nb * nb` blocks
-    // (upper triangle filled).
+    // (upper triangle filled). A wide design keeps `g e` and `g e^2 / w` per
+    // cell for the Gram instead of the blocks.
+    let wide = nb > MAX_UNROLLED_WIDTH;
+    let n_block = if wide { 0 } else { k * nn };
     let mut xexb_f = vec![0.0; k * nb];
     let mut dbeta_41 = vec![0.0; k * nb];
     let mut tmp1_f = vec![0.0; k * nb];
     let mut tmp2_f = vec![0.0; k * nb];
-    let mut block_plain = vec![0.0; k * nn];
-    let mut block_g = vec![0.0; k * nn];
-    let mut block_gte = vec![0.0; k * nn];
+    let mut block_plain = vec![0.0; n_block];
+    let mut block_g = vec![0.0; n_block];
+    let mut block_gte = vec![0.0; n_block];
+    let mut cell_terms = vec![0.0; if wide { 2 * n_cells } else { 0 }];
     let mut hb2_f = vec![0.0; k];
     let mut b2f = vec![0.0; k];
     let mut d42c = vec![0.0; k];
@@ -1006,7 +1054,11 @@ fn evaluate_hessian(
     };
     for s in 0..k {
         let v = s * nb..(s + 1) * nb;
-        let m = s * nn..(s + 1) * nn;
+        let (m, c) = if wide {
+            (0..0, 2 * fid[s]..2 * fid[s + 1])
+        } else {
+            (s * nn..(s + 1) * nn, 0..0)
+        };
         let block = SubjectBlock {
             xf: &mut xexb_f[v.clone()],
             d41: &mut dbeta_41[v.clone()],
@@ -1015,6 +1067,7 @@ fn evaluate_hessian(
             plain: &mut block_plain[m.clone()],
             g: &mut block_g[m.clone()],
             gte: &mut block_gte[m],
+            cell: &mut cell_terms[c],
         };
         macro_rules! width {
             ($nb:literal) => {
@@ -1131,14 +1184,31 @@ fn evaluate_hessian(
     let ymuymuimu: Vec<f64> = (0..k).map(|s| ymu2[s] * imustar[s]).collect();
     let b2f_scaled: Vec<f64> = (0..k).map(|s| b2f[s] * ymuymuimu[s] * imustar[s]).collect();
     let ymmd_imu: Vec<f64> = (0..k).map(|s| ymm_d[s] * imustar[s]).collect();
+    // The three blocks enter only as `sum x x' e (ymm_d - ym g + ym^2 g e / w)`.
+    let gram = wide.then(|| {
+        let mut weight = vec![0.0; n_cells];
+        for s in 0..k {
+            let ym = ymustar[s];
+            for i in fid[s]..fid[s + 1] {
+                weight[i] =
+                    extb[i] * ymm_d[s] - ym * cell_terms[2 * i] + ym * ym * cell_terms[2 * i + 1];
+            }
+        }
+        weighted_gram(data.design, nb, &weight)
+    });
     for p in 0..nb {
         for q in p..nb {
             let mut acc = 0.0;
-            for s in 0..k {
-                let at = s * nn + p * nb + q;
-                acc -= block_g[at] * ymustar[s];
-                acc += block_gte[at] * ymu2[s];
-                acc += ymm_d[s] * block_plain[at];
+            match &gram {
+                Some(gram) => acc += gram[p * nb + q],
+                None => {
+                    for s in 0..k {
+                        let at = s * nn + p * nb + q;
+                        acc -= block_g[at] * ymustar[s];
+                        acc += block_gte[at] * ymu2[s];
+                        acc += ymm_d[s] * block_plain[at];
+                    }
+                }
             }
             for s in 0..k {
                 let xf_p = xexb_f[s * nb + p];
@@ -1210,10 +1280,10 @@ struct SubjectBlock<'a> {
     g: &'a mut [f64],
     /// `sum x x' e g e / w`, upper triangle.
     gte: &'a mut [f64],
+    /// `g e` and `g e^2 / w` per cell, interleaved. Wide designs only, which
+    /// leave the three blocks empty.
+    cell: &'a mut [f64],
 }
-
-/// Widest design whose per-subject Hessian sums live on the stack.
-const HESSIAN_LOCAL_COEF: usize = 8;
 
 /// One subject's sweep for [`evaluate_hessian`], at a compile-time design
 /// width (`NB == 0` reads it from `data`).
@@ -1248,7 +1318,7 @@ fn hessian_subject<const NB: usize>(
     scalars: &mut HessianScalars,
 ) -> (f64, f64, f64) {
     let nb = if NB == 0 { data.n_coef } else { NB };
-    const V: usize = HESSIAN_LOCAL_COEF;
+    const V: usize = MAX_UNROLLED_WIDTH;
     let mut vecs = [[0.0f64; V]; 4];
     let mut blocks = [[0.0f64; V * V]; 3];
     let local = NB != 0;
@@ -1260,7 +1330,9 @@ fn hessian_subject<const NB: usize>(
         plain,
         g: bg,
         gte: bgte,
+        cell,
     } = block;
+    let first = cells.start;
     let mut acc = 0.0;
     let mut hb2 = 0.0;
     let mut b2 = 0.0;
@@ -1282,6 +1354,7 @@ fn hessian_subject<const NB: usize>(
             plain: bp,
             g: bg,
             gte: bgte,
+            cell,
         } = if local {
             SubjectBlock {
                 xf: &mut lxf[..nb],
@@ -1291,6 +1364,7 @@ fn hessian_subject<const NB: usize>(
                 plain: &mut lbp[..nb * nb],
                 g: &mut lbg[..nb * nb],
                 gte: &mut lbgte[..nb * nb],
+                cell: &mut [],
             }
         } else {
             SubjectBlock {
@@ -1301,6 +1375,7 @@ fn hessian_subject<const NB: usize>(
                 plain: &mut *plain,
                 g: &mut *bg,
                 gte: &mut *bgte,
+                cell: &mut *cell,
             }
         };
         for i in cells {
@@ -1325,6 +1400,18 @@ fn hessian_subject<const NB: usize>(
             let f1 = gt - inv_w;
 
             let row = &data.design[i * nb..(i + 1) * nb];
+            if !local {
+                cell[2 * (i - first)] = g * e;
+                cell[2 * (i - first) + 1] = gte * e;
+                for a in 0..nb {
+                    let xe = row[a] * e;
+                    xf[a] += xe;
+                    d41[a] += g * xe;
+                    t1[a] += xe * f1;
+                    t2[a] += xe * gte;
+                }
+                continue;
+            }
             for a in 0..nb {
                 let xe = row[a] * e;
                 xf[a] += xe;
@@ -2436,6 +2523,90 @@ mod tests {
             for i in 0..n {
                 let fd = (g_up[i] - g_down[i]) / (2.0 * step);
                 assert_relative_eq!(hessian[i * n + j], fd, max_relative = 1e-5, epsilon = 1e-7);
+            }
+        }
+    }
+
+    /// Fixture W: 240 cells over four subjects and ten design columns, past
+    /// [`MAX_UNROLLED_WIDTH`], so the Hessian takes the weighted Gram.
+    ///
+    /// ### Returns
+    ///
+    /// Design, log offsets, non-zero counts, their cells, subject totals, `fid`.
+    #[allow(clippy::type_complexity)]
+    fn fixture_wide() -> (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<f64>,
+        Vec<usize>,
+    ) {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(29);
+        let fid = vec![0usize, 50, 110, 160, 240];
+        let mut design = Vec::new();
+        let mut log_offset = Vec::new();
+        let mut counts = Vec::new();
+        let mut cells = Vec::new();
+        let mut subject_totals = vec![0.0; 4];
+        for c in 0..240 {
+            let s = fid.iter().rposition(|&b| b <= c).unwrap();
+            design.push(1.0);
+            design.push((s % 2) as f64);
+            design.extend((0..8).map(|_| rng.random_range(-1.0..1.0)));
+            log_offset.push(rng.random_range(-0.5..0.5));
+            if rng.random_bool(0.4) {
+                let y = rng.random_range(1..8) as f64;
+                counts.push(y);
+                cells.push(c);
+                subject_totals[s] += y;
+            }
+        }
+        (design, log_offset, counts, cells, subject_totals, fid)
+    }
+
+    /// The wide Hessian against a central difference of the gradient, which
+    /// never builds a Hessian.
+    #[test]
+    fn test_wide_hessian_agrees_with_finite_differences() {
+        let (design, log_offset, counts, cells, subject_totals, fid) = fixture_wide();
+        let n_coef = 10;
+        assert!(n_coef > MAX_UNROLLED_WIDTH);
+        let data = GeneData::new(
+            &design,
+            &log_offset,
+            &counts,
+            &cells,
+            &subject_totals,
+            &fid,
+            n_coef,
+        )
+        .unwrap();
+        let mut params = vec![0.0; n_coef + 2];
+        params[0] = 0.5;
+        for (j, p) in params[1..n_coef].iter_mut().enumerate() {
+            *p = 0.1 * (j as f64 - 4.0);
+        }
+        params[n_coef] = 0.4;
+        params[n_coef + 1] = 2.0;
+        let (_, gradient, hessian) = ptmg_value_gradient_hessian(&data, &params);
+        let n = params.len();
+        assert_eq!(gradient, ptmg_gradient(&data, &params));
+
+        for j in 0..n {
+            let step = 1e-6 * params[j].abs().max(1.0);
+            let mut up = params.clone();
+            let mut down = params.clone();
+            up[j] += step;
+            down[j] -= step;
+            let g_up = ptmg_gradient(&data, &up);
+            let g_down = ptmg_gradient(&data, &down);
+            for i in 0..n {
+                let fd = (g_up[i] - g_down[i]) / (2.0 * step);
+                assert_relative_eq!(hessian[i * n + j], fd, max_relative = 1e-5, epsilon = 1e-6);
+                assert_relative_eq!(hessian[i * n + j], hessian[j * n + i], max_relative = 1e-13);
             }
         }
     }
