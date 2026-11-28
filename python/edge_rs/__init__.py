@@ -17,12 +17,18 @@ Step by step, as in edgeR and limma:
     >>> fit = edge_rs.glm_ql_fit(counts[keep], design, lib_size=lib, norm_factors=nf)
     >>> edge_rs.top_tags(edge_rs.glm_ql_ftest(fit, coef="treated"))
 
+NEBULA on an `AnnData`, cells x genes as scanpy keeps them, with the
+`anndata` extra:
+
+    >>> res = edge_rs.nebula(adata, "donor", "~ condition", genes=hvgs)
+
 Every function that takes counts also takes a `DgeList` from `make_dgelist`,
 which carries `lib_size` and `norm_factors` and keeps the library sizes of the
 full matrix through a gene subset.
 """
 
 from importlib.metadata import version
+from typing import TYPE_CHECKING
 
 from edge_rs._core import (
     ave_log_cpm,
@@ -45,6 +51,9 @@ from edge_rs._limma import (
     voom_lm_fit,
 )
 from edge_rs._pipelines import run_edger_ql, run_limma_voom
+
+if TYPE_CHECKING:
+    from edge_rs._anndata import nebula as nebula
 
 __version__ = version("edge-rs")
 
@@ -74,3 +83,17 @@ __all__ = [
     "voom",
     "voom_lm_fit",
 ]
+
+
+def __getattr__(name: str) -> object:
+    # `nebula` imports `anndata`, an optional extra. Resolving it lazily keeps
+    # `import edge_rs` working without it.
+    if name == "nebula":
+        try:
+            from edge_rs import _anndata
+        except ImportError as e:
+            raise ImportError(
+                "edge_rs.nebula needs anndata: uv add 'edge-rs[anndata]'"
+            ) from e
+        return _anndata.nebula
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

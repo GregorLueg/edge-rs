@@ -1,4 +1,5 @@
-//! Python bindings for the bulk edgeR and limma-voom stacks of edge-rs.
+//! Python bindings for the bulk edgeR and limma-voom stacks of edge-rs, and
+//! NEBULA over AnnData's cell-major CSR.
 //!
 //! Thin by design: arrays in, arrays out, and the Python package on top does
 //! the validation, the defaults and the polars tables. Every matrix crosses
@@ -14,6 +15,7 @@ use pyo3::prelude::*;
 mod core;
 mod edger;
 mod limma;
+mod sc;
 
 ////////////////
 // Exceptions //
@@ -145,6 +147,7 @@ fn _edge_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(limma::contrasts_fit, m)?,
         wrap_pyfunction!(limma::ebayes, m)?,
         wrap_pyfunction!(limma::top_table, m)?,
+        wrap_pyfunction!(sc::nebula_cell_major, m)?,
     ] {
         m.add_function(f)?;
     }

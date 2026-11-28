@@ -165,3 +165,22 @@ def top_table(
     lfc: float,
     confint: float | None,
 ) -> dict[str, np.ndarray]: ...
+def nebula_cell_major(
+    data: np.ndarray,
+    indices: np.ndarray,
+    indptr: np.ndarray,
+    n_vars: int,
+    cells: np.ndarray,
+    subject_run: np.ndarray,
+    genes: np.ndarray,
+    design: np.ndarray,
+    offset: np.ndarray | None = None,
+    coef: int = 0,
+    contrast: list[float] | None = None,
+    method: str = "ln",
+    cpc: float = 0.005,
+    mincp: int = 5,
+    min_subjects: int = 0,
+    shrink_dispersion: bool = True,
+    gene_block_size: int = 1000,
+) -> dict[str, Any]: ...

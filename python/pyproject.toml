@@ -21,12 +21,17 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
+[project.optional-dependencies]
+# `edge_rs.nebula(adata, ...)`. scipy and pandas come with anndata.
+anndata = ["anndata>=0.10"]
+
 [project.urls]
 Repository = "https://github.com/GregorLueg/edge-rs"
 Documentation = "https://gregorlueg.github.io/edge-rs/"
 
 [dependency-groups]
 dev = [
+    "anndata>=0.10",
     "maturin>=1.15,<2.0",
     "pytest>=8",
     "ruff>=0.9",
