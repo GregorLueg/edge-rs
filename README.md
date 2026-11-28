@@ -37,12 +37,15 @@ under the full feature set.
 
 ## Python
 
-The bulk edgeR quasi-likelihood and limma-voom stacks also ship as a Python
-package, built from `python/` with PyO3. NumPy in, polars out, every function
-named after the R function it reproduces.
+[![PyPI](https://img.shields.io/pypi/v/edge-rs.svg)](https://pypi.org/project/edge-rs/)
+
+Python bindings ship on PyPI as `edge-rs`, built from `python/` with PyO3: the
+bulk edgeR quasi-likelihood and limma-voom stacks, and NEBULA on `AnnData`.
+NumPy in, polars out, every function named after the R function it reproduces.
 
 ```sh
-uv pip install edge-rs
+uv pip install edge-rs              # bulk
+uv pip install 'edge-rs[anndata]'   # plus NEBULA on AnnData
 ```
 
 ```python
@@ -57,8 +60,18 @@ The step functions are there too (`filter_by_expr`, `calc_norm_factors`,
 `glm_ql_fit`, `voom_lm_fit`, `ebayes`, `top_table` and friends), plus an
 optional `DgeList` that keeps library sizes through a gene filter. Pseudobulked
 single cell data from [bixverse](https://gregorlueg.github.io/bixverse-rs/)
-goes straight in as `pb.counts.T`. NEBULA, the exact test and the plain NB GLM
-are not exposed yet.
+goes straight in as `pb.counts.T`.
+
+Single cell people get NEBULA straight on an `AnnData`, cells x genes as scanpy
+keeps them, and a pandas frame back:
+
+```python
+res = edge_rs.nebula(adata, "donor", "~ condition", genes=hvgs)
+```
+
+The layer's CSR is read in place and transposed one gene block at a time, so
+memory on top of the counts stays at one block. The exact test and the plain
+NB GLM are not exposed yet.
 
 Docs, API reference and vignettes: <https://gregorlueg.github.io/edge-rs/>.
 The Python package is versioned on its own; see

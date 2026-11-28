@@ -17,7 +17,8 @@ Docs, API reference and vignettes: <https://gregorlueg.github.io/edge-rs/>
 uv pip install edge-rs
 ```
 
-The runtime dependencies are NumPy, polars and beartype.
+The runtime dependencies are NumPy, polars and beartype. NEBULA on AnnData
+needs the extra: `uv pip install 'edge-rs[anndata]'`.
 
 ## Use
 
@@ -63,6 +64,38 @@ pseudobulk from [bixverse](https://gregorlueg.github.io/bixverse-rs/) goes in as
 column names become coefficient names and `coef="treated"` works. Everything is
 0-based.
 
+## Single cell: NEBULA on AnnData
+
+Donors in a single cell experiment are the replicates, not the cells. NEBULA
+models that with a subject-level random effect, and `edge_rs.nebula` runs it
+straight on an `AnnData`:
+
+```bash
+uv pip install 'edge-rs[anndata]'
+```
+
+```python
+res = edge_rs.nebula(adata, "donor", "~ condition + age", genes=hvgs)
+res.sort_values("p_value").head()
+```
+
+Cells x genes, as scanpy keeps them. Counts come from `layers["counts"]` by
+default (`layer=None` for `X`, `"raw"` for `adata.raw.X`) and have to be raw
+integers. Cells need not be sorted by donor. The design is an additive formula
+over `obs`: numeric columns go in as they are, anything else is treatment coded
+against its first level, so `coef="conditiontreated"` picks the effect. Offsets
+default to the library sizes.
+
+Yes, this one returns a pandas frame, indexed by gene: it's what the scverse
+crowd expects. Columns are `log_fc` (natural log, as NEBULA reports it), `se`,
+`z`, `p_value`, `fdr`, both overdispersions and the convergence flags.
+
+The layer's CSR is read in place and transposed one block of genes at a time,
+so memory on top of the counts stays at one block. A fit is milliseconds to
+seconds per gene, so pass the HVGs or a candidate set rather than all 30k
+genes. Need data larger than memory? [bixverse](https://gregorlueg.github.io/bixverse-rs/)
+runs the same Rust out of core.
+
 ## What's in it
 
 | Python | R |
@@ -77,14 +110,16 @@ column names become coefficient names and `coef="treated"` works. Everything is
 | `make_contrasts`, `contrasts_fit` | `limma::makeContrasts`, `limma::contrasts.fit` |
 | `ebayes`, `top_table` | `limma::eBayes`, `limma::topTable` |
 | `run_edger_ql`, `run_limma_voom` | the above, chained |
+| `nebula` (on `AnnData`) | `nebula::nebula` |
 
-Not exposed yet: NEBULA, the exact test, `glmFit`/`glmLRT`/`glmTreat` and
+Not exposed yet: the exact test, `glmFit`/`glmLRT`/`glmTreat` and
 `diffSpliceDGE`. The crate has all of them.
 
 ## How close to R?
 
-The crate is gated against edgeR 4.8.2 and limma 3.66.0 on committed fixtures,
-and the Python tests run the same fixtures through the bindings. The bulk
+The crate is gated against edgeR 4.8.2, limma 3.66.0 and nebula 1.5.9 on
+committed fixtures, and the Python tests run the same fixtures through the
+bindings. The bulk
 vignette reruns the edgeR QL F1000 workflow on GSE60450 and matches R on every
 number it shows.
 

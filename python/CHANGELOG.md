@@ -3,6 +3,18 @@
 Versions here track the Python package, not the `edge-rs` crate. Each release
 says which crate version it builds against.
 
+## 0.2.0
+
+Builds against the `edge-rs` crate at 0.4.0. NEBULA parity is tested against
+nebula 1.5.9 on the crate's committed fixtures.
+
+**Features**
+
+- `nebula(adata, subject_key, design)`: NEBULA's negative binomial gamma mixed
+  model straight on an `AnnData`, behind the new `anndata` extra. Takes an
+  additive formula over `obs` and returns a pandas frame indexed by gene.
+- Cells need not be sorted by subject.
+
 ## 0.1.0
 
 Builds against the `edge-rs` crate at 0.4.0. Parity is tested against edgeR
